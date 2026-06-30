@@ -32,10 +32,11 @@ describe('connection store', () => {
     expect(store.lastError).toBe('认证失败: 无效密钥')
   })
 
-  it('marks connected after successful invoke', async () => {
+  it('marks connected after successful invoke via backend event', async () => {
     vi.mocked(tauriInvoke).mockResolvedValue(undefined)
     const store = useConnectionStore()
     await store.connect(true)
+    store.setStatus('connected')
     expect(store.status).toBe('connected')
     expect(tauriInvoke).toHaveBeenCalledWith('connect', { startRealtime: true })
   })

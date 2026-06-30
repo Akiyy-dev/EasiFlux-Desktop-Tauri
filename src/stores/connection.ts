@@ -47,12 +47,11 @@ export const useConnectionStore = defineStore('connection', () => {
     }
   }
 
-  async function connect(startRealtime = true): Promise<void> {
+    async function connect(startRealtime = true): Promise<void> {
     lastError.value = null
     status.value = 'connecting'
     try {
       await tauriInvoke('connect', { startRealtime })
-      status.value = 'connected'
     } catch (error) {
       status.value = 'error'
       const message = formatInvokeError(error)

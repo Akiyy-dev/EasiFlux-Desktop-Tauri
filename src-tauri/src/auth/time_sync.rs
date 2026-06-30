@@ -53,26 +53,38 @@ pub async fn sync_from_server(
     Ok(())
 }
 
-pub fn parse_server_time(payload: &serde_json::Value) -> AppResult<u64> {
-    if let Some(ts) = payload.as_u64() {
-        return Ok(ts);
+fn normalize_timestamp_ms(value: u64) -> Option<u64> {
+    if value >= 10_u64.pow(12) {
+        Some(value)
+    } else if value >= 10_u64.pow(9) {
+        Some(value * 1000)
+    } else {
+        None
     }
-    if let Some(ts) = payload.as_i64() {
-        return Ok(ts.max(0) as u64);
+}
+
+fn parse_timestamp_value(value: &serde_json::Value) -> Option<u64> {
+    let raw = if let Some(ts) = value.as_u64() {
+        ts
+    } else if let Some(ts) = value.as_i64() {
+        ts.max(0) as u64
+    } else if let Some(s) = value.as_str() {
+        s.parse::<u64>().ok()?
+    } else {
+        return None;
+    };
+    normalize_timestamp_ms(raw)
+}
+
+pub fn parse_server_time(payload: &serde_json::Value) -> AppResult<u64> {
+    if let Some(ts) = parse_timestamp_value(payload) {
+        return Ok(ts);
     }
     if let Some(obj) = payload.as_object() {
         for key in ["serverTime", "server_time", "time", "timestamp"] {
             if let Some(val) = obj.get(key) {
-                if let Some(ts) = val.as_u64() {
+                if let Some(ts) = parse_timestamp_value(val) {
                     return Ok(ts);
-                }
-                if let Some(ts) = val.as_i64() {
-                    return Ok(ts.max(0) as u64);
-                }
-                if let Some(s) = val.as_str() {
-                    if let Ok(ts) = s.parse::<u64>() {
-                        return Ok(ts);
-                    }
                 }
             }
         }
@@ -90,5 +102,12 @@ mod tests {
         let before = sync.timestamp_ms();
         sync.set_server_time(before + 1000);
         assert_eq!(sync.offset_ms(), 1000);
+    }
+
+    #[test]
+    fn parse_server_time_seconds_to_ms() {
+        let payload = serde_json::json!({"time": "1782850580"});
+        let ts = parse_server_time(&payload).unwrap();
+        assert_eq!(ts, 1_782_850_580_000);
     }
 }

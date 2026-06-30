@@ -11,6 +11,15 @@ use crate::models::config::{ApiCredential, DEFAULT_BASE_URL, RECV_WINDOW_MS};
 
 use super::response::{error_message, is_success_response};
 
+pub fn normalize_base_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        DEFAULT_BASE_URL.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiClient {
     http: Client,
@@ -139,10 +148,6 @@ impl Default for ApiClient {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn normalize_base_url(url: &str) -> String {
-    url.trim_end_matches('/').to_string()
 }
 
 fn encode_query(params: &HashMap<String, String>) -> String {

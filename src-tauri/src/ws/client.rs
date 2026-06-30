@@ -11,6 +11,7 @@ use url::Url;
 use crate::api::mapper::{parse_balance, parse_depth, parse_order, parse_position, parse_ticker};
 use crate::auth::Signer;
 use crate::auth::TimeSync;
+use crate::api::client::normalize_base_url;
 use crate::error::{AppError, AppResult};
 use crate::events::EventEmitter;
 
@@ -50,7 +51,7 @@ impl WsManager {
     }
 
     pub async fn configure(&self, base_url: &str, signer: Signer) {
-        *self.base_url.write().await = base_url.trim_end_matches('/').to_string();
+        *self.base_url.write().await = normalize_base_url(base_url);
         *self.signer.write().await = Some(signer);
     }
 
@@ -196,10 +197,8 @@ impl WsManager {
 }
 
 pub fn build_ws_url(base: &str) -> AppResult<String> {
-    if base.is_empty() {
-        return Err(AppError::NotConnected);
-    }
-    let parsed = Url::parse(base).map_err(|e| AppError::Connection(e.to_string()))?;
+    let base = normalize_base_url(base);
+    let parsed = Url::parse(&base).map_err(|e| AppError::Connection(e.to_string()))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| AppError::Connection("无效 base_url".into()))?;
@@ -368,8 +367,14 @@ mod tests {
     }
 
     #[test]
-    fn ws_url_rejects_empty_base() {
-        assert!(build_ws_url("").is_err());
+    fn ws_url_rejects_invalid_base() {
+        assert!(build_ws_url("not-a-url").is_err());
+    }
+
+    #[test]
+    fn ws_url_uses_default_for_empty_base() {
+        let url = build_ws_url("").unwrap();
+        assert_eq!(url, "wss://api.easicoin.io/ws");
     }
 
     #[test]

@@ -3,7 +3,7 @@ import { onMounted, ref } from 'vue'
 import { NConfigProvider, NMessageProvider, darkTheme } from 'naive-ui'
 import AppShell from './components/layout/AppShell.vue'
 import SettingsDialog from './components/settings/SettingsDialog.vue'
-import { useTauriEvent } from './composables/useTauriEvent'
+import { useTauriEvent, whenTauriListenersReady } from './composables/useTauriEvent'
 import { useAppStore } from './stores/app'
 import { useConfigStore } from './stores/config'
 import { useConnectionStore } from './stores/connection'
@@ -80,6 +80,8 @@ useTauriEvent<LogEntry>('log:entry', (entry) => {
 })
 
 onMounted(async () => {
+  await whenTauriListenersReady()
+
   try {
     await appStore.ping()
   } catch (error) {
