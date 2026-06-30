@@ -25,12 +25,26 @@ const logStore = useLogStore()
 
 const showSettings = ref(false)
 
+function reportError(context: string, error: unknown): void {
+  const text =
+    typeof error === 'string'
+      ? error
+      : error instanceof Error
+        ? error.message
+        : '未知错误'
+  logStore.setError(`${context}: ${text}`)
+}
+
 useTauriEvent<string>('app:ready', (version) => {
   appStore.markReady(version)
 })
 
 useTauriEvent<string>('connection:status', (status) => {
   connectionStore.setStatus(status)
+})
+
+useTauriEvent<string>('websocket:status', (status) => {
+  connectionStore.setWsStatus(status)
 })
 
 useTauriEvent<Ticker>('market:ticker', (ticker) => {
@@ -57,8 +71,8 @@ useTauriEvent<Balance>('balance:updated', (balance) => {
   accountStore.setBalance(balance)
 })
 
-useTauriEvent<string>('error:occurred', (message) => {
-  logStore.setError(message)
+useTauriEvent<string>('error:occurred', (msg) => {
+  logStore.setError(msg)
 })
 
 useTauriEvent<LogEntry>('log:entry', (entry) => {
@@ -66,19 +80,33 @@ useTauriEvent<LogEntry>('log:entry', (entry) => {
 })
 
 onMounted(async () => {
-  await appStore.ping()
-  await configStore.fetchConfig()
+  try {
+    await appStore.ping()
+  } catch (error) {
+    reportError('启动检查失败', error)
+  }
+
+  try {
+    await configStore.fetchConfig()
+  } catch (error) {
+    reportError('加载配置失败', error)
+    showSettings.value = true
+    return
+  }
+
   if (configStore.config) {
     marketStore.activeSymbol = configStore.config.activeSymbol
     marketStore.klineInterval = configStore.config.klineInterval
   }
+
   const hasCreds = await configStore.hasCredentials(
     configStore.config?.activeAccountId ?? 'default',
   )
   if (hasCreds) {
     try {
       await connectionStore.connect(configStore.config?.useWebsocket ?? true)
-    } catch {
+    } catch (error) {
+      reportError('自动连接失败', error)
       showSettings.value = true
     }
   } else {

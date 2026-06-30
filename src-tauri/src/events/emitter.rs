@@ -20,7 +20,12 @@ impl EventEmitter {
 
     pub fn emit_connection(&self, status: &str) {
         let _ = self.app.emit("connection:status", status);
-        self.emit_log("info", &format!("连接状态: {}", status));
+        self.emit_log("info", &format!("API 连接状态: {}", status));
+    }
+
+    pub fn emit_websocket(&self, status: &str) {
+        let _ = self.app.emit("websocket:status", status);
+        self.emit_log("info", &format!("WebSocket 状态: {}", status));
     }
 
     pub fn emit_ticker(&self, ticker: Ticker) {

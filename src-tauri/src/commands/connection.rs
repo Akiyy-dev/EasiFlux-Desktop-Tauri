@@ -35,7 +35,11 @@ pub async fn connect(
         .connect(&account_id, start_realtime.unwrap_or(use_ws), &symbol)
         .await?;
     state.market.set_active_symbol(&symbol).await;
-    state.market.refresh_snapshot(&symbol).await?;
+    if let Err(e) = state.market.refresh_snapshot(&symbol).await {
+        state
+            .emitter
+            .emit_error(&format!("行情快照失败: {}", e));
+    }
     let _ = state
         .account
         .refresh_account(&account_id, Some(&symbol))

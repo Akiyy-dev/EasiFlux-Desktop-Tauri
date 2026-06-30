@@ -11,7 +11,16 @@ pub async fn set_active_symbol(state: State<'_, AppState>, symbol: String) -> Ap
     config.active_symbol = symbol.clone();
     state.config_store.save(&config)?;
     if state.connection.status().await == crate::models::config::ConnectionStatus::Connected {
-        state.market.refresh_snapshot(&symbol).await?;
+        if let Err(e) = state.connection.refresh_realtime(&symbol).await {
+            state
+                .emitter
+                .emit_error(&format!("WebSocket 重订阅失败: {}", e));
+        }
+        if let Err(e) = state.market.refresh_snapshot(&symbol).await {
+            state
+                .emitter
+                .emit_error(&format!("行情快照失败: {}", e));
+        }
     }
     Ok(())
 }

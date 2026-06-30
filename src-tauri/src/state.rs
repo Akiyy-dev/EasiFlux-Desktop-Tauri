@@ -43,8 +43,14 @@ impl AppState {
         let time_sync = api.time_sync();
         let ws = Arc::new(WsManager::new(emitter.clone(), time_sync));
 
-        let connection = Arc::new(ConnectionService::new(api.clone(), ws, emitter.clone()));
         let market = Arc::new(MarketService::new(api.clone(), cache.clone(), emitter.clone()));
+        let connection = Arc::new(ConnectionService::new(
+            api.clone(),
+            ws,
+            market.clone(),
+            config.clone(),
+            emitter.clone(),
+        ));
         let risk = Arc::new(RwLock::new(RiskService::new(risk_config)));
         let trading = Arc::new(TradingService::new(
             api.clone(),
