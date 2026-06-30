@@ -1,75 +1,80 @@
 # EasiFlux Desktop (Tauri)
 
-Modern cryptocurrency contract trading desktop client built with **Tauri 2**, **Rust**, and **Vue 3**.
+基于 **Tauri 2**、**Rust** 与 **Vue 3** 构建的现代加密货币合约交易桌面客户端。
 
-> **For AI agents / new sessions:** read [AGENTS.md](AGENTS.md) first — it contains project memory, architecture decisions, and development conventions.
+这是下一代客户端。旧版 Python/PySide6 实现仍保留在 [EasiFlux-Desktop](https://github.com/Akiyy-dev/EasiFlux-Desktop)。
 
-This is the next-generation client. The legacy Python/PySide6 client remains in [EasiFlux-Desktop](https://github.com/Akiyy-dev/EasiFlux-Desktop).
+## 技术栈
 
-## Stack
+| 层级 | 技术 |
+|------|------|
+| 桌面壳 | Tauri 2 |
+| 后端 | Rust（tokio, reqwest, tokio-tungstenite） |
+| 前端 | Vue 3, TypeScript, Vite, Pinia, Naive UI |
+| 图表 | ECharts |
 
-| Layer | Technology |
-|-------|------------|
-| Desktop | Tauri 2 |
-| Backend | Rust (tokio, reqwest, tokio-tungstenite) |
-| Frontend | Vue 3, TypeScript, Vite, Pinia, Naive UI |
-| Charts | ECharts |
+API 通信在 Rust 中独立实现（协议与 [EasiFlux-SDK](https://github.com/Akiyy-dev/EasiFlux-SDK) 对齐）；运行时**不嵌入** Python SDK。
 
-API communication is implemented in Rust (protocol-aligned with [EasiFlux-SDK](https://github.com/Akiyy-dev/EasiFlux-SDK)); Python SDK is **not** embedded at runtime.
-
-## Requirements
+## 环境要求
 
 - Node.js 20+
 - pnpm 9+
-- Rust stable (with MSVC toolchain on Windows)
-- [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
+- Rust stable（Windows 需 MSVC 工具链）
+- [Tauri 前置依赖](https://v2.tauri.app/start/prerequisites/)
 
-## Development
+## 开发
 
 ```bash
 pnpm install
 pnpm tauri dev
 ```
 
-Frontend only (browser, IPC calls will fail):
+仅前端（浏览器模式，IPC 调用会失败）：
 
 ```bash
 pnpm dev
 ```
 
-## Build
+## 构建
 
 ```bash
 pnpm tauri build
 ```
 
-Artifacts are written to `src-tauri/target/release/bundle/`.
+产物输出至 `src-tauri/target/release/bundle/`。
 
-## Testing
+## 测试
 
 ```bash
-# Frontend
+# 前端
 pnpm test
 pnpm lint
 
 # Rust
-cd src-tauri && cargo test && cargo clippy -- -D warnings
+cd src-tauri && cargo test && cargo clippy
 ```
 
-## Project layout
+## 项目结构
 
 ```
-src/                 Vue 3 frontend
-src-tauri/src/       Rust core (api, ws, services, storage)
-tests/               Frontend + Rust tests
+src/                 Vue 3 前端
+src-tauri/src/       Rust 核心（api, ws, services, storage）
+tests/               前端与 Rust 测试
 ```
 
-## Configuration
+## 配置
 
-User config: `%APPDATA%/EasiFlux Desktop/config.toml` (compatible schema with legacy client)
+- 用户配置：`%APPDATA%/EasiFlux Desktop/config.toml`（与旧版客户端 schema 兼容）
+- API 凭据：系统 Keyring（service 名 `easiflux_desktop_tauri`）
 
-API credentials: OS keyring (`easiflux_desktop_tauri` service)
+## 版本与发布
 
-## License
+本项目使用 [release-please](https://github.com/googleapis/release-please) 管理版本与变更日志。提交请遵循 [Conventional Commits](https://www.conventionalcommits.org/) 规范，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 贡献
+
+欢迎提交 Issue 与 Pull Request。请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 了解提交规范与开发流程。
+
+## 许可证
 
 MIT

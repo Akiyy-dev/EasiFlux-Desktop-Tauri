@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config/schema.json",
+  "packages": {
+    ".": {
+      "release-type": "node",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        "src-tauri/Cargo.toml",
+        "src-tauri/tauri.conf.json"
+      ]
+    }
+  },
+  "bootstrap-sha": "4e42ae3"
+}

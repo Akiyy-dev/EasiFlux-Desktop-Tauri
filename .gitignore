@@ -24,3 +24,7 @@ tmp
 *.njsproj
 *.sln
 *.sw?
+
+# Local-only (not pushed)
+AGENTS.md
+.cursor/
