@@ -1,0 +1,9 @@
+pub const SERVER_TIME: &str = "/futures/public/v1/market/time";
+pub const TICKER: &str = "/futures/public/v1/market/tickers";
+pub const KLINE: &str = "/futures/public/v1/market/kline";
+pub const DEPTH: &str = "/futures/public/v1/market/order-book";
+pub const CREATE_ORDER: &str = "/futures/private/v1/create-order";
+pub const CANCEL_ORDER: &str = "/futures/private/v1/cancel-order";
+pub const OPEN_ORDERS: &str = "/futures/private/v1/trade/activity-orders";
+pub const BALANCES: &str = "/futures/private/v1/account/balance";
+pub const POSITIONS: &str = "/futures/private/v1/position/list";
