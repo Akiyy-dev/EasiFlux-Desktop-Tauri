@@ -58,14 +58,20 @@ pub struct PlaceOrderRequest {
     pub side: String,
     pub order_type: String,
     pub qty: String,
+    #[serde(default)]
+    pub position_idx: i32,
     pub price: Option<String>,
+    pub time_in_force: Option<String>,
+    pub order_link_id: Option<String>,
+    pub reduce_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelOrderRequest {
     pub symbol: String,
-    pub order_id: String,
+    pub order_id: Option<String>,
+    pub order_link_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

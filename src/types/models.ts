@@ -13,6 +13,8 @@ export interface AppConfig {
   theme: ThemeMode
   klineInterval: string
   useWebsocket: boolean
+  wsPublicUrl: string
+  wsPrivateUrl: string
   tickerPollInterval: number
   windowWidth: number
   windowHeight: number
@@ -117,12 +119,81 @@ export interface PlaceOrderRequest {
   side: string
   orderType: string
   qty: string
+  positionIdx?: number
   price?: string
+  timeInForce?: string
+  orderLinkId?: string
+  reduceOnly?: boolean
 }
 
 export interface CancelOrderRequest {
   symbol: string
+  orderId?: string
+  orderLinkId?: string
+}
+
+export interface CancelAllOrdersRequest {
+  symbol?: string
+  coin?: string
+  orderFilter?: string
+}
+
+export interface ReplaceOrderRequest {
+  symbol: string
+  orderId?: string
+  orderLinkId?: string
+  price?: string
+  qty?: string
+}
+
+export interface SetLeverageRequest {
+  symbol: string
+  buyLeverage?: number
+  sellLeverage?: number
+}
+
+export interface AddMarginRequest {
+  symbol: string
+  positionIdx: number
+  margin: string
+}
+
+export interface CloseAllPositionsRequest {
+  symbol?: string
+  coin?: string
+  positionIdx?: number
+}
+
+export interface CreateTpslRequest {
+  symbol: string
+  positionIdx: number
+  tpSlMode: string
+  takeProfit?: string
+  stopLoss?: string
+}
+
+export interface ReplaceTpslRequest {
+  symbol: string
   orderId: string
+  takeProfit?: string
+  stopLoss?: string
+}
+
+export interface SwitchMarginModeRequest {
+  symbol: string
+  marginMode: string
+}
+
+export interface SwitchSeparatePositionModeRequest {
+  coin: string
+  positionMode: string
+}
+
+export interface TransferRequest {
+  amount: string
+  coin: string
+  fromWallet: string
+  toWallet: string
 }
 
 export interface TradeStats {

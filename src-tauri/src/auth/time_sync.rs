@@ -77,6 +77,11 @@ fn parse_timestamp_value(value: &serde_json::Value) -> Option<u64> {
 }
 
 pub fn parse_server_time(payload: &serde_json::Value) -> AppResult<u64> {
+    if let Some(time) = payload.get("time") {
+        if let Some(ts) = parse_timestamp_value(time) {
+            return Ok(ts);
+        }
+    }
     if let Some(ts) = parse_timestamp_value(payload) {
         return Ok(ts);
     }

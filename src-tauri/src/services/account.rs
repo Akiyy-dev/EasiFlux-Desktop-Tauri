@@ -17,7 +17,7 @@ impl AccountService {
     }
 
     pub async fn refresh_balances(&self) -> AppResult<Vec<Balance>> {
-        let balances = PrivateApi::balances(&self.api).await?;
+        let balances = PrivateApi::balances(&self.api, None).await?;
         for balance in &balances {
             self.emitter.emit_balance(balance.clone());
         }
@@ -25,7 +25,7 @@ impl AccountService {
     }
 
     pub async fn refresh_positions(&self, symbol: Option<&str>) -> AppResult<Vec<Position>> {
-        let positions = PrivateApi::positions(&self.api, symbol).await?;
+        let positions = PrivateApi::positions(&self.api, symbol, None).await?;
         for position in &positions {
             self.emitter.emit_position(position.clone());
         }

@@ -49,7 +49,7 @@ impl TradingService {
     }
 
     pub async fn cancel_order(&self, request: CancelOrderRequest) -> AppResult<Order> {
-        let order = PrivateApi::cancel_order(&self.api, &request.symbol, &request.order_id).await?;
+        let order = PrivateApi::cancel_order(&self.api, &request).await?;
         let _ = self.trade_log.append_order(&order);
         self.emitter.emit_order(order.clone());
         self.emitter.emit_log("info", &format!("撤单成功: {}", order.order_id));

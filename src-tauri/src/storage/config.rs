@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
-use crate::models::config::{AppConfig, ThemeMode, APP_NAME, CONFIG_FILENAME};
+use crate::models::config::{
+    AppConfig, ThemeMode, DEFAULT_WS_PRIVATE_URL, DEFAULT_WS_PUBLIC_URL, APP_NAME, CONFIG_FILENAME,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TomlConfig {
@@ -20,6 +22,10 @@ struct TomlConfig {
     kline_interval: String,
     #[serde(default = "default_true")]
     use_websocket: bool,
+    #[serde(default = "default_ws_public")]
+    ws_public_url: String,
+    #[serde(default = "default_ws_private")]
+    ws_private_url: String,
     #[serde(default = "default_poll")]
     ticker_poll_interval: f64,
     #[serde(default = "default_width")]
@@ -61,6 +67,12 @@ fn default_true() -> bool {
 fn default_poll() -> f64 {
     5.0
 }
+fn default_ws_public() -> String {
+    DEFAULT_WS_PUBLIC_URL.to_string()
+}
+fn default_ws_private() -> String {
+    DEFAULT_WS_PRIVATE_URL.to_string()
+}
 fn default_width() -> u32 {
     1400
 }
@@ -93,6 +105,8 @@ impl From<TomlConfig> for AppConfig {
             },
             kline_interval: t.kline_interval,
             use_websocket: t.use_websocket,
+            ws_public_url: t.ws_public_url,
+            ws_private_url: t.ws_private_url,
             ticker_poll_interval: t.ticker_poll_interval,
             window_width: t.window_width,
             window_height: t.window_height,
@@ -114,6 +128,8 @@ impl From<&AppConfig> for TomlConfig {
             theme: format!("{:?}", c.theme).to_lowercase(),
             kline_interval: c.kline_interval.clone(),
             use_websocket: c.use_websocket,
+            ws_public_url: c.ws_public_url.clone(),
+            ws_private_url: c.ws_private_url.clone(),
             ticker_poll_interval: c.ticker_poll_interval,
             window_width: c.window_width,
             window_height: c.window_height,

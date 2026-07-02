@@ -64,6 +64,15 @@ docs(readme): translate to Chinese
 3. 提交信息遵循上述 Conventional Commits 规范
 4. 向 `main` 发起 PR
 
+## 协议对照 SDK v0.3
+
+Rust 层 API 实现以 [EasiFlux-SDK](https://github.com/Akiyy-dev/EasiFlux-SDK) v0.3 为协议对照（**不嵌入** Python 运行时）：
+
+- REST：33 个端点，路径见 `src-tauri/src/api/endpoints.rs`
+- WebSocket：双连接 `contract/public/v1` + `contract/private/v1`，topic 订阅与 `GET/realtime` 鉴权
+- 请求体：出站 snake_case（含 `position_idx`）；前端 TypeScript 仍用 camelCase
+- 对照测试：Rust 单测参考 SDK `tests/test_auth.py`、`test_websocket.py`、`test_client.py`
+
 ## 相关仓库
 
 - 旧版客户端：[EasiFlux-Desktop](https://github.com/Akiyy-dev/EasiFlux-Desktop)（Python/PySide6）

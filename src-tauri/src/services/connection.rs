@@ -61,8 +61,6 @@ impl ConnectionService {
         let credential = CredentialStore::load(account_id)?
             .ok_or_else(|| AppError::Auth("未找到 API 凭据".into()))?;
         self.api.set_credential(credential.clone()).await;
-        let base_url = self.api.base_url().await;
-
         sync_from_server(
             self.api.time_sync().as_ref(),
             PublicApi::server_time(&self.api),
@@ -70,9 +68,14 @@ impl ConnectionService {
         .await?;
 
         if start_realtime {
+            let (ws_public, ws_private) = {
+                let cfg = self.config.read().await;
+                (cfg.ws_public_url.clone(), cfg.ws_private_url.clone())
+            };
             self.ws
                 .configure(
-                    &base_url,
+                    &ws_public,
+                    &ws_private,
                     Signer::new(credential.api_key.clone(), credential.api_secret.clone()),
                 )
                 .await;
