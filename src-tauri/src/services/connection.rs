@@ -155,30 +155,34 @@ impl ConnectionService {
 
         let market = self.market.clone();
         let config = self.config.clone();
-        let ws = self.ws.clone();
+        let emitter = self.emitter.clone();
 
         tauri::async_runtime::spawn(async move {
-            loop {
-                let (use_ws, interval_secs) = {
-                    let cfg = config.read().await;
-                    (cfg.use_websocket, cfg.ticker_poll_interval.max(1.0))
-                };
+            const KLINE_POLL_EVERY_N: u64 = 5;
+            let mut poll_tick: u64 = 0;
 
-                if use_ws && ws.is_connected() {
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => return,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs_f64(interval_secs)) => continue,
-                    }
-                }
+            loop {
+                let interval_secs = {
+                    let cfg = config.read().await;
+                    cfg.ticker_poll_interval.max(1.0)
+                };
 
                 tokio::select! {
                     _ = shutdown_rx.recv() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_secs_f64(interval_secs)) => {}
                 }
 
+                poll_tick += 1;
                 let symbol = market.active_symbol().await;
-                if let Err(e) = market.refresh_snapshot(&symbol).await {
-                    tracing::warn!("Market poll failed: {}", e);
+
+                if let Err(e) = market.refresh_ticker_depth(&symbol).await {
+                    emitter.emit_error(&format!("行情轮询失败: {}", e));
+                }
+
+                if poll_tick % KLINE_POLL_EVERY_N == 0 {
+                    if let Err(e) = market.refresh_klines(&symbol).await {
+                        emitter.emit_error(&format!("K线轮询失败: {}", e));
+                    }
                 }
             }
         });

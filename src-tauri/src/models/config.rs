@@ -121,7 +121,7 @@ impl Default for AppConfig {
             use_websocket: true,
             ws_public_url: DEFAULT_WS_PUBLIC_URL.to_string(),
             ws_private_url: DEFAULT_WS_PRIVATE_URL.to_string(),
-            ticker_poll_interval: 5.0,
+            ticker_poll_interval: 1.0,
             window_width: 1400,
             window_height: 900,
             accounts: vec!["default".to_string()],

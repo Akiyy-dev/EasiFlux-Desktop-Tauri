@@ -60,15 +60,51 @@ impl MarketService {
         Ok(klines)
     }
 
-    pub async fn refresh_snapshot(&self, symbol: &str) -> AppResult<()> {
+    pub async fn refresh_ticker_depth(&self, symbol: &str) -> AppResult<()> {
+        let mut failures = Vec::new();
+
+        if let Err(e) = self.fetch_ticker(symbol).await {
+            let message = format!("Ticker 刷新失败: {}", e);
+            self.emitter.emit_error(&message);
+            failures.push(message);
+        }
+        if let Err(e) = self.fetch_depth(symbol).await {
+            let message = format!("深度刷新失败: {}", e);
+            self.emitter.emit_error(&message);
+            failures.push(message);
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::error::AppError::Internal(failures.join("; ")))
+        }
+    }
+
+    pub async fn refresh_klines(&self, symbol: &str) -> AppResult<()> {
         let interval = self.kline_interval.read().await.clone();
-        let (ticker, depth, klines) =
-            PublicApi::market_snapshot(&self.api, symbol, &interval).await?;
-        self.cache.set_ticker(ticker.clone());
-        self.emitter.emit_ticker(ticker);
-        self.emitter.emit_depth(depth);
-        self.cache.set_klines(symbol, &interval, klines.clone());
-        self.emitter.emit_klines(&klines);
+        if let Err(e) = self.fetch_klines(symbol, &interval).await {
+            let message = format!("K线刷新失败: {}", e);
+            self.emitter.emit_error(&message);
+            return Err(crate::error::AppError::Internal(message));
+        }
         Ok(())
+    }
+
+    pub async fn refresh_snapshot(&self, symbol: &str) -> AppResult<()> {
+        let mut failures = Vec::new();
+
+        if let Err(e) = self.refresh_ticker_depth(symbol).await {
+            failures.push(e.to_string());
+        }
+        if let Err(e) = self.refresh_klines(symbol).await {
+            failures.push(e.to_string());
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::error::AppError::Internal(failures.join("; ")))
+        }
     }
 }

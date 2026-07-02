@@ -65,7 +65,7 @@ fn default_true() -> bool {
     true
 }
 fn default_poll() -> f64 {
-    5.0
+    1.0
 }
 fn default_ws_public() -> String {
     DEFAULT_WS_PUBLIC_URL.to_string()

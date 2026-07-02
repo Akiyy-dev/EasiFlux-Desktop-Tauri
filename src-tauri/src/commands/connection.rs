@@ -23,12 +23,13 @@ pub async fn connect(
     start_realtime: Option<bool>,
     credential: Option<ApiCredential>,
 ) -> AppResult<()> {
-    let (account_id, symbol, use_ws) = {
+    let (account_id, symbol, use_ws, kline_interval) = {
         let config = state.config.read().await;
         (
             normalize_account_id(&config.active_account_id),
             config.active_symbol.clone(),
             config.use_websocket,
+            config.kline_interval.clone(),
         )
     };
     state
@@ -41,16 +42,31 @@ pub async fn connect(
         )
         .await?;
     state.market.set_active_symbol(&symbol).await;
+    state.market.set_kline_interval(&kline_interval).await;
     if let Err(e) = state.market.refresh_snapshot(&symbol).await {
         state
             .emitter
             .emit_error(&format!("行情快照失败: {}", e));
     }
-    let _ = state
+    if let Err(e) = state
         .account
         .refresh_account(&account_id, Some(&symbol))
-        .await;
-    let _ = state.trading.refresh_orders(Some(&symbol)).await;
+        .await
+    {
+        state
+            .emitter
+            .emit_error(&format!("账户刷新失败: {}", e));
+    }
+    if let Err(e) = state.trading.refresh_orders(Some(&symbol)).await {
+        state
+            .emitter
+            .emit_error(&format!("订单刷新失败: {}", e));
+    }
+    if let Err(e) = state.account.refresh_positions(Some(&symbol)).await {
+        state
+            .emitter
+            .emit_error(&format!("持仓刷新失败: {}", e));
+    }
     Ok(())
 }
 

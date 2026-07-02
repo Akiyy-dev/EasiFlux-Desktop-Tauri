@@ -8,6 +8,33 @@ vi.mock('../../src/composables/useTauriCommand', () => ({
 
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 
+const emptySummary = {
+  accountId: 'default',
+  balances: [],
+  totalEquity: '0',
+}
+
+function mockSuccessfulConnectInvoke(): void {
+  vi.mocked(tauriInvoke).mockImplementation((cmd) => {
+    if (cmd === 'get_connection_status') {
+      return Promise.resolve('connected')
+    }
+    if (cmd === 'refresh_account') {
+      return Promise.resolve(emptySummary)
+    }
+    if (cmd === 'refresh_market') {
+      return Promise.resolve(undefined)
+    }
+    if (cmd === 'refresh_orders') {
+      return Promise.resolve([])
+    }
+    if (cmd === 'refresh_positions') {
+      return Promise.resolve([])
+    }
+    return Promise.resolve(undefined)
+  })
+}
+
 describe('connection store', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
@@ -32,13 +59,8 @@ describe('connection store', () => {
     expect(store.lastError).toBe('认证失败: 无效密钥')
   })
 
-  it('refreshes status from backend after successful connect', async () => {
-    vi.mocked(tauriInvoke).mockImplementation((cmd) => {
-      if (cmd === 'get_connection_status') {
-        return Promise.resolve('connected')
-      }
-      return Promise.resolve(undefined)
-    })
+  it('refreshes account, market, orders, and positions after connect', async () => {
+    mockSuccessfulConnectInvoke()
     const store = useConnectionStore()
     await store.connect(true)
     expect(store.status).toBe('connected')
@@ -47,15 +69,14 @@ describe('connection store', () => {
       credential: undefined,
     })
     expect(tauriInvoke).toHaveBeenCalledWith('get_connection_status')
+    expect(tauriInvoke).toHaveBeenCalledWith('refresh_account')
+    expect(tauriInvoke).toHaveBeenCalledWith('refresh_market')
+    expect(tauriInvoke).toHaveBeenCalledWith('refresh_orders', { symbol: null })
+    expect(tauriInvoke).toHaveBeenCalledWith('refresh_positions', { symbol: null })
   })
 
   it('passes inline credential to connect command', async () => {
-    vi.mocked(tauriInvoke).mockImplementation((cmd) => {
-      if (cmd === 'get_connection_status') {
-        return Promise.resolve('connected')
-      }
-      return Promise.resolve(undefined)
-    })
+    mockSuccessfulConnectInvoke()
     const cred = {
       apiKey: 'k',
       apiSecret: 's',

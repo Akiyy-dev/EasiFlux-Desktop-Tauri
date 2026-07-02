@@ -5,6 +5,7 @@ import {
   NForm,
   NFormItem,
   NInput,
+  NInputNumber,
   NModal,
   NSwitch,
   useMessage,
@@ -26,6 +27,7 @@ const apiKey = ref('')
 const apiSecret = ref('')
 const baseUrl = ref('https://api.easicoin.io')
 const useWebsocket = ref(true)
+const tickerPollInterval = ref(1)
 const testing = ref(false)
 
 watch(
@@ -34,6 +36,7 @@ watch(
     if (visible && configStore.config) {
       baseUrl.value = 'https://api.easicoin.io'
       useWebsocket.value = configStore.config.useWebsocket
+      tickerPollInterval.value = configStore.config.tickerPollInterval
     }
   },
 )
@@ -57,7 +60,11 @@ async function save(): Promise<void> {
     label: 'default',
   })
   if (configStore.config) {
-    await configStore.saveConfig({ ...configStore.config, useWebsocket: useWebsocket.value })
+    await configStore.saveConfig({
+      ...configStore.config,
+      useWebsocket: useWebsocket.value,
+      tickerPollInterval: Math.max(1, tickerPollInterval.value),
+    })
   }
   message.success('凭据已保存')
 }
@@ -101,6 +108,9 @@ async function connect(): Promise<void> {
       </NFormItem>
       <NFormItem label="WebSocket 实时推送">
         <NSwitch v-model:value="useWebsocket" />
+      </NFormItem>
+      <NFormItem label="行情刷新间隔（秒）">
+        <NInputNumber v-model:value="tickerPollInterval" :min="1" :step="1" style="width: 100%" />
       </NFormItem>
     </NForm>
     <template #footer>

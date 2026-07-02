@@ -20,6 +20,9 @@ export const useMarketStore = defineStore('market', () => {
   }
 
   function setKlines(next: Kline[]): void {
+    if (next.length === 0 && klines.value.length > 0) {
+      return
+    }
     klines.value = next
   }
 

@@ -2,6 +2,12 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type { ApiCredential, ConnectionStatus } from '../types/models'
+import { useAccountStore } from './account'
+import { useConfigStore } from './config'
+import { useLogStore } from './log'
+import { useMarketStore } from './market'
+import { useOrderStore } from './order'
+import { usePositionStore } from './position'
 
 function parseStatus(next: string): ConnectionStatus | null {
   if (
@@ -23,6 +29,33 @@ function formatInvokeError(error: unknown): string {
     return error.message
   }
   return '连接失败'
+}
+
+async function refreshPostConnectData(): Promise<void> {
+  const configStore = useConfigStore()
+  const logStore = useLogStore()
+  const symbol = configStore.config?.activeSymbol
+
+  const tasks: Array<{ label: string; run: () => Promise<void> }> = [
+    { label: '账户', run: () => useAccountStore().refreshAccount() },
+    { label: '行情', run: () => useMarketStore().refreshMarket() },
+    {
+      label: '订单',
+      run: () => useOrderStore().refreshOrders(symbol),
+    },
+    {
+      label: '持仓',
+      run: () => usePositionStore().refreshPositions(symbol),
+    },
+  ]
+
+  for (const task of tasks) {
+    try {
+      await task.run()
+    } catch (error) {
+      logStore.setError(`${task.label}刷新失败: ${formatInvokeError(error)}`)
+    }
+  }
 }
 
 export const useConnectionStore = defineStore('connection', () => {
@@ -56,6 +89,7 @@ export const useConnectionStore = defineStore('connection', () => {
     try {
       await tauriInvoke('connect', { startRealtime, credential })
       await refreshStatus()
+      await refreshPostConnectData()
     } catch (error) {
       status.value = 'error'
       const message = formatInvokeError(error)
