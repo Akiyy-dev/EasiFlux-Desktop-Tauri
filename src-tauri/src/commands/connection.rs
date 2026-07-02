@@ -46,10 +46,15 @@ pub async fn connect(
             .emitter
             .emit_error(&format!("行情快照失败: {}", e));
     }
-    let _ = state
+    if let Err(e) = state
         .account
         .refresh_account(&account_id, Some(&symbol))
-        .await;
+        .await
+    {
+        state
+            .emitter
+            .emit_error(&format!("账户刷新失败: {}", e));
+    }
     let _ = state.trading.refresh_orders(Some(&symbol)).await;
     Ok(())
 }

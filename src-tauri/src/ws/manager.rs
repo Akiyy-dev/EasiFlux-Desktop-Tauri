@@ -73,6 +73,10 @@ impl WsManager {
             || self.private_connected.load(Ordering::Relaxed)
     }
 
+    pub fn is_public_connected(&self) -> bool {
+        self.public_connected.load(Ordering::Relaxed)
+    }
+
     pub async fn subscribe_all(&self, symbol: &str) {
         let mut subs = self.subscriptions.lock().await;
         subs.clear();
@@ -327,8 +331,13 @@ fn handle_message(message: &Value, symbol: &str, emitter: &EventEmitter) {
 
     match super::topics::event_name_for_topic(topic) {
         "ticker" => {
-            if let Some(obj) = message.get("data").and_then(|d| d.as_object()) {
+            let data = message.get("data").unwrap_or(message);
+            if let Some(obj) = data.as_object() {
                 emitter.emit_ticker(parse_ticker(&Value::Object(obj.clone()), symbol));
+            } else if let Some(arr) = data.as_array() {
+                if let Some(first) = arr.first().and_then(|v| v.as_object()) {
+                    emitter.emit_ticker(parse_ticker(&Value::Object(first.clone()), symbol));
+                }
             }
         }
         "depth" => {

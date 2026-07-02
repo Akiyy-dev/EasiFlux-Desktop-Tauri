@@ -1,18 +1,25 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue'
-import { use } from 'echarts/core'
-import { CanvasRenderer } from 'echarts/renderers'
-import { CandlestickChart } from 'echarts/charts'
-import { GridComponent, TooltipComponent, DataZoomComponent } from 'echarts/components'
-import VChart from 'vue-echarts'
+import { onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
+import {
+  CandlestickSeries,
+  ColorType,
+  createChart,
+  type IChartApi,
+  type ISeriesApi,
+  type CandlestickData,
+} from 'lightweight-charts'
 import { storeToRefs } from 'pinia'
 import { useMarketStore } from '../../stores/market'
+import { toCandlestickData } from '../../utils/kline'
 import { NSelect } from 'naive-ui'
-
-use([CanvasRenderer, CandlestickChart, GridComponent, TooltipComponent, DataZoomComponent])
 
 const marketStore = useMarketStore()
 const { klines, klineInterval } = storeToRefs(marketStore)
+
+const chartContainer = ref<globalThis.HTMLDivElement | null>(null)
+const chart = shallowRef<IChartApi | null>(null)
+const series = shallowRef<ISeriesApi<'Candlestick'> | null>(null)
+let resizeObserver: globalThis.ResizeObserver | null = null
 
 const intervals = [
   { label: '1m', value: '1' },
@@ -23,38 +30,77 @@ const intervals = [
   { label: '1D', value: 'D' },
 ]
 
-const option = computed(() => {
-  const data = klines.value.map((k) => [
-    k.openTime,
-    parseFloat(k.open),
-    parseFloat(k.close),
-    parseFloat(k.low),
-    parseFloat(k.high),
-  ])
-  return {
-    backgroundColor: 'transparent',
-    grid: { left: 48, right: 16, top: 24, bottom: 48 },
-    tooltip: { trigger: 'axis' },
-    xAxis: { type: 'time', axisLine: { lineStyle: { color: '#30363d' } } },
-    yAxis: {
-      scale: true,
-      splitLine: { lineStyle: { color: '#21262d' } },
-      axisLine: { lineStyle: { color: '#30363d' } },
-    },
-    dataZoom: [{ type: 'inside' }, { type: 'slider', height: 18, bottom: 4 }],
-    series: [
-      {
-        type: 'candlestick',
-        data,
-        itemStyle: {
-          color: '#26a69a',
-          color0: '#ef5350',
-          borderColor: '#26a69a',
-          borderColor0: '#ef5350',
-        },
-      },
-    ],
+function applyKlines(data: CandlestickData[]): void {
+  series.value?.setData(data)
+  chart.value?.timeScale().fitContent()
+}
+
+function resizeChart(): void {
+  if (!chartContainer.value || !chart.value) {
+    return
   }
+  const { clientWidth, clientHeight } = chartContainer.value
+  chart.value.applyOptions({ width: clientWidth, height: clientHeight })
+}
+
+onMounted(() => {
+  if (!chartContainer.value) {
+    return
+  }
+
+  const instance = createChart(chartContainer.value, {
+    layout: {
+      background: { type: ColorType.Solid, color: 'transparent' },
+      textColor: '#8b949e',
+    },
+    grid: {
+      vertLines: { color: '#21262d' },
+      horzLines: { color: '#21262d' },
+    },
+    rightPriceScale: {
+      borderColor: '#30363d',
+    },
+    timeScale: {
+      borderColor: '#30363d',
+      timeVisible: true,
+      secondsVisible: false,
+    },
+    crosshair: {
+      vertLine: { color: '#484f58' },
+      horzLine: { color: '#484f58' },
+    },
+  })
+
+  const candleSeries = instance.addSeries(CandlestickSeries, {
+    upColor: '#26a69a',
+    downColor: '#ef5350',
+    borderUpColor: '#26a69a',
+    borderDownColor: '#ef5350',
+    wickUpColor: '#26a69a',
+    wickDownColor: '#ef5350',
+  })
+
+  chart.value = instance
+  series.value = candleSeries
+  applyKlines(toCandlestickData(klines.value))
+
+  resizeObserver = new globalThis.ResizeObserver(() => {
+    resizeChart()
+  })
+  resizeObserver.observe(chartContainer.value)
+  resizeChart()
+})
+
+onUnmounted(() => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  chart.value?.remove()
+  chart.value = null
+  series.value = null
+})
+
+watch(klines, (next) => {
+  applyKlines(toCandlestickData(next))
 })
 
 watch(klineInterval, async (interval) => {
@@ -72,7 +118,7 @@ watch(klineInterval, async (interval) => {
         style="width: 88px"
       />
     </div>
-    <VChart class="chart-view" :option="option" autoresize />
+    <div ref="chartContainer" class="chart-view" />
   </div>
 </template>
 

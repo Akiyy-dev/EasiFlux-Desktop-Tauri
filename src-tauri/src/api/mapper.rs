@@ -9,14 +9,27 @@ use crate::models::trading::{Order, OrderStatus, Position};
 
 use super::response::{extract_data, extract_list, get_str};
 
+fn normalize_open_time_ms(value: i64) -> i64 {
+    if value > 0 && value < 10_000_000_000 {
+        value * 1000
+    } else {
+        value
+    }
+}
+
 pub fn parse_ticker(value: &Value, symbol: &str) -> Ticker {
     Ticker {
-        symbol: get_str(value, &["symbol"]).unwrap_or_else(|| symbol.to_string()),
-        last_price: get_str(value, &["lastPrice", "last_price", "last"]).unwrap_or_else(|| "0".into()),
-        bid_price: get_str(value, &["bidPrice", "bid_price", "bid"]).unwrap_or_else(|| "0".into()),
-        ask_price: get_str(value, &["askPrice", "ask_price", "ask"]).unwrap_or_else(|| "0".into()),
-        volume_24h: get_str(value, &["volume24h", "volume_24h", "volume"]).unwrap_or_else(|| "0".into()),
-        change_24h_pct: get_str(value, &["change24hPct", "change_24h_pct", "change"]).unwrap_or_else(|| "0".into()),
+        symbol: get_str(value, &["symbol", "s"]).unwrap_or_else(|| symbol.to_string()),
+        last_price: get_str(value, &["lastPrice", "last_price", "last", "price"])
+            .unwrap_or_else(|| "0".into()),
+        bid_price: get_str(value, &["bidPrice", "bid_price", "bid", "bid1Price"])
+            .unwrap_or_else(|| "0".into()),
+        ask_price: get_str(value, &["askPrice", "ask_price", "ask", "ask1Price"])
+            .unwrap_or_else(|| "0".into()),
+        volume_24h: get_str(value, &["volume24h", "volume_24h", "volume"])
+            .unwrap_or_else(|| "0".into()),
+        change_24h_pct: get_str(value, &["change24hPct", "change_24h_pct", "change", "price24hPcnt"])
+            .unwrap_or_else(|| "0".into()),
     }
 }
 
@@ -64,7 +77,7 @@ pub fn parse_klines(payload: &Value, symbol: &str, interval: &str) -> Vec<Kline>
                     return Some(Kline {
                         symbol: symbol.to_string(),
                         interval: interval.to_string(),
-                        open_time: arr[0].as_i64().unwrap_or(0),
+                        open_time: normalize_open_time_ms(arr[0].as_i64().unwrap_or(0)),
                         open: arr[1].to_string().trim_matches('"').to_string(),
                         high: arr[2].to_string().trim_matches('"').to_string(),
                         low: arr[3].to_string().trim_matches('"').to_string(),
@@ -78,9 +91,11 @@ pub fn parse_klines(payload: &Value, symbol: &str, interval: &str) -> Vec<Kline>
                 return Some(Kline {
                     symbol: symbol.to_string(),
                     interval: interval.to_string(),
-                    open_time: get_str(&v, &["openTime", "open_time", "t"])
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0),
+                    open_time: normalize_open_time_ms(
+                        get_str(&v, &["openTime", "open_time", "t", "timestamp", "start", "time"])
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0),
+                    ),
                     open: get_str(&v, &["open", "o"]).unwrap_or_else(|| "0".into()),
                     high: get_str(&v, &["high", "h"]).unwrap_or_else(|| "0".into()),
                     low: get_str(&v, &["low", "l"]).unwrap_or_else(|| "0".into()),
@@ -319,6 +334,50 @@ pub fn build_cancel_order_body(req: &crate::models::trading::CancelOrderRequest)
 mod tests {
     use super::*;
     use crate::models::trading::PlaceOrderRequest;
+    use serde_json::json;
+
+    #[test]
+    fn parse_ticker_supports_legacy_aliases() {
+        let ticker = parse_ticker(
+            &json!({
+                "s": "ETHUSDT",
+                "price": "3200",
+                "bid1Price": "3199",
+                "ask1Price": "3201",
+                "volume": "1000",
+                "price24hPcnt": "1.5"
+            }),
+            "BTCUSDT",
+        );
+        assert_eq!(ticker.symbol, "ETHUSDT");
+        assert_eq!(ticker.last_price, "3200");
+        assert_eq!(ticker.bid_price, "3199");
+        assert_eq!(ticker.ask_price, "3201");
+        assert_eq!(ticker.volume_24h, "1000");
+        assert_eq!(ticker.change_24h_pct, "1.5");
+    }
+
+    #[test]
+    fn parse_klines_normalizes_second_timestamps() {
+        let klines = parse_klines(
+            &json!([[1700000000, "1", "2", "0.5", "1.5", "10"]]),
+            "BTCUSDT",
+            "1",
+        );
+        assert_eq!(klines.len(), 1);
+        assert_eq!(klines[0].open_time, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn parse_klines_keeps_millisecond_timestamps() {
+        let klines = parse_klines(
+            &json!([[1700000000000_i64, "1", "2", "0.5", "1.5", "10"]]),
+            "BTCUSDT",
+            "1",
+        );
+        assert_eq!(klines.len(), 1);
+        assert_eq!(klines[0].open_time, 1_700_000_000_000);
+    }
 
     #[test]
     fn depth_params_use_depth_key() {

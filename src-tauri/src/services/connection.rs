@@ -164,7 +164,7 @@ impl ConnectionService {
                     (cfg.use_websocket, cfg.ticker_poll_interval.max(1.0))
                 };
 
-                if use_ws && ws.is_connected() {
+                if use_ws && ws.is_public_connected() {
                     tokio::select! {
                         _ = shutdown_rx.recv() => return,
                         _ = tokio::time::sleep(std::time::Duration::from_secs_f64(interval_secs)) => continue,

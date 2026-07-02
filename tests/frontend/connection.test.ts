@@ -37,6 +37,13 @@ describe('connection store', () => {
       if (cmd === 'get_connection_status') {
         return Promise.resolve('connected')
       }
+      if (cmd === 'refresh_account') {
+        return Promise.resolve({
+          accountId: 'default',
+          balances: [],
+          totalEquity: '0',
+        })
+      }
       return Promise.resolve(undefined)
     })
     const store = useConnectionStore()
@@ -47,12 +54,20 @@ describe('connection store', () => {
       credential: undefined,
     })
     expect(tauriInvoke).toHaveBeenCalledWith('get_connection_status')
+    expect(tauriInvoke).toHaveBeenCalledWith('refresh_account')
   })
 
   it('passes inline credential to connect command', async () => {
     vi.mocked(tauriInvoke).mockImplementation((cmd) => {
       if (cmd === 'get_connection_status') {
         return Promise.resolve('connected')
+      }
+      if (cmd === 'refresh_account') {
+        return Promise.resolve({
+          accountId: 'default',
+          balances: [],
+          totalEquity: '0',
+        })
       }
       return Promise.resolve(undefined)
     })

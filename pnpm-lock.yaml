@@ -14,9 +14,9 @@ importers:
       '@tauri-apps/plugin-opener':
         specifier: ^2
         version: 2.5.4
-      echarts:
-        specifier: ^6.1.0
-        version: 6.1.0
+      lightweight-charts:
+        specifier: ^5.0.8
+        version: 5.2.0
       naive-ui:
         specifier: ^2.44.1
         version: 2.44.1(vue@3.5.39(typescript@5.6.3))
@@ -26,9 +26,6 @@ importers:
       vue:
         specifier: ^3.5.13
         version: 3.5.39(typescript@5.6.3)
-      vue-echarts:
-        specifier: ^8.0.1
-        version: 8.0.1(echarts@6.1.0)(vue@3.5.39(typescript@5.6.3))
     devDependencies:
       '@eslint/js':
         specifier: ^10.0.1
@@ -957,9 +954,6 @@ packages:
   eastasianwidth@0.2.0:
     resolution: {integrity: sha512-I88TYZWc9XiYHRQ4/3c5rjjfgkjhLyW2luGIheGERbNQ6OY7yTybanSpDXZa8y7VUP9YmDcYa+eyq4ca7iLqWA==}
 
-  echarts@6.1.0:
-    resolution: {integrity: sha512-q0yaFPggC9FUdsWH4blavRWFmxdrIodbkoKNAjJudAI6CA9gNPxHtV2RcZNEepZVlk4yvBYkOkbk6HIVpIyHZA==}
-
   editorconfig@1.0.7:
     resolution: {integrity: sha512-e0GOtq/aTQhVdNyDU9e02+wz9oDDM+SIOQxWME2QRjzRX5yyLAuHDE+0aE8vHb9XRC8XD37eO2u57+F09JqFhw==}
     engines: {node: '>=14'}
@@ -1059,6 +1053,9 @@ packages:
   expect-type@1.4.0:
     resolution: {integrity: sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==}
     engines: {node: '>=12.0.0'}
+
+  fancy-canvas@2.1.0:
+    resolution: {integrity: sha512-nifxXJ95JNLFR2NgRV4/MxVP45G9909wJTEKz5fg/TZS20JJZA6hfgRVh/bC9bwl2zBtBNcYPjiBE4njQHVBwQ==}
 
   fast-deep-equal@3.1.3:
     resolution: {integrity: sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q==}
@@ -1198,6 +1195,9 @@ packages:
   levn@0.4.1:
     resolution: {integrity: sha512-+bT2uH4E5LGE7h/n3evcS/sQlJXCpIp6ym8OWJ5eV6+67Dsql/LaaT7qJBAt2rzfoa/5QBGBhxDix1dMt2kQKQ==}
     engines: {node: '>= 0.8.0'}
+
+  lightweight-charts@5.2.0:
+    resolution: {integrity: sha512-ey3Vas8UhV06ni+LT9TA1nEe4y8So4Mi6CL/oarNHFMyTktz/xy8e8+oh04Q//eO3t6etvFXgayz2fClyFQb5w==}
 
   locate-path@6.0.0:
     resolution: {integrity: sha512-iPZK6eYjbxRu3uB4/WZ3EsEIMJFMqAoopl3R+zuq0UjcAm/MO6KCweDgPfP3elTztoKP3KtnVHxTn2NHBSDVUw==}
@@ -1458,9 +1458,6 @@ packages:
     peerDependencies:
       typescript: '>=4.8.4'
 
-  tslib@2.3.0:
-    resolution: {integrity: sha512-N82ooyxVNm6h1riLCoyS9e3fuJ3AMG2zIZs2Gd1ATcSFjSA23Q0fzjjZeh0jbJvWVDZ0cJT8yaNNaaXHzueNjg==}
-
   type-check@0.4.0:
     resolution: {integrity: sha512-XleUoc9uwGXqjWwXaUTZAmzMcFZ5858QA2vvx1Ur5xIcixXIP+8LnFDgRplU30us6teqdlskFfu+ae4K79Ooew==}
     engines: {node: '>= 0.8.0'}
@@ -1587,12 +1584,6 @@ packages:
   vue-component-type-helpers@3.3.6:
     resolution: {integrity: sha512-FkljacAwJ9BUoSUdpFe3VDy0sGigNlTH9+2zcXUWmZOjN8swiCkl3t48wOJun0OsUd2cEIda1l04tsxMiKIIrQ==}
 
-  vue-echarts@8.0.1:
-    resolution: {integrity: sha512-23rJTFLu1OUEGRWjJGmdGt8fP+8+ja1gVgzMYPIPaHWpXegcO1viIAaeu2H4QHESlVeHzUAHIxKXGrwjsyXAaA==}
-    peerDependencies:
-      echarts: ^6.0.0
-      vue: ^3.3.0
-
   vue-eslint-parser@10.4.1:
     resolution: {integrity: sha512-Gk6gRDj0n/fkRa3C3l0bBheoBckUq/Rs0F/TvMWIS6nzzx67amAViMe9CkNgsP2tXyQONvGiHQESHwFtZ3aYDA==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
@@ -1670,9 +1661,6 @@ packages:
   yocto-queue@0.1.0:
     resolution: {integrity: sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q==}
     engines: {node: '>=10'}
-
-  zrender@6.1.0:
-    resolution: {integrity: sha512-oEGMDB6pOP2S6OwRR4PdVv610zrjnA3Bh+JnSG12fYJlBKjtNAoEb5fSUoCOOINlH96I2fU38/A2UpRKs67xYQ==}
 
 snapshots:
 
@@ -2415,11 +2403,6 @@ snapshots:
 
   eastasianwidth@0.2.0: {}
 
-  echarts@6.1.0:
-    dependencies:
-      tslib: 2.3.0
-      zrender: 6.1.0
-
   editorconfig@1.0.7:
     dependencies:
       '@one-ini/wasm': 0.1.1
@@ -2554,6 +2537,8 @@ snapshots:
   evtd@0.2.4: {}
 
   expect-type@1.4.0: {}
+
+  fancy-canvas@2.1.0: {}
 
   fast-deep-equal@3.1.3: {}
 
@@ -2692,6 +2677,10 @@ snapshots:
     dependencies:
       prelude-ls: 1.2.1
       type-check: 0.4.0
+
+  lightweight-charts@5.2.0:
+    dependencies:
+      fancy-canvas: 2.1.0
 
   locate-path@6.0.0:
     dependencies:
@@ -2947,8 +2936,6 @@ snapshots:
     dependencies:
       typescript: 5.6.3
 
-  tslib@2.3.0: {}
-
   type-check@0.4.0:
     dependencies:
       prelude-ls: 1.2.1
@@ -3029,11 +3016,6 @@ snapshots:
   vscode-uri@3.1.0: {}
 
   vue-component-type-helpers@3.3.6: {}
-
-  vue-echarts@8.0.1(echarts@6.1.0)(vue@3.5.39(typescript@5.6.3)):
-    dependencies:
-      echarts: 6.1.0
-      vue: 3.5.39(typescript@5.6.3)
 
   vue-eslint-parser@10.4.1(eslint@10.6.0):
     dependencies:
@@ -3120,7 +3102,3 @@ snapshots:
   xmlchars@2.2.0: {}
 
   yocto-queue@0.1.0: {}
-
-  zrender@6.1.0:
-    dependencies:
-      tslib: 2.3.0
