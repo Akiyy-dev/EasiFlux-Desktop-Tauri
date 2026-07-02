@@ -56,10 +56,37 @@ impl ConnectionService {
         account_id: &str,
         start_realtime: bool,
         symbol: &str,
+        credential: Option<ApiCredential>,
     ) -> AppResult<()> {
         self.set_status(ConnectionStatus::Connecting).await;
-        let credential = CredentialStore::load(account_id)?
-            .ok_or_else(|| AppError::Auth("未找到 API 凭据".into()))?;
+
+        match self
+            .connect_inner(account_id, start_realtime, symbol, credential)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = e.user_message();
+                self.set_status(ConnectionStatus::Error).await;
+                self.emitter.emit_error(&msg);
+                Err(e)
+            }
+        }
+    }
+
+    async fn connect_inner(
+        &self,
+        account_id: &str,
+        start_realtime: bool,
+        symbol: &str,
+        credential: Option<ApiCredential>,
+    ) -> AppResult<()> {
+        let credential = match credential {
+            Some(c) => c,
+            None => CredentialStore::load(account_id)?
+                .ok_or_else(|| AppError::Auth("未找到 API 凭据".into()))?,
+        };
+
         self.api.set_credential(credential.clone()).await;
         sync_from_server(
             self.api.time_sync().as_ref(),

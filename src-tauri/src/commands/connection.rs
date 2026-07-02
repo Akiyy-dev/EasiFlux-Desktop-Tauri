@@ -1,7 +1,7 @@
 use tauri::State;
 
 use crate::error::AppResult;
-use crate::models::config::ApiCredential;
+use crate::models::config::{normalize_account_id, ApiCredential};
 use crate::state::AppState;
 
 #[tauri::command]
@@ -21,18 +21,24 @@ pub async fn test_connection(credential: ApiCredential) -> AppResult<()> {
 pub async fn connect(
     state: State<'_, AppState>,
     start_realtime: Option<bool>,
+    credential: Option<ApiCredential>,
 ) -> AppResult<()> {
     let (account_id, symbol, use_ws) = {
         let config = state.config.read().await;
         (
-            config.active_account_id.clone(),
+            normalize_account_id(&config.active_account_id),
             config.active_symbol.clone(),
             config.use_websocket,
         )
     };
     state
         .connection
-        .connect(&account_id, start_realtime.unwrap_or(use_ws), &symbol)
+        .connect(
+            &account_id,
+            start_realtime.unwrap_or(use_ws),
+            &symbol,
+            credential,
+        )
         .await?;
     state.market.set_active_symbol(&symbol).await;
     if let Err(e) = state.market.refresh_snapshot(&symbol).await {

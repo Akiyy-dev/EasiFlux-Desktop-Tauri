@@ -4,7 +4,7 @@ import { storeToRefs } from 'pinia'
 import { useConnectionStore } from '../../stores/connection'
 
 const connectionStore = useConnectionStore()
-const { status, wsStatus, connected } = storeToRefs(connectionStore)
+const { status, wsStatus, connected, lastError } = storeToRefs(connectionStore)
 
 const label = computed(() => {
   const apiLabels: Record<string, string> = {
@@ -12,6 +12,14 @@ const label = computed(() => {
     connecting: 'API 连接中…',
     connected: 'API 已连接',
     error: 'API 连接错误',
+  }
+
+  if (status.value === 'error' && lastError.value) {
+    const short =
+      lastError.value.length > 48
+        ? `${lastError.value.slice(0, 45)}…`
+        : lastError.value
+    return `${apiLabels.error} · ${short}`
   }
 
   if (status.value !== 'connected') {

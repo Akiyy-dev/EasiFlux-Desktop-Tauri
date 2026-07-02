@@ -16,6 +16,16 @@ pub const DEFAULT_WATCHLIST: &[&str] = &["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUS
 pub const KLINE_INTERVALS: &[&str] = &["1", "5", "15", "60", "240", "D"];
 pub const RECV_WINDOW_MS: u64 = 5000;
 
+/// Normalize account id: trim whitespace, fall back to `"default"` when empty.
+pub fn normalize_account_id(account_id: &str) -> String {
+    let trimmed = account_id.trim();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeMode {
@@ -172,4 +182,16 @@ pub struct ConnectionSettings {
     pub api_secret: String,
     pub base_url: String,
     pub use_websocket: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_account_id_empty_to_default() {
+        assert_eq!(normalize_account_id(""), "default");
+        assert_eq!(normalize_account_id("   "), "default");
+        assert_eq!(normalize_account_id("main"), "main");
+    }
 }

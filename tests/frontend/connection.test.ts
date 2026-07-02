@@ -32,12 +32,41 @@ describe('connection store', () => {
     expect(store.lastError).toBe('认证失败: 无效密钥')
   })
 
-  it('marks connected after successful invoke via backend event', async () => {
-    vi.mocked(tauriInvoke).mockResolvedValue(undefined)
+  it('refreshes status from backend after successful connect', async () => {
+    vi.mocked(tauriInvoke).mockImplementation((cmd) => {
+      if (cmd === 'get_connection_status') {
+        return Promise.resolve('connected')
+      }
+      return Promise.resolve(undefined)
+    })
     const store = useConnectionStore()
     await store.connect(true)
-    store.setStatus('connected')
     expect(store.status).toBe('connected')
-    expect(tauriInvoke).toHaveBeenCalledWith('connect', { startRealtime: true })
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: true,
+      credential: undefined,
+    })
+    expect(tauriInvoke).toHaveBeenCalledWith('get_connection_status')
+  })
+
+  it('passes inline credential to connect command', async () => {
+    vi.mocked(tauriInvoke).mockImplementation((cmd) => {
+      if (cmd === 'get_connection_status') {
+        return Promise.resolve('connected')
+      }
+      return Promise.resolve(undefined)
+    })
+    const cred = {
+      apiKey: 'k',
+      apiSecret: 's',
+      baseUrl: 'https://api.easicoin.io',
+      label: 'default',
+    }
+    const store = useConnectionStore()
+    await store.connect(true, cred)
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: true,
+      credential: cred,
+    })
   })
 })

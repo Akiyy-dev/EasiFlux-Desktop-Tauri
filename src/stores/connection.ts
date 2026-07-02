@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
-import type { ConnectionStatus } from '../types/models'
+import type { ApiCredential, ConnectionStatus } from '../types/models'
 
 function parseStatus(next: string): ConnectionStatus | null {
   if (
@@ -47,11 +47,15 @@ export const useConnectionStore = defineStore('connection', () => {
     }
   }
 
-    async function connect(startRealtime = true): Promise<void> {
+  async function connect(
+    startRealtime = true,
+    credential?: ApiCredential,
+  ): Promise<void> {
     lastError.value = null
     status.value = 'connecting'
     try {
-      await tauriInvoke('connect', { startRealtime })
+      await tauriInvoke('connect', { startRealtime, credential })
+      await refreshStatus()
     } catch (error) {
       status.value = 'error'
       const message = formatInvokeError(error)

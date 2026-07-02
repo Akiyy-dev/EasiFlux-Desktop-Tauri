@@ -82,6 +82,13 @@ pub fn parse_server_time(payload: &serde_json::Value) -> AppResult<u64> {
             return Ok(ts);
         }
     }
+    if let Some(data) = payload.get("data") {
+        if let Some(time) = data.get("time") {
+            if let Some(ts) = parse_timestamp_value(time) {
+                return Ok(ts);
+            }
+        }
+    }
     if let Some(ts) = parse_timestamp_value(payload) {
         return Ok(ts);
     }
@@ -114,5 +121,15 @@ mod tests {
         let payload = serde_json::json!({"time": "1782850580"});
         let ts = parse_server_time(&payload).unwrap();
         assert_eq!(ts, 1_782_850_580_000);
+    }
+
+    #[test]
+    fn parse_server_time_from_data_envelope() {
+        let payload = serde_json::json!({
+            "code": 0,
+            "data": {"time": "1782997445"}
+        });
+        let ts = parse_server_time(&payload).unwrap();
+        assert_eq!(ts, 1_782_997_445_000);
     }
 }

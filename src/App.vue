@@ -12,6 +12,7 @@ import { useOrderStore } from './stores/order'
 import { usePositionStore } from './stores/position'
 import { useAccountStore } from './stores/account'
 import { useLogStore } from './stores/log'
+import { normalizeAccountId } from './utils/account'
 import type { Balance, Depth, Kline, LogEntry, Order, Position, Ticker } from './types/models'
 
 const appStore = useAppStore()
@@ -102,7 +103,7 @@ onMounted(async () => {
   }
 
   const hasCreds = await configStore.hasCredentials(
-    configStore.config?.activeAccountId ?? 'default',
+    normalizeAccountId(configStore.config?.activeAccountId),
   )
   if (hasCreds) {
     try {
