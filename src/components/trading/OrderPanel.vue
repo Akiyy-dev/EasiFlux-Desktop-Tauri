@@ -35,6 +35,7 @@ async function submit(): Promise<void> {
       side: side.value,
       orderType: orderType.value,
       qty: qty.value,
+      positionIdx: 0,
       price: orderType.value === 'Limit' ? price.value : undefined,
     })
     message.success('下单成功')

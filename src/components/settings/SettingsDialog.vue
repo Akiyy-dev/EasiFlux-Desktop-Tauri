@@ -12,6 +12,7 @@ import {
 import { tauriInvoke } from '../../composables/useTauriCommand'
 import { useConfigStore } from '../../stores/config'
 import { useConnectionStore } from '../../stores/connection'
+import { normalizeAccountId } from '../../utils/account'
 import type { ApiCredential } from '../../types/models'
 
 const props = defineProps<{ show: boolean }>()
@@ -37,8 +38,17 @@ watch(
   },
 )
 
+function buildCredential(): ApiCredential {
+  return {
+    apiKey: apiKey.value,
+    apiSecret: apiSecret.value,
+    baseUrl: baseUrl.value,
+    label: 'default',
+  }
+}
+
 async function save(): Promise<void> {
-  const accountId = configStore.config?.activeAccountId ?? 'default'
+  const accountId = normalizeAccountId(configStore.config?.activeAccountId)
   await configStore.saveCredentials({
     accountId,
     apiKey: apiKey.value,
@@ -55,13 +65,7 @@ async function save(): Promise<void> {
 async function test(): Promise<void> {
   testing.value = true
   try {
-    const cred: ApiCredential = {
-      apiKey: apiKey.value,
-      apiSecret: apiSecret.value,
-      baseUrl: baseUrl.value,
-      label: 'default',
-    }
-    await tauriInvoke('test_connection', { credential: cred })
+    await tauriInvoke('test_connection', { credential: buildCredential() })
     message.success('连接测试成功')
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
@@ -73,7 +77,7 @@ async function test(): Promise<void> {
 async function connect(): Promise<void> {
   await save()
   emit('update:show', false)
-  await connectionStore.connect(useWebsocket.value)
+  await connectionStore.connect(useWebsocket.value, buildCredential())
 }
 </script>
 

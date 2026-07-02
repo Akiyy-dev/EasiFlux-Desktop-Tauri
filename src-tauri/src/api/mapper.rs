@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::models::api_requests::{ApiCancelOrderRequest, ApiOrderRequest};
 use crate::models::account::Balance;
 use crate::models::market::{Depth, DepthLevel, Kline, Ticker};
 use crate::models::trading::{Order, OrderStatus, Position};
@@ -148,22 +149,65 @@ pub fn parse_balances(payload: &Value) -> Vec<Balance> {
     extract_list(payload).iter().map(|v| parse_balance(v)).collect()
 }
 
-pub fn build_kline_params(symbol: &str, interval: &str, limit: u32) -> HashMap<String, String> {
+pub fn build_kline_params(
+    symbol: &str,
+    interval: &str,
+    limit: Option<u32>,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> HashMap<String, String> {
     let mut params = HashMap::new();
     params.insert("symbol".into(), symbol.into());
     params.insert("interval".into(), interval.into());
-    params.insert("limit".into(), limit.to_string());
+    if let Some(l) = limit {
+        params.insert("limit".into(), l.to_string());
+    }
+    if let Some(s) = start {
+        params.insert("start".into(), s.to_string());
+    }
+    if let Some(e) = end {
+        params.insert("end".into(), e.to_string());
+    }
     params
 }
 
-pub fn build_depth_params(symbol: &str, limit: u32) -> HashMap<String, String> {
+pub fn build_depth_params(symbol: &str, depth: u32) -> HashMap<String, String> {
     let mut params = HashMap::new();
     params.insert("symbol".into(), symbol.into());
-    params.insert("limit".into(), limit.to_string());
+    params.insert("depth".into(), depth.to_string());
     params
 }
 
-pub fn build_order_query_params(symbol: Option<&str>) -> HashMap<String, String> {
+pub fn build_public_trades_params(symbol: &str, limit: Option<u32>) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    params.insert("symbol".into(), symbol.into());
+    if let Some(l) = limit {
+        params.insert("limit".into(), l.to_string());
+    }
+    params
+}
+
+pub fn build_funding_rate_history_params(
+    symbol: &str,
+    from_time: Option<i64>,
+    to_time: Option<i64>,
+    limit: Option<u32>,
+) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    params.insert("symbol".into(), symbol.into());
+    if let Some(f) = from_time {
+        params.insert("from".into(), f.to_string());
+    }
+    if let Some(t) = to_time {
+        params.insert("to".into(), t.to_string());
+    }
+    if let Some(l) = limit {
+        params.insert("limit".into(), l.to_string());
+    }
+    params
+}
+
+pub fn build_instruments_params(symbol: Option<&str>) -> HashMap<String, String> {
     let mut params = HashMap::new();
     if let Some(s) = symbol {
         params.insert("symbol".into(), s.into());
@@ -171,21 +215,135 @@ pub fn build_order_query_params(symbol: Option<&str>) -> HashMap<String, String>
     params
 }
 
-pub fn build_place_order_body(req: &crate::models::trading::PlaceOrderRequest) -> Value {
-    let mut body = serde_json::Map::new();
-    body.insert("symbol".into(), req.symbol.clone().into());
-    body.insert("side".into(), req.side.clone().into());
-    body.insert("orderType".into(), req.order_type.clone().into());
-    body.insert("qty".into(), req.qty.clone().into());
-    if let Some(price) = &req.price {
-        body.insert("price".into(), price.clone().into());
+pub fn build_fiat_rate_params(symbol_list: Option<&str>) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if let Some(s) = symbol_list {
+        params.insert("symbol_list".into(), s.into());
     }
-    Value::Object(body)
+    params
 }
 
-pub fn build_cancel_order_body(symbol: &str, order_id: &str) -> Value {
-    serde_json::json!({
-        "symbol": symbol,
-        "orderId": order_id,
-    })
+pub fn build_order_query_params(
+    symbol: Option<&str>,
+    coin: Option<&str>,
+    order_id: Option<&str>,
+    order_link_id: Option<&str>,
+    order_filter: Option<&str>,
+    limit: Option<u32>,
+    cursor: Option<&str>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    exec_type: Option<&str>,
+) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if let Some(s) = symbol {
+        params.insert("symbol".into(), s.into());
+    }
+    if let Some(c) = coin {
+        params.insert("coin".into(), c.into());
+    }
+    if let Some(id) = order_id {
+        params.insert("order_id".into(), id.into());
+    }
+    if let Some(id) = order_link_id {
+        params.insert("order_link_id".into(), id.into());
+    }
+    if let Some(f) = order_filter {
+        params.insert("order_filter".into(), f.into());
+    }
+    if let Some(l) = limit {
+        params.insert("limit".into(), l.to_string());
+    }
+    if let Some(c) = cursor {
+        params.insert("cursor".into(), c.into());
+    }
+    if let Some(s) = start_time {
+        params.insert("start_time".into(), s.to_string());
+    }
+    if let Some(e) = end_time {
+        params.insert("end_time".into(), e.to_string());
+    }
+    if let Some(t) = exec_type {
+        params.insert("exec_type".into(), t.into());
+    }
+    params
+}
+
+pub fn build_transfer_history_params(
+    start_time: i64,
+    end_time: i64,
+    coin: Option<&str>,
+    page_num: Option<u32>,
+    page_size: Option<u32>,
+) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    params.insert("start_time".into(), start_time.to_string());
+    params.insert("end_time".into(), end_time.to_string());
+    if let Some(c) = coin {
+        params.insert("coin".into(), c.into());
+    }
+    if let Some(p) = page_num {
+        params.insert("page_num".into(), p.to_string());
+    }
+    if let Some(p) = page_size {
+        params.insert("page_size".into(), p.to_string());
+    }
+    params
+}
+
+pub fn build_place_order_body(req: &crate::models::trading::PlaceOrderRequest) -> Value {
+    ApiOrderRequest {
+        symbol: req.symbol.clone(),
+        side: req.side.clone(),
+        qty: req.qty.clone(),
+        position_idx: req.position_idx,
+        order_type: Some(req.order_type.clone()),
+        price: req.price.clone(),
+        time_in_force: req.time_in_force.clone(),
+        order_link_id: req.order_link_id.clone(),
+        reduce_only: req.reduce_only,
+    }
+    .to_value()
+}
+
+pub fn build_cancel_order_body(req: &crate::models::trading::CancelOrderRequest) -> Value {
+    ApiCancelOrderRequest {
+        symbol: req.symbol.clone(),
+        order_id: req.order_id.clone(),
+        order_link_id: req.order_link_id.clone(),
+    }
+    .to_value()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::trading::PlaceOrderRequest;
+
+    #[test]
+    fn depth_params_use_depth_key() {
+        let params = build_depth_params("BTCUSDT", 20);
+        assert_eq!(params.get("depth"), Some(&"20".to_string()));
+        assert!(params.get("limit").is_none());
+    }
+
+    #[test]
+    fn place_order_body_snake_case_with_position_idx() {
+        let req = PlaceOrderRequest {
+            symbol: "BTCUSDT".into(),
+            side: "Buy".into(),
+            order_type: "Limit".into(),
+            qty: "0.001".into(),
+            position_idx: 1,
+            price: Some("50000".into()),
+            time_in_force: None,
+            order_link_id: None,
+            reduce_only: None,
+        };
+        let body = build_place_order_body(&req);
+        assert_eq!(body["symbol"], "BTCUSDT");
+        assert_eq!(body["position_idx"], 1);
+        assert_eq!(body["order_type"], "Limit");
+        assert!(body.get("orderType").is_none());
+    }
 }

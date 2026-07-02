@@ -46,8 +46,9 @@ impl Signer {
         ]
     }
 
-    pub fn ws_auth_sign(&self, timestamp: &str) -> String {
-        self.sign(&format!("{}{}", timestamp, self.api_key))
+    /// SDK v0.3 WebSocket private auth: HMAC("GET/realtime{expires_ms}")
+    pub fn sign_ws_auth(&self, expires_ms: u64) -> String {
+        self.sign(&format!("GET/realtime{expires_ms}"))
     }
 }
 
@@ -65,9 +66,17 @@ mod tests {
     }
 
     #[test]
-    fn ws_auth_payload_format() {
-        let signer = Signer::new("mykey".to_string(), "mysecret".to_string());
-        let sig = signer.ws_auth_sign("1234567890");
+    fn ws_auth_signature_length() {
+        let signer = Signer::new("key".to_string(), "secret".to_string());
+        let sig = signer.sign_ws_auth(1_662_350_400_000);
+        assert_eq!(sig.len(), 64);
+    }
+
+    #[test]
+    fn post_body_signature_payload() {
+        let signer = Signer::new("key".to_string(), "secret".to_string());
+        let body = r#"{"symbol":"BTCUSDT","side":"Buy"}"#;
+        let sig = signer.sign(&format!("1key5000{}", body));
         assert_eq!(sig.len(), 64);
     }
 }

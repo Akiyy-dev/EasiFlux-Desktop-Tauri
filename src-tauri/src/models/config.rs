@@ -6,6 +6,8 @@ pub const DEFAULT_DEPTH_LIMIT: u32 = 20;
 pub const APP_NAME: &str = "EasiFlux Desktop";
 pub const APP_ORG: &str = "EasiFlux";
 pub const DEFAULT_BASE_URL: &str = "https://api.easicoin.io";
+pub const DEFAULT_WS_PUBLIC_URL: &str = "wss://ws.easicoin.io/contract/public/v1";
+pub const DEFAULT_WS_PRIVATE_URL: &str = "wss://ws.easicoin.io/contract/private/v1";
 pub const DEFAULT_SYMBOL: &str = "BTCUSDT";
 pub const KEYRING_SERVICE: &str = "easiflux_desktop_tauri";
 pub const CONFIG_FILENAME: &str = "config.toml";
@@ -13,6 +15,16 @@ pub const CONFIG_FILENAME: &str = "config.toml";
 pub const DEFAULT_WATCHLIST: &[&str] = &["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
 pub const KLINE_INTERVALS: &[&str] = &["1", "5", "15", "60", "240", "D"];
 pub const RECV_WINDOW_MS: u64 = 5000;
+
+/// Normalize account id: trim whitespace, fall back to `"default"` when empty.
+pub fn normalize_account_id(account_id: &str) -> String {
+    let trimmed = account_id.trim();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -56,6 +68,14 @@ fn default_label() -> String {
     "default".to_string()
 }
 
+fn default_ws_public_url() -> String {
+    DEFAULT_WS_PUBLIC_URL.to_string()
+}
+
+fn default_ws_private_url() -> String {
+    DEFAULT_WS_PRIVATE_URL.to_string()
+}
+
 impl Default for ApiCredential {
     fn default() -> Self {
         Self {
@@ -76,6 +96,10 @@ pub struct AppConfig {
     pub theme: ThemeMode,
     pub kline_interval: String,
     pub use_websocket: bool,
+    #[serde(default = "default_ws_public_url")]
+    pub ws_public_url: String,
+    #[serde(default = "default_ws_private_url")]
+    pub ws_private_url: String,
     pub ticker_poll_interval: f64,
     pub window_width: u32,
     pub window_height: u32,
@@ -95,6 +119,8 @@ impl Default for AppConfig {
             theme: ThemeMode::Dark,
             kline_interval: "1".to_string(),
             use_websocket: true,
+            ws_public_url: DEFAULT_WS_PUBLIC_URL.to_string(),
+            ws_private_url: DEFAULT_WS_PRIVATE_URL.to_string(),
             ticker_poll_interval: 5.0,
             window_width: 1400,
             window_height: 900,
@@ -156,4 +182,16 @@ pub struct ConnectionSettings {
     pub api_secret: String,
     pub base_url: String,
     pub use_websocket: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_account_id_empty_to_default() {
+        assert_eq!(normalize_account_id(""), "default");
+        assert_eq!(normalize_account_id("   "), "default");
+        assert_eq!(normalize_account_id("main"), "main");
+    }
 }

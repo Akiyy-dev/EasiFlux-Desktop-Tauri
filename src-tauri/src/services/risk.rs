@@ -93,7 +93,11 @@ mod tests {
             side: "Buy".into(),
             order_type: "Market".into(),
             qty: "10".into(),
+            position_idx: 0,
             price: None,
+            time_in_force: None,
+            order_link_id: None,
+            reduce_only: None,
         };
         assert!(svc.validate_order(&req, None).is_err());
     }

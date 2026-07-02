@@ -1,0 +1,362 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
+use tokio::sync::{Mutex, RwLock};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+use crate::api::endpoints::{WS_PRIVATE, WS_PUBLIC};
+use crate::api::mapper::{parse_balance, parse_depth, parse_order, parse_position, parse_ticker};
+use crate::auth::Signer;
+use crate::auth::TimeSync;
+use crate::error::AppResult;
+use crate::events::EventEmitter;
+
+use super::messages::{build_auth_message, build_ping_message, build_subscribe_message, default_auth_expires_ms};
+use super::topics::{
+    topic_depth, topic_ticker, TOPIC_EXECUTION, TOPIC_ORDER, TOPIC_POSITION, TOPIC_WALLET,
+};
+
+const HEARTBEAT_SECS: u64 = 15;
+const RECONNECT_SECS: u64 = 3;
+
+#[derive(Clone)]
+struct Subscription {
+    topic: String,
+    private: bool,
+}
+
+pub struct WsManager {
+    ws_public_url: Arc<RwLock<String>>,
+    ws_private_url: Arc<RwLock<String>>,
+    signer: Arc<RwLock<Option<Signer>>>,
+    time_sync: Arc<TimeSync>,
+    emitter: EventEmitter,
+    subscriptions: Arc<Mutex<Vec<Subscription>>>,
+    running: Arc<AtomicBool>,
+    public_connected: Arc<AtomicBool>,
+    private_connected: Arc<AtomicBool>,
+    active_symbol: Arc<RwLock<String>>,
+}
+
+impl WsManager {
+    pub fn new(emitter: EventEmitter, time_sync: Arc<TimeSync>) -> Self {
+        Self {
+            ws_public_url: Arc::new(RwLock::new(WS_PUBLIC.to_string())),
+            ws_private_url: Arc::new(RwLock::new(WS_PRIVATE.to_string())),
+            signer: Arc::new(RwLock::new(None)),
+            time_sync,
+            emitter,
+            subscriptions: Arc::new(Mutex::new(Vec::new())),
+            running: Arc::new(AtomicBool::new(false)),
+            public_connected: Arc::new(AtomicBool::new(false)),
+            private_connected: Arc::new(AtomicBool::new(false)),
+            active_symbol: Arc::new(RwLock::new(String::new())),
+        }
+    }
+
+    pub async fn configure(
+        &self,
+        ws_public_url: &str,
+        ws_private_url: &str,
+        signer: Signer,
+    ) {
+        *self.ws_public_url.write().await = ws_public_url.to_string();
+        *self.ws_private_url.write().await = ws_private_url.to_string();
+        *self.signer.write().await = Some(signer);
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.public_connected.load(Ordering::Relaxed)
+            || self.private_connected.load(Ordering::Relaxed)
+    }
+
+    pub async fn subscribe_all(&self, symbol: &str) {
+        let mut subs = self.subscriptions.lock().await;
+        subs.clear();
+        subs.push(Subscription {
+            topic: topic_ticker(symbol),
+            private: false,
+        });
+        subs.push(Subscription {
+            topic: topic_depth(symbol, "1"),
+            private: false,
+        });
+        for t in [TOPIC_POSITION, TOPIC_ORDER, TOPIC_EXECUTION, TOPIC_WALLET] {
+            subs.push(Subscription {
+                topic: t.to_string(),
+                private: true,
+            });
+        }
+    }
+
+    pub async fn start(&self, symbol: &str) -> AppResult<()> {
+        self.stop().await;
+        *self.active_symbol.write().await = symbol.to_string();
+        self.running.store(true, Ordering::Relaxed);
+        self.emitter.emit_websocket("connecting");
+
+        let ws_public = self.ws_public_url.read().await.clone();
+        let ws_private = self.ws_private_url.read().await.clone();
+        let subs = self.subscriptions.lock().await.clone();
+        let public_topics: Vec<String> = subs
+            .iter()
+            .filter(|s| !s.private)
+            .map(|s| s.topic.clone())
+            .collect();
+        let private_topics: Vec<String> = subs
+            .iter()
+            .filter(|s| s.private)
+            .map(|s| s.topic.clone())
+            .collect();
+
+        let emitter = self.emitter.clone();
+        let signer = self.signer.read().await.clone();
+        let time_sync = self.time_sync.clone();
+        let symbol_owned = symbol.to_string();
+        let running = self.running.clone();
+        let public_connected = self.public_connected.clone();
+        let private_connected = self.private_connected.clone();
+
+        if !public_topics.is_empty() {
+            let emitter_p = emitter.clone();
+            let running_p = running.clone();
+            let pc = public_connected.clone();
+            let sym = symbol_owned.clone();
+            tauri::async_runtime::spawn(async move {
+                run_public_loop(ws_public, public_topics, sym, emitter_p, running_p, pc).await;
+            });
+        }
+
+        if !private_topics.is_empty() {
+            if let Some(s) = signer {
+                let emitter_pr = emitter.clone();
+                let running_pr = running.clone();
+                let prc = private_connected.clone();
+                let sym = symbol_owned.clone();
+                tauri::async_runtime::spawn(async move {
+                    run_private_loop(
+                        ws_private,
+                        private_topics,
+                        s,
+                        time_sync,
+                        sym,
+                        emitter_pr,
+                        running_pr,
+                        prc,
+                    )
+                    .await;
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.public_connected.store(false, Ordering::Relaxed);
+        self.private_connected.store(false, Ordering::Relaxed);
+    }
+}
+
+async fn run_public_loop(
+    url: String,
+    topics: Vec<String>,
+    symbol: String,
+    emitter: EventEmitter,
+    running: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
+) {
+    while running.load(Ordering::Relaxed) {
+        match run_public_session(&url, &topics, &symbol, &emitter, &running, &connected).await {
+            Ok(()) => connected.store(false, Ordering::Relaxed),
+            Err(e) => {
+                connected.store(false, Ordering::Relaxed);
+                tracing::warn!("Public WS error: {}", e);
+                emitter.emit_websocket("error");
+            }
+        }
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
+    }
+    emitter.emit_websocket("disconnected");
+}
+
+async fn run_private_loop(
+    url: String,
+    topics: Vec<String>,
+    signer: Signer,
+    time_sync: Arc<TimeSync>,
+    symbol: String,
+    emitter: EventEmitter,
+    running: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
+) {
+    while running.load(Ordering::Relaxed) {
+        match run_private_session(&url, &topics, &signer, &time_sync, &symbol, &emitter, &running, &connected)
+            .await
+        {
+            Ok(()) => connected.store(false, Ordering::Relaxed),
+            Err(e) => {
+                connected.store(false, Ordering::Relaxed);
+                tracing::warn!("Private WS error: {}", e);
+                emitter.emit_error(&format!("Private WebSocket: {}", e));
+                emitter.emit_websocket("error");
+            }
+        }
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
+    }
+}
+
+async fn run_public_session(
+    url: &str,
+    topics: &[String],
+    symbol: &str,
+    emitter: &EventEmitter,
+    running: &Arc<AtomicBool>,
+    connected: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
+    let (mut write, mut read) = stream.split();
+    connected.store(true, Ordering::Relaxed);
+    emitter.emit_websocket("connected");
+
+    write
+        .send(Message::Text(
+            build_subscribe_message(topics).to_string().into(),
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|e| e.to_string())?;
+            }
+            msg = read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            handle_message(&value, symbol, emitter);
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return Err("closed".into()),
+                    Some(Err(e)) => return Err(e.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn run_private_session(
+    url: &str,
+    topics: &[String],
+    signer: &Signer,
+    time_sync: &TimeSync,
+    symbol: &str,
+    emitter: &EventEmitter,
+    running: &Arc<AtomicBool>,
+    connected: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
+    let (mut write, mut read) = stream.split();
+    connected.store(true, Ordering::Relaxed);
+    emitter.emit_websocket("connected");
+
+    let expires = default_auth_expires_ms(time_sync.timestamp_ms());
+    write
+        .send(Message::Text(
+            build_auth_message(signer, expires).to_string().into(),
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    write
+        .send(Message::Text(
+            build_subscribe_message(topics).to_string().into(),
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|e| e.to_string())?;
+            }
+            msg = read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            if value.get("op").and_then(|v| v.as_str()) == Some("auth") {
+                                continue;
+                            }
+                            handle_message(&value, symbol, emitter);
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return Err("closed".into()),
+                    Some(Err(e)) => return Err(e.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn handle_message(message: &Value, symbol: &str, emitter: &EventEmitter) {
+    let topic = message
+        .get("topic")
+        .or_else(|| message.get("channel"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match super::topics::event_name_for_topic(topic) {
+        "ticker" => {
+            if let Some(obj) = message.get("data").and_then(|d| d.as_object()) {
+                emitter.emit_ticker(parse_ticker(&Value::Object(obj.clone()), symbol));
+            }
+        }
+        "depth" => {
+            let data = message.get("data").unwrap_or(message);
+            emitter.emit_depth(parse_depth(data, symbol));
+        }
+        "order" => {
+            let data = message.get("data").unwrap_or(message);
+            dispatch_list(data, |item| emitter.emit_order(parse_order(item)));
+        }
+        "position" => {
+            let data = message.get("data").unwrap_or(message);
+            dispatch_list(data, |item| emitter.emit_position(parse_position(item)));
+        }
+        "balance" => {
+            let data = message.get("data").unwrap_or(message);
+            dispatch_list(data, |item| emitter.emit_balance(parse_balance(item)));
+        }
+        _ => {}
+    }
+}
+
+fn dispatch_list(data: &Value, mut handler: impl FnMut(&Value)) {
+    if let Some(arr) = data.as_array() {
+        for item in arr {
+            handler(item);
+        }
+    } else if data.is_object() {
+        handler(data);
+    }
+}

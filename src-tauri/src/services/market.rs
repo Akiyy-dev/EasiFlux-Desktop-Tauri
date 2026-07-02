@@ -54,7 +54,7 @@ impl MarketService {
     }
 
     pub async fn fetch_klines(&self, symbol: &str, interval: &str) -> AppResult<Vec<Kline>> {
-        let klines = PublicApi::klines(&self.api, symbol, interval, 200).await?;
+        let klines = PublicApi::klines(&self.api, symbol, interval, 200, None, None).await?;
         self.cache.set_klines(symbol, interval, klines.clone());
         self.emitter.emit_klines(&klines);
         Ok(klines)

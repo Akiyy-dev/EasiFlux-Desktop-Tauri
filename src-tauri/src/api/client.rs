@@ -5,11 +5,22 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
+use crate::api::PublicApi;
+use crate::auth::time_sync::sync_from_server;
 use crate::auth::{Signer, TimeSync};
 use crate::error::{AppError, AppResult};
 use crate::models::config::{ApiCredential, DEFAULT_BASE_URL, RECV_WINDOW_MS};
 
-use super::response::{error_message, is_success_response};
+use super::response::{error_message, is_success_response, is_timestamp_error};
+
+pub fn normalize_base_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        DEFAULT_BASE_URL.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -24,7 +35,7 @@ impl ApiClient {
     pub fn new() -> Self {
         Self {
             http: Client::builder()
-                .user_agent("EasiFlux-Desktop/0.2.0")
+                .user_agent("EasiFlux-Desktop/0.3.0")
                 .build()
                 .expect("http client"),
             base_url: Arc::new(RwLock::new(DEFAULT_BASE_URL.to_string())),
@@ -72,6 +83,32 @@ impl ApiClient {
         path: &str,
         params: HashMap<String, String>,
     ) -> AppResult<Value> {
+        self.ensure_time_sync().await?;
+        match self.private_get_once(path, params.clone()).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if let AppError::Trading(ref msg) = e {
+                    if msg.contains("timestamp") || msg.contains("recv_window") {
+                        self.force_time_sync().await?;
+                        return self.private_get_once(path, params).await;
+                    }
+                }
+                if let AppError::Connection(ref msg) = e {
+                    if msg.contains("timestamp") || msg.contains("recv_window") {
+                        self.force_time_sync().await?;
+                        return self.private_get_once(path, params).await;
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn private_get_once(
+        &self,
+        path: &str,
+        params: HashMap<String, String>,
+    ) -> AppResult<Value> {
         let url = format!("{}{}", self.base_url().await, path);
         let query = encode_query(&params);
         let headers = self.sign_headers(&query, "").await?;
@@ -84,15 +121,50 @@ impl ApiClient {
     }
 
     pub async fn private_post(&self, path: &str, body: Value) -> AppResult<Value> {
+        self.ensure_time_sync().await?;
+        match self.private_post_once(path, body.clone()).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if let AppError::Trading(ref msg) = e {
+                    if msg.contains("timestamp") || msg.contains("recv_window") {
+                        self.force_time_sync().await?;
+                        return self.private_post_once(path, body).await;
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn private_post_once(&self, path: &str, body: Value) -> AppResult<Value> {
         let url = format!("{}{}", self.base_url().await, path);
-        let body_text = serde_json::to_string(&body).map_err(|e| AppError::Internal(e.to_string()))?;
+        let body_text =
+            serde_json::to_string(&body).map_err(|e| AppError::Internal(e.to_string()))?;
         let headers = self.sign_headers("", &body_text).await?;
-        let mut req = self.http.post(&url).header("Content-Type", "application/json");
+        let mut req = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json");
         for (k, v) in headers {
             req = req.header(k, v);
         }
         let response = req.body(body_text).send().await?;
         self.parse_response(response).await
+    }
+
+    async fn ensure_time_sync(&self) -> AppResult<()> {
+        if self.time_sync.offset_ms() == 0 {
+            self.force_time_sync().await?;
+        }
+        Ok(())
+    }
+
+    async fn force_time_sync(&self) -> AppResult<()> {
+        sync_from_server(
+            self.time_sync.as_ref(),
+            PublicApi::server_time(self),
+        )
+        .await
     }
 
     async fn sign_headers(&self, query: &str, body: &str) -> AppResult<Vec<(String, String)>> {
@@ -127,9 +199,11 @@ impl ApiClient {
             ));
         }
         if !is_success_response(&payload) {
-            return Err(AppError::Trading(
-                error_message(&payload).unwrap_or_else(|| "API 返回错误".into()),
-            ));
+            let msg = error_message(&payload).unwrap_or_else(|| "API 返回错误".into());
+            if is_timestamp_error(&payload) {
+                return Err(AppError::Trading(format!("timestamp: {}", msg)));
+            }
+            return Err(AppError::Trading(msg));
         }
         Ok(payload)
     }
@@ -141,16 +215,26 @@ impl Default for ApiClient {
     }
 }
 
-fn normalize_base_url(url: &str) -> String {
-    url.trim_end_matches('/').to_string()
-}
-
-fn encode_query(params: &HashMap<String, String>) -> String {
-    let mut pairs: Vec<_> = params.iter().collect();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-    pairs
+/// Encode query without sorting keys (SDK default: sort_query_for_signature=False).
+pub fn encode_query(params: &HashMap<String, String>) -> String {
+    params
         .iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_query_preserves_insertion_order() {
+        let mut params = HashMap::new();
+        params.insert("symbol".into(), "BTCUSDT".into());
+        params.insert("limit".into(), "10".into());
+        let encoded = encode_query(&params);
+        assert!(encoded.contains("symbol=BTCUSDT"));
+        assert!(encoded.contains("limit=10"));
+    }
 }
