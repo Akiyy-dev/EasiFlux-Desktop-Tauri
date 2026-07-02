@@ -17,6 +17,13 @@ fn normalize_open_time_ms(value: i64) -> i64 {
     }
 }
 
+fn parse_i64_value(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|n| n as i64))
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+}
+
 pub fn parse_ticker(value: &Value, symbol: &str) -> Ticker {
     Ticker {
         symbol: get_str(value, &["symbol", "s"]).unwrap_or_else(|| symbol.to_string()),
@@ -28,7 +35,16 @@ pub fn parse_ticker(value: &Value, symbol: &str) -> Ticker {
             .unwrap_or_else(|| "0".into()),
         volume_24h: get_str(value, &["volume24h", "volume_24h", "volume"])
             .unwrap_or_else(|| "0".into()),
-        change_24h_pct: get_str(value, &["change24hPct", "change_24h_pct", "change", "price24hPcnt"])
+        change_24h_pct: get_str(
+            value,
+            &[
+                "change24hPct",
+                "change_24h_pct",
+                "change",
+                "price24hPcnt",
+                "price_24h_pcnt",
+            ],
+        )
             .unwrap_or_else(|| "0".into()),
     }
 }
@@ -62,14 +78,28 @@ pub fn parse_depth(value: &Value, symbol: &str) -> Depth {
             .unwrap_or_default()
     };
     Depth {
-        symbol: get_str(data, &["symbol"]).unwrap_or_else(|| symbol.to_string()),
-        bids: parse_levels("bids"),
-        asks: parse_levels("asks"),
+        symbol: get_str(data, &["symbol", "s"]).unwrap_or_else(|| symbol.to_string()),
+        bids: {
+            let bids = parse_levels("bids");
+            if bids.is_empty() {
+                parse_levels("b")
+            } else {
+                bids
+            }
+        },
+        asks: {
+            let asks = parse_levels("asks");
+            if asks.is_empty() {
+                parse_levels("a")
+            } else {
+                asks
+            }
+        },
     }
 }
 
 pub fn parse_klines(payload: &Value, symbol: &str, interval: &str) -> Vec<Kline> {
-    extract_list(payload)
+    let mut klines: Vec<Kline> = extract_list(payload)
         .iter()
         .filter_map(|item| {
             if let Some(arr) = item.as_array() {
@@ -77,7 +107,7 @@ pub fn parse_klines(payload: &Value, symbol: &str, interval: &str) -> Vec<Kline>
                     return Some(Kline {
                         symbol: symbol.to_string(),
                         interval: interval.to_string(),
-                        open_time: normalize_open_time_ms(arr[0].as_i64().unwrap_or(0)),
+                        open_time: normalize_open_time_ms(parse_i64_value(&arr[0]).unwrap_or(0)),
                         open: arr[1].to_string().trim_matches('"').to_string(),
                         high: arr[2].to_string().trim_matches('"').to_string(),
                         low: arr[3].to_string().trim_matches('"').to_string(),
@@ -105,7 +135,10 @@ pub fn parse_klines(payload: &Value, symbol: &str, interval: &str) -> Vec<Kline>
             }
             None
         })
-        .collect()
+        .collect();
+    klines.retain(|k| k.open_time > 0);
+    klines.sort_by_key(|k| k.open_time);
+    klines
 }
 
 pub fn parse_order(value: &Value) -> Order {
@@ -355,6 +388,34 @@ mod tests {
         assert_eq!(ticker.ask_price, "3201");
         assert_eq!(ticker.volume_24h, "1000");
         assert_eq!(ticker.change_24h_pct, "1.5");
+    }
+
+    #[test]
+    fn parse_depth_supports_b_a_aliases() {
+        let depth = parse_depth(
+            &json!({
+                "s": "BTCUSDT",
+                "b": [["61727.0", "8.91"]],
+                "a": [["61728.5", "8.79"]]
+            }),
+            "BTCUSDT",
+        );
+        assert_eq!(depth.symbol, "BTCUSDT");
+        assert_eq!(depth.bids.len(), 1);
+        assert_eq!(depth.asks.len(), 1);
+        assert_eq!(depth.bids[0].price, "61727.0");
+        assert_eq!(depth.asks[0].price, "61728.5");
+    }
+
+    #[test]
+    fn parse_klines_parses_string_timestamps_in_arrays() {
+        let klines = parse_klines(
+            &json!([["1783006260", "61679.3", "61700", "61650", "61690", "12"]]),
+            "BTCUSDT",
+            "1",
+        );
+        assert_eq!(klines.len(), 1);
+        assert_eq!(klines[0].open_time, 1_783_006_260_000);
     }
 
     #[test]
