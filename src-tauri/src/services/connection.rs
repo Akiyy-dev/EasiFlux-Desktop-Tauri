@@ -106,7 +106,8 @@ impl ConnectionService {
                     Signer::new(credential.api_key.clone(), credential.api_secret.clone()),
                 )
                 .await;
-            self.ws.subscribe_all(symbol).await;
+            let kline_interval = self.market.kline_interval().await;
+            self.ws.subscribe_all(symbol, &kline_interval).await;
             if let Err(e) = self.ws.start(symbol).await {
                 self.emitter
                     .emit_error(&format!("WebSocket 启动失败: {}", e));
@@ -132,7 +133,8 @@ impl ConnectionService {
         if !use_ws || self.status().await != ConnectionStatus::Connected {
             return Ok(());
         }
-        self.ws.subscribe_all(symbol).await;
+        let kline_interval = self.market.kline_interval().await;
+        self.ws.subscribe_all(symbol, &kline_interval).await;
         self.ws.start(symbol).await
     }
 

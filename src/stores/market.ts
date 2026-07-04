@@ -12,7 +12,6 @@ export const useMarketStore = defineStore('market', () => {
 
   function setTicker(next: Ticker): void {
     ticker.value = next
-    activeSymbol.value = next.symbol
   }
 
   function setDepth(next: Depth): void {
@@ -27,8 +26,15 @@ export const useMarketStore = defineStore('market', () => {
   }
 
   async function setActiveSymbol(symbol: string): Promise<void> {
-    await tauriInvoke('set_active_symbol', { symbol })
+    if (symbol === activeSymbol.value) {
+      return
+    }
     activeSymbol.value = symbol
+    try {
+      await tauriInvoke('set_active_symbol', { symbol })
+    } catch (error) {
+      throw error instanceof Error ? error : new Error(String(error))
+    }
   }
 
   async function setKlineInterval(interval: string): Promise<void> {

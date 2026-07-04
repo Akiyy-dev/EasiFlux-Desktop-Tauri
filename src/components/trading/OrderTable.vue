@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { NButton, NDataTable } from 'naive-ui'
-import { computed, h } from 'vue'
+import { computed, h, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useOrderStore } from '../../stores/order'
 import { useConnectionStore } from '../../stores/connection'
@@ -55,7 +55,15 @@ async function refresh(): Promise<void> {
   }
 }
 
-refresh()
+watch(
+  () => connectionStore.connected,
+  (isConnected) => {
+    if (isConnected) {
+      void refresh()
+    }
+  },
+  { immediate: true },
+)
 </script>
 
 <template>

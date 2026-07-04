@@ -44,6 +44,7 @@ impl AppState {
         let ws = Arc::new(WsManager::new(emitter.clone(), time_sync));
 
         let market = Arc::new(MarketService::new(api.clone(), cache.clone(), emitter.clone()));
+        ws.set_market(market.clone());
         let connection = Arc::new(ConnectionService::new(
             api.clone(),
             ws,

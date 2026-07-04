@@ -34,7 +34,11 @@ pub async fn refresh_orders(
     symbol: Option<String>,
 ) -> AppResult<Vec<Order>> {
     let sym = symbol.as_deref();
-    state.trading.refresh_orders(sym).await
+    let orders = state.trading.refresh_orders(sym).await?;
+    for order in &orders {
+        state.analytics.record_order(order.clone()).await;
+    }
+    Ok(orders)
 }
 
 #[tauri::command]

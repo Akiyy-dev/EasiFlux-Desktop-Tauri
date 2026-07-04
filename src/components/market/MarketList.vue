@@ -3,16 +3,23 @@ import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useConfigStore } from '../../stores/config'
 import { useMarketStore } from '../../stores/market'
+import { useLogStore } from '../../stores/log'
 
 const configStore = useConfigStore()
 const marketStore = useMarketStore()
+const logStore = useLogStore()
 const { config } = storeToRefs(configStore)
 const { activeSymbol } = storeToRefs(marketStore)
 
 const symbols = computed(() => config.value?.watchlistSymbols ?? ['BTCUSDT', 'ETHUSDT'])
 
-async function selectSymbol(symbol: string): Promise<void> {
-  await marketStore.setActiveSymbol(symbol)
+function selectSymbol(symbol: string): void {
+  if (symbol === activeSymbol.value) {
+    return
+  }
+  void marketStore.setActiveSymbol(symbol).catch((error: unknown) => {
+    logStore.setError(error instanceof Error ? error.message : String(error))
+  })
 }
 </script>
 

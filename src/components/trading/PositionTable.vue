@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { NDataTable } from 'naive-ui'
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { usePositionStore } from '../../stores/position'
 import { useConnectionStore } from '../../stores/connection'
@@ -20,9 +20,21 @@ const columns = [
 
 const data = computed(() => positions.value)
 
-if (connectionStore.connected) {
-  positionStore.refreshPositions()
+async function refresh(): Promise<void> {
+  if (connectionStore.connected) {
+    await positionStore.refreshPositions()
+  }
 }
+
+watch(
+  () => connectionStore.connected,
+  (isConnected) => {
+    if (isConnected) {
+      void refresh()
+    }
+  },
+  { immediate: true },
+)
 </script>
 
 <template>

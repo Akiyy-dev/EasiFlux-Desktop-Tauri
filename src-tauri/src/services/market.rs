@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio::sync::RwLock;
 
+use crate::api::mapper::merge_ticker;
 use crate::api::{ApiClient, PublicApi};
 use crate::error::AppResult;
 use crate::events::EventEmitter;
 use crate::models::market::{Depth, Kline, Ticker};
 use crate::storage::CacheStore;
+
+const MAX_KLINES: usize = 200;
 
 pub struct MarketService {
     api: Arc<ApiClient>,
@@ -38,6 +42,43 @@ impl MarketService {
 
     pub async fn set_kline_interval(&self, interval: &str) {
         *self.kline_interval.write().await = interval.to_string();
+    }
+
+    pub async fn kline_interval(&self) -> String {
+        self.kline_interval.read().await.clone()
+    }
+
+    pub fn merge_and_emit_ticker(&self, value: &Value, symbol: &str) {
+        let sym = crate::api::response::get_str(value, &["symbol", "s"])
+            .unwrap_or_else(|| symbol.to_string());
+        let existing = self.cache.get_ticker(&sym);
+        let merged = merge_ticker(existing.as_ref(), value, symbol);
+        self.cache.set_ticker(merged.clone());
+        self.emitter.emit_ticker(merged);
+    }
+
+    pub fn merge_and_emit_klines(&self, symbol: &str, interval: &str, updates: Vec<Kline>) {
+        if updates.is_empty() {
+            return;
+        }
+        let mut klines = self
+            .cache
+            .get_klines(symbol, interval)
+            .unwrap_or_default();
+        for update in updates {
+            if let Some(idx) = klines.iter().position(|k| k.open_time == update.open_time) {
+                klines[idx] = update;
+            } else {
+                klines.push(update);
+            }
+        }
+        klines.sort_by_key(|k| k.open_time);
+        if klines.len() > MAX_KLINES {
+            let excess = klines.len() - MAX_KLINES;
+            klines.drain(0..excess);
+        }
+        self.cache.set_klines(symbol, interval, klines.clone());
+        self.emitter.emit_klines(&klines);
     }
 
     pub async fn fetch_ticker(&self, symbol: &str) -> AppResult<Ticker> {

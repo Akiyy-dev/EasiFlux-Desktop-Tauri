@@ -1,17 +1,45 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
+import { storeToRefs } from 'pinia'
 import { tauriInvoke } from '../../composables/useTauriCommand'
+import { useConnectionStore } from '../../stores/connection'
 import type { TradeStats } from '../../types/models'
+
+const props = defineProps<{
+  active?: boolean
+}>()
+
+const connectionStore = useConnectionStore()
+const { connected } = storeToRefs(connectionStore)
 
 const stats = ref<TradeStats | null>(null)
 
-onMounted(async () => {
+async function loadStats(): Promise<void> {
   try {
     stats.value = await tauriInvoke<TradeStats>('get_trade_stats')
   } catch {
     stats.value = null
   }
+}
+
+onMounted(() => {
+  void loadStats()
 })
+
+watch(connected, (isConnected) => {
+  if (isConnected) {
+    void loadStats()
+  }
+})
+
+watch(
+  () => props.active,
+  (isActive) => {
+    if (isActive) {
+      void loadStats()
+    }
+  },
+)
 </script>
 
 <template>

@@ -57,12 +57,19 @@ pub async fn connect(
             .emitter
             .emit_error(&format!("账户刷新失败: {}", e));
     }
-    if let Err(e) = state.trading.refresh_orders(Some(&symbol)).await {
-        state
-            .emitter
-            .emit_error(&format!("订单刷新失败: {}", e));
+    match state.trading.refresh_orders(None).await {
+        Ok(orders) => {
+            for order in orders {
+                state.analytics.record_order(order).await;
+            }
+        }
+        Err(e) => {
+            state
+                .emitter
+                .emit_error(&format!("订单刷新失败: {}", e));
+        }
     }
-    if let Err(e) = state.account.refresh_positions(Some(&symbol)).await {
+    if let Err(e) = state.account.refresh_positions(None).await {
         state
             .emitter
             .emit_error(&format!("持仓刷新失败: {}", e));

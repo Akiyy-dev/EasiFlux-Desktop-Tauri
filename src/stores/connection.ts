@@ -3,7 +3,6 @@ import { computed, ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type { ApiCredential, ConnectionStatus } from '../types/models'
 import { useAccountStore } from './account'
-import { useConfigStore } from './config'
 import { useLogStore } from './log'
 import { useMarketStore } from './market'
 import { useOrderStore } from './order'
@@ -32,21 +31,13 @@ function formatInvokeError(error: unknown): string {
 }
 
 async function refreshPostConnectData(): Promise<void> {
-  const configStore = useConfigStore()
   const logStore = useLogStore()
-  const symbol = configStore.config?.activeSymbol
 
   const tasks: Array<{ label: string; run: () => Promise<void> }> = [
     { label: '账户', run: () => useAccountStore().refreshAccount() },
     { label: '行情', run: () => useMarketStore().refreshMarket() },
-    {
-      label: '订单',
-      run: () => useOrderStore().refreshOrders(symbol),
-    },
-    {
-      label: '持仓',
-      run: () => usePositionStore().refreshPositions(symbol),
-    },
+    { label: '订单', run: () => useOrderStore().refreshOrders() },
+    { label: '持仓', run: () => usePositionStore().refreshPositions() },
   ]
 
   for (const task of tasks) {

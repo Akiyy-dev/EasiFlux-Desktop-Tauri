@@ -32,7 +32,7 @@ const tabs = [
       <OrderTable v-if="activeTab === 'orders'" />
       <PositionTable v-else-if="activeTab === 'positions'" />
       <LogPanel v-else-if="activeTab === 'logs'" />
-      <AnalyticsPanel v-else />
+      <AnalyticsPanel v-else :active="activeTab === 'analytics'" />
     </div>
   </footer>
 </template>
