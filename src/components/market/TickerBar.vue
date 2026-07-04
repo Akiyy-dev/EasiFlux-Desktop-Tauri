@@ -2,12 +2,15 @@
 import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useMarketStore } from '../../stores/market'
+import { change24hPctValue, formatChange24hPct } from '../../utils/ticker'
 
 const marketStore = useMarketStore()
 const { ticker } = storeToRefs(marketStore)
 
+const formattedChange = computed(() => formatChange24hPct(ticker.value?.change24hPct))
+
 const changeClass = computed(() => {
-  const pct = parseFloat(ticker.value?.change24hPct ?? '0')
+  const pct = change24hPctValue(ticker.value?.change24hPct)
   if (pct > 0) return 'text-up'
   if (pct < 0) return 'text-down'
   return ''
@@ -22,7 +25,7 @@ const changeClass = computed(() => {
       <span>买一 {{ ticker?.bidPrice ?? '--' }}</span>
       <span>卖一 {{ ticker?.askPrice ?? '--' }}</span>
       <span>24h量 {{ ticker?.volume24h ?? '--' }}</span>
-      <span :class="changeClass">{{ ticker?.change24hPct ?? '0' }}%</span>
+      <span :class="changeClass">{{ formattedChange }}</span>
     </div>
   </div>
 </template>

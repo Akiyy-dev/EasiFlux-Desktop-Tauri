@@ -112,6 +112,16 @@ pub fn is_timestamp_error(payload: &Value) -> bool {
     msg.contains("timestamp") || msg.contains("recv_window")
 }
 
+pub fn is_sign_error(payload: &Value) -> bool {
+    if let Some(code) = response_code(payload) {
+        if matches!(code.as_str(), "26200003" | "26200004" | "26200005" | "20011005") {
+            return true;
+        }
+    }
+    let msg = error_message(payload).unwrap_or_default().to_lowercase();
+    msg.contains("error sign") || msg.contains("invalid signature") || msg.contains("sign!")
+}
+
 pub fn error_message(payload: &Value) -> Option<String> {
     for key in ["msg", "message", "error", "detail", "errorMessage"] {
         if let Some(msg) = payload.get(key).and_then(|v| v.as_str()) {

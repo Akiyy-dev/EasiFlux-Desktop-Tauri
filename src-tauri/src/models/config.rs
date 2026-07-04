@@ -87,6 +87,19 @@ impl Default for ApiCredential {
     }
 }
 
+impl ApiCredential {
+    pub fn normalize(mut self) -> Self {
+        self.api_key = self.api_key.trim().to_string();
+        self.api_secret = self.api_secret.trim().to_string();
+        self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
+        if self.base_url.is_empty() {
+            self.base_url = DEFAULT_BASE_URL.to_string();
+        }
+        self.label = self.label.trim().to_string();
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {

@@ -31,7 +31,6 @@ const TICKER_VOLUME_KEYS: &[&str] = &["volume24h", "volume_24h", "volume", "v"];
 const TICKER_CHANGE_KEYS: &[&str] = &[
     "change24hPct",
     "change_24h_pct",
-    "change",
     "price24hPcnt",
     "price_24h_pcnt",
 ];
@@ -447,6 +446,38 @@ mod tests {
         assert_eq!(merged.ask_price, "61701");
         assert_eq!(merged.volume_24h, "1234");
         assert_eq!(merged.change_24h_pct, "0.5");
+    }
+
+    #[test]
+    fn merge_ticker_ignores_absolute_change_field() {
+        let base = Ticker {
+            symbol: "BTCUSDT".into(),
+            last_price: "61700".into(),
+            bid_price: "61699".into(),
+            ask_price: "61701".into(),
+            volume_24h: "1234".into(),
+            change_24h_pct: "0.034".into(),
+        };
+        let merged = merge_ticker(
+            Some(&base),
+            &json!({"change": "100", "price24hPcnt": "0.034"}),
+            "BTCUSDT",
+        );
+        assert_eq!(merged.change_24h_pct, "0.034");
+    }
+
+    #[test]
+    fn merge_ticker_ws_change_field_does_not_override_pct() {
+        let base = Ticker {
+            symbol: "BTCUSDT".into(),
+            last_price: "61700".into(),
+            bid_price: "61699".into(),
+            ask_price: "61701".into(),
+            volume_24h: "1234".into(),
+            change_24h_pct: "1.5".into(),
+        };
+        let merged = merge_ticker(Some(&base), &json!({"change": "150.5"}), "BTCUSDT");
+        assert_eq!(merged.change_24h_pct, "1.5");
     }
 
     #[test]

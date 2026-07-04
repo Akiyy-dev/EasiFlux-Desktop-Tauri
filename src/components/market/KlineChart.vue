@@ -144,6 +144,12 @@ watch(klines, (next) => {
 })
 
 watch(activeSymbol, () => {
+  lastCandles.value = []
+  resetViewport.value = true
+})
+
+watch(klineInterval, () => {
+  lastCandles.value = []
   resetViewport.value = true
 })
 

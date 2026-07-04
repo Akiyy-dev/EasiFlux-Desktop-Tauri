@@ -7,13 +7,14 @@ use crate::state::AppState;
 #[tauri::command]
 pub async fn test_connection(credential: ApiCredential) -> AppResult<()> {
     let temp = crate::api::ApiClient::new();
-    temp.set_credential(credential).await;
+    temp.set_credential(credential.normalize()).await;
     crate::auth::time_sync::sync_from_server(
         temp.time_sync().as_ref(),
         crate::api::PublicApi::server_time(&temp),
     )
     .await?;
     crate::api::PublicApi::ticker(&temp, "BTCUSDT").await?;
+    crate::api::PrivateApi::balances(&temp, None).await?;
     Ok(())
 }
 

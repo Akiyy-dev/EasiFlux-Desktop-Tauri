@@ -403,7 +403,9 @@ fn handle_message(
             let interval = topic.split('.').nth(1).unwrap_or("1");
             let updates = parse_klines(data, symbol, interval);
             if let Some(market) = market {
-                market.merge_and_emit_klines(symbol, interval, updates);
+                if market.merge_and_emit_klines(symbol, interval, updates) {
+                    market.schedule_kline_refresh(symbol, interval);
+                }
             }
         }
         "order" => {

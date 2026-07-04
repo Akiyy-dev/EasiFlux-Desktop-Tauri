@@ -29,11 +29,12 @@ pub async fn save_credentials(
 ) -> AppResult<()> {
     let account_id = normalize_account_id(&request.account_id);
     let credential = crate::models::config::ApiCredential {
-        api_key: request.api_key,
-        api_secret: request.api_secret,
-        base_url: request.base_url,
-        label: request.label,
-    };
+        api_key: request.api_key.trim().to_string(),
+        api_secret: request.api_secret.trim().to_string(),
+        base_url: request.base_url.trim().to_string(),
+        label: request.label.trim().to_string(),
+    }
+    .normalize();
     CredentialStore::save(&account_id, &credential)?;
     let mut config = state.config.write().await;
     if !config.accounts.contains(&account_id) {

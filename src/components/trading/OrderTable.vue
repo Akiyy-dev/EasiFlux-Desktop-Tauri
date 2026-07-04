@@ -50,8 +50,13 @@ async function cancel(row: Order): Promise<void> {
 }
 
 async function refresh(): Promise<void> {
-  if (connectionStore.connected) {
+  if (!connectionStore.connected) {
+    return
+  }
+  try {
     await orderStore.refreshOrders()
+  } catch (e) {
+    logStore.setError(e instanceof Error ? e.message : String(e))
   }
 }
 

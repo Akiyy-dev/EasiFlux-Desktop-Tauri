@@ -4,9 +4,11 @@ import { computed, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { usePositionStore } from '../../stores/position'
 import { useConnectionStore } from '../../stores/connection'
+import { useLogStore } from '../../stores/log'
 
 const positionStore = usePositionStore()
 const connectionStore = useConnectionStore()
+const logStore = useLogStore()
 const { positions } = storeToRefs(positionStore)
 
 const columns = [
@@ -21,8 +23,13 @@ const columns = [
 const data = computed(() => positions.value)
 
 async function refresh(): Promise<void> {
-  if (connectionStore.connected) {
+  if (!connectionStore.connected) {
+    return
+  }
+  try {
     await positionStore.refreshPositions()
+  } catch (e) {
+    logStore.setError(e instanceof Error ? e.message : String(e))
   }
 }
 

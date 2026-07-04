@@ -55,6 +55,7 @@ impl Signer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::config::RECV_WINDOW_MS;
 
     #[test]
     fn sign_is_deterministic() {
@@ -70,6 +71,29 @@ mod tests {
         let signer = Signer::new("key".to_string(), "secret".to_string());
         let sig = signer.sign_ws_auth(1_662_350_400_000);
         assert_eq!(sig.len(), 64);
+    }
+
+    #[test]
+    fn golden_empty_get_signature_matches_sdk() {
+        let signer = Signer::new("key".to_string(), "secret".to_string());
+        let expected = signer.sign(&format!("1700000000000key{}{}", RECV_WINDOW_MS, ""));
+        assert_eq!(
+            expected,
+            "409b3edd049b76dda5f93952b22658a4ccbd498ce7934755f12cb9249b80777a"
+        );
+    }
+
+    #[test]
+    fn golden_query_get_signature_matches_sdk() {
+        let signer = Signer::new("key".to_string(), "secret".to_string());
+        let expected = signer.sign(&format!(
+            "1700000000000key{}{}symbol=BTCUSDT",
+            RECV_WINDOW_MS, ""
+        ));
+        assert_eq!(
+            expected,
+            "5daf860b89f39c4a19f66539e8ba820518cb2017946d49001b6ff312cbe73b95"
+        );
     }
 
     #[test]

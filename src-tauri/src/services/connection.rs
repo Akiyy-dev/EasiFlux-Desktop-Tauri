@@ -82,9 +82,10 @@ impl ConnectionService {
         credential: Option<ApiCredential>,
     ) -> AppResult<()> {
         let credential = match credential {
-            Some(c) => c,
+            Some(c) => c.normalize(),
             None => CredentialStore::load(account_id)?
-                .ok_or_else(|| AppError::Auth("未找到 API 凭据".into()))?,
+                .ok_or_else(|| AppError::Auth("未找到 API 凭据".into()))?
+                .normalize(),
         };
 
         self.api.set_credential(credential.clone()).await;
