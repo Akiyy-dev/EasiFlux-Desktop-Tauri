@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use crate::api::diagnostic::{warn_if_parse_empty, warn_if_raw_parsed_mismatch};
+use crate::api::mapper::build_order_query_params;
+use crate::api::endpoints;
 use crate::api::{ApiClient, PrivateApi};
 use crate::error::AppResult;
 use crate::events::EventEmitter;
@@ -57,10 +60,40 @@ impl TradingService {
     }
 
     pub async fn refresh_orders(&self, symbol: Option<&str>) -> AppResult<Vec<Order>> {
-        let orders = PrivateApi::open_orders(&self.api, symbol).await?;
+        let params = build_order_query_params(
+            symbol,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let payload = self.api.private_get(endpoints::OPEN_ORDERS, params).await?;
+        let meta = crate::api::mapper::list_envelope_meta(&payload);
+        let orders = crate::api::mapper::parse_orders(&payload);
+        warn_if_parse_empty(
+            &self.emitter,
+            "activity-orders",
+            &payload,
+            orders.len(),
+        );
+        warn_if_raw_parsed_mismatch(&self.emitter, "activity-orders", &meta, orders.len());
         for order in &orders {
             self.emitter.emit_order(order.clone());
         }
+        Ok(orders)
+    }
+
+    pub async fn refresh_order_history(
+        &self,
+        symbol: Option<&str>,
+        limit: Option<u32>,
+    ) -> AppResult<Vec<Order>> {
+        let orders = PrivateApi::order_history(&self.api, symbol, limit).await?;
         Ok(orders)
     }
 }

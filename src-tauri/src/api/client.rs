@@ -11,7 +11,10 @@ use crate::auth::{Signer, TimeSync};
 use crate::error::{AppError, AppResult};
 use crate::models::config::{ApiCredential, DEFAULT_BASE_URL, RECV_WINDOW_MS};
 
-use super::response::{error_message, is_success_response, is_timestamp_error};
+use super::response::{error_message, is_sign_error, is_success_response, is_timestamp_error};
+
+/// Ordered query pairs for private GET signing (SDK insertion order).
+pub type QueryParams = Vec<(String, String)>;
 
 pub fn normalize_base_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
@@ -50,6 +53,7 @@ impl ApiClient {
     }
 
     pub async fn set_credential(&self, credential: ApiCredential) {
+        let credential = credential.normalize();
         let base = normalize_base_url(&credential.base_url);
         *self.base_url.write().await = base;
         *self.signer.write().await = Some(Signer::new(
@@ -81,38 +85,33 @@ impl ApiClient {
     pub async fn private_get(
         &self,
         path: &str,
-        params: HashMap<String, String>,
+        params: QueryParams,
     ) -> AppResult<Value> {
         self.ensure_time_sync().await?;
-        match self.private_get_once(path, params.clone()).await {
+        match self.private_get_once(path, &params).await {
             Ok(v) => Ok(v),
-            Err(e) => {
-                if let AppError::Trading(ref msg) = e {
-                    if msg.contains("timestamp") || msg.contains("recv_window") {
-                        self.force_time_sync().await?;
-                        return self.private_get_once(path, params).await;
-                    }
-                }
-                if let AppError::Connection(ref msg) = e {
-                    if msg.contains("timestamp") || msg.contains("recv_window") {
-                        self.force_time_sync().await?;
-                        return self.private_get_once(path, params).await;
-                    }
-                }
-                Err(e)
+            Err(e) if should_retry_private_request(&e) => {
+                self.force_time_sync().await?;
+                self.private_get_once(path, &params).await
             }
+            Err(e) => Err(e),
         }
     }
 
     async fn private_get_once(
         &self,
         path: &str,
-        params: HashMap<String, String>,
+        params: &QueryParams,
     ) -> AppResult<Value> {
-        let url = format!("{}{}", self.base_url().await, path);
-        let query = encode_query(&params);
+        let query = encode_query(params);
         let headers = self.sign_headers(&query, "").await?;
-        let mut req = self.http.get(&url).query(&params);
+        let base = format!("{}{}", self.base_url().await, path);
+        let request_url = if query.is_empty() {
+            base
+        } else {
+            format!("{}?{}", base, query)
+        };
+        let mut req = self.http.get(request_url);
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -124,15 +123,11 @@ impl ApiClient {
         self.ensure_time_sync().await?;
         match self.private_post_once(path, body.clone()).await {
             Ok(v) => Ok(v),
-            Err(e) => {
-                if let AppError::Trading(ref msg) = e {
-                    if msg.contains("timestamp") || msg.contains("recv_window") {
-                        self.force_time_sync().await?;
-                        return self.private_post_once(path, body).await;
-                    }
-                }
-                Err(e)
+            Err(e) if should_retry_private_request(&e) => {
+                self.force_time_sync().await?;
+                self.private_post_once(path, body).await
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -203,10 +198,33 @@ impl ApiClient {
             if is_timestamp_error(&payload) {
                 return Err(AppError::Trading(format!("timestamp: {}", msg)));
             }
+            if is_sign_error(&payload) || is_sign_error_message(&msg) {
+                return Err(AppError::Trading(format!(
+                    "sign: {}（请重新保存 API Secret）",
+                    msg
+                )));
+            }
             return Err(AppError::Trading(msg));
         }
         Ok(payload)
     }
+}
+
+fn should_retry_private_request(error: &AppError) -> bool {
+    match error {
+        AppError::Trading(msg) => {
+            msg.contains("timestamp")
+                || msg.contains("recv_window")
+                || msg.contains("sign")
+                || msg.contains("error sign")
+        }
+        AppError::Connection(msg) => msg.contains("timestamp") || msg.contains("recv_window"),
+        _ => false,
+    }
+}
+
+fn is_sign_error_message(message: &str) -> bool {
+    message.contains("error sign") || message.contains("invalid signature")
 }
 
 impl Default for ApiClient {
@@ -215,26 +233,71 @@ impl Default for ApiClient {
     }
 }
 
-/// Encode query without sorting keys (SDK default: sort_query_for_signature=False).
-pub fn encode_query(params: &HashMap<String, String>) -> String {
-    params
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&")
+/// Encode query preserving insertion order and URL escaping (SDK compatible).
+pub fn encode_query(params: &QueryParams) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Signer;
+    use crate::models::config::RECV_WINDOW_MS;
 
     #[test]
     fn encode_query_preserves_insertion_order() {
-        let mut params = HashMap::new();
-        params.insert("symbol".into(), "BTCUSDT".into());
-        params.insert("limit".into(), "10".into());
-        let encoded = encode_query(&params);
-        assert!(encoded.contains("symbol=BTCUSDT"));
-        assert!(encoded.contains("limit=10"));
+        let params = vec![
+            ("symbol".into(), "BTCUSDT".into()),
+            ("limit".into(), "10".into()),
+        ];
+        assert_eq!(encode_query(&params), "symbol=BTCUSDT&limit=10");
+    }
+
+    #[test]
+    fn encode_query_multi_param_matches_sdk_order() {
+        let params = vec![
+            ("symbol".into(), "BTCUSDT".into()),
+            ("coin".into(), "USDT".into()),
+        ];
+        assert_eq!(encode_query(&params), "symbol=BTCUSDT&coin=USDT");
+    }
+
+    #[test]
+    fn encode_query_empty_params() {
+        assert_eq!(encode_query(&Vec::new()), "");
+    }
+
+    #[test]
+    fn signed_get_payload_matches_sdk_layout() {
+        let signer = Signer::new("key".to_string(), "secret".to_string());
+        let headers = signer.prepare_headers(1_700_000_000_000, RECV_WINDOW_MS, "symbol=BTCUSDT");
+        let signature = headers
+            .iter()
+            .find(|(name, _)| name == "Access-Sign")
+            .map(|(_, value)| value.as_str())
+            .expect("signature header");
+        let expected = signer.sign(&format!(
+            "1700000000000key{}{}symbol=BTCUSDT",
+            RECV_WINDOW_MS, ""
+        ));
+        assert_eq!(signature, expected);
+    }
+
+    #[test]
+    fn signed_get_empty_query_payload_matches_sdk_layout() {
+        let signer = Signer::new("key".to_string(), "secret".to_string());
+        let headers = signer.prepare_headers(1_700_000_000_000, RECV_WINDOW_MS, "");
+        let signature = headers
+            .iter()
+            .find(|(name, _)| name == "Access-Sign")
+            .map(|(_, value)| value.as_str())
+            .expect("signature header");
+        let expected = signer.sign(&format!("1700000000000key{}{}", RECV_WINDOW_MS, ""));
+        assert_eq!(signature, expected);
     }
 }

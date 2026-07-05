@@ -1,17 +1,48 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
+import { storeToRefs } from 'pinia'
 import { tauriInvoke } from '../../composables/useTauriCommand'
+import { useConnectionStore } from '../../stores/connection'
 import type { TradeStats } from '../../types/models'
 
-const stats = ref<TradeStats | null>(null)
+const props = defineProps<{
+  active?: boolean
+}>()
 
-onMounted(async () => {
+const connectionStore = useConnectionStore()
+const { connected } = storeToRefs(connectionStore)
+
+const stats = ref<TradeStats | null>(null)
+const loadError = ref<string | null>(null)
+
+async function loadStats(): Promise<void> {
+  loadError.value = null
   try {
     stats.value = await tauriInvoke<TradeStats>('get_trade_stats')
-  } catch {
+  } catch (error) {
     stats.value = null
+    loadError.value = error instanceof Error ? error.message : String(error)
+  }
+}
+
+onMounted(() => {
+  void loadStats()
+})
+
+watch(connected, (isConnected) => {
+  if (isConnected) {
+    void loadStats()
   }
 })
+
+watch(
+  () => props.active,
+  (isActive) => {
+    if (isActive) {
+      void loadStats()
+    }
+  },
+)
 </script>
 
 <template>
@@ -21,8 +52,12 @@ onMounted(async () => {
       <div class="row"><span>成交</span><span>{{ stats.filledOrders }}</span></div>
       <div class="row"><span>撤销</span><span>{{ stats.cancelledOrders }}</span></div>
       <div class="row"><span>成交量</span><span>{{ stats.totalVolume }}</span></div>
+      <div class="row"><span>未实现盈亏</span><span>{{ stats.unrealisedPnl }}</span></div>
+      <div class="row"><span>已实现盈亏</span><span>{{ stats.realizedPnl }}</span></div>
       <div class="row"><span>胜率</span><span>{{ stats.winRatePct }}%</span></div>
+      <div class="row"><span>盈/亏次数</span><span>{{ stats.winCount }} / {{ stats.lossCount }}</span></div>
     </template>
+    <div v-else-if="loadError" class="empty error">{{ loadError }}</div>
     <div v-else class="empty">暂无统计数据</div>
   </div>
 </template>
@@ -42,5 +77,9 @@ onMounted(async () => {
 
 .empty {
   color: var(--text-secondary);
+}
+
+.error {
+  color: #ef5350;
 }
 </style>

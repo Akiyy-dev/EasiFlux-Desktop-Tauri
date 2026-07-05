@@ -43,22 +43,14 @@ watch(
 
 function buildCredential(): ApiCredential {
   return {
-    apiKey: apiKey.value,
-    apiSecret: apiSecret.value,
-    baseUrl: baseUrl.value,
+    apiKey: apiKey.value.trim(),
+    apiSecret: apiSecret.value.trim(),
+    baseUrl: baseUrl.value.trim(),
     label: 'default',
   }
 }
 
-async function save(): Promise<void> {
-  const accountId = normalizeAccountId(configStore.config?.activeAccountId)
-  await configStore.saveCredentials({
-    accountId,
-    apiKey: apiKey.value,
-    apiSecret: apiSecret.value,
-    baseUrl: baseUrl.value,
-    label: 'default',
-  })
+async function saveConfigOnly(): Promise<void> {
   if (configStore.config) {
     await configStore.saveConfig({
       ...configStore.config,
@@ -66,10 +58,32 @@ async function save(): Promise<void> {
       tickerPollInterval: Math.max(1, tickerPollInterval.value),
     })
   }
-  message.success('凭据已保存')
+}
+
+async function save(): Promise<void> {
+  const accountId = normalizeAccountId(configStore.config?.activeAccountId)
+  const key = apiKey.value.trim()
+  const secret = apiSecret.value.trim()
+
+  if (key || secret) {
+    await configStore.saveCredentials({
+      accountId,
+      apiKey: key,
+      apiSecret: secret,
+      baseUrl: baseUrl.value.trim(),
+      label: 'default',
+    })
+  }
+
+  await saveConfigOnly()
+  message.success('设置已保存')
 }
 
 async function test(): Promise<void> {
+  if (!apiKey.value.trim() || !apiSecret.value.trim()) {
+    message.warning('测试连接需要填写 API Key 和 Secret')
+    return
+  }
   testing.value = true
   try {
     await tauriInvoke('test_connection', { credential: buildCredential() })
@@ -82,9 +96,19 @@ async function test(): Promise<void> {
 }
 
 async function connect(): Promise<void> {
-  await save()
+  try {
+    await save()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+    return
+  }
   emit('update:show', false)
-  await connectionStore.connect(useWebsocket.value, buildCredential())
+  const credential = apiSecret.value.trim() ? buildCredential() : undefined
+  try {
+    await connectionStore.connect(useWebsocket.value, credential)
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
 }
 </script>
 
@@ -101,7 +125,12 @@ async function connect(): Promise<void> {
         <NInput v-model:value="apiKey" type="password" show-password-on="click" />
       </NFormItem>
       <NFormItem label="API Secret">
-        <NInput v-model:value="apiSecret" type="password" show-password-on="click" />
+        <NInput
+          v-model:value="apiSecret"
+          type="password"
+          show-password-on="click"
+          placeholder="留空则保留已保存的 Secret"
+        />
       </NFormItem>
       <NFormItem label="Base URL">
         <NInput v-model:value="baseUrl" />

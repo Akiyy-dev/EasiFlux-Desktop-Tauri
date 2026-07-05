@@ -9,7 +9,7 @@ use crate::plugin::PluginRegistry;
 use crate::services::{
     AccountService, AnalyticsService, ConnectionService, MarketService, RiskService, TradingService,
 };
-use crate::storage::{CacheStore, ConfigStore, TradeLogStore};
+use crate::storage::{CacheStore, ConfigStore, KlineStore, TradeLogStore};
 use crate::ws::WsManager;
 
 pub struct AppState {
@@ -37,13 +37,21 @@ impl AppState {
 
         let api = Arc::new(ApiClient::new());
         let cache = Arc::new(CacheStore::new());
+        let kline_store = Arc::new(KlineStore::new());
         let trade_log = Arc::new(TradeLogStore::new());
-        let emitter = EventEmitter::new(app);
+        let analytics = Arc::new(AnalyticsService::new(api.clone()));
+        let emitter = EventEmitter::new(app.clone(), analytics.clone());
 
         let time_sync = api.time_sync();
         let ws = Arc::new(WsManager::new(emitter.clone(), time_sync));
 
-        let market = Arc::new(MarketService::new(api.clone(), cache.clone(), emitter.clone()));
+        let market = Arc::new(MarketService::new(
+            api.clone(),
+            cache.clone(),
+            kline_store,
+            emitter.clone(),
+        ));
+        ws.set_market(market.clone());
         let connection = Arc::new(ConnectionService::new(
             api.clone(),
             ws,
@@ -60,7 +68,7 @@ impl AppState {
             emitter.clone(),
         ));
         let account = Arc::new(AccountService::new(api.clone(), emitter.clone()));
-        let analytics = Arc::new(AnalyticsService::new());
+
         let plugins = Arc::new(RwLock::new(PluginRegistry::new()));
 
         Ok(Self {

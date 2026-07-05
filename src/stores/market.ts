@@ -12,26 +12,46 @@ export const useMarketStore = defineStore('market', () => {
 
   function setTicker(next: Ticker): void {
     ticker.value = next
-    activeSymbol.value = next.symbol
   }
 
   function setDepth(next: Depth): void {
     depth.value = next
   }
 
+  function clearKlines(): void {
+    klines.value = []
+  }
+
   function setKlines(next: Kline[]): void {
-    if (next.length === 0 && klines.value.length > 0) {
+    if (next.length === 0) {
+      klines.value = []
+      return
+    }
+    const first = next[0]
+    if (
+      first.symbol !== activeSymbol.value ||
+      first.interval !== klineInterval.value
+    ) {
       return
     }
     klines.value = next
   }
 
   async function setActiveSymbol(symbol: string): Promise<void> {
-    await tauriInvoke('set_active_symbol', { symbol })
+    if (symbol === activeSymbol.value) {
+      return
+    }
+    clearKlines()
     activeSymbol.value = symbol
+    try {
+      await tauriInvoke('set_active_symbol', { symbol })
+    } catch (error) {
+      throw error instanceof Error ? error : new Error(String(error))
+    }
   }
 
   async function setKlineInterval(interval: string): Promise<void> {
+    clearKlines()
     await tauriInvoke('set_kline_interval', { interval })
     klineInterval.value = interval
   }
@@ -49,6 +69,7 @@ export const useMarketStore = defineStore('market', () => {
     setTicker,
     setDepth,
     setKlines,
+    clearKlines,
     setActiveSymbol,
     setKlineInterval,
     refreshMarket,

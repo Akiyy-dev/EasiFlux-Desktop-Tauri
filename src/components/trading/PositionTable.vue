@@ -1,13 +1,24 @@
 <script setup lang="ts">
-import { NDataTable } from 'naive-ui'
-import { computed } from 'vue'
+import { NButton, NDataTable } from 'naive-ui'
+import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { usePositionStore } from '../../stores/position'
 import { useConnectionStore } from '../../stores/connection'
+import { useLogStore } from '../../stores/log'
+import { refreshPrivatePanels } from '../../stores/privatePanels'
+
+const TABLE_MAX_HEIGHT = 168
+
+const props = defineProps<{
+  active?: boolean
+}>()
 
 const positionStore = usePositionStore()
 const connectionStore = useConnectionStore()
+const logStore = useLogStore()
 const { positions } = storeToRefs(positionStore)
+
+const loading = ref(false)
 
 const columns = [
   { title: '交易对', key: 'symbol' },
@@ -20,11 +31,80 @@ const columns = [
 
 const data = computed(() => positions.value)
 
-if (connectionStore.connected) {
-  positionStore.refreshPositions()
+async function refreshPanels(): Promise<void> {
+  if (!connectionStore.connected) {
+    return
+  }
+  loading.value = true
+  try {
+    await refreshPrivatePanels()
+  } catch (e) {
+    logStore.setError(e instanceof Error ? e.message : String(e))
+  } finally {
+    loading.value = false
+  }
 }
+
+onMounted(() => {
+  void refreshPanels()
+})
+
+watch(
+  () => connectionStore.connected,
+  (isConnected) => {
+    if (isConnected) {
+      void refreshPanels()
+    }
+  },
+  { immediate: true },
+)
+
+watch(
+  () => props.active,
+  (isActive) => {
+    if (isActive) {
+      void refreshPanels()
+    }
+  },
+)
 </script>
 
 <template>
-  <NDataTable :columns="columns" :data="data" size="small" :bordered="false" flex-height />
+  <div class="position-table">
+    <div class="toolbar">
+      <span class="meta">持仓 ({{ positions.length }})</span>
+      <NButton size="tiny" :loading="loading" @click="refreshPanels">刷新</NButton>
+    </div>
+    <NDataTable
+      :columns="columns"
+      :data="data"
+      :row-key="(row) => `${row.symbol}:${row.positionIdx ?? 0}`"
+      :max-height="TABLE_MAX_HEIGHT"
+      size="small"
+      :bordered="false"
+    />
+  </div>
 </template>
+
+<style scoped>
+.position-table {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  flex-shrink: 0;
+}
+
+.meta {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+</style>

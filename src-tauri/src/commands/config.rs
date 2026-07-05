@@ -28,12 +28,30 @@ pub async fn save_credentials(
     request: SaveCredentialRequest,
 ) -> AppResult<()> {
     let account_id = normalize_account_id(&request.account_id);
-    let credential = crate::models::config::ApiCredential {
-        api_key: request.api_key,
-        api_secret: request.api_secret,
-        base_url: request.base_url,
-        label: request.label,
-    };
+    let mut credential = crate::models::config::ApiCredential {
+        api_key: request.api_key.trim().to_string(),
+        api_secret: request.api_secret.trim().to_string(),
+        base_url: request.base_url.trim().to_string(),
+        label: request.label.trim().to_string(),
+    }
+    .normalize();
+
+    if !credential.has_secret() {
+        if let Some(existing) = CredentialStore::load(&account_id)? {
+            credential.api_secret = existing.api_secret;
+            if credential.api_key.is_empty() {
+                credential.api_key = existing.api_key;
+            }
+        } else {
+            return Err(crate::error::AppError::Auth(
+                "首次保存凭据时必须填写 API Secret".into(),
+            ));
+        }
+    }
+    if credential.api_key.is_empty() {
+        return Err(crate::error::AppError::Auth("API Key 不能为空".into()));
+    }
+
     CredentialStore::save(&account_id, &credential)?;
     let mut config = state.config.write().await;
     if !config.accounts.contains(&account_id) {

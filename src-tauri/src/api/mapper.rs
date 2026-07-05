@@ -1,13 +1,37 @@
 use std::collections::HashMap;
 
+use rust_decimal::Decimal;
 use serde_json::Value;
+use std::str::FromStr;
 
 use crate::models::api_requests::{ApiCancelOrderRequest, ApiOrderRequest};
 use crate::models::account::Balance;
 use crate::models::market::{Depth, DepthLevel, Kline, Ticker};
 use crate::models::trading::{Order, OrderStatus, Position};
 
-use super::response::{extract_data, extract_list, get_str};
+use super::response::{extract_data, extract_list, extract_list_with_meta, get_str, ListEnvelopeMeta};
+
+pub const DEFAULT_SETTLE_COIN: &str = "USDT";
+
+pub fn list_envelope_meta(payload: &Value) -> ListEnvelopeMeta {
+    extract_list_with_meta(payload).1
+}
+
+fn parse_decimal_value(raw: &str) -> Decimal {
+    Decimal::from_str(raw.trim()).unwrap_or(Decimal::ZERO)
+}
+
+fn is_zero_size(raw: &str) -> bool {
+    raw.trim().is_empty() || parse_decimal_value(raw) == Decimal::ZERO
+}
+
+fn parse_i32_value(value: &Value) -> i32 {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|n| n as i64))
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0) as i32
+}
 
 fn normalize_open_time_ms(value: i64) -> i64 {
     if value > 0 && value < 10_000_000_000 {
@@ -24,28 +48,106 @@ fn parse_i64_value(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
+const TICKER_LAST_KEYS: &[&str] = &[
+    "lastPrice", "last_price", "last", "price", "lp", "p",
+];
+const TICKER_BID_KEYS: &[&str] = &[
+    "bidPrice", "bid_price", "bid", "bid1Price", "bp", "b1",
+];
+const TICKER_ASK_KEYS: &[&str] = &[
+    "askPrice", "ask_price", "ask", "ask1Price", "ap", "a1",
+];
+const TICKER_VOLUME_KEYS: &[&str] = &["volume24h", "volume_24h", "volume", "v"];
+const TICKER_PREV_KEYS: &[&str] = &["prev_price_24h", "prevPrice24h", "p24"];
+const TICKER_CHANGE_KEYS: &[&str] = &[
+    "change24hPct",
+    "change_24h_pct",
+    "price24hPcnt",
+    "price_24h_pcnt",
+    "pP",
+    "pp",
+];
+
+fn normalize_change_24h_pcnt(raw: &str) -> String {
+    let value: f64 = raw.parse().unwrap_or(0.0);
+    let pct = value / 10_000.0;
+    format!("{pct:.6}")
+}
+
+fn compute_change_from_prices(last: &str, prev: &str) -> Option<String> {
+    let last: f64 = last.parse().ok()?;
+    let prev: f64 = prev.parse().ok()?;
+    if prev == 0.0 {
+        return None;
+    }
+    let pct = (last - prev) / prev * 100.0;
+    Some(format!("{pct:.6}"))
+}
+
+fn resolve_change_24h_pct(value: &Value, last_price: &str) -> String {
+    if let Some(raw) = get_str(value, TICKER_CHANGE_KEYS) {
+        return normalize_change_24h_pcnt(&raw);
+    }
+    if let Some(prev) = get_str(value, TICKER_PREV_KEYS) {
+        if let Some(pct) = compute_change_from_prices(last_price, &prev) {
+            return pct;
+        }
+    }
+    "0".into()
+}
+
+fn pick_ticker_field(base: &str, parsed: &str, value: &Value, keys: &[&str]) -> String {
+    if get_str(value, keys).is_some() {
+        parsed.to_string()
+    } else {
+        base.to_string()
+    }
+}
+
 pub fn parse_ticker(value: &Value, symbol: &str) -> Ticker {
+    let last_price = get_str(value, TICKER_LAST_KEYS).unwrap_or_else(|| "0".into());
     Ticker {
         symbol: get_str(value, &["symbol", "s"]).unwrap_or_else(|| symbol.to_string()),
-        last_price: get_str(value, &["lastPrice", "last_price", "last", "price"])
-            .unwrap_or_else(|| "0".into()),
-        bid_price: get_str(value, &["bidPrice", "bid_price", "bid", "bid1Price"])
-            .unwrap_or_else(|| "0".into()),
-        ask_price: get_str(value, &["askPrice", "ask_price", "ask", "ask1Price"])
-            .unwrap_or_else(|| "0".into()),
-        volume_24h: get_str(value, &["volume24h", "volume_24h", "volume"])
-            .unwrap_or_else(|| "0".into()),
-        change_24h_pct: get_str(
-            value,
-            &[
-                "change24hPct",
-                "change_24h_pct",
-                "change",
-                "price24hPcnt",
-                "price_24h_pcnt",
-            ],
-        )
-            .unwrap_or_else(|| "0".into()),
+        last_price: last_price.clone(),
+        bid_price: get_str(value, TICKER_BID_KEYS).unwrap_or_else(|| "0".into()),
+        ask_price: get_str(value, TICKER_ASK_KEYS).unwrap_or_else(|| "0".into()),
+        volume_24h: get_str(value, TICKER_VOLUME_KEYS).unwrap_or_else(|| "0".into()),
+        change_24h_pct: resolve_change_24h_pct(value, &last_price),
+    }
+}
+
+/// Merge a WebSocket ticker delta into an existing snapshot; missing fields keep prior values.
+pub fn merge_ticker(existing: Option<&Ticker>, value: &Value, symbol: &str) -> Ticker {
+    let delta = parse_ticker(value, symbol);
+    let Some(base) = existing else {
+        return delta;
+    };
+    let sym = if get_str(value, &["symbol", "s"]).is_some() {
+        delta.symbol
+    } else {
+        base.symbol.clone()
+    };
+    Ticker {
+        symbol: sym,
+        last_price: pick_ticker_field(&base.last_price, &delta.last_price, value, TICKER_LAST_KEYS),
+        bid_price: pick_ticker_field(&base.bid_price, &delta.bid_price, value, TICKER_BID_KEYS),
+        ask_price: pick_ticker_field(&base.ask_price, &delta.ask_price, value, TICKER_ASK_KEYS),
+        volume_24h: pick_ticker_field(&base.volume_24h, &delta.volume_24h, value, TICKER_VOLUME_KEYS),
+        change_24h_pct: {
+            let parsed = if get_str(value, TICKER_CHANGE_KEYS).is_some() {
+                delta.change_24h_pct.clone()
+            } else if get_str(value, TICKER_PREV_KEYS).is_some() {
+                resolve_change_24h_pct(value, &pick_ticker_field(
+                    &base.last_price,
+                    &delta.last_price,
+                    value,
+                    TICKER_LAST_KEYS,
+                ))
+            } else {
+                base.change_24h_pct.clone()
+            };
+            pick_ticker_field(&base.change_24h_pct, &parsed, value, TICKER_CHANGE_KEYS)
+        },
     }
 }
 
@@ -144,7 +246,7 @@ pub fn parse_klines(payload: &Value, symbol: &str, interval: &str) -> Vec<Kline>
 pub fn parse_order(value: &Value) -> Order {
     Order {
         order_id: get_str(value, &["orderId", "order_id", "id"]).unwrap_or_default(),
-        symbol: get_str(value, &["symbol"]).unwrap_or_default(),
+        symbol: get_str(value, &["symbol", "s"]).unwrap_or_default(),
         side: get_str(value, &["side"]).unwrap_or_default(),
         order_type: get_str(value, &["orderType", "order_type", "type"]).unwrap_or_default(),
         price: get_str(value, &["price"]).unwrap_or_else(|| "0".into()),
@@ -153,7 +255,8 @@ pub fn parse_order(value: &Value) -> Order {
             &get_str(value, &["status", "orderStatus", "order_status"]).unwrap_or_default(),
         ),
         order_link_id: get_str(value, &["orderLinkId", "order_link_id"]),
-        filled_qty: get_str(value, &["cumExecQty", "filled_qty", "filledQty"]).unwrap_or_else(|| "0".into()),
+        filled_qty: get_str(value, &["cumExecQty", "cum_exec_qty", "filled_qty", "filledQty"])
+            .unwrap_or_else(|| "0".into()),
         avg_price: get_str(value, &["avgPrice", "avg_price"]).unwrap_or_else(|| "0".into()),
     }
 }
@@ -163,13 +266,53 @@ pub fn parse_orders(payload: &Value) -> Vec<Order> {
 }
 
 pub fn parse_position(value: &Value) -> Position {
+    let position_idx = value
+        .get("positionIdx")
+        .or_else(|| value.get("position_idx"))
+        .map(parse_i32_value)
+        .unwrap_or(0);
     Position {
-        symbol: get_str(value, &["symbol"]).unwrap_or_default(),
-        side: get_str(value, &["side", "positionSide", "position_side"]).unwrap_or_default(),
-        size: get_str(value, &["size", "qty", "positionAmt", "position_amt"]).unwrap_or_else(|| "0".into()),
-        entry_price: get_str(value, &["entryPrice", "entry_price", "avgPrice"]).unwrap_or_else(|| "0".into()),
+        symbol: get_str(value, &["symbol", "s"]).unwrap_or_default(),
+        side: get_str(value, &["side", "positionSide", "position_side", "direction"]).unwrap_or_default(),
+        size: get_str(value, &[
+            "size",
+            "qty",
+            "quantity",
+            "positionAmt",
+            "position_amt",
+            "positionQty",
+            "position_qty",
+            "holdQty",
+            "hold_qty",
+            "openQty",
+            "open_qty",
+            "currentPiece",
+            "current_piece",
+            "totalPiece",
+            "total_piece",
+        ])
+        .unwrap_or_else(|| "0".into()),
+        entry_price: get_str(value, &[
+            "entryPrice",
+            "entry_price",
+            "avgPrice",
+            "avg_price",
+            "openPrice",
+            "open_price",
+        ])
+        .unwrap_or_else(|| "0".into()),
         leverage: get_str(value, &["leverage"]).unwrap_or_else(|| "1".into()),
-        unrealised_pnl: get_str(value, &["unrealisedPnl", "unrealised_pnl", "unrealizedPnl"]).unwrap_or_else(|| "0".into()),
+        unrealised_pnl: get_str(value, &[
+            "unrealisedPnl",
+            "unrealised_pnl",
+            "unrealizedPnl",
+            "unrealized_pnl",
+            "profitUnreal",
+            "profit_unreal",
+            "pnl",
+        ])
+        .unwrap_or_else(|| "0".into()),
+        position_idx,
     }
 }
 
@@ -177,14 +320,16 @@ pub fn parse_positions(payload: &Value) -> Vec<Position> {
     extract_list(payload)
         .iter()
         .map(|v| parse_position(v))
-        .filter(|p| p.size != "0" && !p.size.is_empty())
+        .filter(|p| !is_zero_size(&p.size))
         .collect()
 }
 
 pub fn parse_balance(value: &Value) -> Balance {
-    let available = get_str(value, &["available", "availableBalance", "available_balance"]).unwrap_or_else(|| "0".into());
+    let available = get_str(value, &["available", "availableBalance", "available_balance"])
+        .unwrap_or_else(|| "0".into());
     let frozen = get_str(value, &["frozen", "locked", "frozenBalance"]).unwrap_or_else(|| "0".into());
-    let total = get_str(value, &["total", "balance", "equity"]).unwrap_or_else(|| available.clone());
+    let total = get_str(value, &["total", "balance", "equity", "walletBalance", "wallet_balance"])
+        .unwrap_or_else(|| available.clone());
     Balance {
         asset: get_str(value, &["asset", "coin", "currency"]).unwrap_or_else(|| "USDT".into()),
         available,
@@ -211,12 +356,21 @@ pub fn build_kline_params(
         params.insert("limit".into(), l.to_string());
     }
     if let Some(s) = start {
-        params.insert("start".into(), s.to_string());
+        params.insert("start".into(), normalize_kline_query_time(s).to_string());
     }
     if let Some(e) = end {
-        params.insert("end".into(), e.to_string());
+        params.insert("end".into(), normalize_kline_query_time(e).to_string());
     }
     params
+}
+
+/// EasiCoin kline `start`/`end` query params use **seconds** (ms values are rejected).
+fn normalize_kline_query_time(value: i64) -> i64 {
+    if value >= 10_000_000_000 {
+        value / 1000
+    } else {
+        value
+    }
 }
 
 pub fn build_depth_params(symbol: &str, depth: u32) -> HashMap<String, String> {
@@ -282,37 +436,46 @@ pub fn build_order_query_params(
     start_time: Option<i64>,
     end_time: Option<i64>,
     exec_type: Option<&str>,
-) -> HashMap<String, String> {
-    let mut params = HashMap::new();
+) -> Vec<(String, String)> {
+    let mut params = Vec::new();
     if let Some(s) = symbol {
-        params.insert("symbol".into(), s.into());
+        if !s.is_empty() {
+            params.push(("symbol".into(), s.into()));
+        }
     }
     if let Some(c) = coin {
-        params.insert("coin".into(), c.into());
+        if !c.is_empty() {
+            params.push(("coin".into(), c.into()));
+        }
     }
     if let Some(id) = order_id {
-        params.insert("order_id".into(), id.into());
+        params.push(("order_id".into(), id.into()));
     }
     if let Some(id) = order_link_id {
-        params.insert("order_link_id".into(), id.into());
+        params.push(("order_link_id".into(), id.into()));
     }
     if let Some(f) = order_filter {
-        params.insert("order_filter".into(), f.into());
+        params.push(("order_filter".into(), f.into()));
     }
     if let Some(l) = limit {
-        params.insert("limit".into(), l.to_string());
+        params.push(("limit".into(), l.to_string()));
     }
     if let Some(c) = cursor {
-        params.insert("cursor".into(), c.into());
+        params.push(("cursor".into(), c.into()));
     }
     if let Some(s) = start_time {
-        params.insert("start_time".into(), s.to_string());
+        params.push(("start_time".into(), s.to_string()));
     }
     if let Some(e) = end_time {
-        params.insert("end_time".into(), e.to_string());
+        params.push(("end_time".into(), e.to_string()));
     }
     if let Some(t) = exec_type {
-        params.insert("exec_type".into(), t.into());
+        params.push(("exec_type".into(), t.into()));
+    }
+    let has_symbol = params.iter().any(|(k, _)| k == "symbol");
+    let has_coin = params.iter().any(|(k, _)| k == "coin");
+    if !has_symbol && !has_coin {
+        params.push(("coin".into(), DEFAULT_SETTLE_COIN.into()));
     }
     params
 }
@@ -323,18 +486,18 @@ pub fn build_transfer_history_params(
     coin: Option<&str>,
     page_num: Option<u32>,
     page_size: Option<u32>,
-) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    params.insert("start_time".into(), start_time.to_string());
-    params.insert("end_time".into(), end_time.to_string());
+) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    params.push(("start_time".into(), start_time.to_string()));
+    params.push(("end_time".into(), end_time.to_string()));
     if let Some(c) = coin {
-        params.insert("coin".into(), c.into());
+        params.push(("coin".into(), c.into()));
     }
     if let Some(p) = page_num {
-        params.insert("page_num".into(), p.to_string());
+        params.push(("page_num".into(), p.to_string()));
     }
     if let Some(p) = page_size {
-        params.insert("page_size".into(), p.to_string());
+        params.push(("page_size".into(), p.to_string()));
     }
     params
 }
@@ -370,6 +533,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn parse_ticker_normalizes_price_24h_pcnt_fixed_point() {
+        let ticker = parse_ticker(
+            &json!({
+                "symbol": "BTCUSDT",
+                "last_price": "62816.9",
+                "price_24h_pcnt": "1829"
+            }),
+            "BTCUSDT",
+        );
+        assert_eq!(ticker.change_24h_pct, "0.182900");
+    }
+
+    #[test]
     fn parse_ticker_supports_legacy_aliases() {
         let ticker = parse_ticker(
             &json!({
@@ -378,7 +554,7 @@ mod tests {
                 "bid1Price": "3199",
                 "ask1Price": "3201",
                 "volume": "1000",
-                "price24hPcnt": "1.5"
+                "price24hPcnt": "3950"
             }),
             "BTCUSDT",
         );
@@ -387,7 +563,87 @@ mod tests {
         assert_eq!(ticker.bid_price, "3199");
         assert_eq!(ticker.ask_price, "3201");
         assert_eq!(ticker.volume_24h, "1000");
-        assert_eq!(ticker.change_24h_pct, "1.5");
+        assert_eq!(ticker.change_24h_pct, "0.395000");
+    }
+
+    #[test]
+    fn merge_ticker_applies_ws_pp_delta() {
+        let base = Ticker {
+            symbol: "BTCUSDT".into(),
+            last_price: "61700".into(),
+            bid_price: "61699".into(),
+            ask_price: "61701".into(),
+            volume_24h: "1234".into(),
+            change_24h_pct: "0.100000".into(),
+        };
+        let merged = merge_ticker(Some(&base), &json!({"pP": "1963", "p": "61800"}), "BTCUSDT");
+        assert_eq!(merged.last_price, "61800");
+        assert_eq!(merged.change_24h_pct, "0.196300");
+    }
+
+    #[test]
+    fn merge_ticker_preserves_snapshot_when_ws_delta_is_symbol_only() {
+        let base = Ticker {
+            symbol: "BTCUSDT".into(),
+            last_price: "61700".into(),
+            bid_price: "61699".into(),
+            ask_price: "61701".into(),
+            volume_24h: "1234".into(),
+            change_24h_pct: "0.5".into(),
+        };
+        let merged = merge_ticker(Some(&base), &json!({"s": "BTCUSDT"}), "BTCUSDT");
+        assert_eq!(merged.last_price, "61700");
+        assert_eq!(merged.bid_price, "61699");
+        assert_eq!(merged.ask_price, "61701");
+        assert_eq!(merged.volume_24h, "1234");
+        assert_eq!(merged.change_24h_pct, "0.5");
+    }
+
+    #[test]
+    fn merge_ticker_ignores_absolute_change_field() {
+        let base = Ticker {
+            symbol: "BTCUSDT".into(),
+            last_price: "61700".into(),
+            bid_price: "61699".into(),
+            ask_price: "61701".into(),
+            volume_24h: "1234".into(),
+            change_24h_pct: "0.034".into(),
+        };
+        let merged = merge_ticker(
+            Some(&base),
+            &json!({"change": "100", "price24hPcnt": "340"}),
+            "BTCUSDT",
+        );
+        assert_eq!(merged.change_24h_pct, "0.034000");
+    }
+
+    #[test]
+    fn merge_ticker_ws_change_field_does_not_override_pct() {
+        let base = Ticker {
+            symbol: "BTCUSDT".into(),
+            last_price: "61700".into(),
+            bid_price: "61699".into(),
+            ask_price: "61701".into(),
+            volume_24h: "1234".into(),
+            change_24h_pct: "1.5".into(),
+        };
+        let merged = merge_ticker(Some(&base), &json!({"change": "150.5"}), "BTCUSDT");
+        assert_eq!(merged.change_24h_pct, "1.5");
+    }
+
+    #[test]
+    fn merge_ticker_applies_ws_price_delta() {
+        let base = Ticker {
+            symbol: "BTCUSDT".into(),
+            last_price: "61700".into(),
+            bid_price: "61699".into(),
+            ask_price: "61701".into(),
+            volume_24h: "1234".into(),
+            change_24h_pct: "0.5".into(),
+        };
+        let merged = merge_ticker(Some(&base), &json!({"lp": "61800"}), "BTCUSDT");
+        assert_eq!(merged.last_price, "61800");
+        assert_eq!(merged.bid_price, "61699");
     }
 
     #[test]
@@ -438,6 +694,88 @@ mod tests {
         );
         assert_eq!(klines.len(), 1);
         assert_eq!(klines[0].open_time, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn parse_orders_from_list_envelope() {
+        let orders = parse_orders(&json!({
+            "data": {
+                "list": [{
+                    "orderId": "abc123",
+                    "symbol": "ETHUSDT",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "price": "3200",
+                    "qty": "0.1",
+                    "status": "New"
+                }]
+            }
+        }));
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_id, "abc123");
+        assert_eq!(orders[0].symbol, "ETHUSDT");
+    }
+
+    #[test]
+    fn parse_positions_filters_decimal_zero_size() {
+        let positions = parse_positions(&json!({
+            "data": {
+                "list": [
+                    {"symbol": "BTCUSDT", "size": "0.01", "side": "Buy"},
+                    {"symbol": "ETHUSDT", "size": "0.000", "side": "Buy"},
+                    {"symbol": "SOLUSDT", "size": "0", "side": "Buy"}
+                ]
+            }
+        }));
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, "BTCUSDT");
+    }
+
+    #[test]
+    fn order_query_params_default_coin_when_scope_missing() {
+        let params = build_order_query_params(None, None, None, None, None, None, None, None, None, None);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], ("coin".into(), "USDT".into()));
+    }
+
+    #[test]
+    fn order_query_params_keep_symbol_without_coin() {
+        let params = build_order_query_params(Some("BTCUSDT"), None, None, None, None, None, None, None, None, None);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "symbol");
+    }
+
+    #[test]
+    fn order_query_params_ignore_empty_symbol() {
+        let params = build_order_query_params(Some(""), None, None, None, None, None, None, None, None, None);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], ("coin".into(), "USDT".into()));
+    }
+
+    #[test]
+    fn build_kline_params_normalize_millisecond_times_to_seconds() {
+        let params = build_kline_params("BTCUSDT", "1", Some(10), Some(1_700_000_000_000), Some(1_700_000_060_000));
+        assert_eq!(params.get("start"), Some(&"1700000000".to_string()));
+        assert_eq!(params.get("end"), Some(&"1700000060".to_string()));
+    }
+
+    #[test]
+    fn parse_positions_supports_position_list_envelope() {
+        let positions = parse_positions(&json!({
+            "data": {
+                "positionList": [{
+                    "symbol": "BTCUSDT",
+                    "positionAmt": "0.5",
+                    "positionSide": "Buy",
+                    "entryPrice": "60000",
+                    "positionIdx": 1,
+                    "unrealisedPnl": "12.5"
+                }]
+            }
+        }));
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].size, "0.5");
+        assert_eq!(positions[0].position_idx, 1);
     }
 
     #[test]

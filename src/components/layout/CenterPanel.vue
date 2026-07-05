@@ -1,7 +1,11 @@
 <script setup lang="ts">
+import { storeToRefs } from 'pinia'
 import TickerBar from '../market/TickerBar.vue'
 import KlineChart from '../market/KlineChart.vue'
 import OrderBook from '../market/OrderBook.vue'
+import { useMarketStore } from '../../stores/market'
+
+const { activeSymbol, klineInterval } = storeToRefs(useMarketStore())
 </script>
 
 <template>
@@ -10,7 +14,7 @@ import OrderBook from '../market/OrderBook.vue'
     <div class="center-grid">
       <div class="panel chart-panel">
         <div class="panel-title">K 线</div>
-        <KlineChart />
+        <KlineChart :key="`${activeSymbol}-${klineInterval}`" />
       </div>
       <div class="panel depth-panel">
         <div class="panel-title">深度</div>

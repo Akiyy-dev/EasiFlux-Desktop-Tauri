@@ -91,6 +91,9 @@ export type OrderStatus =
   | 'Cancelled'
   | 'Rejected'
   | 'Unknown'
+  | 'Created'
+  | 'Active'
+  | 'Untriggered'
 
 export interface Order {
   orderId: string
@@ -112,6 +115,7 @@ export interface Position {
   entryPrice: string
   leverage: string
   unrealisedPnl: string
+  positionIdx?: number
 }
 
 export interface PlaceOrderRequest {
@@ -202,7 +206,10 @@ export interface TradeStats {
   cancelledOrders: number
   totalVolume: string
   realizedPnl: string
+  unrealisedPnl: string
   winRatePct: string
+  winCount: number
+  lossCount: number
 }
 
 export interface LogEntry {
@@ -214,4 +221,29 @@ export interface LogEntry {
 export interface PingResponse {
   message: string
   version: string
+}
+
+export interface ProbeEndpointResult {
+  endpoint: string
+  success: boolean
+  code?: string
+  dataType: string
+  dataKeys: string[]
+  envelopeHint: string
+  rawCount: number
+  parsedCount: number
+  firstItemKeys: string[]
+  error?: string
+}
+
+export interface ProbePrivateEndpointsResult {
+  balancesOk: boolean
+  balanceCount: number
+  endpoints: ProbeEndpointResult[]
+}
+
+export interface PrivatePanelsSnapshot {
+  openOrders: Order[]
+  orderHistory: Order[]
+  positions: Position[]
 }

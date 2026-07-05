@@ -97,6 +97,9 @@ pub fn run() {
             fetch_transfer_history,
             get_trade_stats,
             export_trade_log,
+            probe_private_endpoints,
+            refresh_order_history,
+            refresh_private_panels,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

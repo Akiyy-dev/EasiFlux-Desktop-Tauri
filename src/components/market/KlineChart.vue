@@ -38,8 +38,25 @@ function seriesKey(): string {
   return `${activeSymbol.value}-${klineInterval.value}`
 }
 
+function resetChartSeries(): void {
+  lastSeriesKey.value = ''
+  lastCandles.value = []
+  resetViewport.value = true
+  series.value?.setData([])
+  chart.value?.timeScale().fitContent()
+}
+
 function applyKlines(next: CandlestickData[]): void {
-  if (next.length === 0 || !series.value) {
+  if (!series.value) {
+    return
+  }
+
+  if (next.length === 0) {
+    if (resetViewport.value || lastSeriesKey.value !== seriesKey()) {
+      series.value.setData([])
+      lastCandles.value = []
+      chart.value?.timeScale().fitContent()
+    }
     return
   }
 
@@ -47,11 +64,15 @@ function applyKlines(next: CandlestickData[]): void {
   const shouldFit = resetViewport.value || lastSeriesKey.value !== key || lastCandles.value.length === 0
   const prev = lastCandles.value
 
-  if (!shouldFit && prev.length === next.length && prev.length > 0) {
-    const prefixSame = prev.slice(0, -1).every((candle, index) => candlesEqual(candle, next[index]!))
+  if (!shouldFit && prev.length > 0 && next.length > 0) {
+    const prefixSame =
+      prev.length === next.length
+        ? prev.slice(0, -1).every((candle, index) => candlesEqual(candle, next[index]!))
+        : prev.length + 1 === next.length &&
+          prev.every((candle, index) => candlesEqual(candle, next[index]!))
     const last = next[next.length - 1]
     const prevLast = prev[prev.length - 1]
-    if (prefixSame && last && prevLast && !candlesEqual(prevLast, last)) {
+    if (prefixSame && last && (!prevLast || !candlesEqual(prevLast, last))) {
       series.value.update(last)
       lastCandles.value = next
       lastSeriesKey.value = key
@@ -140,23 +161,31 @@ watch(klines, (next) => {
 })
 
 watch(activeSymbol, () => {
-  resetViewport.value = true
+  resetChartSeries()
 })
 
-watch(klineInterval, async (interval) => {
+watch(klineInterval, () => {
+  resetChartSeries()
+})
+
+async function onIntervalChange(interval: string): Promise<void> {
+  if (interval === klineInterval.value) {
+    return
+  }
   resetViewport.value = true
   await marketStore.setKlineInterval(interval)
-})
+}
 </script>
 
 <template>
   <div class="chart">
     <div class="toolbar">
       <NSelect
-        v-model:value="klineInterval"
+        :value="klineInterval"
         :options="intervals"
         size="small"
         style="width: 88px"
+        @update:value="onIntervalChange"
       />
     </div>
     <div ref="chartContainer" class="chart-view" />

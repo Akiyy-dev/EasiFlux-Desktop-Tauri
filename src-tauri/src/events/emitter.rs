@@ -1,17 +1,21 @@
+use std::sync::Arc;
+
 use tauri::{AppHandle, Emitter};
 
 use crate::models::account::Balance;
 use crate::models::market::{Depth, Kline, Ticker};
 use crate::models::trading::{Order, Position};
+use crate::services::AnalyticsService;
 
 #[derive(Clone)]
 pub struct EventEmitter {
     app: AppHandle,
+    analytics: Arc<AnalyticsService>,
 }
 
 impl EventEmitter {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
+    pub fn new(app: AppHandle, analytics: Arc<AnalyticsService>) -> Self {
+        Self { app, analytics }
     }
 
     pub fn emit_app_ready(&self, version: &str) {
@@ -42,10 +46,20 @@ impl EventEmitter {
 
     pub fn emit_order(&self, order: Order) {
         let _ = self.app.emit("order:updated", &order);
+        let analytics = self.analytics.clone();
+        let tracked = order.clone();
+        tauri::async_runtime::spawn(async move {
+            analytics.record_order(tracked).await;
+        });
     }
 
     pub fn emit_position(&self, position: Position) {
         let _ = self.app.emit("position:updated", &position);
+        let analytics = self.analytics.clone();
+        let tracked = position.clone();
+        tauri::async_runtime::spawn(async move {
+            analytics.record_position(tracked).await;
+        });
     }
 
     pub fn emit_balance(&self, balance: Balance) {

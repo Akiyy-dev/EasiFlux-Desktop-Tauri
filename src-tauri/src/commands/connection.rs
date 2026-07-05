@@ -7,13 +7,14 @@ use crate::state::AppState;
 #[tauri::command]
 pub async fn test_connection(credential: ApiCredential) -> AppResult<()> {
     let temp = crate::api::ApiClient::new();
-    temp.set_credential(credential).await;
+    temp.set_credential(credential.normalize()).await;
     crate::auth::time_sync::sync_from_server(
         temp.time_sync().as_ref(),
         crate::api::PublicApi::server_time(&temp),
     )
     .await?;
     crate::api::PublicApi::ticker(&temp, "BTCUSDT").await?;
+    crate::api::PrivateApi::balances(&temp, None).await?;
     Ok(())
 }
 
@@ -43,6 +44,11 @@ pub async fn connect(
         .await?;
     state.market.set_active_symbol(&symbol).await;
     state.market.set_kline_interval(&kline_interval).await;
+    if let Err(e) = state.market.restore_klines(&symbol, &kline_interval) {
+        state
+            .emitter
+            .emit_error(&format!("K线恢复失败: {}", e));
+    }
     if let Err(e) = state.market.refresh_snapshot(&symbol).await {
         state
             .emitter
@@ -57,15 +63,34 @@ pub async fn connect(
             .emitter
             .emit_error(&format!("账户刷新失败: {}", e));
     }
-    if let Err(e) = state.trading.refresh_orders(Some(&symbol)).await {
-        state
-            .emitter
-            .emit_error(&format!("订单刷新失败: {}", e));
+    match state.trading.refresh_orders(None).await {
+        Ok(orders) => {
+            for order in orders {
+                state.analytics.record_order(order).await;
+            }
+        }
+        Err(e) => {
+            state
+                .emitter
+                .emit_error(&format!("订单刷新失败: {}", e));
+        }
     }
-    if let Err(e) = state.account.refresh_positions(Some(&symbol)).await {
+    match state.account.refresh_positions(None).await {
+        Ok(positions) => {
+            for position in positions {
+                state.analytics.record_position(position).await;
+            }
+        }
+        Err(e) => {
+            state
+                .emitter
+                .emit_error(&format!("持仓刷新失败: {}", e));
+        }
+    }
+    if let Err(e) = state.analytics.refresh_from_api(&state.emitter).await {
         state
             .emitter
-            .emit_error(&format!("持仓刷新失败: {}", e));
+            .emit_error(&format!("分析数据刷新失败: {}", e));
     }
     Ok(())
 }

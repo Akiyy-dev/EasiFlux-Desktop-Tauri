@@ -8,7 +8,7 @@ import AnalyticsPanel from '../common/AnalyticsPanel.vue'
 const activeTab = ref<'orders' | 'positions' | 'logs' | 'analytics'>('orders')
 
 const tabs = [
-  { key: 'orders' as const, label: '订单' },
+  { key: 'orders' as const, label: '订单/挂单' },
   { key: 'positions' as const, label: '持仓' },
   { key: 'logs' as const, label: '日志' },
   { key: 'analytics' as const, label: '分析' },
@@ -29,10 +29,10 @@ const tabs = [
       </button>
     </div>
     <div class="tab-body">
-      <OrderTable v-if="activeTab === 'orders'" />
-      <PositionTable v-else-if="activeTab === 'positions'" />
-      <LogPanel v-else-if="activeTab === 'logs'" />
-      <AnalyticsPanel v-else />
+      <OrderTable v-show="activeTab === 'orders'" :active="activeTab === 'orders'" />
+      <PositionTable v-show="activeTab === 'positions'" :active="activeTab === 'positions'" />
+      <LogPanel v-show="activeTab === 'logs'" />
+      <AnalyticsPanel v-show="activeTab === 'analytics'" :active="activeTab === 'analytics'" />
     </div>
   </footer>
 </template>
@@ -50,6 +50,7 @@ const tabs = [
   gap: 4px;
   padding: 6px 8px;
   border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
 }
 
 .tab {
@@ -68,8 +69,14 @@ const tabs = [
 }
 
 .tab-body {
+  position: relative;
   flex: 1;
-  overflow: auto;
+  min-height: 0;
+  overflow: hidden;
   padding: 4px;
+}
+
+.tab-body > * {
+  height: 100%;
 }
 </style>

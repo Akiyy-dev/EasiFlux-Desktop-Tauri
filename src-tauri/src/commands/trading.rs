@@ -8,7 +8,7 @@ use crate::models::api_requests::{
     ApiCreateTpslRequest, ApiReplaceOrderRequest, ApiReplaceTpslRequest,
     ApiSetLeverageRequest, ApiSwitchMarginModeRequest, ApiSwitchSeparatePositionModeRequest,
 };
-use crate::models::trading::{CancelOrderRequest, Order, PlaceOrderRequest};
+use crate::models::trading::{CancelOrderRequest, Order, PlaceOrderRequest, PrivatePanelsSnapshot};
 use crate::state::AppState;
 
 #[tauri::command]
@@ -34,7 +34,52 @@ pub async fn refresh_orders(
     symbol: Option<String>,
 ) -> AppResult<Vec<Order>> {
     let sym = symbol.as_deref();
-    state.trading.refresh_orders(sym).await
+    let orders = state.trading.refresh_orders(sym).await?;
+    for order in &orders {
+        state.analytics.record_order(order.clone()).await;
+    }
+    Ok(orders)
+}
+
+#[tauri::command]
+pub async fn refresh_order_history(
+    state: State<'_, AppState>,
+    symbol: Option<String>,
+    limit: Option<u32>,
+) -> AppResult<Vec<Order>> {
+    let orders = state
+        .trading
+        .refresh_order_history(symbol.as_deref(), limit)
+        .await?;
+    for order in &orders {
+        state.analytics.record_order(order.clone()).await;
+    }
+    Ok(orders)
+}
+
+#[tauri::command]
+pub async fn refresh_private_panels(
+    state: State<'_, AppState>,
+    symbol: Option<String>,
+) -> AppResult<PrivatePanelsSnapshot> {
+    let sym = symbol.as_deref();
+    let open_orders = state.trading.refresh_orders(sym).await?;
+    let order_history = state
+        .trading
+        .refresh_order_history(sym, Some(50))
+        .await?;
+    let positions = state.account.refresh_positions(sym).await?;
+    for order in open_orders.iter().chain(order_history.iter()) {
+        state.analytics.record_order(order.clone()).await;
+    }
+    for position in &positions {
+        state.analytics.record_position(position.clone()).await;
+    }
+    Ok(PrivatePanelsSnapshot {
+        open_orders,
+        order_history,
+        positions,
+    })
 }
 
 #[tauri::command]

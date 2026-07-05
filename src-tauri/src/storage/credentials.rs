@@ -5,6 +5,9 @@ pub struct CredentialStore;
 
 impl CredentialStore {
     pub fn save(account_id: &str, credential: &ApiCredential) -> AppResult<()> {
+        if !credential.is_valid() {
+            return Err(AppError::Auth("API Key 与 Secret 均不能为空".into()));
+        }
         let json = serde_json::to_string(credential)
             .map_err(|e| AppError::Config(e.to_string()))?;
         let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
@@ -18,7 +21,7 @@ impl CredentialStore {
             Ok(json) => {
                 let cred: ApiCredential = serde_json::from_str(&json)
                     .map_err(|e| AppError::Config(e.to_string()))?;
-                Ok(Some(cred))
+                Ok(Some(cred.normalize()))
             }
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(AppError::from(e)),
@@ -35,6 +38,10 @@ impl CredentialStore {
     }
 
     pub fn has(account_id: &str) -> bool {
-        Self::load(account_id).ok().flatten().is_some()
+        Self::load(account_id)
+            .ok()
+            .flatten()
+            .map(|cred| cred.is_valid())
+            .unwrap_or(false)
     }
 }
