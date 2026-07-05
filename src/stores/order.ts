@@ -31,5 +31,12 @@ export const useOrderStore = defineStore('order', () => {
     orders.value = await tauriInvoke<Order[]>('refresh_orders', { symbol: symbol ?? null })
   }
 
-  return { orders, upsertOrder, placeOrder, cancelOrder, refreshOrders }
+  async function refreshOrderHistory(symbol?: string, limit = 50): Promise<void> {
+    orders.value = await tauriInvoke<Order[]>('refresh_order_history', {
+      symbol: symbol ?? null,
+      limit,
+    })
+  }
+
+  return { orders, upsertOrder, placeOrder, cancelOrder, refreshOrders, refreshOrderHistory }
 })

@@ -3,11 +3,16 @@ import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type { Position } from '../types/models'
 
+function positionKey(position: Position): string {
+  return `${position.symbol}:${position.positionIdx ?? 0}`
+}
+
 export const usePositionStore = defineStore('position', () => {
   const positions = ref<Position[]>([])
 
   function upsertPosition(position: Position): void {
-    const idx = positions.value.findIndex((p) => p.symbol === position.symbol)
+    const key = positionKey(position)
+    const idx = positions.value.findIndex((p) => positionKey(p) === key)
     if (idx >= 0) {
       positions.value[idx] = position
     } else {

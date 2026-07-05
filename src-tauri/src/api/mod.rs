@@ -1,4 +1,5 @@
 pub mod client;
+pub mod diagnostic;
 pub mod endpoints;
 pub mod mapper;
 pub mod private;

@@ -2,35 +2,99 @@ use serde_json::Value;
 
 const SUCCESS_CODES: &[&str] = &["0", "200", "SUCCESS", "success"];
 
+const LIST_KEYS: &[&str] = &[
+    "list",
+    "items",
+    "records",
+    "orders",
+    "positions",
+    "balances",
+    "tickers",
+    "kline",
+    "klines",
+    "fills",
+    "rows",
+    "result",
+    "dataList",
+    "orderList",
+    "positionList",
+    "order_list",
+    "position_list",
+];
+
+#[derive(Debug, Clone)]
+pub struct ListEnvelopeMeta {
+    pub hint: String,
+    pub raw_count: usize,
+}
+
 pub fn extract_data(payload: &Value) -> &Value {
     payload.get("data").unwrap_or(payload)
 }
 
 pub fn extract_list(payload: &Value) -> Vec<&Value> {
+    extract_list_with_meta(payload).0
+}
+
+pub fn extract_list_with_meta(payload: &Value) -> (Vec<&Value>, ListEnvelopeMeta) {
     let data = extract_data(payload);
     if let Some(arr) = data.as_array() {
-        return arr.iter().collect();
+        let count = arr.len();
+        return (
+            arr.iter().collect(),
+            ListEnvelopeMeta {
+                hint: "data[]".into(),
+                raw_count: count,
+            },
+        );
     }
     if let Some(obj) = data.as_object() {
-        for key in [
-            "list",
-            "items",
-            "records",
-            "orders",
-            "positions",
-            "balances",
-            "tickers",
-            "kline",
-            "klines",
-            "fills",
-        ] {
-            if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
-                return arr.iter().collect();
+        for key in LIST_KEYS {
+            if let Some(arr) = obj.get(*key).and_then(|v| v.as_array()) {
+                let count = arr.len();
+                return (
+                    arr.iter().collect(),
+                    ListEnvelopeMeta {
+                        hint: format!("data.{key}"),
+                        raw_count: count,
+                    },
+                );
             }
         }
-        return vec![data];
+        return (
+            vec![data],
+            ListEnvelopeMeta {
+                hint: "data(object)".into(),
+                raw_count: 1,
+            },
+        );
     }
-    vec![]
+    (
+        vec![],
+        ListEnvelopeMeta {
+            hint: "empty".into(),
+            raw_count: 0,
+        },
+    )
+}
+
+pub fn payload_has_content(payload: &Value) -> bool {
+    if payload.is_null() {
+        return false;
+    }
+    if let Some(obj) = payload.as_object() {
+        return !obj.is_empty();
+    }
+    !payload.as_array().map(|a| a.is_empty()).unwrap_or(false)
+}
+
+pub fn first_object_keys(payload: &Value) -> Vec<String> {
+    let items = extract_list(payload);
+    items
+        .first()
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 pub fn get_str(value: &Value, keys: &[&str]) -> Option<String> {
@@ -133,6 +197,15 @@ pub fn error_message(payload: &Value) -> Option<String> {
     None
 }
 
+pub fn describe_data_shape(payload: &Value) -> (String, Vec<String>) {
+    let data = extract_data(payload);
+    match data {
+        Value::Array(_arr) => ("array".into(), vec![]),
+        Value::Object(obj) => ("object".into(), obj.keys().cloned().collect()),
+        other => (format!("{}", other), vec![]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +227,21 @@ mod tests {
     #[test]
     fn timestamp_error_detection() {
         assert!(is_timestamp_error(&json!({"code": 26200002, "msg": "timestamp"})));
+    }
+
+    #[test]
+    fn extract_list_supports_rows_key() {
+        let payload = json!({"data": {"rows": [{"symbol": "BTCUSDT"}]}});
+        let (items, meta) = extract_list_with_meta(&payload);
+        assert_eq!(items.len(), 1);
+        assert_eq!(meta.hint, "data.rows");
+    }
+
+    #[test]
+    fn extract_list_supports_position_list_key() {
+        let payload = json!({"data": {"positionList": [{"symbol": "ETHUSDT"}]}});
+        let (items, meta) = extract_list_with_meta(&payload);
+        assert_eq!(items.len(), 1);
+        assert_eq!(meta.hint, "data.positionList");
     }
 }

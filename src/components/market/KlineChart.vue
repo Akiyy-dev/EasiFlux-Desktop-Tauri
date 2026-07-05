@@ -38,8 +38,25 @@ function seriesKey(): string {
   return `${activeSymbol.value}-${klineInterval.value}`
 }
 
+function resetChartSeries(): void {
+  lastSeriesKey.value = ''
+  lastCandles.value = []
+  resetViewport.value = true
+  series.value?.setData([])
+  chart.value?.timeScale().fitContent()
+}
+
 function applyKlines(next: CandlestickData[]): void {
-  if (next.length === 0 || !series.value) {
+  if (!series.value) {
+    return
+  }
+
+  if (next.length === 0) {
+    if (resetViewport.value || lastSeriesKey.value !== seriesKey()) {
+      series.value.setData([])
+      lastCandles.value = []
+      chart.value?.timeScale().fitContent()
+    }
     return
   }
 
@@ -144,13 +161,11 @@ watch(klines, (next) => {
 })
 
 watch(activeSymbol, () => {
-  lastCandles.value = []
-  resetViewport.value = true
+  resetChartSeries()
 })
 
 watch(klineInterval, () => {
-  lastCandles.value = []
-  resetViewport.value = true
+  resetChartSeries()
 })
 
 async function onIntervalChange(interval: string): Promise<void> {

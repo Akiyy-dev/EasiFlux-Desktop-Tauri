@@ -8,7 +8,7 @@ import AnalyticsPanel from '../common/AnalyticsPanel.vue'
 const activeTab = ref<'orders' | 'positions' | 'logs' | 'analytics'>('orders')
 
 const tabs = [
-  { key: 'orders' as const, label: '订单' },
+  { key: 'orders' as const, label: '订单/挂单' },
   { key: 'positions' as const, label: '持仓' },
   { key: 'logs' as const, label: '日志' },
   { key: 'analytics' as const, label: '分析' },

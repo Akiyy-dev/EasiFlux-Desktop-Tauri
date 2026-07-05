@@ -41,7 +41,7 @@ pub async fn set_active_symbol(state: State<'_, AppState>, symbol: String) -> Ap
             if let Err(e) = market.refresh_snapshot(&symbol_bg).await {
                 emitter.emit_error(&format!("行情快照失败: {}", e));
             }
-            match trading.refresh_orders(Some(&symbol_bg)).await {
+            match trading.refresh_orders(None).await {
                 Ok(orders) => {
                     for order in orders {
                         analytics.record_order(order).await;
@@ -49,8 +49,13 @@ pub async fn set_active_symbol(state: State<'_, AppState>, symbol: String) -> Ap
                 }
                 Err(e) => emitter.emit_error(&format!("订单刷新失败: {}", e)),
             }
-            if let Err(e) = account.refresh_positions(None).await {
-                emitter.emit_error(&format!("持仓刷新失败: {}", e));
+            match account.refresh_positions(None).await {
+                Ok(positions) => {
+                    for position in positions {
+                        analytics.record_position(position).await;
+                    }
+                }
+                Err(e) => emitter.emit_error(&format!("持仓刷新失败: {}", e)),
             }
         });
     }

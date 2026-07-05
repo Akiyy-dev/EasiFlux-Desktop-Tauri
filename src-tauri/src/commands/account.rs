@@ -35,6 +35,11 @@ pub async fn refresh_positions(
 
 #[tauri::command]
 pub async fn get_trade_stats(state: State<'_, AppState>) -> AppResult<TradeStats> {
+    if let Err(e) = state.analytics.refresh_from_api(&state.emitter).await {
+        state
+            .emitter
+            .emit_error(&format!("分析数据刷新失败: {}", e.user_message()));
+    }
     Ok(state.analytics.compute_stats().await)
 }
 

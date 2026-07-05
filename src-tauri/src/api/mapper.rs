@@ -1,13 +1,35 @@
 use std::collections::HashMap;
 
+use rust_decimal::Decimal;
 use serde_json::Value;
+use std::str::FromStr;
 
 use crate::models::api_requests::{ApiCancelOrderRequest, ApiOrderRequest};
 use crate::models::account::Balance;
 use crate::models::market::{Depth, DepthLevel, Kline, Ticker};
 use crate::models::trading::{Order, OrderStatus, Position};
 
-use super::response::{extract_data, extract_list, get_str};
+use super::response::{extract_data, extract_list, extract_list_with_meta, get_str, ListEnvelopeMeta};
+
+pub fn list_envelope_meta(payload: &Value) -> ListEnvelopeMeta {
+    extract_list_with_meta(payload).1
+}
+
+fn parse_decimal_value(raw: &str) -> Decimal {
+    Decimal::from_str(raw.trim()).unwrap_or(Decimal::ZERO)
+}
+
+fn is_zero_size(raw: &str) -> bool {
+    raw.trim().is_empty() || parse_decimal_value(raw) == Decimal::ZERO
+}
+
+fn parse_i32_value(value: &Value) -> i32 {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|n| n as i64))
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0) as i32
+}
 
 fn normalize_open_time_ms(value: i64) -> i64 {
     if value > 0 && value < 10_000_000_000 {
@@ -241,20 +263,47 @@ pub fn parse_orders(payload: &Value) -> Vec<Order> {
 }
 
 pub fn parse_position(value: &Value) -> Position {
+    let position_idx = value
+        .get("positionIdx")
+        .or_else(|| value.get("position_idx"))
+        .map(parse_i32_value)
+        .unwrap_or(0);
     Position {
         symbol: get_str(value, &["symbol", "s"]).unwrap_or_default(),
-        side: get_str(value, &["side", "positionSide", "position_side"]).unwrap_or_default(),
-        size: get_str(value, &["size", "qty", "positionAmt", "position_amt"]).unwrap_or_else(|| "0".into()),
-        entry_price: get_str(value, &["entryPrice", "entry_price", "avgPrice"]).unwrap_or_else(|| "0".into()),
+        side: get_str(value, &["side", "positionSide", "position_side", "direction"]).unwrap_or_default(),
+        size: get_str(value, &[
+            "size",
+            "qty",
+            "quantity",
+            "positionAmt",
+            "position_amt",
+            "currentPiece",
+            "current_piece",
+            "totalPiece",
+            "total_piece",
+        ])
+        .unwrap_or_else(|| "0".into()),
+        entry_price: get_str(value, &[
+            "entryPrice",
+            "entry_price",
+            "avgPrice",
+            "avg_price",
+            "openPrice",
+            "open_price",
+        ])
+        .unwrap_or_else(|| "0".into()),
         leverage: get_str(value, &["leverage"]).unwrap_or_else(|| "1".into()),
         unrealised_pnl: get_str(value, &[
             "unrealisedPnl",
             "unrealised_pnl",
             "unrealizedPnl",
             "unrealized_pnl",
+            "profitUnreal",
+            "profit_unreal",
             "pnl",
         ])
         .unwrap_or_else(|| "0".into()),
+        position_idx,
     }
 }
 
@@ -262,7 +311,7 @@ pub fn parse_positions(payload: &Value) -> Vec<Position> {
     extract_list(payload)
         .iter()
         .map(|v| parse_position(v))
-        .filter(|p| p.size != "0" && !p.size.is_empty())
+        .filter(|p| !is_zero_size(&p.size))
         .collect()
 }
 
@@ -641,17 +690,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_positions_filters_zero_size() {
+    fn parse_positions_filters_decimal_zero_size() {
         let positions = parse_positions(&json!({
             "data": {
                 "list": [
                     {"symbol": "BTCUSDT", "size": "0.01", "side": "Buy"},
-                    {"symbol": "ETHUSDT", "size": "0", "side": "Buy"}
+                    {"symbol": "ETHUSDT", "size": "0.000", "side": "Buy"},
+                    {"symbol": "SOLUSDT", "size": "0", "side": "Buy"}
                 ]
             }
         }));
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].symbol, "BTCUSDT");
+    }
+
+    #[test]
+    fn parse_positions_supports_position_list_envelope() {
+        let positions = parse_positions(&json!({
+            "data": {
+                "positionList": [{
+                    "symbol": "BTCUSDT",
+                    "positionAmt": "0.5",
+                    "positionSide": "Buy",
+                    "entryPrice": "60000",
+                    "positionIdx": 1,
+                    "unrealisedPnl": "12.5"
+                }]
+            }
+        }));
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].size, "0.5");
+        assert_eq!(positions[0].position_idx, 1);
     }
 
     #[test]

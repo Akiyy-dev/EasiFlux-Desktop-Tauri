@@ -75,10 +75,22 @@ pub async fn connect(
                 .emit_error(&format!("订单刷新失败: {}", e));
         }
     }
-    if let Err(e) = state.account.refresh_positions(None).await {
+    match state.account.refresh_positions(None).await {
+        Ok(positions) => {
+            for position in positions {
+                state.analytics.record_position(position).await;
+            }
+        }
+        Err(e) => {
+            state
+                .emitter
+                .emit_error(&format!("持仓刷新失败: {}", e));
+        }
+    }
+    if let Err(e) = state.analytics.refresh_from_api(&state.emitter).await {
         state
             .emitter
-            .emit_error(&format!("持仓刷新失败: {}", e));
+            .emit_error(&format!("分析数据刷新失败: {}", e));
     }
     Ok(())
 }

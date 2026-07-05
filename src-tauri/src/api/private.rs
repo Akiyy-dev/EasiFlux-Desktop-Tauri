@@ -27,6 +27,27 @@ impl PrivateApi {
         Ok(parse_orders(&payload))
     }
 
+    pub async fn order_history(
+        client: &ApiClient,
+        symbol: Option<&str>,
+        limit: Option<u32>,
+    ) -> AppResult<Vec<Order>> {
+        let params = build_order_query_params(
+            symbol,
+            None,
+            None,
+            None,
+            None,
+            limit,
+            None,
+            None,
+            None,
+            None,
+        );
+        let payload = client.private_get(endpoints::ORDERS, params).await?;
+        Ok(parse_orders(&payload))
+    }
+
     pub async fn orders(
         client: &ApiClient,
         symbol: Option<&str>,

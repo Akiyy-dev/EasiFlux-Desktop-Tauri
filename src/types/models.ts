@@ -112,6 +112,7 @@ export interface Position {
   entryPrice: string
   leverage: string
   unrealisedPnl: string
+  positionIdx?: number
 }
 
 export interface PlaceOrderRequest {
@@ -202,7 +203,10 @@ export interface TradeStats {
   cancelledOrders: number
   totalVolume: string
   realizedPnl: string
+  unrealisedPnl: string
   winRatePct: string
+  winCount: number
+  lossCount: number
 }
 
 export interface LogEntry {

@@ -39,7 +39,8 @@ impl AppState {
         let cache = Arc::new(CacheStore::new());
         let kline_store = Arc::new(KlineStore::new());
         let trade_log = Arc::new(TradeLogStore::new());
-        let emitter = EventEmitter::new(app);
+        let analytics = Arc::new(AnalyticsService::new(api.clone()));
+        let emitter = EventEmitter::new(app.clone(), analytics.clone());
 
         let time_sync = api.time_sync();
         let ws = Arc::new(WsManager::new(emitter.clone(), time_sync));
@@ -67,7 +68,7 @@ impl AppState {
             emitter.clone(),
         ));
         let account = Arc::new(AccountService::new(api.clone(), emitter.clone()));
-        let analytics = Arc::new(AnalyticsService::new());
+
         let plugins = Arc::new(RwLock::new(PluginRegistry::new()));
 
         Ok(Self {

@@ -42,6 +42,22 @@ pub async fn refresh_orders(
 }
 
 #[tauri::command]
+pub async fn refresh_order_history(
+    state: State<'_, AppState>,
+    symbol: Option<String>,
+    limit: Option<u32>,
+) -> AppResult<Vec<Order>> {
+    let orders = state
+        .trading
+        .refresh_order_history(symbol.as_deref(), limit)
+        .await?;
+    for order in &orders {
+        state.analytics.record_order(order.clone()).await;
+    }
+    Ok(orders)
+}
+
+#[tauri::command]
 pub async fn cancel_all_orders(
     state: State<'_, AppState>,
     request: ApiCancelAllOrdersRequest,
