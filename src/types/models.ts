@@ -91,6 +91,9 @@ export type OrderStatus =
   | 'Cancelled'
   | 'Rejected'
   | 'Unknown'
+  | 'Created'
+  | 'Active'
+  | 'Untriggered'
 
 export interface Order {
   orderId: string
@@ -237,4 +240,10 @@ export interface ProbePrivateEndpointsResult {
   balancesOk: boolean
   balanceCount: number
   endpoints: ProbeEndpointResult[]
+}
+
+export interface PrivatePanelsSnapshot {
+  openOrders: Order[]
+  orderHistory: Order[]
+  positions: Position[]
 }

@@ -255,7 +255,8 @@ pub fn parse_order(value: &Value) -> Order {
             &get_str(value, &["status", "orderStatus", "order_status"]).unwrap_or_default(),
         ),
         order_link_id: get_str(value, &["orderLinkId", "order_link_id"]),
-        filled_qty: get_str(value, &["cumExecQty", "filled_qty", "filledQty"]).unwrap_or_else(|| "0".into()),
+        filled_qty: get_str(value, &["cumExecQty", "cum_exec_qty", "filled_qty", "filledQty"])
+            .unwrap_or_else(|| "0".into()),
         avg_price: get_str(value, &["avgPrice", "avg_price"]).unwrap_or_else(|| "0".into()),
     }
 }
@@ -279,6 +280,12 @@ pub fn parse_position(value: &Value) -> Position {
             "quantity",
             "positionAmt",
             "position_amt",
+            "positionQty",
+            "position_qty",
+            "holdQty",
+            "hold_qty",
+            "openQty",
+            "open_qty",
             "currentPiece",
             "current_piece",
             "totalPiece",
@@ -432,10 +439,14 @@ pub fn build_order_query_params(
 ) -> Vec<(String, String)> {
     let mut params = Vec::new();
     if let Some(s) = symbol {
-        params.push(("symbol".into(), s.into()));
+        if !s.is_empty() {
+            params.push(("symbol".into(), s.into()));
+        }
     }
     if let Some(c) = coin {
-        params.push(("coin".into(), c.into()));
+        if !c.is_empty() {
+            params.push(("coin".into(), c.into()));
+        }
     }
     if let Some(id) = order_id {
         params.push(("order_id".into(), id.into()));
@@ -732,6 +743,13 @@ mod tests {
         let params = build_order_query_params(Some("BTCUSDT"), None, None, None, None, None, None, None, None, None);
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].0, "symbol");
+    }
+
+    #[test]
+    fn order_query_params_ignore_empty_symbol() {
+        let params = build_order_query_params(Some(""), None, None, None, None, None, None, None, None, None);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], ("coin".into(), "USDT".into()));
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub enum OrderStatus {
 impl OrderStatus {
     pub fn from_raw(value: &str) -> Self {
         match value.to_lowercase().as_str() {
-            "new" => Self::New,
+            "new" | "created" | "active" | "untriggered" => Self::New,
             "partiallyfilled" | "partially_filled" => Self::PartiallyFilled,
             "filled" => Self::Filled,
             "cancelled" | "canceled" => Self::Cancelled,
@@ -88,4 +88,12 @@ pub struct TradeStats {
     pub win_rate_pct: String,
     pub win_count: u32,
     pub loss_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivatePanelsSnapshot {
+    pub open_orders: Vec<Order>,
+    pub order_history: Vec<Order>,
+    pub positions: Vec<Position>,
 }

@@ -29,10 +29,10 @@ const tabs = [
       </button>
     </div>
     <div class="tab-body">
-      <OrderTable v-if="activeTab === 'orders'" />
-      <PositionTable v-else-if="activeTab === 'positions'" />
-      <LogPanel v-else-if="activeTab === 'logs'" />
-      <AnalyticsPanel v-else :active="activeTab === 'analytics'" />
+      <OrderTable v-show="activeTab === 'orders'" :active="activeTab === 'orders'" />
+      <PositionTable v-show="activeTab === 'positions'" :active="activeTab === 'positions'" />
+      <LogPanel v-show="activeTab === 'logs'" />
+      <AnalyticsPanel v-show="activeTab === 'analytics'" :active="activeTab === 'analytics'" />
     </div>
   </footer>
 </template>
@@ -50,6 +50,7 @@ const tabs = [
   gap: 4px;
   padding: 6px 8px;
   border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
 }
 
 .tab {
@@ -68,8 +69,14 @@ const tabs = [
 }
 
 .tab-body {
+  position: relative;
   flex: 1;
-  overflow: auto;
+  min-height: 0;
+  overflow: hidden;
   padding: 4px;
+}
+
+.tab-body > * {
+  height: 100%;
 }
 </style>

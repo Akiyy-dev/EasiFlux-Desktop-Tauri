@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type { Position } from '../types/models'
+import { normalizePosition, normalizePositions } from '../utils/position'
 
 function positionKey(position: Position): string {
   return `${position.symbol}:${position.positionIdx ?? 0}`
@@ -11,20 +12,30 @@ export const usePositionStore = defineStore('position', () => {
   const positions = ref<Position[]>([])
 
   function upsertPosition(position: Position): void {
-    const key = positionKey(position)
+    const normalized = normalizePosition(position)
+    if (!normalized.symbol || parseFloat(normalized.size) === 0) {
+      positions.value = positions.value.filter((p) => positionKey(p) !== positionKey(normalized))
+      return
+    }
+    const key = positionKey(normalized)
     const idx = positions.value.findIndex((p) => positionKey(p) === key)
     if (idx >= 0) {
-      positions.value[idx] = position
+      positions.value[idx] = normalized
     } else {
-      positions.value.push(position)
+      positions.value.push(normalized)
     }
   }
 
-  async function refreshPositions(symbol?: string): Promise<void> {
-    positions.value = await tauriInvoke<Position[]>('refresh_positions', {
-      symbol: symbol ?? null,
-    })
+  function setPositions(next: Position[]): void {
+    positions.value = next
   }
 
-  return { positions, upsertPosition, refreshPositions }
+  async function refreshPositions(symbol?: string): Promise<void> {
+    const raw = await tauriInvoke<Position[]>('refresh_positions', {
+      symbol: symbol ?? null,
+    })
+    positions.value = normalizePositions(raw)
+  }
+
+  return { positions, upsertPosition, setPositions, refreshPositions }
 })

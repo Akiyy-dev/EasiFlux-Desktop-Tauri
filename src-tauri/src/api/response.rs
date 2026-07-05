@@ -96,6 +96,8 @@ fn is_entity_object(obj: &serde_json::Map<String, Value>) -> bool {
         || obj.contains_key("orderLinkId")
         || obj.contains_key("order_link_id")
         || (obj.contains_key("symbol") && (obj.contains_key("side") || obj.contains_key("size")))
+        || (obj.contains_key("symbol")
+            && (obj.contains_key("position_idx") || obj.contains_key("positionIdx")))
 }
 
 fn find_best_object_array<'a>(value: &'a Value) -> Option<(Vec<&'a Value>, String)> {

@@ -5,8 +5,7 @@ import type { ApiCredential, ConnectionStatus } from '../types/models'
 import { useAccountStore } from './account'
 import { useLogStore } from './log'
 import { useMarketStore } from './market'
-import { useOrderStore } from './order'
-import { usePositionStore } from './position'
+import { refreshPrivatePanels } from './privatePanels'
 
 function parseStatus(next: string): ConnectionStatus | null {
   if (
@@ -36,8 +35,7 @@ async function refreshPostConnectData(): Promise<void> {
   const tasks: Array<{ label: string; run: () => Promise<void> }> = [
     { label: '账户', run: () => useAccountStore().refreshAccount() },
     { label: '行情', run: () => useMarketStore().refreshMarket() },
-    { label: '订单', run: () => useOrderStore().refreshOrders() },
-    { label: '持仓', run: () => usePositionStore().refreshPositions() },
+    { label: '订单/持仓', run: () => refreshPrivatePanels() },
   ]
 
   for (const task of tasks) {
