@@ -35,7 +35,7 @@ async function refreshPostConnectData(): Promise<void> {
   const tasks: Array<{ label: string; run: () => Promise<void> }> = [
     { label: '账户', run: () => useAccountStore().refreshAccount() },
     { label: '行情', run: () => useMarketStore().refreshMarket() },
-    { label: '订单/持仓', run: () => refreshPrivatePanels() },
+    { label: '订单/持仓', run: async () => { await refreshPrivatePanels() } },
   ]
 
   for (const task of tasks) {
