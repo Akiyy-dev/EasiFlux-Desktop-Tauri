@@ -82,11 +82,36 @@ impl ConnectionService {
         credential: Option<ApiCredential>,
     ) -> AppResult<()> {
         let credential = match credential {
-            Some(c) => c.normalize(),
+            Some(mut c) => {
+                c = c.normalize();
+                if !c.has_secret() {
+                    let stored = CredentialStore::load(account_id)?
+                        .ok_or_else(|| AppError::Auth("未找到 API 凭据".into()))?;
+                    c.api_secret = stored.api_secret;
+                    if c.api_key.is_empty() {
+                        c.api_key = stored.api_key;
+                    }
+                    if c.base_url.is_empty() {
+                        c.base_url = stored.base_url;
+                    }
+                }
+                if !c.is_valid() {
+                    return Err(AppError::Auth(
+                        "API 凭据无效，请在设置中重新保存 API Key 与 Secret".into(),
+                    ));
+                }
+                c
+            }
             None => CredentialStore::load(account_id)?
                 .ok_or_else(|| AppError::Auth("未找到 API 凭据".into()))?
                 .normalize(),
         };
+
+        if !credential.is_valid() {
+            return Err(AppError::Auth(
+                "API Secret 缺失，请在设置中重新保存完整凭据".into(),
+            ));
+        }
 
         self.api.set_credential(credential.clone()).await;
         sync_from_server(

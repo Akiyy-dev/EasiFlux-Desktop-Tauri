@@ -24,16 +24,53 @@ fn parse_i64_value(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
-const TICKER_LAST_KEYS: &[&str] = &["lastPrice", "last_price", "last", "price", "lp"];
-const TICKER_BID_KEYS: &[&str] = &["bidPrice", "bid_price", "bid", "bid1Price", "bp"];
-const TICKER_ASK_KEYS: &[&str] = &["askPrice", "ask_price", "ask", "ask1Price", "ap"];
+const TICKER_LAST_KEYS: &[&str] = &[
+    "lastPrice", "last_price", "last", "price", "lp", "p",
+];
+const TICKER_BID_KEYS: &[&str] = &[
+    "bidPrice", "bid_price", "bid", "bid1Price", "bp", "b1",
+];
+const TICKER_ASK_KEYS: &[&str] = &[
+    "askPrice", "ask_price", "ask", "ask1Price", "ap", "a1",
+];
 const TICKER_VOLUME_KEYS: &[&str] = &["volume24h", "volume_24h", "volume", "v"];
+const TICKER_PREV_KEYS: &[&str] = &["prev_price_24h", "prevPrice24h", "p24"];
 const TICKER_CHANGE_KEYS: &[&str] = &[
     "change24hPct",
     "change_24h_pct",
     "price24hPcnt",
     "price_24h_pcnt",
+    "pP",
+    "pp",
 ];
+
+fn normalize_change_24h_pcnt(raw: &str) -> String {
+    let value: f64 = raw.parse().unwrap_or(0.0);
+    let pct = value / 10_000.0;
+    format!("{pct:.6}")
+}
+
+fn compute_change_from_prices(last: &str, prev: &str) -> Option<String> {
+    let last: f64 = last.parse().ok()?;
+    let prev: f64 = prev.parse().ok()?;
+    if prev == 0.0 {
+        return None;
+    }
+    let pct = (last - prev) / prev * 100.0;
+    Some(format!("{pct:.6}"))
+}
+
+fn resolve_change_24h_pct(value: &Value, last_price: &str) -> String {
+    if let Some(raw) = get_str(value, TICKER_CHANGE_KEYS) {
+        return normalize_change_24h_pcnt(&raw);
+    }
+    if let Some(prev) = get_str(value, TICKER_PREV_KEYS) {
+        if let Some(pct) = compute_change_from_prices(last_price, &prev) {
+            return pct;
+        }
+    }
+    "0".into()
+}
 
 fn pick_ticker_field(base: &str, parsed: &str, value: &Value, keys: &[&str]) -> String {
     if get_str(value, keys).is_some() {
@@ -44,13 +81,14 @@ fn pick_ticker_field(base: &str, parsed: &str, value: &Value, keys: &[&str]) -> 
 }
 
 pub fn parse_ticker(value: &Value, symbol: &str) -> Ticker {
+    let last_price = get_str(value, TICKER_LAST_KEYS).unwrap_or_else(|| "0".into());
     Ticker {
         symbol: get_str(value, &["symbol", "s"]).unwrap_or_else(|| symbol.to_string()),
-        last_price: get_str(value, TICKER_LAST_KEYS).unwrap_or_else(|| "0".into()),
+        last_price: last_price.clone(),
         bid_price: get_str(value, TICKER_BID_KEYS).unwrap_or_else(|| "0".into()),
         ask_price: get_str(value, TICKER_ASK_KEYS).unwrap_or_else(|| "0".into()),
         volume_24h: get_str(value, TICKER_VOLUME_KEYS).unwrap_or_else(|| "0".into()),
-        change_24h_pct: get_str(value, TICKER_CHANGE_KEYS).unwrap_or_else(|| "0".into()),
+        change_24h_pct: resolve_change_24h_pct(value, &last_price),
     }
 }
 
@@ -71,12 +109,21 @@ pub fn merge_ticker(existing: Option<&Ticker>, value: &Value, symbol: &str) -> T
         bid_price: pick_ticker_field(&base.bid_price, &delta.bid_price, value, TICKER_BID_KEYS),
         ask_price: pick_ticker_field(&base.ask_price, &delta.ask_price, value, TICKER_ASK_KEYS),
         volume_24h: pick_ticker_field(&base.volume_24h, &delta.volume_24h, value, TICKER_VOLUME_KEYS),
-        change_24h_pct: pick_ticker_field(
-            &base.change_24h_pct,
-            &delta.change_24h_pct,
-            value,
-            TICKER_CHANGE_KEYS,
-        ),
+        change_24h_pct: {
+            let parsed = if get_str(value, TICKER_CHANGE_KEYS).is_some() {
+                delta.change_24h_pct.clone()
+            } else if get_str(value, TICKER_PREV_KEYS).is_some() {
+                resolve_change_24h_pct(value, &pick_ticker_field(
+                    &base.last_price,
+                    &delta.last_price,
+                    value,
+                    TICKER_LAST_KEYS,
+                ))
+            } else {
+                base.change_24h_pct.clone()
+            };
+            pick_ticker_field(&base.change_24h_pct, &parsed, value, TICKER_CHANGE_KEYS)
+        },
     }
 }
 
@@ -322,37 +369,37 @@ pub fn build_order_query_params(
     start_time: Option<i64>,
     end_time: Option<i64>,
     exec_type: Option<&str>,
-) -> HashMap<String, String> {
-    let mut params = HashMap::new();
+) -> Vec<(String, String)> {
+    let mut params = Vec::new();
     if let Some(s) = symbol {
-        params.insert("symbol".into(), s.into());
+        params.push(("symbol".into(), s.into()));
     }
     if let Some(c) = coin {
-        params.insert("coin".into(), c.into());
+        params.push(("coin".into(), c.into()));
     }
     if let Some(id) = order_id {
-        params.insert("order_id".into(), id.into());
+        params.push(("order_id".into(), id.into()));
     }
     if let Some(id) = order_link_id {
-        params.insert("order_link_id".into(), id.into());
+        params.push(("order_link_id".into(), id.into()));
     }
     if let Some(f) = order_filter {
-        params.insert("order_filter".into(), f.into());
+        params.push(("order_filter".into(), f.into()));
     }
     if let Some(l) = limit {
-        params.insert("limit".into(), l.to_string());
+        params.push(("limit".into(), l.to_string()));
     }
     if let Some(c) = cursor {
-        params.insert("cursor".into(), c.into());
+        params.push(("cursor".into(), c.into()));
     }
     if let Some(s) = start_time {
-        params.insert("start_time".into(), s.to_string());
+        params.push(("start_time".into(), s.to_string()));
     }
     if let Some(e) = end_time {
-        params.insert("end_time".into(), e.to_string());
+        params.push(("end_time".into(), e.to_string()));
     }
     if let Some(t) = exec_type {
-        params.insert("exec_type".into(), t.into());
+        params.push(("exec_type".into(), t.into()));
     }
     params
 }
@@ -363,18 +410,18 @@ pub fn build_transfer_history_params(
     coin: Option<&str>,
     page_num: Option<u32>,
     page_size: Option<u32>,
-) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    params.insert("start_time".into(), start_time.to_string());
-    params.insert("end_time".into(), end_time.to_string());
+) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    params.push(("start_time".into(), start_time.to_string()));
+    params.push(("end_time".into(), end_time.to_string()));
     if let Some(c) = coin {
-        params.insert("coin".into(), c.into());
+        params.push(("coin".into(), c.into()));
     }
     if let Some(p) = page_num {
-        params.insert("page_num".into(), p.to_string());
+        params.push(("page_num".into(), p.to_string()));
     }
     if let Some(p) = page_size {
-        params.insert("page_size".into(), p.to_string());
+        params.push(("page_size".into(), p.to_string()));
     }
     params
 }
@@ -410,6 +457,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn parse_ticker_normalizes_price_24h_pcnt_fixed_point() {
+        let ticker = parse_ticker(
+            &json!({
+                "symbol": "BTCUSDT",
+                "last_price": "62816.9",
+                "price_24h_pcnt": "1829"
+            }),
+            "BTCUSDT",
+        );
+        assert_eq!(ticker.change_24h_pct, "0.182900");
+    }
+
+    #[test]
     fn parse_ticker_supports_legacy_aliases() {
         let ticker = parse_ticker(
             &json!({
@@ -418,7 +478,7 @@ mod tests {
                 "bid1Price": "3199",
                 "ask1Price": "3201",
                 "volume": "1000",
-                "price24hPcnt": "1.5"
+                "price24hPcnt": "3950"
             }),
             "BTCUSDT",
         );
@@ -427,7 +487,22 @@ mod tests {
         assert_eq!(ticker.bid_price, "3199");
         assert_eq!(ticker.ask_price, "3201");
         assert_eq!(ticker.volume_24h, "1000");
-        assert_eq!(ticker.change_24h_pct, "1.5");
+        assert_eq!(ticker.change_24h_pct, "0.395000");
+    }
+
+    #[test]
+    fn merge_ticker_applies_ws_pp_delta() {
+        let base = Ticker {
+            symbol: "BTCUSDT".into(),
+            last_price: "61700".into(),
+            bid_price: "61699".into(),
+            ask_price: "61701".into(),
+            volume_24h: "1234".into(),
+            change_24h_pct: "0.100000".into(),
+        };
+        let merged = merge_ticker(Some(&base), &json!({"pP": "1963", "p": "61800"}), "BTCUSDT");
+        assert_eq!(merged.last_price, "61800");
+        assert_eq!(merged.change_24h_pct, "0.196300");
     }
 
     #[test]
@@ -460,10 +535,10 @@ mod tests {
         };
         let merged = merge_ticker(
             Some(&base),
-            &json!({"change": "100", "price24hPcnt": "0.034"}),
+            &json!({"change": "100", "price24hPcnt": "340"}),
             "BTCUSDT",
         );
-        assert_eq!(merged.change_24h_pct, "0.034");
+        assert_eq!(merged.change_24h_pct, "0.034000");
     }
 
     #[test]

@@ -44,6 +44,11 @@ pub async fn connect(
         .await?;
     state.market.set_active_symbol(&symbol).await;
     state.market.set_kline_interval(&kline_interval).await;
+    if let Err(e) = state.market.restore_klines(&symbol, &kline_interval) {
+        state
+            .emitter
+            .emit_error(&format!("K线恢复失败: {}", e));
+    }
     if let Err(e) = state.market.refresh_snapshot(&symbol).await {
         state
             .emitter

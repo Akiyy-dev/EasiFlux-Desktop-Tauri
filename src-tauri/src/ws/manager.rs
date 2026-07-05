@@ -277,6 +277,11 @@ async fn run_public_session(
     connected.store(true, Ordering::Relaxed);
     emitter.emit_websocket("connected");
 
+    if let Some(market) = market {
+        let interval = market.kline_interval().await;
+        market.schedule_kline_backfill(symbol, &interval);
+    }
+
     write
         .send(Message::Text(
             build_subscribe_message(topics).to_string().into(),
@@ -404,7 +409,7 @@ fn handle_message(
             let updates = parse_klines(data, symbol, interval);
             if let Some(market) = market {
                 if market.merge_and_emit_klines(symbol, interval, updates) {
-                    market.schedule_kline_refresh(symbol, interval);
+                    market.schedule_kline_backfill(symbol, interval);
                 }
             }
         }

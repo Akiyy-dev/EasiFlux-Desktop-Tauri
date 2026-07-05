@@ -98,6 +98,14 @@ impl ApiCredential {
         self.label = self.label.trim().to_string();
         self
     }
+
+    pub fn is_valid(&self) -> bool {
+        !self.api_key.is_empty() && !self.api_secret.is_empty()
+    }
+
+    pub fn has_secret(&self) -> bool {
+        !self.api_secret.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

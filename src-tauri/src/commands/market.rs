@@ -16,6 +16,11 @@ pub async fn set_active_symbol(state: State<'_, AppState>, symbol: String) -> Ap
         state.config_store.save(&config)?;
     }
 
+    let interval = state.market.kline_interval().await;
+    if let Err(e) = state.market.restore_klines(&symbol, &interval) {
+        state.emitter.emit_error(&format!("K线恢复失败: {}", e));
+    }
+
     if state.connection.status().await == ConnectionStatus::Connected {
         let connection = state.connection.clone();
         let market = state.market.clone();
@@ -24,8 +29,12 @@ pub async fn set_active_symbol(state: State<'_, AppState>, symbol: String) -> Ap
         let analytics = state.analytics.clone();
         let emitter = state.emitter.clone();
         let symbol_bg = symbol.clone();
+        let interval = interval.clone();
 
         tauri::async_runtime::spawn(async move {
+            if let Err(e) = market.backfill_gaps(&symbol_bg, &interval).await {
+                emitter.emit_error(&format!("K线回填失败: {}", e));
+            }
             if let Err(e) = connection.refresh_realtime(&symbol_bg).await {
                 emitter.emit_error(&format!("WebSocket 重订阅失败: {}", e));
             }
@@ -58,7 +67,12 @@ pub async fn set_kline_interval(state: State<'_, AppState>, interval: String) ->
         state.config_store.save(&config)?;
     }
     let symbol = state.market.active_symbol().await;
-    state.market.fetch_klines(&symbol, &interval).await?;
+    if let Err(e) = state.market.restore_klines(&symbol, &interval) {
+        state
+            .emitter
+            .emit_error(&format!("K线恢复失败: {}", e));
+    }
+    state.market.backfill_gaps(&symbol, &interval).await?;
     if state.connection.status().await == ConnectionStatus::Connected {
         if let Err(e) = state.connection.refresh_realtime(&symbol).await {
             state

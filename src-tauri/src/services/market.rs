@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -8,7 +9,7 @@ use crate::api::{ApiClient, PublicApi};
 use crate::error::AppResult;
 use crate::events::EventEmitter;
 use crate::models::market::{Depth, Kline, Ticker};
-use crate::storage::CacheStore;
+use crate::storage::{CacheStore, KlineStore};
 
 const MAX_KLINES: usize = 200;
 
@@ -23,49 +24,55 @@ pub fn interval_to_ms(interval: &str) -> i64 {
     }
 }
 
-/// Apply WS kline updates. Returns `true` when callers should trigger a REST refresh.
+fn trim_display_klines(mut klines: Vec<Kline>) -> Vec<Kline> {
+    if klines.len() > MAX_KLINES {
+        let start = klines.len() - MAX_KLINES;
+        klines = klines.split_off(start);
+    }
+    klines
+}
+
+/// Upsert WS/REST bars and detect timeline gaps needing REST backfill.
 pub fn merge_kline_updates(klines: &mut Vec<Kline>, updates: &[Kline], interval_ms: i64) -> bool {
+    if updates.is_empty() {
+        return false;
+    }
+
+    let mut map: BTreeMap<i64, Kline> = klines
+        .iter()
+        .cloned()
+        .map(|k| (k.open_time, k))
+        .collect();
     for update in updates {
         if update.open_time <= 0 {
             continue;
         }
-
-        if klines.is_empty() {
-            klines.push(update.clone());
-            continue;
-        }
-
-        let last = klines.last().cloned().expect("non-empty klines");
-        if update.open_time == last.open_time {
-            if let Some(idx) = klines.iter().position(|k| k.open_time == update.open_time) {
-                klines[idx] = update.clone();
-            }
-        } else if update.open_time == last.open_time + interval_ms {
-            klines.push(update.clone());
-        } else if update.open_time < last.open_time {
-            if let Some(idx) = klines.iter().position(|k| k.open_time == update.open_time) {
-                klines[idx] = update.clone();
-            }
-        } else {
-            return true;
-        }
+        map.insert(update.open_time, update.clone());
     }
-    false
+    *klines = map.values().cloned().collect();
+    !KlineStore::detect_gaps(klines, interval_ms).is_empty()
 }
 
 pub struct MarketService {
     api: Arc<ApiClient>,
     cache: Arc<CacheStore>,
+    kline_store: Arc<KlineStore>,
     emitter: EventEmitter,
     active_symbol: Arc<RwLock<String>>,
     kline_interval: Arc<RwLock<String>>,
 }
 
 impl MarketService {
-    pub fn new(api: Arc<ApiClient>, cache: Arc<CacheStore>, emitter: EventEmitter) -> Self {
+    pub fn new(
+        api: Arc<ApiClient>,
+        cache: Arc<CacheStore>,
+        kline_store: Arc<KlineStore>,
+        emitter: EventEmitter,
+    ) -> Self {
         Self {
             api,
             cache,
+            kline_store,
             emitter,
             active_symbol: Arc::new(RwLock::new("BTCUSDT".into())),
             kline_interval: Arc::new(RwLock::new("1".into())),
@@ -89,6 +96,42 @@ impl MarketService {
         self.kline_interval.read().await.clone()
     }
 
+    fn persist_and_emit(&self, symbol: &str, interval: &str, bars: &[Kline]) -> AppResult<()> {
+        let stored = self.kline_store.upsert_bars(symbol, interval, bars)?;
+        let display = trim_display_klines(stored);
+        self.cache.set_klines(symbol, interval, display.clone());
+        self.emitter.emit_klines(&display);
+        Ok(())
+    }
+
+    pub fn restore_klines(&self, symbol: &str, interval: &str) -> AppResult<()> {
+        let stored = self.kline_store.load(symbol, interval)?;
+        if stored.is_empty() {
+            return Ok(());
+        }
+        let display = trim_display_klines(stored);
+        self.cache.set_klines(symbol, interval, display.clone());
+        self.emitter.emit_klines(&display);
+        Ok(())
+    }
+
+    pub async fn backfill_gaps(&self, symbol: &str, interval: &str) -> AppResult<()> {
+        let interval_ms = interval_to_ms(interval);
+        let series = self.kline_store.load(symbol, interval)?;
+        if series.is_empty() {
+            return self.fetch_klines(symbol, interval).await.map(|_| ());
+        }
+
+        for (start, end) in KlineStore::detect_gaps(&series, interval_ms) {
+            let bars = PublicApi::klines(&self.api, symbol, interval, 200, Some(start), Some(end)).await?;
+            let _ = self.kline_store.upsert_bars(symbol, interval, &bars)?;
+        }
+
+        let rest = PublicApi::klines(&self.api, symbol, interval, 200, None, None).await?;
+        self.persist_and_emit(symbol, interval, &rest)?;
+        Ok(())
+    }
+
     pub fn merge_and_emit_ticker(&self, value: &Value, symbol: &str) {
         let sym = crate::api::response::get_str(value, &["symbol", "s"])
             .unwrap_or_else(|| symbol.to_string());
@@ -98,7 +141,6 @@ impl MarketService {
         self.emitter.emit_ticker(merged);
     }
 
-    /// Merge WS kline updates into cache. Returns `true` when a full REST refresh is needed.
     pub fn merge_and_emit_klines(&self, symbol: &str, interval: &str, updates: Vec<Kline>) -> bool {
         if updates.is_empty() {
             return false;
@@ -108,32 +150,30 @@ impl MarketService {
         let mut klines = self
             .cache
             .get_klines(symbol, interval)
+            .or_else(|| self.kline_store.load(symbol, interval).ok())
             .unwrap_or_default();
-        let needs_refresh = merge_kline_updates(&mut klines, &updates, interval_ms);
+        let needs_backfill = merge_kline_updates(&mut klines, &updates, interval_ms);
 
-        if needs_refresh {
+        if needs_backfill {
             return true;
         }
 
-        klines.sort_by_key(|k| k.open_time);
-        if klines.len() > MAX_KLINES {
-            let excess = klines.len() - MAX_KLINES;
-            klines.drain(0..excess);
+        if let Err(e) = self.persist_and_emit(symbol, interval, &klines) {
+            self.emitter
+                .emit_error(&format!("K线持久化失败: {}", e));
         }
-        self.cache.set_klines(symbol, interval, klines.clone());
-        self.emitter.emit_klines(&klines);
         false
     }
 
-    pub fn schedule_kline_refresh(self: &Arc<Self>, symbol: &str, interval: &str) {
+    pub fn schedule_kline_backfill(self: &Arc<Self>, symbol: &str, interval: &str) {
         let market = Arc::clone(self);
         let symbol = symbol.to_string();
         let interval = interval.to_string();
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = market.fetch_klines(&symbol, &interval).await {
+            if let Err(e) = market.backfill_gaps(&symbol, &interval).await {
                 market
                     .emitter
-                    .emit_error(&format!("K线刷新失败: {}", e));
+                    .emit_error(&format!("K线回填失败: {}", e));
             }
         });
     }
@@ -152,10 +192,12 @@ impl MarketService {
     }
 
     pub async fn fetch_klines(&self, symbol: &str, interval: &str) -> AppResult<Vec<Kline>> {
-        let klines = PublicApi::klines(&self.api, symbol, interval, 200, None, None).await?;
-        self.cache.set_klines(symbol, interval, klines.clone());
-        self.emitter.emit_klines(&klines);
-        Ok(klines)
+        let rest = PublicApi::klines(&self.api, symbol, interval, 200, None, None).await?;
+        self.persist_and_emit(symbol, interval, &rest)?;
+        Ok(self
+            .cache
+            .get_klines(symbol, interval)
+            .unwrap_or_else(|| trim_display_klines(rest)))
     }
 
     pub async fn refresh_ticker_depth(&self, symbol: &str) -> AppResult<()> {
@@ -181,7 +223,7 @@ impl MarketService {
 
     pub async fn refresh_klines(&self, symbol: &str) -> AppResult<()> {
         let interval = self.kline_interval.read().await.clone();
-        if let Err(e) = self.fetch_klines(symbol, &interval).await {
+        if let Err(e) = self.backfill_gaps(symbol, &interval).await {
             let message = format!("K线刷新失败: {}", e);
             self.emitter.emit_error(&message);
             return Err(crate::error::AppError::Internal(message));
@@ -239,31 +281,42 @@ mod tests {
             sample_kline(61_000, "2"),
             sample_kline(121_000, "3"),
         ];
-        let needs_refresh = merge_kline_updates(
+        let needs_backfill = merge_kline_updates(
             &mut klines,
             &[sample_kline(181_000, "4")],
             interval_to_ms("1"),
         );
-        assert!(!needs_refresh);
+        assert!(!needs_backfill);
         assert_eq!(klines.len(), 4);
         assert_eq!(klines.last().unwrap().close, "4");
     }
 
     #[test]
-    fn merge_klines_gap_triggers_refresh() {
+    fn merge_klines_inserts_middle_bar_without_backfill() {
+        let mut klines = vec![sample_kline(1_000, "1"), sample_kline(121_000, "3")];
+        let needs_backfill = merge_kline_updates(
+            &mut klines,
+            &[sample_kline(61_000, "2")],
+            interval_to_ms("1"),
+        );
+        assert!(!needs_backfill);
+        assert_eq!(klines.len(), 3);
+        assert_eq!(klines[1].open_time, 61_000);
+    }
+
+    #[test]
+    fn merge_klines_gap_triggers_backfill() {
         let mut klines = vec![
             sample_kline(1_000, "1"),
             sample_kline(61_000, "2"),
             sample_kline(121_000, "3"),
         ];
-        let original = klines.clone();
-        let needs_refresh = merge_kline_updates(
+        let needs_backfill = merge_kline_updates(
             &mut klines,
             &[sample_kline(301_000, "gap")],
             interval_to_ms("1"),
         );
-        assert!(needs_refresh);
-        assert_eq!(klines.len(), original.len());
-        assert_eq!(klines.last().unwrap().close, original.last().unwrap().close);
+        assert!(needs_backfill);
+        assert_eq!(klines.len(), 4);
     }
 }

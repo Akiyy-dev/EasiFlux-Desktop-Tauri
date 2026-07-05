@@ -235,7 +235,7 @@ impl PrivateApi {
 
     pub async fn funding_balances(client: &ApiClient) -> AppResult<Value> {
         client
-            .private_get(endpoints::FUNDING_BALANCES, Default::default())
+            .private_get(endpoints::FUNDING_BALANCES, Vec::new())
             .await
     }
 
@@ -250,7 +250,7 @@ impl PrivateApi {
 
     pub async fn user_id(client: &ApiClient) -> AppResult<Value> {
         client
-            .private_get(endpoints::USER_ID, Default::default())
+            .private_get(endpoints::USER_ID, Vec::new())
             .await
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use reqwest::Client;
@@ -12,6 +12,9 @@ use crate::error::{AppError, AppResult};
 use crate::models::config::{ApiCredential, DEFAULT_BASE_URL, RECV_WINDOW_MS};
 
 use super::response::{error_message, is_sign_error, is_success_response, is_timestamp_error};
+
+/// Ordered query pairs for private GET signing (SDK insertion order).
+pub type QueryParams = Vec<(String, String)>;
 
 pub fn normalize_base_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
@@ -82,7 +85,7 @@ impl ApiClient {
     pub async fn private_get(
         &self,
         path: &str,
-        params: HashMap<String, String>,
+        params: QueryParams,
     ) -> AppResult<Value> {
         self.ensure_time_sync().await?;
         match self.private_get_once(path, &params).await {
@@ -98,7 +101,7 @@ impl ApiClient {
     async fn private_get_once(
         &self,
         path: &str,
-        params: &HashMap<String, String>,
+        params: &QueryParams,
     ) -> AppResult<Value> {
         let query = encode_query(params);
         let headers = self.sign_headers(&query, "").await?;
@@ -196,7 +199,10 @@ impl ApiClient {
                 return Err(AppError::Trading(format!("timestamp: {}", msg)));
             }
             if is_sign_error(&payload) || is_sign_error_message(&msg) {
-                return Err(AppError::Trading(format!("sign: {}", msg)));
+                return Err(AppError::Trading(format!(
+                    "sign: {}（请重新保存 API Secret）",
+                    msg
+                )));
             }
             return Err(AppError::Trading(msg));
         }
@@ -227,17 +233,13 @@ impl Default for ApiClient {
     }
 }
 
-/// Encode query with stable key order and URL escaping (SDK `encode_mapping` compatible).
-pub fn encode_query(params: &HashMap<String, String>) -> String {
+/// Encode query preserving insertion order and URL escaping (SDK compatible).
+pub fn encode_query(params: &QueryParams) -> String {
     if params.is_empty() {
         return String::new();
     }
-    let ordered: BTreeMap<_, _> = params
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
     url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(ordered)
+        .extend_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .finish()
 }
 
@@ -248,16 +250,26 @@ mod tests {
     use crate::models::config::RECV_WINDOW_MS;
 
     #[test]
-    fn encode_query_sorts_keys_for_stable_signature() {
-        let mut params = HashMap::new();
-        params.insert("symbol".into(), "BTCUSDT".into());
-        params.insert("limit".into(), "10".into());
-        assert_eq!(encode_query(&params), "limit=10&symbol=BTCUSDT");
+    fn encode_query_preserves_insertion_order() {
+        let params = vec![
+            ("symbol".into(), "BTCUSDT".into()),
+            ("limit".into(), "10".into()),
+        ];
+        assert_eq!(encode_query(&params), "symbol=BTCUSDT&limit=10");
     }
 
     #[test]
-    fn encode_query_empty_map() {
-        assert_eq!(encode_query(&HashMap::new()), "");
+    fn encode_query_multi_param_matches_sdk_order() {
+        let params = vec![
+            ("symbol".into(), "BTCUSDT".into()),
+            ("coin".into(), "USDT".into()),
+        ];
+        assert_eq!(encode_query(&params), "symbol=BTCUSDT&coin=USDT");
+    }
+
+    #[test]
+    fn encode_query_empty_params() {
+        assert_eq!(encode_query(&Vec::new()), "");
     }
 
     #[test]
