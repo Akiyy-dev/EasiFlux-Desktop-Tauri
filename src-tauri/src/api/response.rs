@@ -61,13 +61,25 @@ pub fn extract_list_with_meta(payload: &Value) -> (Vec<&Value>, ListEnvelopeMeta
                 );
             }
         }
-        return (
-            vec![data],
-            ListEnvelopeMeta {
-                hint: "data(object)".into(),
-                raw_count: 1,
-            },
-        );
+        if let Some((items, hint)) = find_best_object_array(data) {
+            let count = items.len();
+            return (
+                items,
+                ListEnvelopeMeta {
+                    hint,
+                    raw_count: count,
+                },
+            );
+        }
+        if is_entity_object(obj) {
+            return (
+                vec![data],
+                ListEnvelopeMeta {
+                    hint: "data(entity)".into(),
+                    raw_count: 1,
+                },
+            );
+        }
     }
     (
         vec![],
@@ -76,6 +88,51 @@ pub fn extract_list_with_meta(payload: &Value) -> (Vec<&Value>, ListEnvelopeMeta
             raw_count: 0,
         },
     )
+}
+
+fn is_entity_object(obj: &serde_json::Map<String, Value>) -> bool {
+    obj.contains_key("orderId")
+        || obj.contains_key("order_id")
+        || obj.contains_key("orderLinkId")
+        || obj.contains_key("order_link_id")
+        || (obj.contains_key("symbol") && (obj.contains_key("side") || obj.contains_key("size")))
+}
+
+fn find_best_object_array<'a>(value: &'a Value) -> Option<(Vec<&'a Value>, String)> {
+    let mut best: Option<(&'a Vec<Value>, String, usize)> = None;
+    collect_object_arrays(value, "data", &mut best);
+    best.map(|(arr, hint, _)| (arr.iter().collect(), hint))
+}
+
+fn collect_object_arrays<'a>(
+    value: &'a Value,
+    path: &str,
+    best: &mut Option<(&'a Vec<Value>, String, usize)>,
+) {
+    match value {
+        Value::Array(arr) => {
+            let object_count = arr.iter().filter(|item| item.is_object()).count();
+            if object_count == 0 {
+                return;
+            }
+            let replace = best
+                .as_ref()
+                .map(|(_, _, count)| object_count > *count)
+                .unwrap_or(true);
+            if replace {
+                *best = Some((arr, path.to_string(), object_count));
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                if matches!(key.as_str(), "symbol" | "interval" | "coin" | "cursor" | "total") {
+                    continue;
+                }
+                collect_object_arrays(child, &format!("{path}.{key}"), best);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn payload_has_content(payload: &Value) -> bool {
@@ -238,10 +295,26 @@ mod tests {
     }
 
     #[test]
-    fn extract_list_supports_position_list_key() {
-        let payload = json!({"data": {"positionList": [{"symbol": "ETHUSDT"}]}});
+    fn extract_list_skips_empty_data_object() {
+        let payload = json!({"code": 0, "data": {}});
+        let (items, meta) = extract_list_with_meta(&payload);
+        assert!(items.is_empty());
+        assert_eq!(meta.hint, "empty");
+    }
+
+    #[test]
+    fn extract_list_finds_nested_array() {
+        let payload = json!({
+            "code": 0,
+            "data": {
+                "page": 1,
+                "result": {
+                    "items": [{"orderId": "1", "symbol": "BTCUSDT"}]
+                }
+            }
+        });
         let (items, meta) = extract_list_with_meta(&payload);
         assert_eq!(items.len(), 1);
-        assert_eq!(meta.hint, "data.positionList");
+        assert!(meta.hint.contains("items"));
     }
 }

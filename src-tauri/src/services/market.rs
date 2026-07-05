@@ -116,19 +116,8 @@ impl MarketService {
     }
 
     pub async fn backfill_gaps(&self, symbol: &str, interval: &str) -> AppResult<()> {
-        let interval_ms = interval_to_ms(interval);
-        let series = self.kline_store.load(symbol, interval)?;
-        if series.is_empty() {
-            return self.fetch_klines(symbol, interval).await.map(|_| ());
-        }
-
-        for (start, end) in KlineStore::detect_gaps(&series, interval_ms) {
-            let bars = PublicApi::klines(&self.api, symbol, interval, 200, Some(start), Some(end)).await?;
-            let _ = self.kline_store.upsert_bars(symbol, interval, &bars)?;
-        }
-
-        let rest = PublicApi::klines(&self.api, symbol, interval, 200, None, None).await?;
-        self.persist_and_emit(symbol, interval, &rest)?;
+        let bars = PublicApi::klines(&self.api, symbol, interval, 200, None, None).await?;
+        self.persist_and_emit(symbol, interval, &bars)?;
         Ok(())
     }
 

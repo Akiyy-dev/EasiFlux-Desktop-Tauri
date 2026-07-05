@@ -40,8 +40,13 @@ impl KlineStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let kline: Kline =
-                serde_json::from_str(&line).map_err(|e| AppError::Internal(e.to_string()))?;
+            let kline: Kline = match serde_json::from_str(&line) {
+                Ok(kline) => kline,
+                Err(e) => {
+                    tracing::warn!("skip corrupt kline cache line for {symbol}_{interval}: {e}");
+                    continue;
+                }
+            };
             if kline.open_time > 0 {
                 map.insert(kline.open_time, kline);
             }

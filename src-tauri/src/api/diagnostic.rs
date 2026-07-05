@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::events::EventEmitter;
 
 use super::mapper::list_envelope_meta;
-use super::response::{describe_data_shape, first_object_keys, payload_has_content};
+use super::response::{describe_data_shape, first_object_keys, payload_has_content, ListEnvelopeMeta};
 
 pub fn warn_if_parse_empty(
     emitter: &EventEmitter,
@@ -24,6 +24,24 @@ pub fn warn_if_parse_empty(
             meta.hint,
             data_keys.join(","),
             first_keys.join(",")
+        ),
+    );
+}
+
+pub fn warn_if_raw_parsed_mismatch(
+    emitter: &EventEmitter,
+    endpoint: &str,
+    meta: &ListEnvelopeMeta,
+    parsed_count: usize,
+) {
+    if meta.raw_count == 0 || parsed_count > 0 {
+        return;
+    }
+    emitter.emit_log(
+        "warn",
+        &format!(
+            "{endpoint} API 返回 {} 条原始记录但解析后为 0 条 (envelope={})",
+            meta.raw_count, meta.hint
         ),
     );
 }

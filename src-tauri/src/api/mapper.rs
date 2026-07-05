@@ -11,6 +11,8 @@ use crate::models::trading::{Order, OrderStatus, Position};
 
 use super::response::{extract_data, extract_list, extract_list_with_meta, get_str, ListEnvelopeMeta};
 
+pub const DEFAULT_SETTLE_COIN: &str = "USDT";
+
 pub fn list_envelope_meta(payload: &Value) -> ListEnvelopeMeta {
     extract_list_with_meta(payload).1
 }
@@ -347,12 +349,21 @@ pub fn build_kline_params(
         params.insert("limit".into(), l.to_string());
     }
     if let Some(s) = start {
-        params.insert("start".into(), s.to_string());
+        params.insert("start".into(), normalize_kline_query_time(s).to_string());
     }
     if let Some(e) = end {
-        params.insert("end".into(), e.to_string());
+        params.insert("end".into(), normalize_kline_query_time(e).to_string());
     }
     params
+}
+
+/// EasiCoin kline `start`/`end` query params use **seconds** (ms values are rejected).
+fn normalize_kline_query_time(value: i64) -> i64 {
+    if value >= 10_000_000_000 {
+        value / 1000
+    } else {
+        value
+    }
 }
 
 pub fn build_depth_params(symbol: &str, depth: u32) -> HashMap<String, String> {
@@ -449,6 +460,11 @@ pub fn build_order_query_params(
     }
     if let Some(t) = exec_type {
         params.push(("exec_type".into(), t.into()));
+    }
+    let has_symbol = params.iter().any(|(k, _)| k == "symbol");
+    let has_coin = params.iter().any(|(k, _)| k == "coin");
+    if !has_symbol && !has_coin {
+        params.push(("coin".into(), DEFAULT_SETTLE_COIN.into()));
     }
     params
 }
@@ -702,6 +718,27 @@ mod tests {
         }));
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].symbol, "BTCUSDT");
+    }
+
+    #[test]
+    fn order_query_params_default_coin_when_scope_missing() {
+        let params = build_order_query_params(None, None, None, None, None, None, None, None, None, None);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], ("coin".into(), "USDT".into()));
+    }
+
+    #[test]
+    fn order_query_params_keep_symbol_without_coin() {
+        let params = build_order_query_params(Some("BTCUSDT"), None, None, None, None, None, None, None, None, None);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "symbol");
+    }
+
+    #[test]
+    fn build_kline_params_normalize_millisecond_times_to_seconds() {
+        let params = build_kline_params("BTCUSDT", "1", Some(10), Some(1_700_000_000_000), Some(1_700_000_060_000));
+        assert_eq!(params.get("start"), Some(&"1700000000".to_string()));
+        assert_eq!(params.get("end"), Some(&"1700000060".to_string()));
     }
 
     #[test]

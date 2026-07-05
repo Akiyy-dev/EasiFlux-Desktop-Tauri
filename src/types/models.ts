@@ -219,3 +219,22 @@ export interface PingResponse {
   message: string
   version: string
 }
+
+export interface ProbeEndpointResult {
+  endpoint: string
+  success: boolean
+  code?: string
+  dataType: string
+  dataKeys: string[]
+  envelopeHint: string
+  rawCount: number
+  parsedCount: number
+  firstItemKeys: string[]
+  error?: string
+}
+
+export interface ProbePrivateEndpointsResult {
+  balancesOk: boolean
+  balanceCount: number
+  endpoints: ProbeEndpointResult[]
+}

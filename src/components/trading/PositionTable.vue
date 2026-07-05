@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { NDataTable } from 'naive-ui'
+import { NButton, NDataTable } from 'naive-ui'
 import { computed, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { usePositionStore } from '../../stores/position'
@@ -45,5 +45,22 @@ watch(
 </script>
 
 <template>
-  <NDataTable :columns="columns" :data="data" size="small" :bordered="false" flex-height />
+  <div class="position-table">
+    <div class="toolbar">
+      <NButton size="tiny" @click="refresh">刷新</NButton>
+    </div>
+    <NDataTable :columns="columns" :data="data" size="small" :bordered="false" flex-height />
+  </div>
 </template>
+
+<style scoped>
+.position-table {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.toolbar {
+  padding: 4px 8px;
+}
+</style>

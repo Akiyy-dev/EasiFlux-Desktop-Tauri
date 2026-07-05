@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::api::diagnostic::warn_if_parse_empty;
+use crate::api::diagnostic::{warn_if_parse_empty, warn_if_raw_parsed_mismatch};
 use crate::api::mapper::{build_order_query_params, parse_balances, parse_positions};
 use crate::api::endpoints;
 use crate::api::ApiClient;
@@ -46,8 +46,10 @@ impl AccountService {
             None,
         );
         let payload = self.api.private_get(endpoints::POSITIONS, params).await?;
+        let meta = crate::api::mapper::list_envelope_meta(&payload);
         let positions = parse_positions(&payload);
         warn_if_parse_empty(&self.emitter, "position/list", &payload, positions.len());
+        warn_if_raw_parsed_mismatch(&self.emitter, "position/list", &meta, positions.len());
         for position in &positions {
             self.emitter.emit_position(position.clone());
         }
