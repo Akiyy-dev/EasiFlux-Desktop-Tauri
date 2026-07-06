@@ -1,4 +1,13 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+/* -------------------------------------------------------------------------- */
+/* EasiFlux Design Tokens — shared by Vue (legacy) and React (shadcn) layers   */
+/* -------------------------------------------------------------------------- */
+
 :root {
+  /* Legacy Vue variables — keep until migration completes */
   --bg-primary: #0d1117;
   --bg-secondary: #161b22;
   --bg-tertiary: #21262d;
@@ -8,6 +17,109 @@
   --accent-green: #26a69a;
   --accent-red: #ef5350;
   --accent-blue: #58a6ff;
+
+  /* EasiFlux semantic tokens */
+  --ef-space-1: 0.25rem;
+  --ef-space-2: 0.5rem;
+  --ef-space-3: 0.75rem;
+  --ef-space-4: 1rem;
+  --ef-space-5: 1.25rem;
+  --ef-space-6: 1.5rem;
+  --ef-space-8: 2rem;
+
+  --ef-radius-sm: 0.25rem;
+  --ef-radius-md: 0.375rem;
+  --ef-radius-lg: 0.5rem;
+  --ef-radius-xl: 0.75rem;
+
+  --ef-shadow-sm: 0 1px 2px rgb(0 0 0 / 0.24);
+  --ef-shadow-md: 0 4px 12px rgb(0 0 0 / 0.28);
+
+  --ef-duration-fast: 120ms;
+  --ef-duration-normal: 200ms;
+  --ef-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* shadcn/ui tokens — dark-first trading terminal palette */
+  --background: oklch(0.145 0.014 256);
+  --foreground: oklch(0.93 0.012 256);
+  --card: oklch(0.185 0.014 256);
+  --card-foreground: oklch(0.93 0.012 256);
+  --popover: oklch(0.185 0.014 256);
+  --popover-foreground: oklch(0.93 0.012 256);
+  --primary: oklch(0.72 0.14 235);
+  --primary-foreground: oklch(0.145 0.014 256);
+  --secondary: oklch(0.22 0.014 256);
+  --secondary-foreground: oklch(0.93 0.012 256);
+  --muted: oklch(0.22 0.014 256);
+  --muted-foreground: oklch(0.62 0.02 256);
+  --accent: oklch(0.24 0.014 256);
+  --accent-foreground: oklch(0.93 0.012 256);
+  --destructive: oklch(0.62 0.2 25);
+  --destructive-foreground: oklch(0.98 0.01 25);
+  --border: oklch(0.3 0.014 256);
+  --input: oklch(0.3 0.014 256);
+  --ring: oklch(0.72 0.14 235);
+  --radius: 0.375rem;
+
+  /* Trading semantics */
+  --up: oklch(0.68 0.12 175);
+  --down: oklch(0.62 0.2 25);
+  --up-foreground: oklch(0.145 0.014 256);
+  --down-foreground: oklch(0.98 0.01 25);
+}
+
+.dark {
+  --background: oklch(0.145 0.014 256);
+  --foreground: oklch(0.93 0.012 256);
+  --card: oklch(0.185 0.014 256);
+  --card-foreground: oklch(0.93 0.012 256);
+  --popover: oklch(0.185 0.014 256);
+  --popover-foreground: oklch(0.93 0.012 256);
+  --primary: oklch(0.72 0.14 235);
+  --primary-foreground: oklch(0.145 0.014 256);
+  --secondary: oklch(0.22 0.014 256);
+  --secondary-foreground: oklch(0.93 0.012 256);
+  --muted: oklch(0.22 0.014 256);
+  --muted-foreground: oklch(0.62 0.02 256);
+  --accent: oklch(0.24 0.014 256);
+  --accent-foreground: oklch(0.93 0.012 256);
+  --destructive: oklch(0.62 0.2 25);
+  --destructive-foreground: oklch(0.98 0.01 25);
+  --border: oklch(0.3 0.014 256);
+  --input: oklch(0.3 0.014 256);
+  --ring: oklch(0.72 0.14 235);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-up-foreground: var(--up-foreground);
+  --color-down-foreground: var(--down-foreground);
+  --radius-sm: var(--ef-radius-sm);
+  --radius-md: var(--ef-radius-md);
+  --radius-lg: var(--ef-radius-lg);
+  --radius-xl: var(--ef-radius-xl);
+  --font-sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "Cascadia Code", "Consolas", monospace;
 }
 
 * {
@@ -21,9 +133,10 @@ body,
   height: 100%;
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-family: var(--font-sans);
 }
 
+/* Legacy Vue panel primitives — keep until component migration */
 .panel {
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -46,4 +159,15 @@ body,
 
 .text-down {
   color: var(--accent-red);
+}
+
+/* React / shadcn base layer */
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
 }
