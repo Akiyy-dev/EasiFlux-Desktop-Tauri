@@ -16,7 +16,9 @@ import { computed, h, ref, watch } from 'vue'
 
 const props = withDefaults(
   defineProps<{
-    columns: ColumnDef<T, unknown>[]
+    /** TanStack column cell value types vary per column. */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    columns: ColumnDef<T, any>[]
     data: T[]
     getRowId: (row: T) => string
     loading?: boolean

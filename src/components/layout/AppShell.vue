@@ -6,6 +6,7 @@ import NavigationRail from './NavigationRail.vue'
 import type { NavKey } from './NavigationRail.vue'
 import Sidebar from './Sidebar.vue'
 import TradingLayout from './TradingLayout.vue'
+import DashboardPage from '../dashboard/DashboardPage.vue'
 
 defineProps<{
   version: string
@@ -15,7 +16,7 @@ const emit = defineEmits<{
   openSettings: []
 }>()
 
-const active = ref<NavKey>('trading')
+const active = ref<NavKey>('home')
 const sidebarCollapsed = ref(false)
 
 const pageTitle = computed(() => {
@@ -30,6 +31,10 @@ const pageTitle = computed(() => {
   }
   return map[active.value]
 })
+
+function navigateTo(key: NavKey): void {
+  active.value = key
+}
 </script>
 
 <template>
@@ -43,7 +48,7 @@ const pageTitle = computed(() => {
     <div class="workbench">
       <NavigationRail
         :active="active"
-        @select="(key) => (active = key)"
+        @select="navigateTo"
         @open-settings="emit('openSettings')"
       />
       <Sidebar
@@ -53,17 +58,18 @@ const pageTitle = computed(() => {
       />
 
       <section class="main">
-        <template v-if="active === 'trading'">
-          <TradingLayout />
-        </template>
-        <template v-else>
-          <AppCard :title="pageTitle" class="placeholder">
-            <div class="placeholder-body">
-              <div class="muted">该页面将在后续 PRD 中逐步迁移实现。</div>
-              <div class="muted">当前已保留交易功能入口：左侧选择“交易”。</div>
-            </div>
-          </AppCard>
-        </template>
+        <DashboardPage
+          v-if="active === 'home'"
+          :version="version"
+          @navigate="navigateTo"
+        />
+        <TradingLayout v-else-if="active === 'trading'" />
+        <AppCard v-else :title="pageTitle" class="placeholder">
+          <div class="placeholder-body">
+            <div class="muted">该页面将在后续 PRD 中逐步迁移实现。</div>
+            <div class="muted">当前已保留交易功能入口：左侧选择“交易”。</div>
+          </div>
+        </AppCard>
       </section>
     </div>
   </div>

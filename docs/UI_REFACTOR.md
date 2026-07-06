@@ -92,6 +92,18 @@ Vue 层通过 `useUiMotion.ts` 导出 class 预设（`ef-motion-hover`、`ef-mot
 | 响应式 | `global.css` 断点 + `AppShell` 溢出控制 |
 | Naive 对齐 | `naiveTheme.ts` 覆盖 Dialog / Message |
 
+## PRD-06 落地范围
+
+| 项 | 实现 |
+|----|------|
+| 默认页 | 启动后默认进入 `home` |
+| 布局 | `DashboardPage` 卡片化分区 |
+| 资产 | 读取 account / position store |
+| 行情 | `fetch_ticker` 拉取 BTC/ETH/SOL |
+| 快捷入口 | 跳转交易 / 账户 / 新闻 / 插件 |
+| 动态 | 静态占位，预留 RSS |
+| 状态栏 | API / WS / 版本实时展示 |
+
 ## 目标布局（App Shell）
 
 ```
