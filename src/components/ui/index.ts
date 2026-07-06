@@ -1,4 +1,11 @@
+export { default as AppButton } from './AppButton.vue'
 export { default as AppCard } from './AppCard.vue'
+export { default as AppDialog } from './AppDialog.vue'
 export { default as AppIcon } from './AppIcon.vue'
 export { default as AppTabs } from './AppTabs.vue'
+export { default as AppText } from './AppText.vue'
+export { default as AppTooltip } from './AppTooltip.vue'
 export { default as MonoValue } from './MonoValue.vue'
+
+export type { AppButtonVariant, AppButtonSize } from './AppButton.vue'
+export type { AppTextVariant } from './AppText.vue'

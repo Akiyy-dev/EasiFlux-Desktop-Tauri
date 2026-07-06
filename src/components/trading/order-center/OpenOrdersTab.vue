@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { createColumnHelper } from '@tanstack/vue-table'
-import { NButton } from 'naive-ui'
 import { computed, h, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import TanstackDataTable from '../../common/TanstackDataTable.vue'
+import { AppButton } from '../../ui'
 import { useOrderCenterRefresh } from '../../../composables/useOrderCenterRefresh'
 import { useConnectionStore } from '../../../stores/connection'
 import { useLogStore } from '../../../stores/log'
@@ -93,10 +93,10 @@ const columns = [
     header: '操作',
     cell: ({ row }) =>
       h(
-        NButton,
+        AppButton,
         {
-          size: 'tiny',
-          quaternary: true,
+          variant: 'ghost',
+          size: 'sm',
           disabled: !connectionStore.connected || actionLoading.value,
           onClick: () => void cancelOne(row.original),
         },
@@ -112,11 +112,11 @@ function rowId(row: Order): string {
 
 <template>
   <div class="open-orders-tab">
-    <div class="sub-tabs">
+    <div class="ef-tabs sub-tabs">
       <button
         v-for="item in scopes"
         :key="item.key"
-        class="sub-tab"
+        class="ef-tab ef-motion-tab"
         :class="{ active: scope === item.key }"
         type="button"
         @click="scope = item.key"
@@ -141,22 +141,22 @@ function rowId(row: Order): string {
       @refresh="refresh"
     >
       <template #toolbar-actions="{ selectedRows, clearSelection }">
-        <NButton
-          size="tiny"
+        <AppButton
+          size="sm"
+          variant="ghost"
           :disabled="!connectionStore.connected || selectedRows.length === 0 || actionLoading"
           @click="batchCancel(selectedRows).then(() => clearSelection())"
         >
           批量撤单
-        </NButton>
-        <NButton
-          size="tiny"
-          type="error"
-          secondary
+        </AppButton>
+        <AppButton
+          size="sm"
+          variant="danger"
           :disabled="!connectionStore.connected || scopedOrders.length === 0 || actionLoading"
           @click="cancelAll"
         >
           一键全部撤单
-        </NButton>
+        </AppButton>
       </template>
     </TanstackDataTable>
   </div>
@@ -172,30 +172,7 @@ function rowId(row: Order): string {
 }
 
 .sub-tabs {
-  display: flex;
-  gap: 4px;
   padding: 0 4px;
-  flex-shrink: 0;
-}
-
-.sub-tab {
-  background: transparent;
-  border: 1px solid transparent;
-  color: var(--text-secondary);
-  padding: 4px 10px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 11px;
-}
-
-.sub-tab:hover {
-  color: var(--text-primary);
-  background: var(--bg-tertiary);
-}
-
-.sub-tab.active {
-  color: var(--text-primary);
-  border-color: var(--border-color);
-  background: var(--bg-tertiary);
+  border-bottom: none;
 }
 </style>

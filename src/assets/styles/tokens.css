@@ -1,0 +1,131 @@
+/* EasiFlux Design Tokens — PRD-07 semantic theme */
+
+:root,
+.dark {
+  color-scheme: dark;
+
+  /* Semantic colors */
+  --ef-color-background: oklch(0.145 0.014 256);
+  --ef-color-surface: oklch(0.17 0.014 256);
+  --ef-color-card: oklch(0.185 0.014 256);
+  --ef-color-border: oklch(0.3 0.014 256);
+  --ef-color-primary: oklch(0.72 0.14 235);
+  --ef-color-primary-foreground: oklch(0.145 0.014 256);
+  --ef-color-success: oklch(0.68 0.12 175);
+  --ef-color-danger: oklch(0.62 0.2 25);
+  --ef-color-warning: oklch(0.78 0.14 85);
+  --ef-color-text: oklch(0.93 0.012 256);
+  --ef-color-text-secondary: oklch(0.62 0.02 256);
+  --ef-color-muted: oklch(0.22 0.014 256);
+  --ef-color-accent: oklch(0.24 0.014 256);
+  --ef-color-ring: oklch(0.72 0.14 235);
+
+  /* shadcn / Tailwind aliases */
+  --background: var(--ef-color-background);
+  --foreground: var(--ef-color-text);
+  --card: var(--ef-color-card);
+  --card-foreground: var(--ef-color-text);
+  --popover: var(--ef-color-surface);
+  --popover-foreground: var(--ef-color-text);
+  --primary: var(--ef-color-primary);
+  --primary-foreground: var(--ef-color-primary-foreground);
+  --secondary: var(--ef-color-muted);
+  --secondary-foreground: var(--ef-color-text);
+  --muted: var(--ef-color-muted);
+  --muted-foreground: var(--ef-color-text-secondary);
+  --accent: var(--ef-color-accent);
+  --accent-foreground: var(--ef-color-text);
+  --destructive: var(--ef-color-danger);
+  --destructive-foreground: oklch(0.98 0.01 25);
+  --border: var(--ef-color-border);
+  --input: var(--ef-color-border);
+  --ring: var(--ef-color-ring);
+  --success: var(--ef-color-success);
+  --warning: var(--ef-color-warning);
+  --danger: var(--ef-color-danger);
+  --surface: var(--ef-color-surface);
+  --text: var(--ef-color-text);
+  --text-secondary: var(--ef-color-text-secondary);
+
+  /* Legacy Vue aliases — synced, do not remove until migration completes */
+  --bg-primary: var(--ef-color-background);
+  --bg-secondary: var(--ef-color-surface);
+  --bg-tertiary: var(--ef-color-accent);
+  --border-color: var(--ef-color-border);
+  --text-primary: var(--ef-color-text);
+  --text-secondary: var(--ef-color-text-secondary);
+  --accent-green: #26a69a;
+  --accent-red: #ef5350;
+  --accent-blue: #58a6ff;
+
+  /* Trading semantics */
+  --up: var(--ef-color-success);
+  --down: var(--ef-color-danger);
+  --up-foreground: var(--ef-color-primary-foreground);
+  --down-foreground: oklch(0.98 0.01 25);
+
+  /* Spacing */
+  --ef-space-0: 0;
+  --ef-space-1: 0.25rem;
+  --ef-space-2: 0.5rem;
+  --ef-space-3: 0.75rem;
+  --ef-space-4: 1rem;
+  --ef-space-5: 1.25rem;
+  --ef-space-6: 1.5rem;
+  --ef-space-8: 2rem;
+  --ef-space-10: 2.5rem;
+
+  /* Radius */
+  --ef-radius-sm: 0.25rem;
+  --ef-radius-md: 0.375rem;
+  --ef-radius-lg: 0.5rem;
+  --ef-radius-xl: 0.75rem;
+  --radius: var(--ef-radius-md);
+
+  /* Shadow */
+  --ef-shadow-xs: 0 1px 1px rgb(0 0 0 / 0.18);
+  --ef-shadow-sm: 0 1px 2px rgb(0 0 0 / 0.24);
+  --ef-shadow-md: 0 4px 12px rgb(0 0 0 / 0.28);
+  --ef-shadow-lg: 0 8px 24px rgb(0 0 0 / 0.32);
+
+  /* Motion */
+  --ef-duration-fast: 120ms;
+  --ef-duration-normal: 200ms;
+  --ef-duration-slow: 280ms;
+  --ef-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* Typography */
+  --ef-font-sans: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --ef-font-mono: "Cascadia Code", "Consolas", "SF Mono", ui-monospace, monospace;
+  --ef-text-xs: 0.6875rem;
+  --ef-text-sm: 0.75rem;
+  --ef-text-base: 0.8125rem;
+  --ef-text-md: 0.875rem;
+  --ef-text-lg: 1rem;
+  --ef-text-xl: 1.25rem;
+  --ef-text-heading-weight: 700;
+  --ef-text-body-weight: 400;
+  --ef-text-label-weight: 600;
+  --font-sans: var(--ef-font-sans);
+  --font-mono: var(--ef-font-mono);
+}
+
+/* Light theme — reserved for future PRD */
+.light {
+  color-scheme: light;
+
+  --ef-color-background: oklch(0.98 0.004 256);
+  --ef-color-surface: oklch(0.96 0.006 256);
+  --ef-color-card: oklch(1 0 256);
+  --ef-color-border: oklch(0.88 0.01 256);
+  --ef-color-primary: oklch(0.52 0.16 250);
+  --ef-color-primary-foreground: oklch(0.99 0 256);
+  --ef-color-success: oklch(0.55 0.12 165);
+  --ef-color-danger: oklch(0.55 0.2 25);
+  --ef-color-warning: oklch(0.72 0.14 85);
+  --ef-color-text: oklch(0.2 0.02 256);
+  --ef-color-text-secondary: oklch(0.48 0.02 256);
+  --ef-color-muted: oklch(0.94 0.006 256);
+  --ef-color-accent: oklch(0.92 0.008 256);
+  --ef-color-ring: oklch(0.52 0.16 250);
+}

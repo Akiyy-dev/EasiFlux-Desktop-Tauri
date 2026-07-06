@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Bell, Settings, User, Wifi } from 'lucide-vue-next'
 import ConnectionStatus from '../common/ConnectionStatus.vue'
-import AppIcon from '../ui/AppIcon.vue'
+import { AppButton, AppIcon, MonoValue } from '../ui'
 import type { NavKey } from './NavigationRail.vue'
 
 const props = defineProps<{
@@ -19,49 +19,35 @@ const emit = defineEmits<{
   <header class="top-bar" aria-label="TopBar">
     <div class="left">
       <div class="brand">
-        <span class="logo">EasiFlux</span>
-        <span class="version ef-mono ef-mono-sm">v{{ props.version }}</span>
+        <span class="ef-text-title">EasiFlux</span>
+        <MonoValue class="version ef-text-caption" size="sm">v{{ props.version }}</MonoValue>
       </div>
       <div class="divider" aria-hidden="true" />
       <div class="page">
-        <span class="page-title">{{ props.title }}</span>
+        <span class="ef-text-body page-title">{{ props.title }}</span>
       </div>
     </div>
     <div class="right">
       <ConnectionStatus />
-      <button
-        class="icon-btn ef-motion-hover ef-motion-press"
-        type="button"
-        title="网络（占位）"
-        disabled
-      >
+      <AppButton variant="ghost" size="sm" icon-only title="网络（占位）" disabled>
         <AppIcon :icon="Wifi" :size="16" />
-      </button>
-      <button
-        class="icon-btn ef-motion-hover ef-motion-press"
-        type="button"
-        title="通知（占位）"
-        disabled
-      >
+      </AppButton>
+      <AppButton variant="ghost" size="sm" icon-only title="通知（占位）" disabled>
         <AppIcon :icon="Bell" :size="16" />
-      </button>
-      <button
-        class="icon-btn ef-motion-hover ef-motion-press"
-        type="button"
-        title="用户（占位）"
-        disabled
-      >
+      </AppButton>
+      <AppButton variant="ghost" size="sm" icon-only title="用户（占位）" disabled>
         <AppIcon :icon="User" :size="16" />
-      </button>
-      <button
-        class="icon-btn ef-motion-hover ef-motion-press"
-        type="button"
+      </AppButton>
+      <AppButton
+        variant="ghost"
+        size="sm"
+        icon-only
         title="设置"
-        :data-active="props.active === 'settings' ? 'true' : 'false'"
+        :class="{ active: props.active === 'settings' }"
         @click="emit('openSettings')"
       >
         <AppIcon :icon="Settings" :size="16" />
-      </button>
+      </AppButton>
     </div>
   </header>
 </template>
@@ -92,14 +78,8 @@ const emit = defineEmits<{
   gap: 8px;
 }
 
-.logo {
-  font-weight: 700;
-  font-size: 14px;
-  letter-spacing: 0.02em;
-}
-
 .version {
-  color: var(--muted-foreground);
+  color: var(--text-secondary);
 }
 
 .divider {
@@ -113,8 +93,7 @@ const emit = defineEmits<{
 }
 
 .page-title {
-  font-size: 13px;
-  font-weight: 600;
+  font-weight: var(--ef-text-label-weight);
 }
 
 .right {
@@ -124,30 +103,7 @@ const emit = defineEmits<{
   flex-shrink: 0;
 }
 
-.icon-btn {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--foreground);
-  border-radius: 10px;
-  padding: 4px 8px;
-  cursor: pointer;
-  height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.icon-btn:hover:not(:disabled) {
-  border-color: var(--ring);
-  color: var(--primary);
-}
-
-.icon-btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-.icon-btn[data-active='true'] {
+.right .active {
   border-color: var(--ring);
   color: var(--primary);
 }

@@ -7,8 +7,7 @@ import {
   Wallet,
 } from 'lucide-vue-next'
 import type { FunctionalComponent } from 'vue'
-import AppCard from '../ui/AppCard.vue'
-import AppIcon from '../ui/AppIcon.vue'
+import { AppButton, AppCard, AppIcon } from '../ui'
 import type { DashboardNavTarget } from './types'
 
 const emit = defineEmits<{
@@ -34,11 +33,12 @@ const actions: QuickActionItem[] = [
 <template>
   <AppCard title="快捷入口">
     <div class="quick-grid">
-      <button
+      <AppButton
         v-for="action in actions"
         :key="action.key"
-        type="button"
-        class="quick-btn ef-motion-hover ef-motion-press"
+        variant="ghost"
+        size="md"
+        class="quick-btn"
         @click="emit('navigate', action.key)"
       >
         <span class="icon-wrap">
@@ -48,7 +48,7 @@ const actions: QuickActionItem[] = [
           <span class="label">{{ action.label }}</span>
           <span class="desc">{{ action.description }}</span>
         </span>
-      </button>
+      </AppButton>
     </div>
   </AppCard>
 </template>
@@ -61,21 +61,12 @@ const actions: QuickActionItem[] = [
 }
 
 .quick-btn {
-  display: flex;
+  justify-content: flex-start;
   align-items: flex-start;
   gap: 10px;
   padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--ef-radius-lg);
-  background: transparent;
-  color: var(--foreground);
-  cursor: pointer;
+  height: auto;
   text-align: left;
-}
-
-.quick-btn:hover {
-  background: var(--accent);
-  border-color: color-mix(in srgb, var(--border) 70%, var(--ring));
 }
 
 .icon-wrap {
@@ -98,12 +89,13 @@ const actions: QuickActionItem[] = [
 }
 
 .label {
-  font-size: 13px;
-  font-weight: 600;
+  font-size: var(--ef-text-md);
+  font-weight: var(--ef-text-label-weight);
 }
 
 .desc {
-  font-size: 11px;
-  color: var(--muted-foreground);
+  font-size: var(--ef-text-sm);
+  color: var(--text-secondary);
+  font-weight: var(--ef-text-body-weight);
 }
 </style>

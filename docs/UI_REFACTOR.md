@@ -20,15 +20,24 @@
 ## 目录约定
 
 ```
-src/components/ui/        # Vue Design System 基础组件（PRD-05）
+src/assets/styles/
+  tokens.css            # 颜色 / 间距 / 圆角 / 阴影 / 字体 tokens
+  components.css        # Card / Button / Table / Motion / a11y
+  global.css            # Tailwind + imports
+src/components/ui/        # Vue Design System（PRD-05 / PRD-07）
+  AppButton.vue           # Primary / Secondary / Ghost / Danger
   AppCard.vue             # 统一 Card 容器
+  AppDialog.vue           # Modal 封装
   AppIcon.vue             # Lucide 图标封装
   AppTabs.vue             # 统一 Tab 栏
+  AppText.vue             # 排版组件
+  AppTooltip.vue          # Tooltip 封装
   MonoValue.vue           # 等宽数字展示
 src/composables/
   useUiMotion.ts          # 动画 class 预设
 src/constants/
-  naiveTheme.ts           # Naive UI 与 tokens 对齐
+  designColors.ts         # Naive UI 色板
+  naiveTheme.ts           # Naive UI 全组件主题
 src/react/
   index.ts              # React 模块统一导出
   lib/utils.ts          # cn() 等工具
@@ -103,6 +112,29 @@ Vue 层通过 `useUiMotion.ts` 导出 class 预设（`ef-motion-hover`、`ef-mot
 | 快捷入口 | 跳转交易 / 账户 / 新闻 / 插件 |
 | 动态 | 静态占位，预留 RSS |
 | 状态栏 | API / WS / 版本实时展示 |
+
+## PRD-07 落地范围
+
+| 类别 | 实现 |
+|------|------|
+| Theme | `tokens.css` 语义色 + Dark 默认 + Light 预留 |
+| 字体 | `AppText` + `MonoValue` + typography tokens |
+| 按钮 | `AppButton`（primary/secondary/ghost/danger） |
+| 表单 | Naive UI 全组件 `naiveTheme.ts` 对齐 |
+| 表格 | `.ef-table-*` 统一样式 + `TanstackDataTable` |
+| 弹层 | `AppDialog` / `AppTooltip` + Naive Drawer/Popover 主题 |
+| 动画 | `ef-motion-*` 含 page 切换 |
+| a11y | `ef-focus-ring` 焦点环 + 按钮 `aria-*` |
+
+### 颜色 Token 速查
+
+| Token | 用途 |
+|-------|------|
+| `--background` / `--surface` / `--card` | 背景层级 |
+| `--border` | 边框 |
+| `--primary` | 主操作 |
+| `--success` / `--danger` / `--warning` | 状态语义 |
+| `--text` / `--text-secondary` | 正文 / 次要文字 |
 
 ## 目标布局（App Shell）
 

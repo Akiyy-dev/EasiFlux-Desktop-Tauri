@@ -5,6 +5,7 @@ export const uiMotion = {
   tab: 'ef-motion-tab',
   sidebar: 'ef-motion-sidebar',
   fade: 'ef-motion-fade',
+  page: 'ef-motion-page',
 } as const
 
 export type UiMotionPreset = (typeof uiMotion)[keyof typeof uiMotion]

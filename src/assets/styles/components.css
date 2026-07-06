@@ -1,0 +1,494 @@
+/* EasiFlux Design System components — PRD-07 */
+
+/* Typography */
+.ef-text-heading {
+  font-family: var(--font-sans);
+  font-size: var(--ef-text-xl);
+  font-weight: var(--ef-text-heading-weight);
+  line-height: 1.25;
+  color: var(--text);
+}
+
+.ef-text-title {
+  font-family: var(--font-sans);
+  font-size: var(--ef-text-md);
+  font-weight: var(--ef-text-label-weight);
+  line-height: 1.35;
+  color: var(--text);
+}
+
+.ef-text-body {
+  font-family: var(--font-sans);
+  font-size: var(--ef-text-base);
+  font-weight: var(--ef-text-body-weight);
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.ef-text-caption {
+  font-family: var(--font-sans);
+  font-size: var(--ef-text-sm);
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+.ef-text-code {
+  font-family: var(--font-mono);
+  font-size: var(--ef-text-sm);
+  line-height: 1.4;
+  color: var(--text);
+}
+
+/* Focus / a11y */
+.ef-focus-ring:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* Card */
+.ef-card,
+.panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-lg);
+  box-shadow: var(--ef-shadow-sm);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ef-card-interactive {
+  transition:
+    border-color var(--ef-duration-fast) var(--ef-ease-out),
+    box-shadow var(--ef-duration-fast) var(--ef-ease-out);
+}
+
+.ef-card-interactive:hover {
+  border-color: color-mix(in srgb, var(--border) 65%, var(--ring));
+  box-shadow: var(--ef-shadow-md);
+}
+
+.ef-card-compact .ef-card-header {
+  padding: var(--ef-space-2) var(--ef-space-3);
+}
+
+.ef-card-header,
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: var(--ef-space-2);
+  padding: var(--ef-space-2) var(--ef-space-3);
+  font-size: var(--ef-text-sm);
+  font-weight: var(--ef-text-label-weight);
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+.ef-card-title {
+  margin: 0;
+  font-size: inherit;
+  font-weight: inherit;
+  color: inherit;
+}
+
+.ef-card-body {
+  padding: var(--ef-space-3);
+  min-height: 0;
+  min-width: 0;
+}
+
+.ef-card-body-flush {
+  padding: 0;
+}
+
+/* Mono numbers */
+.ef-mono,
+.ef-mono-sm,
+.ef-mono-md,
+.ef-mono-lg {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+.ef-mono-sm {
+  font-size: var(--ef-text-sm);
+}
+
+.ef-mono-md {
+  font-size: var(--ef-text-base);
+}
+
+.ef-mono-lg {
+  font-size: var(--ef-text-xl);
+  font-weight: var(--ef-text-heading-weight);
+  line-height: 1.1;
+}
+
+.ef-icon {
+  flex-shrink: 0;
+  stroke: currentColor;
+}
+
+/* Buttons */
+.ef-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ef-space-2);
+  border: 1px solid transparent;
+  border-radius: var(--ef-radius-lg);
+  font-family: var(--font-sans);
+  font-weight: var(--ef-text-label-weight);
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.ef-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ef-btn-sm {
+  min-height: 28px;
+  padding: 0 var(--ef-space-3);
+  font-size: var(--ef-text-sm);
+}
+
+.ef-btn-md {
+  min-height: 32px;
+  padding: 0 var(--ef-space-4);
+  font-size: var(--ef-text-base);
+}
+
+.ef-btn-icon.ef-btn-sm {
+  width: 28px;
+  padding: 0;
+}
+
+.ef-btn-icon.ef-btn-md {
+  width: 32px;
+  padding: 0;
+}
+
+.ef-btn-primary {
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border-color: color-mix(in srgb, var(--primary) 80%, var(--border));
+}
+
+.ef-btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.ef-btn-secondary {
+  background: var(--secondary);
+  color: var(--foreground);
+  border-color: var(--border);
+}
+
+.ef-btn-secondary:hover:not(:disabled) {
+  background: var(--accent);
+}
+
+.ef-btn-ghost {
+  background: transparent;
+  color: var(--foreground);
+  border-color: var(--border);
+}
+
+.ef-btn-ghost:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: color-mix(in srgb, var(--border) 70%, var(--ring));
+}
+
+.ef-btn-danger {
+  background: color-mix(in srgb, var(--danger) 18%, var(--card));
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+}
+
+.ef-btn-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 28%, var(--card));
+}
+
+/* Tabs */
+.ef-tabs {
+  display: flex;
+  gap: var(--ef-space-1);
+  padding: var(--ef-space-2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.ef-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.ef-tab {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  padding: 6px 12px;
+  border-radius: var(--ef-radius-lg);
+  cursor: pointer;
+  font-size: var(--ef-text-sm);
+  white-space: nowrap;
+}
+
+.ef-tab:hover {
+  color: var(--text);
+  background: var(--accent);
+}
+
+.ef-tab.active {
+  background: var(--accent);
+  color: var(--text);
+}
+
+/* Table */
+.ef-table-root {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ef-space-2);
+}
+
+.ef-table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--ef-space-2);
+  padding: 0 var(--ef-space-1);
+  flex-shrink: 0;
+}
+
+.ef-table-toolbar-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--ef-space-2);
+}
+
+.ef-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-lg);
+  background: var(--surface);
+}
+
+.ef-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--ef-text-sm);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.ef-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--accent);
+}
+
+.ef-table th,
+.ef-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.ef-table th {
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-weight: var(--ef-text-label-weight);
+  font-size: var(--ef-text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ef-table-th-content {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ef-space-1);
+}
+
+.ef-table-th-content.sortable {
+  cursor: pointer;
+}
+
+.ef-table-th-content.sortable:hover {
+  color: var(--text);
+}
+
+.ef-table-sort {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.ef-table tbody tr:hover {
+  background: color-mix(in srgb, var(--accent) 75%, transparent);
+}
+
+.ef-table tbody tr.selected {
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+}
+
+.ef-table-empty {
+  text-align: center;
+  color: var(--text-secondary);
+  padding: var(--ef-space-5) var(--ef-space-2);
+}
+
+.ef-table-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ef-space-2);
+  padding: 0 var(--ef-space-1);
+  flex-shrink: 0;
+  font-size: var(--ef-text-xs);
+  color: var(--text-secondary);
+}
+
+.ef-table-pager {
+  display: flex;
+  align-items: center;
+  gap: var(--ef-space-2);
+}
+
+/* Motion */
+.ef-motion-hover {
+  transition:
+    background var(--ef-duration-fast) var(--ef-ease-out),
+    border-color var(--ef-duration-fast) var(--ef-ease-out),
+    color var(--ef-duration-fast) var(--ef-ease-out),
+    opacity var(--ef-duration-fast) var(--ef-ease-out),
+    transform var(--ef-duration-fast) var(--ef-ease-out),
+    box-shadow var(--ef-duration-fast) var(--ef-ease-out);
+}
+
+.ef-motion-press:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.ef-motion-tab {
+  transition:
+    background var(--ef-duration-fast) var(--ef-ease-out),
+    color var(--ef-duration-fast) var(--ef-ease-out);
+}
+
+.ef-motion-sidebar {
+  transition: width var(--ef-duration-normal) var(--ef-ease-out);
+}
+
+.ef-motion-page {
+  animation: ef-fade-in var(--ef-duration-normal) var(--ef-ease-out);
+}
+
+.ef-motion-fade {
+  animation: ef-fade-in var(--ef-duration-normal) var(--ef-ease-out);
+}
+
+@keyframes ef-fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+/* Semantic text */
+.text-up {
+  color: var(--up);
+}
+
+.text-down {
+  color: var(--down);
+}
+
+.text-warning {
+  color: var(--warning);
+}
+
+/* Connection status dots */
+.ef-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.ef-status-dot.connected {
+  background: var(--success);
+}
+
+.ef-status-dot.api-only,
+.ef-status-dot.connecting {
+  background: var(--warning);
+}
+
+.ef-status-dot.error {
+  background: var(--danger);
+}
+
+.ef-status-dot.connecting {
+  animation: ef-pulse 1s infinite;
+}
+
+@keyframes ef-pulse {
+  50% {
+    opacity: 0.4;
+  }
+}
+
+/* Dialog shell (Naive modal card) */
+.ef-dialog .n-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  box-shadow: var(--ef-shadow-lg);
+}
+
+/* Responsive — trading layout */
+@media (max-width: 1400px) {
+  :root {
+    --trading-col-chart: 2fr;
+    --trading-col-depth: 0.75fr;
+    --trading-col-trade: 0.9fr;
+  }
+}
+
+@media (max-width: 1100px) {
+  .trading-main {
+    grid-template-columns: 1fr 1fr !important;
+    grid-template-rows: minmax(220px, 1fr) auto;
+  }
+
+  .chart-panel {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 820px) {
+  .trading-main {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: minmax(200px, 1fr) auto auto;
+  }
+
+  .chart-panel {
+    grid-column: auto;
+  }
+}

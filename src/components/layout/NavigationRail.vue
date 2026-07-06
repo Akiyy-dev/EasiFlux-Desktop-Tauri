@@ -9,8 +9,7 @@ import {
   User,
 } from 'lucide-vue-next'
 import type { FunctionalComponent } from 'vue'
-import AppCard from '../ui/AppCard.vue'
-import AppIcon from '../ui/AppIcon.vue'
+import { AppButton, AppCard, AppIcon } from '../ui'
 
 export type NavKey =
   | 'home'
@@ -47,28 +46,34 @@ const items: Array<{
 <template>
   <AppCard as="nav" class="rail" aria-label="一级导航">
     <div class="rail-top">
-      <button
+      <AppButton
         v-for="item in items"
         :key="item.key"
-        class="rail-btn ef-motion-hover ef-motion-press"
+        variant="ghost"
+        size="md"
+        icon-only
+        class="rail-btn"
         :class="{ active: props.active === item.key }"
-        type="button"
         :title="item.label"
+        :aria-label="item.label"
         @click="emit('select', item.key)"
       >
         <AppIcon :icon="item.icon" :size="18" />
-      </button>
+      </AppButton>
     </div>
     <div class="rail-bottom">
-      <button
-        class="rail-btn ef-motion-hover ef-motion-press"
+      <AppButton
+        variant="ghost"
+        size="md"
+        icon-only
+        class="rail-btn"
         :class="{ active: props.active === 'settings' }"
-        type="button"
         title="设置"
+        aria-label="设置"
         @click="emit('openSettings')"
       >
         <AppIcon :icon="Settings" :size="18" />
-      </button>
+      </AppButton>
     </div>
   </AppCard>
 </template>
@@ -107,24 +112,12 @@ const items: Array<{
 .rail-btn {
   width: 44px;
   height: 44px;
-  border-radius: 10px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--muted-foreground);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-}
-
-.rail-btn:hover {
-  background: var(--accent);
-  color: var(--foreground);
+  color: var(--text-secondary);
 }
 
 .rail-btn.active {
   background: var(--accent);
-  color: var(--foreground);
+  color: var(--text);
   border-color: var(--border);
 }
 </style>

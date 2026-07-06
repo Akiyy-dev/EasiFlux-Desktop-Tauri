@@ -57,7 +57,7 @@ function navigateTo(key: NavKey): void {
         @toggle-collapsed="sidebarCollapsed = !sidebarCollapsed"
       />
 
-      <section class="main">
+      <section class="main ef-motion-page">
         <DashboardPage
           v-if="active === 'home'"
           :version="version"
