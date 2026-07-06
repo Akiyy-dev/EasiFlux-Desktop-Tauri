@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 import { NConfigProvider, NMessageProvider, darkTheme } from 'naive-ui'
 import AppShell from './components/layout/AppShell.vue'
 import SettingsDialog from './components/settings/SettingsDialog.vue'
+import { naiveThemeOverrides } from './constants/naiveTheme'
 import { useTauriEvent, whenTauriListenersReady } from './composables/useTauriEvent'
 import { useAppStore } from './stores/app'
 import { useConfigStore } from './stores/config'
@@ -120,7 +121,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <NConfigProvider :theme="darkTheme">
+  <NConfigProvider :theme="darkTheme" :theme-overrides="naiveThemeOverrides">
     <NMessageProvider>
       <AppShell :version="appStore.version" @open-settings="showSettings = true" />
       <SettingsDialog v-model:show="showSettings" />

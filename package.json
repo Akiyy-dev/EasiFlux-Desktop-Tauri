@@ -23,6 +23,7 @@
     "clsx": "^2.1.1",
     "klinecharts": "9.8.12",
     "lucide-react": "^1.23.0",
+    "lucide-vue-next": "^1.0.0",
     "motion": "^12.42.2",
     "naive-ui": "^2.44.1",
     "pinia": "^3.0.4",

@@ -16,7 +16,7 @@ import { computed, h, ref, watch } from 'vue'
 
 const props = withDefaults(
   defineProps<{
-    columns: ColumnDef<T, any>[]
+    columns: ColumnDef<T, unknown>[]
     data: T[]
     getRowId: (row: T) => string
     loading?: boolean
@@ -260,14 +260,16 @@ defineExpose({
   flex: 1;
   min-height: 0;
   overflow: auto;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-lg);
 }
 
 .table {
   width: 100%;
   border-collapse: collapse;
   font-size: 12px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 thead {

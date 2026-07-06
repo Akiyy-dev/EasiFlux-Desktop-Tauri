@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
+import AppCard from '../ui/AppCard.vue'
 import TradingTickerBar from '../market/TradingTickerBar.vue'
 import KlineChart from '../market/KlineChart.vue'
 import OrderBook from '../market/OrderBook.vue'
@@ -24,15 +25,13 @@ onMounted(() => {
     <TradingTickerBar />
 
     <div class="trading-main">
-      <div class="panel chart-panel">
-        <div class="panel-title">K 线</div>
+      <AppCard title="K 线" flush class="chart-panel">
         <KlineChart :key="`${activeSymbol}-${klineInterval}`" />
-      </div>
+      </AppCard>
 
-      <div class="panel depth-panel">
-        <div class="panel-title">深度</div>
+      <AppCard title="深度" flush class="depth-panel">
         <OrderBook />
-      </div>
+      </AppCard>
 
       <RightPanel class="trade-panel" />
     </div>
@@ -48,17 +47,19 @@ onMounted(() => {
   gap: 8px;
   height: 100%;
   min-height: 0;
+  overflow: hidden;
 }
 
 .trading-main {
   display: grid;
   grid-template-columns:
-    minmax(360px, var(--trading-col-chart, 2.2fr))
-    minmax(200px, var(--trading-col-depth, 0.85fr))
-    minmax(280px, var(--trading-col-trade, 1fr));
+    minmax(280px, var(--trading-col-chart, 2.2fr))
+    minmax(180px, var(--trading-col-depth, 0.85fr))
+    minmax(260px, var(--trading-col-trade, 1fr));
   gap: 8px;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 
 .chart-panel,

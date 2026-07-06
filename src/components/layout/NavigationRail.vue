@@ -1,4 +1,17 @@
 <script setup lang="ts">
+import {
+  ArrowLeftRight,
+  BarChart3,
+  Home,
+  Newspaper,
+  Puzzle,
+  Settings,
+  User,
+} from 'lucide-vue-next'
+import type { FunctionalComponent } from 'vue'
+import AppCard from '../ui/AppCard.vue'
+import AppIcon from '../ui/AppIcon.vue'
+
 export type NavKey =
   | 'home'
   | 'trading'
@@ -17,43 +30,47 @@ const emit = defineEmits<{
   openSettings: []
 }>()
 
-const items: Array<{ key: Exclude<NavKey, 'settings'>; label: string; icon: string }> = [
-  { key: 'home', label: '首页', icon: '⌂' },
-  { key: 'trading', label: '交易', icon: '⇄' },
-  { key: 'charts', label: '图表', icon: '▦' },
-  { key: 'news', label: '新闻', icon: '📰' },
-  { key: 'account', label: '账户', icon: '👤' },
-  { key: 'plugins', label: '插件', icon: '⧉' },
+const items: Array<{
+  key: Exclude<NavKey, 'settings'>
+  label: string
+  icon: FunctionalComponent
+}> = [
+  { key: 'home', label: '首页', icon: Home },
+  { key: 'trading', label: '交易', icon: ArrowLeftRight },
+  { key: 'charts', label: '图表', icon: BarChart3 },
+  { key: 'news', label: '新闻', icon: Newspaper },
+  { key: 'account', label: '账户', icon: User },
+  { key: 'plugins', label: '插件', icon: Puzzle },
 ]
 </script>
 
 <template>
-  <nav class="rail panel" aria-label="一级导航">
+  <AppCard as="nav" class="rail" aria-label="一级导航">
     <div class="rail-top">
       <button
         v-for="item in items"
         :key="item.key"
-        class="rail-btn"
+        class="rail-btn ef-motion-hover ef-motion-press"
         :class="{ active: props.active === item.key }"
         type="button"
         :title="item.label"
         @click="emit('select', item.key)"
       >
-        <span class="rail-icon" aria-hidden="true">{{ item.icon }}</span>
+        <AppIcon :icon="item.icon" :size="18" />
       </button>
     </div>
     <div class="rail-bottom">
       <button
-        class="rail-btn"
+        class="rail-btn ef-motion-hover ef-motion-press"
         :class="{ active: props.active === 'settings' }"
         type="button"
         title="设置"
         @click="emit('openSettings')"
       >
-        <span class="rail-icon" aria-hidden="true">⚙</span>
+        <AppIcon :icon="Settings" :size="18" />
       </button>
     </div>
-  </nav>
+  </AppCard>
 </template>
 
 <style scoped>
@@ -63,6 +80,14 @@ const items: Array<{ key: Exclude<NavKey, 'settings'>; label: string; icon: stri
   display: flex;
   flex-direction: column;
   padding: 6px;
+  gap: 6px;
+}
+
+.rail :deep(.ef-card-body) {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
   gap: 6px;
 }
 
@@ -85,30 +110,21 @@ const items: Array<{ key: Exclude<NavKey, 'settings'>; label: string; icon: stri
   border-radius: 10px;
   border: 1px solid transparent;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--muted-foreground);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition:
-    background var(--ef-duration-fast) var(--ef-ease-out),
-    border-color var(--ef-duration-fast) var(--ef-ease-out),
-    color var(--ef-duration-fast) var(--ef-ease-out);
 }
 
 .rail-btn:hover {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
+  background: var(--accent);
+  color: var(--foreground);
 }
 
 .rail-btn.active {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-  border-color: var(--border-color);
-}
-
-.rail-icon {
-  font-size: 16px;
-  line-height: 1;
+  background: var(--accent);
+  color: var(--foreground);
+  border-color: var(--border);
 }
 </style>

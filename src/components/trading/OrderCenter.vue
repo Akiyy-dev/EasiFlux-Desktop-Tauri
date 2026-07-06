@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import AppCard from '../ui/AppCard.vue'
+import AppTabs from '../ui/AppTabs.vue'
 import PositionsTab from './order-center/PositionsTab.vue'
 import OpenOrdersTab from './order-center/OpenOrdersTab.vue'
 import OrderHistoryTab from './order-center/OrderHistoryTab.vue'
@@ -10,38 +12,29 @@ type OrderCenterTab = 'positions' | 'open' | 'history' | 'fills' | 'closedPnl'
 
 const activeTab = ref<OrderCenterTab>('positions')
 
-const tabs: Array<{ key: OrderCenterTab; label: string }> = [
-  { key: 'positions', label: '持有仓位' },
-  { key: 'open', label: '当前委托' },
-  { key: 'history', label: '历史委托' },
-  { key: 'fills', label: '成交历史' },
-  { key: 'closedPnl', label: '平仓盈亏' },
+const tabs = [
+  { key: 'positions' as const, label: '持有仓位' },
+  { key: 'open' as const, label: '当前委托' },
+  { key: 'history' as const, label: '历史委托' },
+  { key: 'fills' as const, label: '成交历史' },
+  { key: 'closedPnl' as const, label: '平仓盈亏' },
 ]
 </script>
 
 <template>
-  <footer class="order-center panel">
-    <div class="tabs">
-      <button
-        v-for="tab in tabs"
-        :key="tab.key"
-        class="tab"
-        :class="{ active: activeTab === tab.key }"
-        type="button"
-        @click="activeTab = tab.key"
-      >
-        {{ tab.label }}
-      </button>
-    </div>
+  <AppCard as="footer" flush class="order-center">
+    <template #header>
+      <AppTabs v-model="activeTab" :items="tabs" class="order-center-tabs" />
+    </template>
 
-    <div class="tab-body">
+    <div :key="activeTab" class="tab-body ef-motion-fade">
       <PositionsTab v-show="activeTab === 'positions'" :active="activeTab === 'positions'" />
       <OpenOrdersTab v-show="activeTab === 'open'" :active="activeTab === 'open'" />
       <OrderHistoryTab v-show="activeTab === 'history'" :active="activeTab === 'history'" />
       <TradeFillsTab v-show="activeTab === 'fills'" :active="activeTab === 'fills'" />
       <ClosedPnlTab v-show="activeTab === 'closedPnl'" :active="activeTab === 'closedPnl'" />
     </div>
-  </footer>
+  </AppCard>
 </template>
 
 <style scoped>
@@ -52,34 +45,14 @@ const tabs: Array<{ key: OrderCenterTab; label: string }> = [
   min-height: 180px;
 }
 
-.tabs {
-  display: flex;
-  gap: 4px;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--border-color);
-  flex-shrink: 0;
-  overflow-x: auto;
+.order-center :deep(.ef-card-header) {
+  padding: 0;
+  border-bottom: none;
 }
 
-.tab {
-  background: transparent;
-  border: none;
-  color: var(--text-secondary);
-  padding: 6px 12px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.tab:hover {
-  color: var(--text-primary);
-  background: var(--bg-tertiary);
-}
-
-.tab.active {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
+.order-center-tabs {
+  width: 100%;
+  border-bottom: 1px solid var(--border);
 }
 
 .tab-body {

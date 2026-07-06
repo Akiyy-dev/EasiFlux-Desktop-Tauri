@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import MonoValue from '../ui/MonoValue.vue'
+
 defineProps<{
   label: string
   value: string
@@ -9,7 +11,7 @@ defineProps<{
 <template>
   <div class="metric">
     <span class="label">{{ label }}</span>
-    <span class="value" :class="valueClass">{{ value }}</span>
+    <MonoValue class="value" :class="valueClass" size="sm">{{ value }}</MonoValue>
   </div>
 </template>
 
@@ -23,14 +25,12 @@ defineProps<{
 
 .label {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: var(--muted-foreground);
   white-space: nowrap;
 }
 
 .value {
-  font-size: 12px;
   font-weight: 600;
-  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 </style>

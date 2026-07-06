@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { ChevronLeft, ChevronRight } from 'lucide-vue-next'
+import AppCard from '../ui/AppCard.vue'
+import AppIcon from '../ui/AppIcon.vue'
 import type { NavKey } from './NavigationRail.vue'
 
 const props = defineProps<{
@@ -51,23 +54,27 @@ const sections = sectionsByNav[props.active] ?? []
 </script>
 
 <template>
-  <aside
+  <AppCard
     v-if="sections.length > 0"
-    class="sidebar panel"
+    as="aside"
+    class="sidebar ef-motion-sidebar"
     :class="{ collapsed: props.collapsed }"
     aria-label="二级导航"
+    flush
   >
-    <div class="sidebar-head">
-      <div v-if="!props.collapsed" class="sidebar-title">导航</div>
-      <button
-        class="collapse-btn"
-        type="button"
-        :title="props.collapsed ? '展开' : '折叠'"
-        @click="emit('toggleCollapsed')"
-      >
-        {{ props.collapsed ? '»' : '«' }}
-      </button>
-    </div>
+    <template #header>
+      <div class="sidebar-head">
+        <div v-if="!props.collapsed" class="sidebar-title">导航</div>
+        <button
+          class="collapse-btn ef-motion-hover ef-motion-press"
+          type="button"
+          :title="props.collapsed ? '展开' : '折叠'"
+          @click="emit('toggleCollapsed')"
+        >
+          <AppIcon :icon="props.collapsed ? ChevronRight : ChevronLeft" :size="16" />
+        </button>
+      </div>
+    </template>
 
     <div class="sidebar-body">
       <section v-for="section in sections" :key="section.title" class="section">
@@ -75,7 +82,7 @@ const sections = sectionsByNav[props.active] ?? []
         <button
           v-for="item in section.items"
           :key="item.key"
-          class="item-btn"
+          class="item-btn ef-motion-hover"
           type="button"
           :title="item.label"
         >
@@ -84,7 +91,7 @@ const sections = sectionsByNav[props.active] ?? []
         </button>
       </section>
     </div>
-  </aside>
+  </AppCard>
 </template>
 
 <style scoped>
@@ -100,34 +107,42 @@ const sections = sectionsByNav[props.active] ?? []
   width: 64px;
 }
 
+.sidebar :deep(.ef-card-header) {
+  padding: 8px 10px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
 .sidebar-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border-color);
+  width: 100%;
 }
 
 .sidebar-title {
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--muted-foreground);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 
 .collapse-btn {
   background: transparent;
-  border: 1px solid var(--border-color);
-  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  color: var(--muted-foreground);
   border-radius: 8px;
   padding: 4px 8px;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .collapse-btn:hover {
-  border-color: var(--accent-blue);
-  color: var(--text-primary);
+  border-color: var(--ring);
+  color: var(--foreground);
 }
 
 .sidebar-body {
@@ -146,7 +161,7 @@ const sections = sectionsByNav[props.active] ?? []
 
 .section-title {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: var(--muted-foreground);
   padding: 0 6px;
 }
 
@@ -159,23 +174,20 @@ const sections = sectionsByNav[props.active] ?? []
   border-radius: 10px;
   border: 1px solid transparent;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--muted-foreground);
   cursor: pointer;
-  transition:
-    background var(--ef-duration-fast) var(--ef-ease-out),
-    color var(--ef-duration-fast) var(--ef-ease-out);
 }
 
 .item-btn:hover {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
+  background: var(--accent);
+  color: var(--foreground);
 }
 
 .dot {
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: var(--border-color);
+  background: var(--border);
 }
 
 .label {

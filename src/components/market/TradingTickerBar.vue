@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
+import AppCard from '../ui/AppCard.vue'
+import MonoValue from '../ui/MonoValue.vue'
 import { useMarketStore } from '../../stores/market'
 import { change24hPctValue, formatChange24hPct } from '../../utils/ticker'
 import SymbolSelector from '../trading/SymbolSelector.vue'
@@ -20,30 +22,38 @@ const changeClass = computed(() => {
 </script>
 
 <template>
-  <header class="trading-ticker-bar panel">
-    <div class="left">
-      <SymbolSelector />
-    </div>
-
-    <div class="metrics">
-      <div class="price-block">
-        <span class="last-price" :class="changeClass">{{ ticker?.lastPrice ?? '--' }}</span>
+  <AppCard as="header" flush class="trading-ticker-bar">
+    <div class="ticker-inner">
+      <div class="left">
+        <SymbolSelector />
       </div>
 
-      <TickerMetric label="24h 涨跌" :value="formattedChange" :value-class="changeClass" />
-      <TickerMetric label="标记价格" value="--" />
-      <TickerMetric label="指数价格" value="--" />
-      <TickerMetric label="24h 最高" value="--" />
-      <TickerMetric label="24h 最低" value="--" />
-      <TickerMetric label="成交额" :value="ticker?.volume24h ?? '--'" />
-      <TickerMetric label="资金费率" value="--" />
-      <TickerMetric label="费率倒计时" value="--:--:--" />
+      <div class="metrics">
+        <div class="price-block">
+          <MonoValue class="last-price" :class="changeClass" size="lg">
+            {{ ticker?.lastPrice ?? '--' }}
+          </MonoValue>
+        </div>
+
+        <TickerMetric label="24h 涨跌" :value="formattedChange" :value-class="changeClass" />
+        <TickerMetric label="标记价格" value="--" />
+        <TickerMetric label="指数价格" value="--" />
+        <TickerMetric label="24h 最高" value="--" />
+        <TickerMetric label="24h 最低" value="--" />
+        <TickerMetric label="成交额" :value="ticker?.volume24h ?? '--'" />
+        <TickerMetric label="资金费率" value="--" />
+        <TickerMetric label="费率倒计时" value="--:--:--" />
+      </div>
     </div>
-  </header>
+  </AppCard>
 </template>
 
 <style scoped>
 .trading-ticker-bar {
+  flex-shrink: 0;
+}
+
+.ticker-inner {
   display: flex;
   align-items: center;
   gap: 16px;
@@ -64,19 +74,18 @@ const changeClass = computed(() => {
   margin-left: auto;
   min-width: 0;
   overflow-x: auto;
+  scrollbar-width: none;
   padding-bottom: 2px;
+}
+
+.metrics::-webkit-scrollbar {
+  display: none;
 }
 
 .price-block {
   padding-right: 6px;
-  border-right: 1px solid var(--border-color);
+  border-right: 1px solid var(--border);
   margin-right: 2px;
-}
-
-.last-price {
-  font-size: 22px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.1;
+  flex-shrink: 0;
 }
 </style>

@@ -1,12 +1,12 @@
 <script setup lang="ts">
+import AppCard from '../ui/AppCard.vue'
 import OrderPanel from '../trading/OrderPanel.vue'
 </script>
 
 <template>
-  <aside class="right-panel panel">
-    <div class="panel-title">交易</div>
+  <AppCard title="交易" flush class="right-panel">
     <OrderPanel />
-  </aside>
+  </AppCard>
 </template>
 
 <style scoped>

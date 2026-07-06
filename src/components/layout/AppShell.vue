@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import AppCard from '../ui/AppCard.vue'
 import TopBar from './TopBar.vue'
 import NavigationRail from './NavigationRail.vue'
 import type { NavKey } from './NavigationRail.vue'
@@ -56,13 +57,12 @@ const pageTitle = computed(() => {
           <TradingLayout />
         </template>
         <template v-else>
-          <div class="placeholder panel">
-            <div class="panel-title">{{ pageTitle }}</div>
+          <AppCard :title="pageTitle" class="placeholder">
             <div class="placeholder-body">
               <div class="muted">该页面将在后续 PRD 中逐步迁移实现。</div>
               <div class="muted">当前已保留交易功能入口：左侧选择“交易”。</div>
             </div>
-          </div>
+          </AppCard>
         </template>
       </section>
     </div>
@@ -76,6 +76,7 @@ const pageTitle = computed(() => {
   height: 100vh;
   gap: 8px;
   padding: 0 8px 8px;
+  overflow: hidden;
 }
 
 .workbench {
@@ -83,6 +84,7 @@ const pageTitle = computed(() => {
   flex: 1;
   gap: 8px;
   min-height: 0;
+  overflow: hidden;
 }
 
 .main {
@@ -92,6 +94,7 @@ const pageTitle = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  overflow: hidden;
 }
 
 .placeholder {
@@ -102,7 +105,6 @@ const pageTitle = computed(() => {
 }
 
 .placeholder-body {
-  padding: 12px;
   font-size: 13px;
   display: flex;
   flex-direction: column;
@@ -110,6 +112,12 @@ const pageTitle = computed(() => {
 }
 
 .muted {
-  color: var(--text-secondary);
+  color: var(--muted-foreground);
+}
+
+@media (max-width: 900px) {
+  .workbench {
+    gap: 6px;
+  }
 }
 </style>
