@@ -100,6 +100,7 @@ onMounted(async () => {
   if (configStore.config) {
     marketStore.activeSymbol = configStore.config.activeSymbol
     marketStore.klineInterval = configStore.config.klineInterval
+    void marketStore.loadInstruments(configStore.config.watchlistSymbols)
   }
 
   const hasCreds = await configStore.hasCredentials(

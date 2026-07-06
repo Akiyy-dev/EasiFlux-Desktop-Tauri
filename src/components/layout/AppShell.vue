@@ -4,10 +4,7 @@ import TopBar from './TopBar.vue'
 import NavigationRail from './NavigationRail.vue'
 import type { NavKey } from './NavigationRail.vue'
 import Sidebar from './Sidebar.vue'
-import LeftSidebar from './LeftSidebar.vue'
-import CenterPanel from './CenterPanel.vue'
-import RightPanel from './RightPanel.vue'
-import BottomPanel from './BottomPanel.vue'
+import TradingLayout from './TradingLayout.vue'
 
 defineProps<{
   version: string
@@ -56,12 +53,7 @@ const pageTitle = computed(() => {
 
       <section class="main">
         <template v-if="active === 'trading'">
-          <div class="main-grid">
-            <LeftSidebar class="left" />
-            <CenterPanel class="center" />
-            <RightPanel class="right" />
-          </div>
-          <BottomPanel />
+          <TradingLayout />
         </template>
         <template v-else>
           <div class="placeholder panel">
@@ -100,20 +92,6 @@ const pageTitle = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
-}
-
-.main-grid {
-  display: grid;
-  grid-template-columns: 200px 1fr 280px;
-  gap: 8px;
-  flex: 1;
-  min-height: 0;
-}
-
-.left,
-.center,
-.right {
-  min-height: 0;
 }
 
 .placeholder {
