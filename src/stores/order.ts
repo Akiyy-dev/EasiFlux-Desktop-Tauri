@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
-import type { CancelOrderRequest, Order, PlaceOrderRequest } from '../types/models'
+import type { CancelAllOrdersRequest, CancelOrderRequest, Order, PlaceOrderRequest } from '../types/models'
 import { isTerminalOrderStatus, normalizeOrder, normalizeOrders } from '../utils/order'
 
 export const useOrderStore = defineStore('order', () => {
@@ -41,6 +41,11 @@ export const useOrderStore = defineStore('order', () => {
     return order
   }
 
+  async function cancelAllOrders(request: CancelAllOrdersRequest = {}): Promise<void> {
+    await tauriInvoke('cancel_all_orders', { request })
+    await refreshOrders(request.symbol)
+  }
+
   async function refreshOrders(symbol?: string): Promise<void> {
     const raw = await tauriInvoke<Order[]>('refresh_orders', { symbol: symbol ?? null })
     openOrders.value = normalizeOrders(raw)
@@ -72,6 +77,7 @@ export const useOrderStore = defineStore('order', () => {
     upsertOrder,
     placeOrder,
     cancelOrder,
+    cancelAllOrders,
     refreshOrders,
     refreshOrderHistory,
     refreshAll,
