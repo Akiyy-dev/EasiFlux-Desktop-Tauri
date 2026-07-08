@@ -32,7 +32,7 @@ pub fn run() {
                 let state: tauri::State<AppState> = app.state();
                 state.emitter.clone()
             };
-            emitter.emit_app_ready(env!("CARGO_PKG_VERSION"));
+            emitter.emit_app_ready(&handle.package_info().version.to_string());
 
             if let Some(window) = app.get_webview_window("main") {
                 let state: tauri::State<AppState> = app.state();
@@ -50,6 +50,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ping,
             get_version,
+            get_environment_status,
             get_config,
             save_config,
             save_credentials,

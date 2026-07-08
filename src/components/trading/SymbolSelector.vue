@@ -4,11 +4,10 @@ import { NSelect } from 'naive-ui'
 import { storeToRefs } from 'pinia'
 import { useConfigStore } from '../../stores/config'
 import { useMarketStore } from '../../stores/market'
-import { useLogStore } from '../../stores/log'
+import { reportError } from '../../services/errorService'
 
 const configStore = useConfigStore()
 const marketStore = useMarketStore()
-const logStore = useLogStore()
 const { config } = storeToRefs(configStore)
 const { activeSymbol, symbols, symbolsLoading } = storeToRefs(marketStore)
 
@@ -25,7 +24,7 @@ function onUpdate(symbol: string): void {
     return
   }
   void marketStore.setActiveSymbol(symbol).catch((error: unknown) => {
-    logStore.setError(error instanceof Error ? error.message : String(error))
+    reportError(error)
   })
 }
 </script>

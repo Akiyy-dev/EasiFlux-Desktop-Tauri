@@ -58,6 +58,17 @@ const TICKER_ASK_KEYS: &[&str] = &[
     "askPrice", "ask_price", "ask", "ask1Price", "ap", "a1",
 ];
 const TICKER_VOLUME_KEYS: &[&str] = &["volume24h", "volume_24h", "volume", "v"];
+const TICKER_MARK_KEYS: &[&str] = &["markPrice", "mark_price", "mark", "mp"];
+const TICKER_HIGH_24H_KEYS: &[&str] = &["high24h", "high_24h", "highPrice24h", "high_price_24h", "h"];
+const TICKER_LOW_24H_KEYS: &[&str] = &["low24h", "low_24h", "lowPrice24h", "low_price_24h", "l"];
+const TICKER_FUNDING_RATE_KEYS: &[&str] = &["fundingRate", "funding_rate", "fr"];
+const TICKER_NEXT_FUNDING_KEYS: &[&str] = &[
+    "nextFundingTime",
+    "next_funding_time",
+    "fundingTime",
+    "funding_time",
+    "nextFunding",
+];
 const TICKER_PREV_KEYS: &[&str] = &["prev_price_24h", "prevPrice24h", "p24"];
 const TICKER_CHANGE_KEYS: &[&str] = &[
     "change24hPct",
@@ -113,6 +124,15 @@ pub fn parse_ticker(value: &Value, symbol: &str) -> Ticker {
         ask_price: get_str(value, TICKER_ASK_KEYS).unwrap_or_else(|| "0".into()),
         volume_24h: get_str(value, TICKER_VOLUME_KEYS).unwrap_or_else(|| "0".into()),
         change_24h_pct: resolve_change_24h_pct(value, &last_price),
+        mark_price: get_str(value, TICKER_MARK_KEYS).unwrap_or_default(),
+        high_24h: get_str(value, TICKER_HIGH_24H_KEYS).unwrap_or_default(),
+        low_24h: get_str(value, TICKER_LOW_24H_KEYS).unwrap_or_default(),
+        funding_rate: get_str(value, TICKER_FUNDING_RATE_KEYS).unwrap_or_default(),
+        next_funding_time: TICKER_NEXT_FUNDING_KEYS
+            .iter()
+            .find_map(|key| value.get(*key).and_then(parse_i64_value))
+            .or_else(|| get_str(value, TICKER_NEXT_FUNDING_KEYS).and_then(|s| s.parse::<i64>().ok()))
+            .map(normalize_open_time_ms),
     }
 }
 
@@ -147,6 +167,20 @@ pub fn merge_ticker(existing: Option<&Ticker>, value: &Value, symbol: &str) -> T
                 base.change_24h_pct.clone()
             };
             pick_ticker_field(&base.change_24h_pct, &parsed, value, TICKER_CHANGE_KEYS)
+        },
+        mark_price: pick_ticker_field(&base.mark_price, &delta.mark_price, value, TICKER_MARK_KEYS),
+        high_24h: pick_ticker_field(&base.high_24h, &delta.high_24h, value, TICKER_HIGH_24H_KEYS),
+        low_24h: pick_ticker_field(&base.low_24h, &delta.low_24h, value, TICKER_LOW_24H_KEYS),
+        funding_rate: pick_ticker_field(
+            &base.funding_rate,
+            &delta.funding_rate,
+            value,
+            TICKER_FUNDING_RATE_KEYS,
+        ),
+        next_funding_time: if get_str(value, TICKER_NEXT_FUNDING_KEYS).is_some() {
+            delta.next_funding_time
+        } else {
+            base.next_funding_time
         },
     }
 }
@@ -239,8 +273,11 @@ pub fn parse_klines(payload: &Value, symbol: &str, interval: &str) -> Vec<Kline>
         })
         .collect();
     klines.retain(|k| k.open_time > 0);
-    klines.sort_by_key(|k| k.open_time);
-    klines
+    let mut by_time = std::collections::BTreeMap::new();
+    for kline in klines {
+        by_time.insert(kline.open_time, kline);
+    }
+    by_time.into_values().collect()
 }
 
 pub fn parse_order(value: &Value) -> Order {
@@ -575,6 +612,7 @@ mod tests {
             ask_price: "61701".into(),
             volume_24h: "1234".into(),
             change_24h_pct: "0.100000".into(),
+            ..Ticker::default()
         };
         let merged = merge_ticker(Some(&base), &json!({"pP": "1963", "p": "61800"}), "BTCUSDT");
         assert_eq!(merged.last_price, "61800");
@@ -590,6 +628,7 @@ mod tests {
             ask_price: "61701".into(),
             volume_24h: "1234".into(),
             change_24h_pct: "0.5".into(),
+            ..Ticker::default()
         };
         let merged = merge_ticker(Some(&base), &json!({"s": "BTCUSDT"}), "BTCUSDT");
         assert_eq!(merged.last_price, "61700");
@@ -608,6 +647,7 @@ mod tests {
             ask_price: "61701".into(),
             volume_24h: "1234".into(),
             change_24h_pct: "0.034".into(),
+            ..Ticker::default()
         };
         let merged = merge_ticker(
             Some(&base),
@@ -626,6 +666,7 @@ mod tests {
             ask_price: "61701".into(),
             volume_24h: "1234".into(),
             change_24h_pct: "1.5".into(),
+            ..Ticker::default()
         };
         let merged = merge_ticker(Some(&base), &json!({"change": "150.5"}), "BTCUSDT");
         assert_eq!(merged.change_24h_pct, "1.5");
@@ -640,6 +681,7 @@ mod tests {
             ask_price: "61701".into(),
             volume_24h: "1234".into(),
             change_24h_pct: "0.5".into(),
+            ..Ticker::default()
         };
         let merged = merge_ticker(Some(&base), &json!({"lp": "61800"}), "BTCUSDT");
         assert_eq!(merged.last_price, "61800");

@@ -83,15 +83,20 @@ watch(klineInterval, (interval) => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-height: 240px;
+  width: 100%;
+  min-height: clamp(320px, 42vh, 620px);
 }
 
 .chart-view {
   flex: 1;
-  min-height: 200px;
+  min-height: 0;
+  width: 100%;
+  overflow: hidden;
+  border-radius: var(--ef-radius-md);
 }
 
 .chart-view :deep(.klinecharts-pro) {
   height: 100%;
+  min-height: 0;
 }
 </style>

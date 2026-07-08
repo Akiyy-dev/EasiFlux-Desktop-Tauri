@@ -141,6 +141,11 @@ impl ConnectionService {
             }
         }
 
+        if let Err(e) = self.market.refresh_snapshot(symbol).await {
+            self.emitter
+                .emit_error(&format!("连接后快照同步失败: {}", e));
+        }
+
         self.set_status(ConnectionStatus::Connected).await;
         self.emitter.emit_log("info", "API 连接成功");
         self.start_market_poll().await;
@@ -161,7 +166,12 @@ impl ConnectionService {
         }
         let kline_interval = self.market.kline_interval().await;
         self.ws.subscribe_all(symbol, &kline_interval).await;
-        self.ws.start(symbol).await
+        self.ws.start(symbol).await?;
+        if let Err(e) = self.market.refresh_snapshot(symbol).await {
+            self.emitter
+                .emit_error(&format!("实时重连后快照同步失败: {}", e));
+        }
+        Ok(())
     }
 
     pub async fn test_connection(&self, credential: &ApiCredential) -> AppResult<()> {

@@ -44,7 +44,7 @@ onMounted(() => {
 .trading-layout {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--ef-space-2);
   height: 100%;
   min-height: 0;
   overflow: hidden;
@@ -53,10 +53,10 @@ onMounted(() => {
 .trading-main {
   display: grid;
   grid-template-columns:
-    minmax(280px, var(--trading-col-chart, 2.2fr))
-    minmax(180px, var(--trading-col-depth, 0.85fr))
-    minmax(260px, var(--trading-col-trade, 1fr));
-  gap: 8px;
+    minmax(420px, var(--trading-col-chart, 2.65fr))
+    minmax(190px, var(--trading-col-depth, 0.78fr))
+    minmax(300px, var(--trading-col-trade, 0.96fr));
+  gap: var(--ef-space-2);
   flex: 1;
   min-height: 0;
   overflow: hidden;
@@ -75,9 +75,29 @@ onMounted(() => {
   flex-direction: column;
 }
 
+.chart-panel :deep(.ef-card-body),
+.depth-panel :deep(.ef-card-body) {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
 .chart-panel :deep(.chart),
 .depth-panel :deep(.order-book) {
   flex: 1;
   min-height: 0;
+}
+
+.chart-panel :deep(.ef-card-body) {
+  padding: var(--ef-space-2);
+}
+
+@media (max-width: 1280px) {
+  .trading-main {
+    grid-template-columns:
+      minmax(360px, 2fr)
+      minmax(180px, 0.74fr)
+      minmax(280px, 0.92fr);
+  }
 }
 </style>

@@ -1,18 +1,16 @@
 <script setup lang="ts">
-import { Bell, Settings, User, Wifi } from 'lucide-vue-next'
+import { Bell, User, Wifi } from 'lucide-vue-next'
+import { storeToRefs } from 'pinia'
 import ConnectionStatus from '../common/ConnectionStatus.vue'
 import { AppButton, AppIcon, MonoValue } from '../ui'
-import type { NavKey } from './NavigationRail.vue'
+import { useAppStore } from '../../stores/app'
 
 const props = defineProps<{
-  version: string
-  active: NavKey
   title: string
 }>()
 
-const emit = defineEmits<{
-  openSettings: []
-}>()
+const appStore = useAppStore()
+const { version } = storeToRefs(appStore)
 </script>
 
 <template>
@@ -20,7 +18,7 @@ const emit = defineEmits<{
     <div class="left">
       <div class="brand">
         <span class="ef-text-title">EasiFlux</span>
-        <MonoValue class="version ef-text-caption" size="sm">v{{ props.version }}</MonoValue>
+        <MonoValue class="version ef-text-caption" size="sm">v{{ version }}</MonoValue>
       </div>
       <div class="divider" aria-hidden="true" />
       <div class="page">
@@ -38,27 +36,17 @@ const emit = defineEmits<{
       <AppButton variant="ghost" size="sm" icon-only title="用户（占位）" disabled>
         <AppIcon :icon="User" :size="16" />
       </AppButton>
-      <AppButton
-        variant="ghost"
-        size="sm"
-        icon-only
-        title="设置"
-        :class="{ active: props.active === 'settings' }"
-        @click="emit('openSettings')"
-      >
-        <AppIcon :icon="Settings" :size="16" />
-      </AppButton>
     </div>
   </header>
 </template>
 
 <style scoped>
 .top-bar {
-  height: 44px;
+  min-height: clamp(46px, 2.4rem + 0.75vw, 58px);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 12px;
+  padding: 0 var(--ef-space-3);
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--ef-radius-lg);
@@ -68,14 +56,14 @@ const emit = defineEmits<{
 .left {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--ef-space-3);
   min-width: 0;
 }
 
 .brand {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--ef-space-2);
 }
 
 .version {
@@ -99,12 +87,8 @@ const emit = defineEmits<{
 .right {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--ef-space-2);
   flex-shrink: 0;
 }
 
-.right .active {
-  border-color: var(--ring);
-  color: var(--primary);
-}
 </style>

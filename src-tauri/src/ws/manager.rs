@@ -121,17 +121,8 @@ impl WsManager {
 
         let ws_public = self.ws_public_url.read().await.clone();
         let ws_private = self.ws_private_url.read().await.clone();
-        let subs = self.subscriptions.lock().await.clone();
-        let public_topics: Vec<String> = subs
-            .iter()
-            .filter(|s| !s.private)
-            .map(|s| s.topic.clone())
-            .collect();
-        let private_topics: Vec<String> = subs
-            .iter()
-            .filter(|s| s.private)
-            .map(|s| s.topic.clone())
-            .collect();
+        let public_topics = topic_snapshot(&self.subscriptions, false).await;
+        let private_topics = topic_snapshot(&self.subscriptions, true).await;
 
         let emitter = self.emitter.clone();
         let market = self.market.read().ok().and_then(|g| g.clone());
@@ -141,6 +132,7 @@ impl WsManager {
         let running = self.running.clone();
         let public_connected = self.public_connected.clone();
         let private_connected = self.private_connected.clone();
+        let subscriptions = self.subscriptions.clone();
 
         if !public_topics.is_empty() {
             let emitter_p = emitter.clone();
@@ -148,8 +140,9 @@ impl WsManager {
             let running_p = running.clone();
             let pc = public_connected.clone();
             let sym = symbol_owned.clone();
+            let subs = subscriptions.clone();
             let handle = tauri::async_runtime::spawn(async move {
-                run_public_loop(ws_public, public_topics, sym, emitter_p, market_p, running_p, pc).await;
+                run_public_loop(ws_public, subs, sym, emitter_p, market_p, running_p, pc).await;
             });
             *self.public_task.lock().await = Some(handle);
         }
@@ -161,10 +154,11 @@ impl WsManager {
                 let running_pr = running.clone();
                 let prc = private_connected.clone();
                 let sym = symbol_owned.clone();
+                let subs = subscriptions.clone();
                 let handle = tauri::async_runtime::spawn(async move {
                     run_private_loop(
                         ws_private,
-                        private_topics,
+                        subs,
                         s,
                         time_sync,
                         sym,
@@ -197,7 +191,7 @@ impl WsManager {
 
 async fn run_public_loop(
     url: String,
-    topics: Vec<String>,
+    subscriptions: Arc<Mutex<Vec<Subscription>>>,
     symbol: String,
     emitter: EventEmitter,
     market: Option<Arc<MarketService>>,
@@ -205,9 +199,12 @@ async fn run_public_loop(
     connected: Arc<AtomicBool>,
 ) {
     while running.load(Ordering::Relaxed) {
-        match run_public_session(&url, &topics, &symbol, &emitter, market.as_ref(), &running, &connected)
-            .await
-        {
+        let topics = topic_snapshot(&subscriptions, false).await;
+        if topics.is_empty() {
+            tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
+            continue;
+        }
+        match run_public_session(&url, &topics, &symbol, &emitter, market.as_ref(), &running, &connected).await {
             Ok(()) => connected.store(false, Ordering::Relaxed),
             Err(e) => {
                 connected.store(false, Ordering::Relaxed);
@@ -225,7 +222,7 @@ async fn run_public_loop(
 
 async fn run_private_loop(
     url: String,
-    topics: Vec<String>,
+    subscriptions: Arc<Mutex<Vec<Subscription>>>,
     signer: Signer,
     time_sync: Arc<TimeSync>,
     symbol: String,
@@ -235,6 +232,11 @@ async fn run_private_loop(
     connected: Arc<AtomicBool>,
 ) {
     while running.load(Ordering::Relaxed) {
+        let topics = topic_snapshot(&subscriptions, true).await;
+        if topics.is_empty() {
+            tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
+            continue;
+        }
         match run_private_session(
             &url,
             &topics,
@@ -278,6 +280,9 @@ async fn run_public_session(
     emitter.emit_websocket("connected");
 
     if let Some(market) = market {
+        if let Err(e) = market.refresh_snapshot(symbol).await {
+            tracing::warn!("Public WS snapshot refresh failed: {}", e);
+        }
         let interval = market.kline_interval().await;
         market.schedule_kline_backfill(symbol, &interval);
     }
@@ -329,6 +334,12 @@ async fn run_private_session(
     let (mut write, mut read) = stream.split();
     connected.store(true, Ordering::Relaxed);
     emitter.emit_websocket("connected");
+
+    if let Some(market) = market {
+        if let Err(e) = market.refresh_snapshot(symbol).await {
+            tracing::warn!("Private WS snapshot refresh failed: {}", e);
+        }
+    }
 
     let expires = default_auth_expires_ms(time_sync.timestamp_ms());
     write
@@ -437,4 +448,14 @@ fn dispatch_list(data: &Value, mut handler: impl FnMut(&Value)) {
     } else if data.is_object() {
         handler(data);
     }
+}
+
+async fn topic_snapshot(subscriptions: &Arc<Mutex<Vec<Subscription>>>, private: bool) -> Vec<String> {
+    subscriptions
+        .lock()
+        .await
+        .iter()
+        .filter(|item| item.private == private)
+        .map(|item| item.topic.clone())
+        .collect()
 }

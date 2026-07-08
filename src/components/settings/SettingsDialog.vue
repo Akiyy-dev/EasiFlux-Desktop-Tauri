@@ -1,19 +1,19 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { NForm, NFormItem, NInput, NInputNumber, NSwitch, useMessage } from 'naive-ui'
+import { NForm, NFormItem, NInput, NInputNumber, NSwitch } from 'naive-ui'
 import { AppButton, AppDialog } from '../ui'
 import { tauriInvoke } from '../../composables/useTauriCommand'
 import { useConfigStore } from '../../stores/config'
 import { useConnectionStore } from '../../stores/connection'
 import { normalizeAccountId } from '../../utils/account'
 import type { ApiCredential } from '../../types/models'
+import { notifySuccess, notifyWarning, reportError } from '../../services/errorService'
 
 const props = defineProps<{ show: boolean }>()
 const emit = defineEmits<{ 'update:show': [boolean] }>()
 
 const configStore = useConfigStore()
 const connectionStore = useConnectionStore()
-const message = useMessage()
 
 const apiKey = ref('')
 const apiSecret = ref('')
@@ -68,20 +68,20 @@ async function save(): Promise<void> {
   }
 
   await saveConfigOnly()
-  message.success('设置已保存')
+  notifySuccess('设置已保存')
 }
 
 async function test(): Promise<void> {
   if (!apiKey.value.trim() || !apiSecret.value.trim()) {
-    message.warning('测试连接需要填写 API Key 和 Secret')
+    notifyWarning('测试连接需要填写 API Key 和 Secret')
     return
   }
   testing.value = true
   try {
     await tauriInvoke('test_connection', { credential: buildCredential() })
-    message.success('连接测试成功')
+    notifySuccess('连接测试成功')
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    reportError(e)
   } finally {
     testing.value = false
   }
@@ -91,7 +91,7 @@ async function connect(): Promise<void> {
   try {
     await save()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    reportError(e)
     return
   }
   emit('update:show', false)
@@ -99,7 +99,7 @@ async function connect(): Promise<void> {
   try {
     await connectionStore.connect(useWebsocket.value, credential)
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    reportError(e)
   }
 }
 </script>

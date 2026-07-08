@@ -1,5 +1,5 @@
 import { createPinia, setActivePinia } from 'pinia'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useConnectionStore } from '../../src/stores/connection'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({
@@ -42,6 +42,10 @@ describe('connection store', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.mocked(tauriInvoke).mockReset()
+  })
+
+  afterEach(() => {
+    useConnectionStore().stopDataSync()
   })
 
   it('tracks api and websocket status separately', () => {

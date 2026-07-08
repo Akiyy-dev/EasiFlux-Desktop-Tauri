@@ -9,6 +9,11 @@ pub struct Ticker {
     pub ask_price: String,
     pub volume_24h: String,
     pub change_24h_pct: String,
+    pub mark_price: String,
+    pub high_24h: String,
+    pub low_24h: String,
+    pub funding_rate: String,
+    pub next_funding_time: Option<i64>,
 }
 
 impl Default for Ticker {
@@ -20,6 +25,11 @@ impl Default for Ticker {
             ask_price: "0".to_string(),
             volume_24h: "0".to_string(),
             change_24h_pct: "0".to_string(),
+            mark_price: String::new(),
+            high_24h: String::new(),
+            low_24h: String::new(),
+            funding_rate: String::new(),
+            next_funding_time: None,
         }
     }
 }

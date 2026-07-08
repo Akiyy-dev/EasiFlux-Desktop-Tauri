@@ -47,6 +47,11 @@ export interface Ticker {
   askPrice: string
   volume24h: string
   change24hPct: string
+  markPrice: string
+  high24h: string
+  low24h: string
+  fundingRate: string
+  nextFundingTime?: number
 }
 
 export interface DepthLevel {
@@ -82,6 +87,14 @@ export interface AccountSummary {
   accountId: string
   balances: Balance[]
   totalEquity: string
+}
+
+export interface EnvironmentStatus {
+  baseUrl: string
+  label: '正式' | '测试' | '未知'
+  reachable: boolean
+  checkedAt: number
+  error?: string
 }
 
 export type OrderStatus =

@@ -1,6 +1,6 @@
 [package]
 name = "easiflux-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "EasiFlux Desktop - cryptocurrency contract trading client"
 authors = ["EasiFlux"]
 edition = "2021"

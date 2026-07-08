@@ -130,6 +130,8 @@
 .ef-icon {
   flex-shrink: 0;
   stroke: currentColor;
+  width: var(--ef-icon-size);
+  height: var(--ef-icon-size);
 }
 
 /* Buttons */
@@ -154,24 +156,24 @@
 }
 
 .ef-btn-sm {
-  min-height: 28px;
+  min-height: var(--ef-control-sm);
   padding: 0 var(--ef-space-3);
   font-size: var(--ef-text-sm);
 }
 
 .ef-btn-md {
-  min-height: 32px;
+  min-height: var(--ef-control-md);
   padding: 0 var(--ef-space-4);
   font-size: var(--ef-text-base);
 }
 
 .ef-btn-icon.ef-btn-sm {
-  width: 28px;
+  width: var(--ef-control-icon-sm);
   padding: 0;
 }
 
 .ef-btn-icon.ef-btn-md {
-  width: 32px;
+  width: var(--ef-control-icon-md);
   padding: 0;
 }
 

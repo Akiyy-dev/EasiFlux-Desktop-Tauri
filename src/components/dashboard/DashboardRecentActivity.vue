@@ -93,22 +93,30 @@ const iconByType: Record<DashboardActivityType, FunctionalComponent> = {
   color: var(--up);
 }
 
+.content {
+  flex: 1;
+  min-width: 0;
+}
+
 .head {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(72px, max-content);
   align-items: baseline;
-  justify-content: space-between;
   gap: 8px;
 }
 
 .title {
   font-size: 13px;
   font-weight: 600;
+  min-width: 0;
 }
 
 .time {
   font-size: 11px;
   color: var(--muted-foreground);
   white-space: nowrap;
+  justify-self: end;
+  text-align: right;
 }
 
 .summary {

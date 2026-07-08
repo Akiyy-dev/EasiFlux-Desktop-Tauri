@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type { Position } from '../types/models'
 import { normalizePosition, normalizePositions } from '../utils/position'
+import { useAsyncState } from '../composables/useAsyncState'
 
 function positionKey(position: Position): string {
   return `${position.symbol}:${position.positionIdx ?? 0}`
@@ -10,6 +11,7 @@ function positionKey(position: Position): string {
 
 export const usePositionStore = defineStore('position', () => {
   const positions = ref<Position[]>([])
+  const request = useAsyncState<Position[]>((value) => value.length === 0)
 
   function upsertPosition(position: Position): void {
     const normalized = normalizePosition(position)
@@ -31,11 +33,21 @@ export const usePositionStore = defineStore('position', () => {
   }
 
   async function refreshPositions(symbol?: string): Promise<void> {
-    const raw = await tauriInvoke<Position[]>('refresh_positions', {
-      symbol: symbol ?? null,
-    })
+    const raw = await request.run(() =>
+      tauriInvoke<Position[]>('refresh_positions', {
+        symbol: symbol ?? null,
+      }),
+    )
     positions.value = normalizePositions(raw)
   }
 
-  return { positions, upsertPosition, setPositions, refreshPositions }
+  return {
+    positions,
+    loading: request.loading,
+    error: request.error,
+    status: request.status,
+    upsertPosition,
+    setPositions,
+    refreshPositions,
+  }
 })

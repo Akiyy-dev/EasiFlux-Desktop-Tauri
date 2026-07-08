@@ -80,12 +80,12 @@ const items: Array<{
 
 <style scoped>
 .rail {
-  width: 56px;
+  width: clamp(56px, 3rem + 1vw, 68px);
   height: 100%;
   display: flex;
   flex-direction: column;
-  padding: 6px;
-  gap: 6px;
+  padding: var(--ef-space-2);
+  gap: var(--ef-space-2);
 }
 
 .rail :deep(.ef-card-body) {
@@ -93,26 +93,30 @@ const items: Array<{
   display: flex;
   flex-direction: column;
   flex: 1;
-  gap: 6px;
+  gap: var(--ef-space-2);
 }
 
 .rail-top {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--ef-space-2);
 }
 
 .rail-bottom {
   margin-top: auto;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--ef-space-2);
 }
 
 .rail-btn {
-  width: 44px;
-  height: 44px;
+  width: clamp(44px, 2.35rem + 0.9vw, 54px);
+  height: clamp(44px, 2.35rem + 0.9vw, 54px);
   color: var(--text-secondary);
+}
+
+.rail-btn :deep(.ef-icon) {
+  --ef-icon-size: clamp(1.1rem, 0.92rem + 0.48vw, 1.38rem);
 }
 
 .rail-btn.active {

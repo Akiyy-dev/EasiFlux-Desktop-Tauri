@@ -70,3 +70,14 @@ export function normalizePositions(raw: unknown): Position[] {
     .map((item) => normalizePosition(item as Record<string, unknown>))
     .filter((position) => position.symbol.length > 0 && parseFloat(position.size) !== 0)
 }
+
+export function positionRoiPct(position: Position): string {
+  const pnl = Number.parseFloat(position.unrealisedPnl)
+  const size = Math.abs(Number.parseFloat(position.size))
+  const entryPrice = Number.parseFloat(position.entryPrice)
+  const notional = size * entryPrice
+  if (!Number.isFinite(pnl) || !Number.isFinite(notional) || notional <= 0) {
+    return '--'
+  }
+  return `${((pnl / notional) * 100).toFixed(2)}%`
+}

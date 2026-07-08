@@ -6,11 +6,11 @@ import TanstackDataTable from '../../common/TanstackDataTable.vue'
 import { AppButton } from '../../ui'
 import { useOrderCenterRefresh } from '../../../composables/useOrderCenterRefresh'
 import { useConnectionStore } from '../../../stores/connection'
-import { useLogStore } from '../../../stores/log'
 import { useOrderStore } from '../../../stores/order'
-import { refreshPrivatePanels } from '../../../stores/privatePanels'
+import { refreshSyncTask } from '../../../services/dataSyncService'
 import type { Order } from '../../../types/models'
 import { filterOpenOrders, type OpenOrderScope } from '../../../utils/orderFilters'
+import { reportError } from '../../../services/errorService'
 
 const props = defineProps<{
   active: boolean
@@ -18,7 +18,6 @@ const props = defineProps<{
 
 const orderStore = useOrderStore()
 const connectionStore = useConnectionStore()
-const logStore = useLogStore()
 const { openOrders } = storeToRefs(orderStore)
 const { loading, refresh } = useOrderCenterRefresh(computed(() => props.active))
 
@@ -40,10 +39,10 @@ async function cancelOne(row: Order): Promise<void> {
   actionLoading.value = true
   try {
     await orderStore.cancelOrder({ symbol: row.symbol, orderId: row.orderId })
-    await refreshPrivatePanels()
+    await refreshSyncTask('privatePanels')
     tableRef.value?.clearSelection()
   } catch (error) {
-    logStore.setError(error instanceof Error ? error.message : String(error))
+    reportError(error)
   } finally {
     actionLoading.value = false
   }
@@ -58,10 +57,10 @@ async function batchCancel(rows: Order[]): Promise<void> {
     for (const row of rows) {
       await orderStore.cancelOrder({ symbol: row.symbol, orderId: row.orderId })
     }
-    await refreshPrivatePanels()
+    await refreshSyncTask('privatePanels')
     tableRef.value?.clearSelection()
   } catch (error) {
-    logStore.setError(error instanceof Error ? error.message : String(error))
+    reportError(error)
   } finally {
     actionLoading.value = false
   }
@@ -71,10 +70,10 @@ async function cancelAll(): Promise<void> {
   actionLoading.value = true
   try {
     await orderStore.cancelAllOrders({})
-    await refreshPrivatePanels()
+    await refreshSyncTask('privatePanels')
     tableRef.value?.clearSelection()
   } catch (error) {
-    logStore.setError(error instanceof Error ? error.message : String(error))
+    reportError(error)
   } finally {
     actionLoading.value = false
   }

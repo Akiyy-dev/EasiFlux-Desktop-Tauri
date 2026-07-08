@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { NConfigProvider, NMessageProvider, darkTheme } from 'naive-ui'
 import AppShell from './components/layout/AppShell.vue'
+import ErrorToastBridge from './components/common/ErrorToastBridge.vue'
 import SettingsDialog from './components/settings/SettingsDialog.vue'
 import { naiveThemeOverrides } from './constants/naiveTheme'
 import { useTauriEvent, whenTauriListenersReady } from './composables/useTauriEvent'
@@ -13,6 +14,8 @@ import { useOrderStore } from './stores/order'
 import { usePositionStore } from './stores/position'
 import { useAccountStore } from './stores/account'
 import { useLogStore } from './stores/log'
+import { reportError as reportGlobalError } from './services/errorService'
+import { onConnectionStatusChanged, onWebsocketStatusChanged } from './services/realtimeService'
 import { normalizeAccountId } from './utils/account'
 import type { Balance, Depth, Kline, LogEntry, Order, Position, Ticker } from './types/models'
 
@@ -28,13 +31,7 @@ const logStore = useLogStore()
 const showSettings = ref(false)
 
 function reportError(context: string, error: unknown): void {
-  const text =
-    typeof error === 'string'
-      ? error
-      : error instanceof Error
-        ? error.message
-        : '未知错误'
-  logStore.setError(`${context}: ${text}`)
+  reportGlobalError(error, context)
 }
 
 useTauriEvent<string>('app:ready', (version) => {
@@ -43,10 +40,12 @@ useTauriEvent<string>('app:ready', (version) => {
 
 useTauriEvent<string>('connection:status', (status) => {
   connectionStore.setStatus(status)
+  onConnectionStatusChanged(status)
 })
 
 useTauriEvent<string>('websocket:status', (status) => {
   connectionStore.setWsStatus(status)
+  onWebsocketStatusChanged(status)
 })
 
 useTauriEvent<Ticker>('market:ticker', (ticker) => {
@@ -74,7 +73,7 @@ useTauriEvent<Balance>('balance:updated', (balance) => {
 })
 
 useTauriEvent<string>('error:occurred', (msg) => {
-  logStore.setError(msg)
+  reportGlobalError(msg)
 })
 
 useTauriEvent<LogEntry>('log:entry', (entry) => {
@@ -85,7 +84,7 @@ onMounted(async () => {
   await whenTauriListenersReady()
 
   try {
-    await appStore.ping()
+    await Promise.all([appStore.initVersion(), appStore.refreshEnvironment()])
   } catch (error) {
     reportError('启动检查失败', error)
   }
@@ -102,6 +101,7 @@ onMounted(async () => {
     marketStore.activeSymbol = configStore.config.activeSymbol
     marketStore.klineInterval = configStore.config.klineInterval
     void marketStore.loadInstruments(configStore.config.watchlistSymbols)
+    void appStore.refreshEnvironment()
   }
 
   const hasCreds = await configStore.hasCredentials(
@@ -123,7 +123,8 @@ onMounted(async () => {
 <template>
   <NConfigProvider :theme="darkTheme" :theme-overrides="naiveThemeOverrides">
     <NMessageProvider>
-      <AppShell :version="appStore.version" @open-settings="showSettings = true" />
+      <ErrorToastBridge />
+      <AppShell @open-settings="showSettings = true" />
       <SettingsDialog v-model:show="showSettings" />
     </NMessageProvider>
   </NConfigProvider>

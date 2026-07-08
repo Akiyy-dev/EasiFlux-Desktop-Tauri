@@ -2,10 +2,13 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type { ApiCredential, ConnectionStatus } from '../types/models'
-import { useAccountStore } from './account'
-import { useLogStore } from './log'
-import { useMarketStore } from './market'
-import { refreshPrivatePanels } from './privatePanels'
+import {
+  refreshAllSyncTasks,
+  refreshSyncTask,
+  startDataSync as startSyncScheduler,
+  stopDataSync as stopSyncScheduler,
+  syncRunning as isSyncRunning,
+} from '../services/dataSyncService'
 
 function parseStatus(next: string): ConnectionStatus | null {
   if (
@@ -29,36 +32,41 @@ function formatInvokeError(error: unknown): string {
   return '连接失败'
 }
 
-async function refreshPostConnectData(): Promise<void> {
-  const logStore = useLogStore()
-
-  const tasks: Array<{ label: string; run: () => Promise<void> }> = [
-    { label: '账户', run: () => useAccountStore().refreshAccount() },
-    { label: '行情', run: () => useMarketStore().refreshMarket() },
-    { label: '订单/持仓', run: async () => { await refreshPrivatePanels() } },
-  ]
-
-  for (const task of tasks) {
-    try {
-      await task.run()
-    } catch (error) {
-      logStore.setError(`${task.label}刷新失败: ${formatInvokeError(error)}`)
-    }
-  }
-}
-
 export const useConnectionStore = defineStore('connection', () => {
   const status = ref<ConnectionStatus>('disconnected')
   const wsStatus = ref<ConnectionStatus>('disconnected')
   const lastError = ref<string | null>(null)
+  const syncRunning = ref(false)
   const connecting = computed(() => status.value === 'connecting')
   const connected = computed(() => status.value === 'connected')
   const wsConnected = computed(() => wsStatus.value === 'connected')
+
+  async function refreshSyncedData(): Promise<void> {
+    if (status.value !== 'connected') {
+      return
+    }
+    await refreshAllSyncTasks()
+  }
+
+  function startDataSync(): void {
+    startSyncScheduler()
+    syncRunning.value = isSyncRunning()
+  }
+
+  function stopDataSync(): void {
+    stopSyncScheduler()
+    syncRunning.value = false
+  }
 
   function setStatus(next: string): void {
     const parsed = parseStatus(next)
     if (parsed) {
       status.value = parsed
+      if (parsed === 'connected') {
+        startDataSync()
+      } else if (parsed === 'disconnected' || parsed === 'error') {
+        stopDataSync()
+      }
     }
   }
 
@@ -77,10 +85,14 @@ export const useConnectionStore = defineStore('connection', () => {
     status.value = 'connecting'
     try {
       await tauriInvoke('connect', { startRealtime, credential })
-      await refreshStatus()
-      await refreshPostConnectData()
+      const currentStatus = await refreshStatus()
+      await refreshAllSyncTasks()
+      if (currentStatus === 'connected') {
+        startDataSync()
+      }
     } catch (error) {
       status.value = 'error'
+      stopDataSync()
       const message = formatInvokeError(error)
       lastError.value = message
       const wrapped = new Error(message) as Error & { cause?: unknown }
@@ -93,17 +105,20 @@ export const useConnectionStore = defineStore('connection', () => {
     await tauriInvoke('disconnect')
     status.value = 'disconnected'
     wsStatus.value = 'disconnected'
+    stopDataSync()
   }
 
-  async function refreshStatus(): Promise<void> {
+  async function refreshStatus(): Promise<ConnectionStatus> {
     const s = await tauriInvoke<ConnectionStatus>('get_connection_status')
     status.value = s
+    return s
   }
 
   return {
     status,
     wsStatus,
     lastError,
+    syncRunning,
     connecting,
     connected,
     wsConnected,
@@ -112,5 +127,9 @@ export const useConnectionStore = defineStore('connection', () => {
     connect,
     disconnect,
     refreshStatus,
+    startDataSync,
+    stopDataSync,
+    refreshSyncedData,
+    refreshTask: refreshSyncTask,
   }
 })

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import AppCard from '../ui/AppCard.vue'
 import MonoValue from '../ui/MonoValue.vue'
@@ -10,6 +10,8 @@ import TickerMetric from './TickerMetric.vue'
 
 const marketStore = useMarketStore()
 const { ticker } = storeToRefs(marketStore)
+const now = ref(Date.now())
+let clockTimer: ReturnType<typeof globalThis.setInterval> | null = null
 
 const formattedChange = computed(() => formatChange24hPct(ticker.value?.change24hPct))
 
@@ -18,6 +20,46 @@ const changeClass = computed(() => {
   if (pct > 0) return 'text-up'
   if (pct < 0) return 'text-down'
   return ''
+})
+
+function displayValue(value?: string | null): string {
+  if (!value || value === '0') {
+    return '--'
+  }
+  return value
+}
+
+const formattedFundingRate = computed(() => {
+  const value = Number.parseFloat(ticker.value?.fundingRate ?? '')
+  if (!Number.isFinite(value)) {
+    return '--'
+  }
+  return `${(value * 100).toFixed(4)}%`
+})
+
+const fundingCountdown = computed(() => {
+  const next = ticker.value?.nextFundingTime
+  if (!next || next <= now.value) {
+    return '--:--:--'
+  }
+  const totalSeconds = Math.floor((next - now.value) / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  return [hours, minutes, seconds].map((part) => String(part).padStart(2, '0')).join(':')
+})
+
+onMounted(() => {
+  clockTimer = globalThis.setInterval(() => {
+    now.value = Date.now()
+  }, 1000)
+})
+
+onUnmounted(() => {
+  if (clockTimer) {
+    globalThis.clearInterval(clockTimer)
+    clockTimer = null
+  }
 })
 </script>
 
@@ -36,13 +78,12 @@ const changeClass = computed(() => {
         </div>
 
         <TickerMetric label="24h 涨跌" :value="formattedChange" :value-class="changeClass" />
-        <TickerMetric label="标记价格" value="--" />
-        <TickerMetric label="指数价格" value="--" />
-        <TickerMetric label="24h 最高" value="--" />
-        <TickerMetric label="24h 最低" value="--" />
-        <TickerMetric label="成交额" :value="ticker?.volume24h ?? '--'" />
-        <TickerMetric label="资金费率" value="--" />
-        <TickerMetric label="费率倒计时" value="--:--:--" />
+        <TickerMetric label="标记价格" :value="displayValue(ticker?.markPrice)" />
+        <TickerMetric label="24h 最高" :value="displayValue(ticker?.high24h)" />
+        <TickerMetric label="24h 最低" :value="displayValue(ticker?.low24h)" />
+        <TickerMetric label="成交额" :value="displayValue(ticker?.volume24h)" />
+        <TickerMetric label="资金费率" :value="formattedFundingRate" />
+        <TickerMetric label="费率倒计时" :value="fundingCountdown" />
       </div>
     </div>
   </AppCard>

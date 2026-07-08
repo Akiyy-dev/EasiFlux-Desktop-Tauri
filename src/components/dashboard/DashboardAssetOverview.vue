@@ -17,6 +17,7 @@ const usdtBalance = computed(() =>
   summary.value?.balances.find((balance) => balance.asset === 'USDT'),
 )
 
+const marginBalance = computed(() => usdtBalance.value?.frozen ?? summary.value?.balances[0]?.frozen)
 const unrealisedPnl = computed(() => sumUnrealisedPnl(positions.value))
 const unrealisedClass = computed(() => pnlToneClass(unrealisedPnl.value))
 </script>
@@ -38,6 +39,10 @@ const unrealisedClass = computed(() => pnlToneClass(unrealisedPnl.value))
       <DashboardMetricTile
         label="可用保证金"
         :value="formatMetric(usdtBalance?.available, 'USDT')"
+      />
+      <DashboardMetricTile
+        label="保证金"
+        :value="formatMetric(marginBalance, 'USDT')"
       />
     </div>
   </AppCard>

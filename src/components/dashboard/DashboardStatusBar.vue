@@ -5,13 +5,12 @@ import { Wifi } from 'lucide-vue-next'
 import AppCard from '../ui/AppCard.vue'
 import AppIcon from '../ui/AppIcon.vue'
 import MonoValue from '../ui/MonoValue.vue'
+import { useAppStore } from '../../stores/app'
 import { useConnectionStore } from '../../stores/connection'
 
-const props = defineProps<{
-  version: string
-}>()
-
+const appStore = useAppStore()
 const connectionStore = useConnectionStore()
+const { version } = storeToRefs(appStore)
 const { status, wsStatus } = storeToRefs(connectionStore)
 
 const apiLabel = computed(() => {
@@ -56,7 +55,7 @@ const networkLabel = computed(() =>
       </div>
       <div class="status-item version">
         <span class="label">版本</span>
-        <MonoValue size="sm">v{{ props.version }}</MonoValue>
+        <MonoValue size="sm">v{{ version }}</MonoValue>
       </div>
     </div>
   </AppCard>

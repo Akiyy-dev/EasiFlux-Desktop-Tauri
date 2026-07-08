@@ -4,9 +4,9 @@ import { computed, h, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useOrderStore } from '../../stores/order'
 import { useConnectionStore } from '../../stores/connection'
-import { useLogStore } from '../../stores/log'
-import { refreshPrivatePanels } from '../../stores/privatePanels'
+import { refreshSyncTask } from '../../services/dataSyncService'
 import type { Order } from '../../types/models'
+import { reportError } from '../../services/errorService'
 
 const TABLE_MAX_HEIGHT = 168
 
@@ -16,7 +16,6 @@ const props = defineProps<{
 
 const orderStore = useOrderStore()
 const connectionStore = useConnectionStore()
-const logStore = useLogStore()
 const { openOrders, orderHistory } = storeToRefs(orderStore)
 
 const activeScope = ref<'open' | 'history'>('open')
@@ -64,7 +63,7 @@ async function cancel(row: Order): Promise<void> {
     await orderStore.cancelOrder({ symbol: row.symbol, orderId: row.orderId })
     await refreshPanels()
   } catch (e) {
-    logStore.setError(e instanceof Error ? e.message : String(e))
+    reportError(e)
   }
 }
 
@@ -74,9 +73,9 @@ async function refreshPanels(): Promise<void> {
   }
   loading.value = true
   try {
-    await refreshPrivatePanels()
+    await refreshSyncTask('privatePanels')
   } catch (e) {
-    logStore.setError(e instanceof Error ? e.message : String(e))
+    reportError(e)
   } finally {
     loading.value = false
   }

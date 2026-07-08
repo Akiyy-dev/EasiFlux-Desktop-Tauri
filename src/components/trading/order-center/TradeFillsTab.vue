@@ -5,15 +5,14 @@ import { storeToRefs } from 'pinia'
 import TanstackDataTable from '../../common/TanstackDataTable.vue'
 import { tauriInvoke } from '../../../composables/useTauriCommand'
 import { useConnectionStore } from '../../../stores/connection'
-import { useLogStore } from '../../../stores/log'
 import { parseTradeFills, type TradeFill } from '../../../utils/tradingRecords'
+import { reportError } from '../../../services/errorService'
 
 const props = defineProps<{
   active: boolean
 }>()
 
 const connectionStore = useConnectionStore()
-const logStore = useLogStore()
 const { connected } = storeToRefs(connectionStore)
 
 const fills = ref<TradeFill[]>([])
@@ -59,7 +58,7 @@ async function refresh(): Promise<void> {
     })
     fills.value = parseTradeFills(payload)
   } catch (error) {
-    logStore.setError(error instanceof Error ? error.message : String(error))
+    reportError(error)
   } finally {
     loading.value = false
   }
