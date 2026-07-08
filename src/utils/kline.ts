@@ -1,40 +1,37 @@
-import type { CandlestickData, UTCTimestamp } from 'lightweight-charts'
 import type { Kline } from '../types/models'
+import { klineBarsEqual, toKLineData } from './klinecharts'
 
-function isValidPrice(value: number): boolean {
-  return Number.isFinite(value)
+export {
+  intervalToPeriod,
+  KLINE_PERIODS,
+  klineBarsEqual,
+  periodToInterval,
+  toKLineData,
+  toSymbolInfo,
+} from './klinecharts'
+
+/** @deprecated Use toKLineData */
+export function toCandlestickData(klines: Kline[]): Array<{
+  time: number
+  open: number
+  high: number
+  low: number
+  close: number
+}> {
+  return toKLineData(klines).map((bar) => ({
+    time: Math.floor(bar.timestamp / 1000),
+    open: bar.open,
+    high: bar.high,
+    low: bar.low,
+    close: bar.close,
+  }))
 }
 
-export function toCandlestickData(klines: Kline[]): CandlestickData[] {
-  const byTime = new Map<number, CandlestickData>()
-
-  for (const kline of klines) {
-    if (kline.openTime <= 0) {
-      continue
-    }
-    const open = parseFloat(kline.open)
-    const high = parseFloat(kline.high)
-    const low = parseFloat(kline.low)
-    const close = parseFloat(kline.close)
-    if (!isValidPrice(open) || !isValidPrice(high) || !isValidPrice(low) || !isValidPrice(close)) {
-      continue
-    }
-    const time = Math.floor(kline.openTime / 1000)
-    byTime.set(time, {
-      time: time as UTCTimestamp,
-      open,
-      high,
-      low,
-      close,
-    })
-  }
-
-  return Array.from(byTime.entries())
-    .sort(([a], [b]) => a - b)
-    .map(([, candle]) => candle)
-}
-
-export function candlesEqual(a: CandlestickData, b: CandlestickData): boolean {
+/** @deprecated Use klineBarsEqual */
+export function candlesEqual(
+  a: { time: number; open: number; high: number; low: number; close: number },
+  b: { time: number; open: number; high: number; low: number; close: number },
+): boolean {
   return (
     a.time === b.time &&
     a.open === b.open &&
@@ -42,4 +39,8 @@ export function candlesEqual(a: CandlestickData, b: CandlestickData): boolean {
     a.low === b.low &&
     a.close === b.close
   )
+}
+
+export function candlesEqualKline(a: ReturnType<typeof toKLineData>[number], b: ReturnType<typeof toKLineData>[number]): boolean {
+  return klineBarsEqual(a, b)
 }

@@ -37,15 +37,15 @@ const label = computed(() => {
 
 const dotClass = computed(() => ({
   connected: connected.value && wsStatus.value === 'connected',
-  apiOnly: connected.value && wsStatus.value !== 'connected',
+  'api-only': connected.value && wsStatus.value !== 'connected',
   error: status.value === 'error',
   connecting: status.value === 'connecting' || wsStatus.value === 'connecting',
 }))
 </script>
 
 <template>
-  <div class="connection-status">
-    <span class="dot" :class="dotClass" />
+  <div class="connection-status ef-text-caption">
+    <span class="ef-status-dot" :class="dotClass" />
     <span>{{ label }}</span>
   </div>
 </template>
@@ -54,38 +54,6 @@ const dotClass = computed(() => ({
 .connection-status {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #6e7681;
-}
-
-.dot.connected {
-  background: var(--accent-green);
-}
-
-.dot.apiOnly {
-  background: #d29922;
-}
-
-.dot.error {
-  background: var(--accent-red);
-}
-
-.dot.connecting {
-  background: #d29922;
-  animation: pulse 1s infinite;
-}
-
-@keyframes pulse {
-  50% {
-    opacity: 0.4;
-  }
+  gap: var(--ef-space-2);
 }
 </style>

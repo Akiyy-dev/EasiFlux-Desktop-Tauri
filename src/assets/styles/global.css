@@ -1,13 +1,43 @@
-:root {
-  --bg-primary: #0d1117;
-  --bg-secondary: #161b22;
-  --bg-tertiary: #21262d;
-  --border-color: #30363d;
-  --text-primary: #e6edf3;
-  --text-secondary: #8b949e;
-  --accent-green: #26a69a;
-  --accent-red: #ef5350;
-  --accent-blue: #58a6ff;
+@import "tailwindcss";
+@import "./tokens.css";
+@import "./components.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-up-foreground: var(--up-foreground);
+  --color-down-foreground: var(--down-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-surface: var(--surface);
+  --radius-sm: var(--ef-radius-sm);
+  --radius-md: var(--ef-radius-md);
+  --radius-lg: var(--ef-radius-lg);
+  --radius-xl: var(--ef-radius-xl);
+  --font-sans: var(--ef-font-sans);
+  --font-mono: var(--ef-font-mono);
 }
 
 * {
@@ -19,31 +49,20 @@ body,
 #app {
   margin: 0;
   height: 100%;
-  background: var(--bg-primary);
-  color: var(--text-primary);
-  font-family: 'Segoe UI', system-ui, sans-serif;
+  overflow: hidden;
+  background: var(--background);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--ef-text-base);
+  -webkit-font-smoothing: antialiased;
 }
 
-.panel {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-}
+@layer base {
+  * {
+    @apply border-border;
+  }
 
-.panel-title {
-  padding: 8px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  border-bottom: 1px solid var(--border-color);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.text-up {
-  color: var(--accent-green);
-}
-
-.text-down {
-  color: var(--accent-red);
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
 }

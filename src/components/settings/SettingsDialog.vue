@@ -1,15 +1,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import {
-  NButton,
-  NForm,
-  NFormItem,
-  NInput,
-  NInputNumber,
-  NModal,
-  NSwitch,
-  useMessage,
-} from 'naive-ui'
+import { NForm, NFormItem, NInput, NInputNumber, NSwitch, useMessage } from 'naive-ui'
+import { AppButton, AppDialog } from '../ui'
 import { tauriInvoke } from '../../composables/useTauriCommand'
 import { useConfigStore } from '../../stores/config'
 import { useConnectionStore } from '../../stores/connection'
@@ -113,13 +105,7 @@ async function connect(): Promise<void> {
 </script>
 
 <template>
-  <NModal
-    :show="show"
-    preset="card"
-    title="API 设置"
-    style="width: 480px"
-    @update:show="emit('update:show', $event)"
-  >
+  <AppDialog :show="show" title="API 设置" @update:show="emit('update:show', $event)">
     <NForm label-placement="top">
       <NFormItem label="API Key">
         <NInput v-model:value="apiKey" type="password" show-password-on="click" />
@@ -144,17 +130,17 @@ async function connect(): Promise<void> {
     </NForm>
     <template #footer>
       <div class="footer">
-        <NButton :loading="testing" @click="test">测试连接</NButton>
-        <NButton type="primary" @click="connect">保存并连接</NButton>
+        <AppButton variant="ghost" :loading="testing" @click="test">测试连接</AppButton>
+        <AppButton variant="primary" @click="connect">保存并连接</AppButton>
       </div>
     </template>
-  </NModal>
+  </AppDialog>
 </template>
 
 <style scoped>
 .footer {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--ef-space-2);
 }
 </style>
