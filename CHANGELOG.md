@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.3.0...easiflux-desktop-tauri-v0.4.0) (2026-07-08)
+
+
+### Features
+
+* **ui:** add app shell navigation layout ([17b6276](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/17b6276678817f21352cf1e2ec6ab38feeb30c11))
+* **ui:** add dashboard home page ([713d417](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/713d4177eb3bf671a615c428c18f3e02279b380e))
+* **ui:** add TanStack order center tables ([3d1b68b](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/3d1b68bc1c334c53a4ab463a4b46b72adf81d489))
+* **ui:** establish design system foundation ([6cb15e7](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/6cb15e7db8a41b458ed5f2f87d7d40f1ec22d66b))
+* **ui:** formalize design system tokens and components ([a8a7ec8](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/a8a7ec84220aa3f69f2983dc244ce19d8da67d16))
+* **ui:** redesign trading page layout ([6fbf9ee](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/6fbf9eeaa4269c82adc150461f9b2fdb9f502b46))
+* **ui:** scaffold React design system foundation ([f4423f4](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/f4423f4d2fd2fac2f9358fd25431f7a615d7dcf1))
+* **ui:** upgrade kline chart and trading panel ([64a95d8](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/64a95d882c200c3a78e7691187d96d6cfd634b08))
+* **ui:** Vue trading UI refactor with design system ([6b6a81d](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/6b6a81dcb725ef7b0d311ec5e51fe85c085f34ee))
+
 ## [0.3.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.2.0...easiflux-desktop-tauri-v0.3.0) (2026-07-05)
 
 
