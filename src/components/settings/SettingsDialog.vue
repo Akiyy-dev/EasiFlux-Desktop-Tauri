@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { NForm, NFormItem, NInput, NInputNumber, NSwitch } from 'naive-ui'
+import { NForm, NFormItem, NInput, NInputNumber, NSelect, NSwitch } from 'naive-ui'
 import { AppButton, AppDialog } from '../ui'
 import { tauriInvoke } from '../../composables/useTauriCommand'
 import { useConfigStore } from '../../stores/config'
@@ -20,7 +20,15 @@ const apiSecret = ref('')
 const baseUrl = ref('https://api.easicoin.io')
 const useWebsocket = ref(true)
 const tickerPollInterval = ref(1)
+const tradingDayTimezone = ref('Asia/Shanghai')
 const testing = ref(false)
+
+const timezoneOptions = [
+  { label: 'Asia/Shanghai (UTC+8)', value: 'Asia/Shanghai' },
+  { label: 'UTC', value: 'UTC' },
+  { label: 'America/New_York', value: 'America/New_York' },
+  { label: 'Europe/London', value: 'Europe/London' },
+]
 
 watch(
   () => props.show,
@@ -29,6 +37,7 @@ watch(
       baseUrl.value = 'https://api.easicoin.io'
       useWebsocket.value = configStore.config.useWebsocket
       tickerPollInterval.value = configStore.config.tickerPollInterval
+      tradingDayTimezone.value = configStore.config.tradingDayTimezone ?? 'Asia/Shanghai'
     }
   },
 )
@@ -48,6 +57,7 @@ async function saveConfigOnly(): Promise<void> {
       ...configStore.config,
       useWebsocket: useWebsocket.value,
       tickerPollInterval: Math.max(1, tickerPollInterval.value),
+      tradingDayTimezone: tradingDayTimezone.value,
     })
   }
 }
@@ -126,6 +136,9 @@ async function connect(): Promise<void> {
       </NFormItem>
       <NFormItem label="行情刷新间隔（秒）">
         <NInputNumber v-model:value="tickerPollInterval" :min="1" :step="1" style="width: 100%" />
+      </NFormItem>
+      <NFormItem label="交易日时区">
+        <NSelect v-model:value="tradingDayTimezone" :options="timezoneOptions" />
       </NFormItem>
     </NForm>
     <template #footer>

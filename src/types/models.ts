@@ -23,6 +23,7 @@ export interface AppConfig {
   riskMaxOrderQty: string
   riskMaxPriceDeviationPct: string
   riskMaxDailyOrders: number
+  tradingDayTimezone: string
 }
 
 export interface ApiCredential {
@@ -51,6 +52,8 @@ export interface Ticker {
   high24h: string
   low24h: string
   fundingRate: string
+  fundingRateUpdatedAt?: number
+  fundingRateError?: string
   nextFundingTime?: number
 }
 
@@ -91,10 +94,34 @@ export interface AccountSummary {
 
 export interface EnvironmentStatus {
   baseUrl: string
-  label: '正式' | '测试' | '未知'
+  label: '正式' | '开发' | '未知'
   reachable: boolean
   checkedAt: number
   error?: string
+}
+
+export type TimeSyncStatus = 'syncing' | 'synced' | 'failed' | 'localFallback'
+export type TimeSource = 'server' | 'local'
+
+export interface TimeSnapshot {
+  serverTimeMs: number
+  localTimeMs: number
+  offsetMs: number
+  syncStatus: TimeSyncStatus
+  source: TimeSource
+  lastSyncAt: number | null
+  lastAttemptAt: number | null
+  lastError: string | null
+}
+
+export interface DailyPnlSnapshot {
+  value: string
+  serverTime: number
+  updatedAt: number
+  recordCount: number
+  dayStart: number
+  dayEnd: number
+  timezone: string
 }
 
 export type OrderStatus =

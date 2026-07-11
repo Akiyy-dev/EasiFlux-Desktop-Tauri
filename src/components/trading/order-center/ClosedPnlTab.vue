@@ -91,7 +91,7 @@ watch(
 )
 
 function rowId(row: ClosedPnlRecord): string {
-  return `${row.symbol}:${row.closedTime}:${row.closedPnl}`
+  return row.id || `${row.symbol}:${row.closedTime}:${row.closedPnl}`
 }
 </script>
 

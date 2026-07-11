@@ -83,6 +83,9 @@ export const useMarketStore = defineStore('market', () => {
   }
 
   function setTicker(next: Ticker): void {
+    if (next.symbol && next.symbol !== activeSymbol.value) {
+      return
+    }
     ticker.value = next
   }
 
@@ -158,6 +161,8 @@ export const useMarketStore = defineStore('market', () => {
     }
     clearKlines()
     activeSymbol.value = symbol
+    ticker.value = null
+    depth.value = null
     try {
       await tauriInvoke('set_active_symbol', { symbol })
     } catch (error) {

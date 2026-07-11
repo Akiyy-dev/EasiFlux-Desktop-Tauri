@@ -13,7 +13,6 @@ import { useMarketStore } from '../../stores/market'
 const configStore = useConfigStore()
 const marketStore = useMarketStore()
 const { config } = storeToRefs(configStore)
-const { activeSymbol, klineInterval } = storeToRefs(marketStore)
 
 onMounted(() => {
   void marketStore.loadInstruments(config.value?.watchlistSymbols ?? [])
@@ -26,7 +25,7 @@ onMounted(() => {
 
     <div class="trading-main">
       <AppCard title="K 线" flush class="chart-panel">
-        <KlineChart :key="`${activeSymbol}-${klineInterval}`" />
+        <KlineChart />
       </AppCard>
 
       <AppCard title="深度" flush class="depth-panel">

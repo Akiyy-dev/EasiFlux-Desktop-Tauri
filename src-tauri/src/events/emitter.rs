@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter};
 
-use crate::models::account::Balance;
+use crate::models::account::AccountSummary;
 use crate::models::market::{Depth, Kline, Ticker};
-use crate::models::trading::{Order, Position};
+use crate::models::time::{DailyPnlSnapshot, TimeSnapshot};
+use crate::models::trading::{Order, Position, PrivatePanelsSnapshot};
 use crate::services::AnalyticsService;
+use crate::models::config::EnvironmentStatus;
 
 #[derive(Clone)]
 pub struct EventEmitter {
@@ -62,8 +64,28 @@ impl EventEmitter {
         });
     }
 
-    pub fn emit_balance(&self, balance: Balance) {
+    pub fn emit_balance(&self, balance: crate::models::account::Balance) {
         let _ = self.app.emit("balance:updated", &balance);
+    }
+
+    pub fn emit_time_updated(&self, snapshot: &TimeSnapshot) {
+        let _ = self.app.emit("time:updated", snapshot);
+    }
+
+    pub fn emit_account_snapshot(&self, snapshot: AccountSummary) {
+        let _ = self.app.emit("account:snapshot", &snapshot);
+    }
+
+    pub fn emit_private_panels_snapshot(&self, snapshot: PrivatePanelsSnapshot) {
+        let _ = self.app.emit("private-panels:snapshot", &snapshot);
+    }
+
+    pub fn emit_daily_pnl_updated(&self, snapshot: &DailyPnlSnapshot) {
+        let _ = self.app.emit("daily-pnl:updated", snapshot);
+    }
+
+    pub fn emit_environment_updated(&self, status: &EnvironmentStatus) {
+        let _ = self.app.emit("environment:updated", status);
     }
 
     pub fn emit_error(&self, message: &str) {

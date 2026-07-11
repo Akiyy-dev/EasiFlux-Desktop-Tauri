@@ -2,12 +2,8 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type { Position } from '../types/models'
-import { normalizePosition, normalizePositions } from '../utils/position'
+import { normalizePosition, normalizePositions, positionKey } from '../utils/position'
 import { useAsyncState } from '../composables/useAsyncState'
-
-function positionKey(position: Position): string {
-  return `${position.symbol}:${position.positionIdx ?? 0}`
-}
 
 export const usePositionStore = defineStore('position', () => {
   const positions = ref<Position[]>([])
@@ -29,7 +25,7 @@ export const usePositionStore = defineStore('position', () => {
   }
 
   function setPositions(next: Position[]): void {
-    positions.value = next
+    positions.value = normalizePositions(next)
   }
 
   async function refreshPositions(symbol?: string): Promise<void> {

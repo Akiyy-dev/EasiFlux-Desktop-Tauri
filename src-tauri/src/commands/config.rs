@@ -12,6 +12,10 @@ pub async fn get_config(state: State<'_, AppState>) -> AppResult<AppConfig> {
 
 #[tauri::command]
 pub async fn save_config(state: State<'_, AppState>, config: AppConfig) -> AppResult<()> {
+    let timezone_changed = {
+        let current = state.config.read().await;
+        current.trading_day_timezone != config.trading_day_timezone
+    };
     state.config_store.save(&config)?;
     *state.config.write().await = config.clone();
     state
@@ -19,6 +23,12 @@ pub async fn save_config(state: State<'_, AppState>, config: AppConfig) -> AppRe
         .write()
         .await
         .update_config(RiskConfig::from(&config));
+    if timezone_changed {
+        let _ = state
+            .scheduler
+            .run_now(crate::services::scheduler::TaskId::DailyPnl, true)
+            .await;
+    }
     Ok(())
 }
 

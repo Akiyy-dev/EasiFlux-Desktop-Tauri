@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +43,8 @@ pub struct WsManager {
     active_symbol: Arc<RwLock<String>>,
     public_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     private_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    last_public_message_at: Arc<AtomicU64>,
+    last_private_message_at: Arc<AtomicU64>,
 }
 
 impl WsManager {
@@ -61,6 +63,8 @@ impl WsManager {
             active_symbol: Arc::new(RwLock::new(String::new())),
             public_task: Arc::new(Mutex::new(None)),
             private_task: Arc::new(Mutex::new(None)),
+            last_public_message_at: Arc::new(AtomicU64::new(0)),
+            last_private_message_at: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -88,6 +92,44 @@ impl WsManager {
 
     pub fn is_public_connected(&self) -> bool {
         self.public_connected.load(Ordering::Relaxed)
+    }
+
+    pub fn is_private_connected(&self) -> bool {
+        self.private_connected.load(Ordering::Relaxed)
+    }
+
+    fn is_channel_fresh(&self, last_message_at: &AtomicU64, stale_ms: u64, connected: bool) -> bool {
+        let last = last_message_at.load(Ordering::Relaxed);
+        if last == 0 {
+            // Connected but no push yet: trust WS during warmup instead of REST storm.
+            return connected;
+        }
+        let now = self.time_sync.local_timestamp_ms();
+        now.saturating_sub(last) <= stale_ms
+    }
+
+    pub fn is_public_healthy(&self, stale_ms: u64) -> bool {
+        let connected = self.is_public_connected();
+        connected && self.is_channel_fresh(&self.last_public_message_at, stale_ms, connected)
+    }
+
+    pub fn is_private_healthy(&self, stale_ms: u64) -> bool {
+        let connected = self.is_private_connected();
+        connected && self.is_channel_fresh(&self.last_private_message_at, stale_ms, connected)
+    }
+
+    fn touch_public_message(&self) {
+        self.last_public_message_at.store(
+            self.time_sync.local_timestamp_ms(),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn touch_private_message(&self) {
+        self.last_private_message_at.store(
+            self.time_sync.local_timestamp_ms(),
+            Ordering::Relaxed,
+        );
     }
 
     pub async fn subscribe_all(&self, symbol: &str, kline_interval: &str) {
@@ -133,6 +175,7 @@ impl WsManager {
         let public_connected = self.public_connected.clone();
         let private_connected = self.private_connected.clone();
         let subscriptions = self.subscriptions.clone();
+        let last_public_message_at = self.last_public_message_at.clone();
 
         if !public_topics.is_empty() {
             let emitter_p = emitter.clone();
@@ -141,8 +184,9 @@ impl WsManager {
             let pc = public_connected.clone();
             let sym = symbol_owned.clone();
             let subs = subscriptions.clone();
+            let last_msg = last_public_message_at.clone();
             let handle = tauri::async_runtime::spawn(async move {
-                run_public_loop(ws_public, subs, sym, emitter_p, market_p, running_p, pc).await;
+                run_public_loop(ws_public, subs, sym, emitter_p, market_p, running_p, pc, last_msg).await;
             });
             *self.public_task.lock().await = Some(handle);
         }
@@ -155,6 +199,7 @@ impl WsManager {
                 let prc = private_connected.clone();
                 let sym = symbol_owned.clone();
                 let subs = subscriptions.clone();
+                let last_msg = self.last_private_message_at.clone();
                 let handle = tauri::async_runtime::spawn(async move {
                     run_private_loop(
                         ws_private,
@@ -166,6 +211,7 @@ impl WsManager {
                         market_pr,
                         running_pr,
                         prc,
+                        last_msg,
                     )
                     .await;
                 });
@@ -197,6 +243,7 @@ async fn run_public_loop(
     market: Option<Arc<MarketService>>,
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    last_message_at: Arc<AtomicU64>,
 ) {
     while running.load(Ordering::Relaxed) {
         let topics = topic_snapshot(&subscriptions, false).await;
@@ -204,7 +251,17 @@ async fn run_public_loop(
             tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
             continue;
         }
-        match run_public_session(&url, &topics, &symbol, &emitter, market.as_ref(), &running, &connected).await {
+        match run_public_session(
+            &url,
+            &topics,
+            &symbol,
+            &emitter,
+            market.as_ref(),
+            &running,
+            &connected,
+            &last_message_at,
+        )
+        .await {
             Ok(()) => connected.store(false, Ordering::Relaxed),
             Err(e) => {
                 connected.store(false, Ordering::Relaxed);
@@ -230,6 +287,7 @@ async fn run_private_loop(
     market: Option<Arc<MarketService>>,
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    last_message_at: Arc<AtomicU64>,
 ) {
     while running.load(Ordering::Relaxed) {
         let topics = topic_snapshot(&subscriptions, true).await;
@@ -247,6 +305,7 @@ async fn run_private_loop(
             market.as_ref(),
             &running,
             &connected,
+            &last_message_at,
         )
         .await
         {
@@ -273,6 +332,7 @@ async fn run_public_session(
     market: Option<&Arc<MarketService>>,
     running: &Arc<AtomicBool>,
     connected: &Arc<AtomicBool>,
+    last_message_at: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
     let (mut write, mut read) = stream.split();
@@ -280,9 +340,6 @@ async fn run_public_session(
     emitter.emit_websocket("connected");
 
     if let Some(market) = market {
-        if let Err(e) = market.refresh_snapshot(symbol).await {
-            tracing::warn!("Public WS snapshot refresh failed: {}", e);
-        }
         let interval = market.kline_interval().await;
         market.schedule_kline_backfill(symbol, &interval);
     }
@@ -307,7 +364,7 @@ async fn run_public_session(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            handle_message(&value, symbol, emitter, market);
+                            handle_message(&value, symbol, emitter, market, Some(last_message_at));
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return Err("closed".into()),
@@ -329,17 +386,12 @@ async fn run_private_session(
     market: Option<&Arc<MarketService>>,
     running: &Arc<AtomicBool>,
     connected: &Arc<AtomicBool>,
+    last_message_at: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
     let (mut write, mut read) = stream.split();
     connected.store(true, Ordering::Relaxed);
     emitter.emit_websocket("connected");
-
-    if let Some(market) = market {
-        if let Err(e) = market.refresh_snapshot(symbol).await {
-            tracing::warn!("Private WS snapshot refresh failed: {}", e);
-        }
-    }
 
     let expires = default_auth_expires_ms(time_sync.timestamp_ms());
     write
@@ -371,7 +423,7 @@ async fn run_private_session(
                             if value.get("op").and_then(|v| v.as_str()) == Some("auth") {
                                 continue;
                             }
-                            handle_message(&value, symbol, emitter, market);
+                            handle_message(&value, symbol, emitter, market, Some(last_message_at));
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return Err("closed".into()),
@@ -388,7 +440,18 @@ fn handle_message(
     symbol: &str,
     emitter: &EventEmitter,
     market: Option<&Arc<MarketService>>,
+    last_message_at: Option<&Arc<AtomicU64>>,
 ) {
+    if let Some(last) = last_message_at {
+        last.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            Ordering::Relaxed,
+        );
+    }
+
     let topic = message
         .get("topic")
         .or_else(|| message.get("channel"))

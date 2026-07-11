@@ -8,6 +8,6 @@ describe('resolveApiEnvironmentLabel', () => {
   })
 
   it('detects non-production api host', () => {
-    expect(resolveApiEnvironmentLabel('https://test-api.example.com')).toBe('测试')
+    expect(resolveApiEnvironmentLabel('https://test-api.example.com')).toBe('开发')
   })
 })

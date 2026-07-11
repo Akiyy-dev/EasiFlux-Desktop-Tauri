@@ -10,7 +10,7 @@ mod state;
 mod storage;
 mod ws;
 
-use tauri::Manager;
+use tauri::{Manager, RunEvent};
 
 use commands::*;
 use state::AppState;
@@ -26,6 +26,7 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             let state = AppState::new(handle.clone())?;
+            let scheduler = state.scheduler.clone();
             app.manage(state);
 
             let emitter = {
@@ -33,6 +34,10 @@ pub fn run() {
                 state.emitter.clone()
             };
             emitter.emit_app_ready(&handle.package_info().version.to_string());
+
+            tauri::async_runtime::spawn(async move {
+                scheduler.start().await;
+            });
 
             if let Some(window) = app.get_webview_window("main") {
                 let state: tauri::State<AppState> = app.state();
@@ -50,7 +55,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ping,
             get_version,
+            get_server_time,
+            get_time_snapshot,
+            sync_time_now,
             get_environment_status,
+            scheduler_run_task,
             get_config,
             save_config,
             save_credentials,
@@ -63,6 +72,7 @@ pub fn run() {
             set_active_symbol,
             set_kline_interval,
             refresh_market,
+            refresh_funding_rate,
             fetch_ticker,
             fetch_depth,
             fetch_klines,
@@ -102,6 +112,14 @@ pub fn run() {
             refresh_order_history,
             refresh_private_panels,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                let state: tauri::State<AppState> = app.state();
+                tauri::async_runtime::block_on(async {
+                    state.scheduler.stop().await;
+                });
+            }
+        });
 }

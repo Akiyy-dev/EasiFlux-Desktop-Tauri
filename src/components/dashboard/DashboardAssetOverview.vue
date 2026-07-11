@@ -10,7 +10,7 @@ import { formatMetric, pnlToneClass, sumUnrealisedPnl } from '../../utils/dashbo
 const accountStore = useAccountStore()
 const positionStore = usePositionStore()
 
-const { summary } = storeToRefs(accountStore)
+const { summary, dailyPnl, dailyPnlLoading, dailyPnlError } = storeToRefs(accountStore)
 const { positions } = storeToRefs(positionStore)
 
 const usdtBalance = computed(() =>
@@ -20,6 +20,12 @@ const usdtBalance = computed(() =>
 const marginBalance = computed(() => usdtBalance.value?.frozen ?? summary.value?.balances[0]?.frozen)
 const unrealisedPnl = computed(() => sumUnrealisedPnl(positions.value))
 const unrealisedClass = computed(() => pnlToneClass(unrealisedPnl.value))
+const todayPnl = computed(() => {
+  if (dailyPnlLoading.value && dailyPnl.value.data == null) return '加载中'
+  if (dailyPnlError.value) return '获取失败'
+  return `${dailyPnl.value.data?.value ?? '0.0000'} USDT`
+})
+const todayPnlClass = computed(() => pnlToneClass(dailyPnl.value.data?.value ?? '0'))
 </script>
 
 <template>
@@ -29,10 +35,14 @@ const unrealisedClass = computed(() => pnlToneClass(unrealisedPnl.value))
         label="总资产"
         :value="formatMetric(summary?.totalEquity, 'USDT')"
       />
-      <DashboardMetricTile label="今日盈亏" value="--" />
+      <DashboardMetricTile
+        label="今日盈亏"
+        :value="todayPnl"
+        :value-class="todayPnlClass"
+      />
       <DashboardMetricTile
         label="未实现盈亏"
-        :value="unrealisedPnl === '--' ? '--' : `${unrealisedPnl} USDT`"
+        :value="`${unrealisedPnl} USDT`"
         :value-class="unrealisedClass"
       />
       <DashboardMetricTile label="持仓数量" :value="String(positions.length)" />

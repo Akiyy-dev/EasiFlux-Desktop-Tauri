@@ -11,6 +11,7 @@ export interface TradeFill {
 }
 
 export interface ClosedPnlRecord {
+  id: string
   symbol: string
   side: string
   closedPnl: string
@@ -53,7 +54,20 @@ export function parseClosedPnlRecords(payload: unknown): ClosedPnlRecord[] {
       if (!symbol) {
         return null
       }
+      const closedTime = normalizeTimestampMs(
+        readRecordNumber(item, 'closedTime', 'closed_time', 'updatedTime', 'time', 'timestamp'),
+      )
       return {
+        id: readRecordString(
+          item,
+          'closedPnlId',
+          'closed_pnl_id',
+          'orderId',
+          'order_id',
+          'execId',
+          'exec_id',
+          'id',
+        ),
         symbol,
         side: readRecordString(item, 'side'),
         closedPnl:
@@ -67,8 +81,15 @@ export function parseClosedPnlRecords(payload: unknown): ClosedPnlRecord[] {
         avgExitPrice:
           readRecordString(item, 'avgExitPrice', 'avg_exit_price', 'exitPrice', 'exit_price') ||
           '0',
-        closedTime: readRecordNumber(item, 'closedTime', 'closed_time', 'updatedTime', 'time'),
+        closedTime,
       }
     })
     .filter((item): item is ClosedPnlRecord => item !== null)
+}
+
+function normalizeTimestampMs(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0
+  }
+  return value < 10_000_000_000 ? value * 1000 : value
 }

@@ -1,13 +1,19 @@
 pub mod account;
 pub mod analytics;
 pub mod connection;
+pub mod daily_pnl;
 pub mod market;
 pub mod risk;
+pub mod scheduler;
+pub mod time;
 pub mod trading;
 
 pub use account::AccountService;
 pub use analytics::AnalyticsService;
 pub use connection::ConnectionService;
+pub use daily_pnl::DailyPnlService;
 pub use market::MarketService;
 pub use risk::RiskService;
+pub use scheduler::SchedulerService;
+pub use time::TimeService;
 pub use trading::TradingService;

@@ -13,6 +13,8 @@ pub struct Ticker {
     pub high_24h: String,
     pub low_24h: String,
     pub funding_rate: String,
+    pub funding_rate_updated_at: Option<u64>,
+    pub funding_rate_error: Option<String>,
     pub next_funding_time: Option<i64>,
 }
 
@@ -29,6 +31,8 @@ impl Default for Ticker {
             high_24h: String::new(),
             low_24h: String::new(),
             funding_rate: String::new(),
+            funding_rate_updated_at: None,
+            funding_rate_error: None,
             next_funding_time: None,
         }
     }

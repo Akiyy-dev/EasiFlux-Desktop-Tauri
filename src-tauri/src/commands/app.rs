@@ -1,46 +1,15 @@
 use tauri::{AppHandle, State};
 
-use crate::api::{ApiClient, PublicApi};
 use crate::error::AppResult;
-use crate::models::config::{normalize_account_id, DEFAULT_BASE_URL};
+use crate::models::config::EnvironmentStatus;
+use crate::models::time::TimeSnapshot;
 use crate::state::AppState;
-use crate::storage::CredentialStore;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PingResponse {
     pub message: String,
     pub version: String,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnvironmentStatus {
-    pub base_url: String,
-    pub label: String,
-    pub reachable: bool,
-    pub checked_at: u64,
-    pub error: Option<String>,
-}
-
-fn environment_label(base_url: &str) -> &'static str {
-    match url::Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_string()))
-        .as_deref()
-    {
-        Some("api.easicoin.io") => "正式",
-        Some(_) => "测试",
-        None if base_url.contains("api.easicoin.io") => "正式",
-        None => "未知",
-    }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn app_version(app: &AppHandle) -> String {
@@ -61,44 +30,34 @@ pub fn get_version(app: AppHandle) -> String {
 }
 
 #[tauri::command]
+pub async fn get_server_time(state: State<'_, AppState>) -> AppResult<u64> {
+    let snapshot = state.time.sync().await?;
+    Ok(snapshot.server_time_ms)
+}
+
+#[tauri::command]
+pub async fn get_time_snapshot(state: State<'_, AppState>) -> AppResult<TimeSnapshot> {
+    Ok(state.time.snapshot().await)
+}
+
+#[tauri::command]
+pub async fn sync_time_now(state: State<'_, AppState>) -> AppResult<TimeSnapshot> {
+    state.time.sync().await
+}
+
+#[tauri::command]
 pub async fn get_environment_status(state: State<'_, AppState>) -> AppResult<EnvironmentStatus> {
-    let active_account_id = {
-        let config = state.config.read().await;
-        normalize_account_id(&config.active_account_id)
-    };
-    let credential = CredentialStore::load(&active_account_id)?;
-    let base_url = if let Some(credential) = credential.as_ref() {
-        credential.base_url.clone()
-    } else {
-        state.api.base_url().await
-    };
-    let base_url = if base_url.trim().is_empty() {
-        DEFAULT_BASE_URL.to_string()
-    } else {
-        base_url
-    };
-    let probe_client;
-    let client: &ApiClient = if let Some(credential) = credential {
-        probe_client = ApiClient::new();
-        probe_client.set_credential(credential).await;
-        &probe_client
-    } else {
-        state.api.as_ref()
-    };
-    match PublicApi::server_time(client).await {
-        Ok(_) => Ok(EnvironmentStatus {
-            label: environment_label(&base_url).to_string(),
-            base_url,
-            reachable: true,
-            checked_at: now_ms(),
-            error: None,
-        }),
-        Err(error) => Ok(EnvironmentStatus {
-            label: environment_label(&base_url).to_string(),
-            base_url,
-            reachable: false,
-            checked_at: now_ms(),
-            error: Some(error.user_message()),
-        }),
-    }
+    state.scheduler.run_now(crate::services::scheduler::TaskId::Environment, true).await?;
+    Ok(state.environment_status.read().await.clone())
+}
+
+#[tauri::command]
+pub async fn scheduler_run_task(
+    state: State<'_, AppState>,
+    task: String,
+    force: Option<bool>,
+) -> AppResult<()> {
+    let task_id = crate::services::scheduler::TaskId::from_name(&task)
+        .ok_or_else(|| crate::error::AppError::Internal(format!("未知调度任务: {task}")))?;
+    state.scheduler.run_now(task_id, force.unwrap_or(false)).await
 }

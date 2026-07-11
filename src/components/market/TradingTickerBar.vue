@@ -1,17 +1,19 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
 import AppCard from '../ui/AppCard.vue'
 import MonoValue from '../ui/MonoValue.vue'
 import { useMarketStore } from '../../stores/market'
+import { useTimeStore } from '../../stores/time'
 import { change24hPctValue, formatChange24hPct } from '../../utils/ticker'
+import { formatClockTime } from '../../utils/time'
 import SymbolSelector from '../trading/SymbolSelector.vue'
 import TickerMetric from './TickerMetric.vue'
 
 const marketStore = useMarketStore()
+const timeStore = useTimeStore()
 const { ticker } = storeToRefs(marketStore)
-const now = ref(Date.now())
-let clockTimer: ReturnType<typeof globalThis.setInterval> | null = null
+const { serverNow } = storeToRefs(timeStore)
 
 const formattedChange = computed(() => formatChange24hPct(ticker.value?.change24hPct))
 
@@ -37,29 +39,23 @@ const formattedFundingRate = computed(() => {
   return `${(value * 100).toFixed(4)}%`
 })
 
+const fundingRateDetail = computed(() => {
+  const updated = ticker.value?.fundingRateUpdatedAt
+    ? formatClockTime(ticker.value.fundingRateUpdatedAt)
+    : '尚未更新'
+  return ticker.value?.fundingRateError ? `获取失败 · ${updated}` : `更新于 ${updated}`
+})
+
 const fundingCountdown = computed(() => {
   const next = ticker.value?.nextFundingTime
-  if (!next || next <= now.value) {
+  if (!next || next <= serverNow.value) {
     return '--:--:--'
   }
-  const totalSeconds = Math.floor((next - now.value) / 1000)
+  const totalSeconds = Math.floor((next - serverNow.value) / 1000)
   const hours = Math.floor(totalSeconds / 3600)
   const minutes = Math.floor((totalSeconds % 3600) / 60)
   const seconds = totalSeconds % 60
   return [hours, minutes, seconds].map((part) => String(part).padStart(2, '0')).join(':')
-})
-
-onMounted(() => {
-  clockTimer = globalThis.setInterval(() => {
-    now.value = Date.now()
-  }, 1000)
-})
-
-onUnmounted(() => {
-  if (clockTimer) {
-    globalThis.clearInterval(clockTimer)
-    clockTimer = null
-  }
 })
 </script>
 
@@ -82,7 +78,12 @@ onUnmounted(() => {
         <TickerMetric label="24h 最高" :value="displayValue(ticker?.high24h)" />
         <TickerMetric label="24h 最低" :value="displayValue(ticker?.low24h)" />
         <TickerMetric label="成交额" :value="displayValue(ticker?.volume24h)" />
-        <TickerMetric label="资金费率" :value="formattedFundingRate" />
+        <TickerMetric
+          label="当前资金费率"
+          :value="formattedFundingRate"
+          :detail="fundingRateDetail"
+          :detail-class="ticker?.fundingRateError ? 'error' : ''"
+        />
         <TickerMetric label="费率倒计时" :value="fundingCountdown" />
       </div>
     </div>

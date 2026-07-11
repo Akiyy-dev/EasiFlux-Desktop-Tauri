@@ -1,5 +1,4 @@
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromStr;

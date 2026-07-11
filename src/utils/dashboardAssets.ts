@@ -1,14 +1,11 @@
 import type { Position } from '../types/models'
+import { normalizePositions } from './position'
 
 export function sumUnrealisedPnl(positions: Position[]): string {
-  const total = positions
+  const total = normalizePositions(positions)
     .map((position) => Number.parseFloat(position.unrealisedPnl))
     .filter((value) => Number.isFinite(value))
     .reduce((sum, value) => sum + value, 0)
-
-  if (positions.length === 0) {
-    return '--'
-  }
 
   return total.toFixed(4)
 }

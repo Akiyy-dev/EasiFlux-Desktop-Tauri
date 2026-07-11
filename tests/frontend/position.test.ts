@@ -31,4 +31,24 @@ describe('normalizePositions', () => {
       positionIdx: 1,
     })
   })
+
+  it('keeps only the latest snapshot row for a duplicate position key', () => {
+    const positions = normalizePositions([
+      {
+        symbol: 'BTCUSDT',
+        positionIdx: 1,
+        size: '0.1',
+        unrealisedPnl: '10',
+      },
+      {
+        symbol: 'BTCUSDT',
+        positionIdx: 1,
+        size: '0.1',
+        unrealisedPnl: '12',
+      },
+    ])
+
+    expect(positions).toHaveLength(1)
+    expect(positions[0]?.unrealisedPnl).toBe('12')
+  })
 })

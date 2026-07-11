@@ -1,46 +1,21 @@
-import { refreshPrivatePanels } from '../stores/privatePanels'
-import { useAccountStore } from '../stores/account'
-import { useAppStore } from '../stores/app'
-import { useConfigStore } from '../stores/config'
+import { tauriInvoke } from '../composables/useTauriCommand'
 import { useLogStore } from '../stores/log'
-import { useMarketStore } from '../stores/market'
 
-export type SyncTaskName = 'market' | 'account' | 'privatePanels' | 'environment'
+export type SyncTaskName =
+  | 'market'
+  | 'account'
+  | 'privatePanels'
+  | 'environment'
+  | 'dailyPnl'
 
-type SyncTask = {
-  label: string
-  run: () => Promise<void>
+const TASK_LABELS: Record<SyncTaskName, string> = {
+  market: '行情',
+  account: '账户',
+  privatePanels: '订单/持仓',
+  environment: '环境',
+  dailyPnl: '今日盈亏',
 }
 
-const tasks: Record<SyncTaskName, SyncTask> = {
-  market: {
-    label: '行情',
-    run: async () => {
-      await useMarketStore().refreshMarket()
-    },
-  },
-  account: {
-    label: '账户',
-    run: async () => {
-      await useAccountStore().refreshAccount()
-    },
-  },
-  privatePanels: {
-    label: '订单/持仓',
-    run: async () => {
-      await refreshPrivatePanels()
-    },
-  },
-  environment: {
-    label: '环境',
-    run: async () => {
-      await useAppStore().refreshEnvironment()
-    },
-  },
-}
-
-let syncTimer: ReturnType<typeof globalThis.setInterval> | null = null
-let syncing = false
 const inFlight = new Set<SyncTaskName>()
 
 function formatError(error: unknown): string {
@@ -49,57 +24,34 @@ function formatError(error: unknown): string {
   return '同步失败'
 }
 
-function intervalMs(): number {
-  const seconds = useConfigStore().config?.tickerPollInterval ?? 1
-  return Math.max(1, seconds) * 1000
-}
-
 export function syncRunning(): boolean {
-  return syncTimer != null
+  return false
 }
 
-export async function refreshSyncTask(name: SyncTaskName): Promise<void> {
+export async function refreshSyncTask(name: SyncTaskName, force = false): Promise<void> {
   if (inFlight.has(name)) {
     return
   }
   inFlight.add(name)
-  const task = tasks[name]
   try {
-    await task.run()
+    await tauriInvoke('scheduler_run_task', { task: name, force })
   } catch (error) {
-    useLogStore().setError(`${task.label}刷新失败: ${formatError(error)}`)
+    useLogStore().setError(`${TASK_LABELS[name]}刷新失败: ${formatError(error)}`)
   } finally {
     inFlight.delete(name)
   }
 }
 
-export async function refreshAllSyncTasks(): Promise<void> {
-  if (syncing) {
-    return
-  }
-  syncing = true
-  try {
-    for (const name of Object.keys(tasks) as SyncTaskName[]) {
-      await refreshSyncTask(name)
-    }
-  } finally {
-    syncing = false
+export async function refreshAllSyncTasks(force = false): Promise<void> {
+  for (const name of Object.keys(TASK_LABELS) as SyncTaskName[]) {
+    await refreshSyncTask(name, force)
   }
 }
 
 export function startDataSync(): void {
-  stopDataSync()
-  void refreshAllSyncTasks()
-  syncTimer = globalThis.setInterval(() => {
-    void refreshAllSyncTasks()
-  }, intervalMs())
+  // Scheduler runs in Rust; frontend only bridges force refresh.
 }
 
 export function stopDataSync(): void {
-  if (syncTimer) {
-    globalThis.clearInterval(syncTimer)
-    syncTimer = null
-  }
-  syncing = false
   inFlight.clear()
 }

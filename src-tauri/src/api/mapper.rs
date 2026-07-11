@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -61,7 +61,8 @@ const TICKER_VOLUME_KEYS: &[&str] = &["volume24h", "volume_24h", "volume", "v"];
 const TICKER_MARK_KEYS: &[&str] = &["markPrice", "mark_price", "mark", "mp"];
 const TICKER_HIGH_24H_KEYS: &[&str] = &["high24h", "high_24h", "highPrice24h", "high_price_24h", "h"];
 const TICKER_LOW_24H_KEYS: &[&str] = &["low24h", "low_24h", "lowPrice24h", "low_price_24h", "l"];
-const TICKER_FUNDING_RATE_KEYS: &[&str] = &["fundingRate", "funding_rate", "fr"];
+const TICKER_FUNDING_RATE_KEYS: &[&str] = &["fundingRate", "funding_rate"];
+const MAX_ABS_FUNDING_RATE: f64 = 0.05;
 const TICKER_NEXT_FUNDING_KEYS: &[&str] = &[
     "nextFundingTime",
     "next_funding_time",
@@ -115,6 +116,16 @@ fn pick_ticker_field(base: &str, parsed: &str, value: &Value, keys: &[&str]) -> 
     }
 }
 
+fn parse_funding_rate(value: &Value) -> Option<String> {
+    let raw = get_str(value, TICKER_FUNDING_RATE_KEYS)?;
+    let parsed = raw.parse::<f64>().ok()?;
+    if !parsed.is_finite() || parsed.abs() > MAX_ABS_FUNDING_RATE {
+        tracing::warn!("Discarding out-of-range funding rate: {}", raw);
+        return None;
+    }
+    Some(raw)
+}
+
 pub fn parse_ticker(value: &Value, symbol: &str) -> Ticker {
     let last_price = get_str(value, TICKER_LAST_KEYS).unwrap_or_else(|| "0".into());
     Ticker {
@@ -127,7 +138,9 @@ pub fn parse_ticker(value: &Value, symbol: &str) -> Ticker {
         mark_price: get_str(value, TICKER_MARK_KEYS).unwrap_or_default(),
         high_24h: get_str(value, TICKER_HIGH_24H_KEYS).unwrap_or_default(),
         low_24h: get_str(value, TICKER_LOW_24H_KEYS).unwrap_or_default(),
-        funding_rate: get_str(value, TICKER_FUNDING_RATE_KEYS).unwrap_or_default(),
+        funding_rate: parse_funding_rate(value).unwrap_or_default(),
+        funding_rate_updated_at: None,
+        funding_rate_error: None,
         next_funding_time: TICKER_NEXT_FUNDING_KEYS
             .iter()
             .find_map(|key| value.get(*key).and_then(parse_i64_value))
@@ -171,12 +184,9 @@ pub fn merge_ticker(existing: Option<&Ticker>, value: &Value, symbol: &str) -> T
         mark_price: pick_ticker_field(&base.mark_price, &delta.mark_price, value, TICKER_MARK_KEYS),
         high_24h: pick_ticker_field(&base.high_24h, &delta.high_24h, value, TICKER_HIGH_24H_KEYS),
         low_24h: pick_ticker_field(&base.low_24h, &delta.low_24h, value, TICKER_LOW_24H_KEYS),
-        funding_rate: pick_ticker_field(
-            &base.funding_rate,
-            &delta.funding_rate,
-            value,
-            TICKER_FUNDING_RATE_KEYS,
-        ),
+        funding_rate: parse_funding_rate(value).unwrap_or_else(|| base.funding_rate.clone()),
+        funding_rate_updated_at: base.funding_rate_updated_at,
+        funding_rate_error: base.funding_rate_error.clone(),
         next_funding_time: if get_str(value, TICKER_NEXT_FUNDING_KEYS).is_some() {
             delta.next_funding_time
         } else {
@@ -354,11 +364,18 @@ pub fn parse_position(value: &Value) -> Position {
 }
 
 pub fn parse_positions(payload: &Value) -> Vec<Position> {
-    extract_list(payload)
-        .iter()
-        .map(|v| parse_position(v))
-        .filter(|p| !is_zero_size(&p.size))
-        .collect()
+    let mut unique = BTreeMap::new();
+    for value in extract_list(payload) {
+        let position = parse_position(value);
+        if position.symbol.is_empty() || is_zero_size(&position.size) {
+            continue;
+        }
+        unique.insert(
+            format!("{}:{}", position.symbol, position.position_idx),
+            position,
+        );
+    }
+    unique.into_values().collect()
 }
 
 pub fn parse_balance(value: &Value) -> Balance {
@@ -604,6 +621,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_ticker_rejects_funding_rate_alias_and_outlier() {
+        let alias = parse_ticker(&json!({"symbol": "BTCUSDT", "fr": "120"}), "BTCUSDT");
+        assert!(alias.funding_rate.is_empty());
+
+        let outlier = parse_ticker(
+            &json!({"symbol": "BTCUSDT", "fundingRate": "12"}),
+            "BTCUSDT",
+        );
+        assert!(outlier.funding_rate.is_empty());
+
+        let valid = parse_ticker(
+            &json!({"symbol": "BTCUSDT", "fundingRate": "0.0001"}),
+            "BTCUSDT",
+        );
+        assert_eq!(valid.funding_rate, "0.0001");
+    }
+
+    #[test]
     fn merge_ticker_applies_ws_pp_delta() {
         let base = Ticker {
             symbol: "BTCUSDT".into(),
@@ -771,6 +806,20 @@ mod tests {
         }));
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].symbol, "BTCUSDT");
+    }
+
+    #[test]
+    fn parse_positions_deduplicates_by_symbol_and_position_idx() {
+        let positions = parse_positions(&json!({
+            "data": {
+                "list": [
+                    {"symbol": "BTCUSDT", "positionIdx": 1, "size": "0.01", "unrealisedPnl": "1"},
+                    {"symbol": "BTCUSDT", "positionIdx": 1, "size": "0.01", "unrealisedPnl": "2"}
+                ]
+            }
+        }));
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].unrealised_pnl, "2");
     }
 
     #[test]
