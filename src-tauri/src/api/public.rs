@@ -31,8 +31,14 @@ impl PublicApi {
         params.insert("symbol".into(), symbol.into());
         let payload = client.public_get(endpoints::TICKER, params).await?;
         let items = extract_list(&payload);
-        if let Some(first) = items.first() {
-            return Ok(parse_ticker(first, symbol));
+        if let Some(item) = items.iter().find(|item| {
+            super::response::get_str(item, &["symbol", "s"])
+                .is_some_and(|value| value.eq_ignore_ascii_case(symbol))
+        }) {
+            return Ok(parse_ticker(item, symbol));
+        }
+        if let Some(item) = items.first() {
+            return Ok(parse_ticker(item, symbol));
         }
         Ok(parse_ticker(super::response::extract_data(&payload), symbol))
     }

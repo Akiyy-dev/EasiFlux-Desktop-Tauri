@@ -60,6 +60,14 @@ impl TradingService {
     }
 
     pub async fn refresh_orders(&self, symbol: Option<&str>) -> AppResult<Vec<Order>> {
+        let orders = self.fetch_open_orders(symbol).await?;
+        for order in &orders {
+            self.emitter.emit_order(order.clone());
+        }
+        Ok(orders)
+    }
+
+    pub async fn fetch_open_orders(&self, symbol: Option<&str>) -> AppResult<Vec<Order>> {
         let params = build_order_query_params(
             symbol,
             None,
@@ -82,9 +90,6 @@ impl TradingService {
             orders.len(),
         );
         warn_if_raw_parsed_mismatch(&self.emitter, "activity-orders", &meta, orders.len());
-        for order in &orders {
-            self.emitter.emit_order(order.clone());
-        }
         Ok(orders)
     }
 
@@ -93,7 +98,14 @@ impl TradingService {
         symbol: Option<&str>,
         limit: Option<u32>,
     ) -> AppResult<Vec<Order>> {
-        let orders = PrivateApi::order_history(&self.api, symbol, limit).await?;
-        Ok(orders)
+        self.fetch_order_history(symbol, limit).await
+    }
+
+    pub async fn fetch_order_history(
+        &self,
+        symbol: Option<&str>,
+        limit: Option<u32>,
+    ) -> AppResult<Vec<Order>> {
+        PrivateApi::order_history(&self.api, symbol, limit).await
     }
 }

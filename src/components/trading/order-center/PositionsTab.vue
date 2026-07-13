@@ -6,6 +6,7 @@ import TanstackDataTable from '../../common/TanstackDataTable.vue'
 import { useOrderCenterRefresh } from '../../../composables/useOrderCenterRefresh'
 import { usePositionStore } from '../../../stores/position'
 import type { Position } from '../../../types/models'
+import { positionRoiPct } from '../../../utils/position'
 
 const props = defineProps<{
   active: boolean
@@ -28,6 +29,16 @@ const columns = [
     enableSorting: true,
     cell: (info) => {
       const value = info.getValue()
+      const num = Number.parseFloat(value)
+      const cls = num > 0 ? 'text-up' : num < 0 ? 'text-down' : ''
+      return h('span', { class: cls }, value)
+    },
+  }),
+  columnHelper.display({
+    id: 'roi',
+    header: '收益率',
+    cell: (info) => {
+      const value = positionRoiPct(info.row.original)
       const num = Number.parseFloat(value)
       const cls = num > 0 ? 'text-up' : num < 0 ? 'text-down' : ''
       return h('span', { class: cls }, value)

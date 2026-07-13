@@ -28,3 +28,4 @@ tmp
 # Local-only (not pushed)
 AGENTS.md
 .cursor/
+Dev-Doc/

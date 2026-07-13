@@ -5,14 +5,16 @@ import { Wifi } from 'lucide-vue-next'
 import AppCard from '../ui/AppCard.vue'
 import AppIcon from '../ui/AppIcon.vue'
 import MonoValue from '../ui/MonoValue.vue'
+import DashboardDevTimeBar from './DashboardDevTimeBar.vue'
+import { useAppStore } from '../../stores/app'
 import { useConnectionStore } from '../../stores/connection'
 
-const props = defineProps<{
-  version: string
-}>()
-
+const appStore = useAppStore()
 const connectionStore = useConnectionStore()
+const { version, environment } = storeToRefs(appStore)
 const { status, wsStatus } = storeToRefs(connectionStore)
+
+const showDevTimeBar = computed(() => environment.value.data?.label === '开发')
 
 const apiLabel = computed(() => {
   const labels: Record<string, string> = {
@@ -54,9 +56,10 @@ const networkLabel = computed(() =>
         <span class="dot" :class="wsStatus" />
         <span>{{ wsLabel }}</span>
       </div>
+      <DashboardDevTimeBar v-if="showDevTimeBar" />
       <div class="status-item version">
         <span class="label">版本</span>
-        <MonoValue size="sm">v{{ props.version }}</MonoValue>
+        <MonoValue size="sm">v{{ version }}</MonoValue>
       </div>
     </div>
   </AppCard>

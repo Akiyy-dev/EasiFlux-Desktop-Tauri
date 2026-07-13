@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +43,8 @@ pub struct WsManager {
     active_symbol: Arc<RwLock<String>>,
     public_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     private_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    last_public_message_at: Arc<AtomicU64>,
+    last_private_message_at: Arc<AtomicU64>,
 }
 
 impl WsManager {
@@ -61,6 +63,8 @@ impl WsManager {
             active_symbol: Arc::new(RwLock::new(String::new())),
             public_task: Arc::new(Mutex::new(None)),
             private_task: Arc::new(Mutex::new(None)),
+            last_public_message_at: Arc::new(AtomicU64::new(0)),
+            last_private_message_at: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -88,6 +92,43 @@ impl WsManager {
 
     pub fn is_public_connected(&self) -> bool {
         self.public_connected.load(Ordering::Relaxed)
+    }
+
+    pub fn is_private_connected(&self) -> bool {
+        self.private_connected.load(Ordering::Relaxed)
+    }
+
+    fn is_channel_fresh(&self, last_message_at: &AtomicU64, stale_ms: u64) -> bool {
+        let last = last_message_at.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = self.time_sync.local_timestamp_ms();
+        now.saturating_sub(last) <= stale_ms
+    }
+
+    pub fn is_public_healthy(&self, stale_ms: u64) -> bool {
+        self.is_public_connected()
+            && self.is_channel_fresh(&self.last_public_message_at, stale_ms)
+    }
+
+    pub fn is_private_healthy(&self, stale_ms: u64) -> bool {
+        self.is_private_connected()
+            && self.is_channel_fresh(&self.last_private_message_at, stale_ms)
+    }
+
+    fn touch_public_message(&self) {
+        self.last_public_message_at.store(
+            self.time_sync.local_timestamp_ms(),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn touch_private_message(&self) {
+        self.last_private_message_at.store(
+            self.time_sync.local_timestamp_ms(),
+            Ordering::Relaxed,
+        );
     }
 
     pub async fn subscribe_all(&self, symbol: &str, kline_interval: &str) {
@@ -121,17 +162,8 @@ impl WsManager {
 
         let ws_public = self.ws_public_url.read().await.clone();
         let ws_private = self.ws_private_url.read().await.clone();
-        let subs = self.subscriptions.lock().await.clone();
-        let public_topics: Vec<String> = subs
-            .iter()
-            .filter(|s| !s.private)
-            .map(|s| s.topic.clone())
-            .collect();
-        let private_topics: Vec<String> = subs
-            .iter()
-            .filter(|s| s.private)
-            .map(|s| s.topic.clone())
-            .collect();
+        let public_topics = topic_snapshot(&self.subscriptions, false).await;
+        let private_topics = topic_snapshot(&self.subscriptions, true).await;
 
         let emitter = self.emitter.clone();
         let market = self.market.read().ok().and_then(|g| g.clone());
@@ -141,6 +173,8 @@ impl WsManager {
         let running = self.running.clone();
         let public_connected = self.public_connected.clone();
         let private_connected = self.private_connected.clone();
+        let subscriptions = self.subscriptions.clone();
+        let last_public_message_at = self.last_public_message_at.clone();
 
         if !public_topics.is_empty() {
             let emitter_p = emitter.clone();
@@ -148,8 +182,10 @@ impl WsManager {
             let running_p = running.clone();
             let pc = public_connected.clone();
             let sym = symbol_owned.clone();
+            let subs = subscriptions.clone();
+            let last_msg = last_public_message_at.clone();
             let handle = tauri::async_runtime::spawn(async move {
-                run_public_loop(ws_public, public_topics, sym, emitter_p, market_p, running_p, pc).await;
+                run_public_loop(ws_public, subs, sym, emitter_p, market_p, running_p, pc, last_msg).await;
             });
             *self.public_task.lock().await = Some(handle);
         }
@@ -161,10 +197,12 @@ impl WsManager {
                 let running_pr = running.clone();
                 let prc = private_connected.clone();
                 let sym = symbol_owned.clone();
+                let subs = subscriptions.clone();
+                let last_msg = self.last_private_message_at.clone();
                 let handle = tauri::async_runtime::spawn(async move {
                     run_private_loop(
                         ws_private,
-                        private_topics,
+                        subs,
                         s,
                         time_sync,
                         sym,
@@ -172,6 +210,7 @@ impl WsManager {
                         market_pr,
                         running_pr,
                         prc,
+                        last_msg,
                     )
                     .await;
                 });
@@ -197,17 +236,31 @@ impl WsManager {
 
 async fn run_public_loop(
     url: String,
-    topics: Vec<String>,
+    subscriptions: Arc<Mutex<Vec<Subscription>>>,
     symbol: String,
     emitter: EventEmitter,
     market: Option<Arc<MarketService>>,
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    last_message_at: Arc<AtomicU64>,
 ) {
     while running.load(Ordering::Relaxed) {
-        match run_public_session(&url, &topics, &symbol, &emitter, market.as_ref(), &running, &connected)
-            .await
-        {
+        let topics = topic_snapshot(&subscriptions, false).await;
+        if topics.is_empty() {
+            tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
+            continue;
+        }
+        match run_public_session(
+            &url,
+            &topics,
+            &symbol,
+            &emitter,
+            market.as_ref(),
+            &running,
+            &connected,
+            &last_message_at,
+        )
+        .await {
             Ok(()) => connected.store(false, Ordering::Relaxed),
             Err(e) => {
                 connected.store(false, Ordering::Relaxed);
@@ -225,7 +278,7 @@ async fn run_public_loop(
 
 async fn run_private_loop(
     url: String,
-    topics: Vec<String>,
+    subscriptions: Arc<Mutex<Vec<Subscription>>>,
     signer: Signer,
     time_sync: Arc<TimeSync>,
     symbol: String,
@@ -233,8 +286,14 @@ async fn run_private_loop(
     market: Option<Arc<MarketService>>,
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    last_message_at: Arc<AtomicU64>,
 ) {
     while running.load(Ordering::Relaxed) {
+        let topics = topic_snapshot(&subscriptions, true).await;
+        if topics.is_empty() {
+            tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
+            continue;
+        }
         match run_private_session(
             &url,
             &topics,
@@ -245,6 +304,7 @@ async fn run_private_loop(
             market.as_ref(),
             &running,
             &connected,
+            &last_message_at,
         )
         .await
         {
@@ -271,6 +331,7 @@ async fn run_public_session(
     market: Option<&Arc<MarketService>>,
     running: &Arc<AtomicBool>,
     connected: &Arc<AtomicBool>,
+    last_message_at: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
     let (mut write, mut read) = stream.split();
@@ -302,7 +363,7 @@ async fn run_public_session(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            handle_message(&value, symbol, emitter, market);
+                            handle_message(&value, symbol, emitter, market, Some(last_message_at));
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return Err("closed".into()),
@@ -324,6 +385,7 @@ async fn run_private_session(
     market: Option<&Arc<MarketService>>,
     running: &Arc<AtomicBool>,
     connected: &Arc<AtomicBool>,
+    last_message_at: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
     let (mut write, mut read) = stream.split();
@@ -360,7 +422,7 @@ async fn run_private_session(
                             if value.get("op").and_then(|v| v.as_str()) == Some("auth") {
                                 continue;
                             }
-                            handle_message(&value, symbol, emitter, market);
+                            handle_message(&value, symbol, emitter, market, Some(last_message_at));
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return Err("closed".into()),
@@ -377,7 +439,18 @@ fn handle_message(
     symbol: &str,
     emitter: &EventEmitter,
     market: Option<&Arc<MarketService>>,
+    last_message_at: Option<&Arc<AtomicU64>>,
 ) {
+    if let Some(last) = last_message_at {
+        last.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            Ordering::Relaxed,
+        );
+    }
+
     let topic = message
         .get("topic")
         .or_else(|| message.get("channel"))
@@ -437,4 +510,14 @@ fn dispatch_list(data: &Value, mut handler: impl FnMut(&Value)) {
     } else if data.is_object() {
         handler(data);
     }
+}
+
+async fn topic_snapshot(subscriptions: &Arc<Mutex<Vec<Subscription>>>, private: bool) -> Vec<String> {
+    subscriptions
+        .lock()
+        .await
+        .iter()
+        .filter(|item| item.private == private)
+        .map(|item| item.topic.clone())
+        .collect()
 }

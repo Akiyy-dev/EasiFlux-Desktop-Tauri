@@ -4,8 +4,8 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { usePositionStore } from '../../stores/position'
 import { useConnectionStore } from '../../stores/connection'
-import { useLogStore } from '../../stores/log'
-import { refreshPrivatePanels } from '../../stores/privatePanels'
+import { refreshSyncTask } from '../../services/dataSyncService'
+import { reportError } from '../../services/errorService'
 
 const TABLE_MAX_HEIGHT = 168
 
@@ -15,7 +15,6 @@ const props = defineProps<{
 
 const positionStore = usePositionStore()
 const connectionStore = useConnectionStore()
-const logStore = useLogStore()
 const { positions } = storeToRefs(positionStore)
 
 const loading = ref(false)
@@ -37,9 +36,9 @@ async function refreshPanels(): Promise<void> {
   }
   loading.value = true
   try {
-    await refreshPrivatePanels()
+    await refreshSyncTask('privatePanels')
   } catch (e) {
-    logStore.setError(e instanceof Error ? e.message : String(e))
+    reportError(e)
   } finally {
     loading.value = false
   }

@@ -95,6 +95,12 @@ pub async fn refresh_market(state: State<'_, AppState>) -> AppResult<()> {
 }
 
 #[tauri::command]
+pub async fn refresh_funding_rate(state: State<'_, AppState>) -> AppResult<()> {
+    let symbol = state.market.active_symbol().await;
+    state.market.refresh_funding_rate(&symbol).await
+}
+
+#[tauri::command]
 pub async fn fetch_ticker(state: State<'_, AppState>, symbol: String) -> AppResult<Ticker> {
     state.market.fetch_ticker(&symbol).await
 }

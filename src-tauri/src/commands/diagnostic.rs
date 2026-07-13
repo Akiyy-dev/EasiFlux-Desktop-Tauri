@@ -2,7 +2,7 @@ use tauri::State;
 
 use crate::api::mapper::{build_order_query_params, parse_orders, parse_positions};
 use crate::api::response::{describe_data_shape, extract_list, first_object_keys, response_code};
-use crate::api::{ApiClient, PrivateApi};
+use crate::api::PrivateApi;
 use crate::api::endpoints;
 use crate::error::AppResult;
 use crate::models::config::ApiCredential;

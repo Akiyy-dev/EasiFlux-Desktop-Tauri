@@ -26,8 +26,17 @@ describe('dashboardAssets', () => {
     expect(sumUnrealisedPnl(samplePositions)).toBe('9.3000')
   })
 
-  it('returns placeholder when no positions', () => {
-    expect(sumUnrealisedPnl([])).toBe('--')
+  it('returns zero when no positions', () => {
+    expect(sumUnrealisedPnl([])).toBe('0.0000')
+  })
+
+  it('deduplicates the same position before summing', () => {
+    expect(
+      sumUnrealisedPnl([
+        { ...samplePositions[0], positionIdx: 1 },
+        { ...samplePositions[0], unrealisedPnl: '13.5', positionIdx: 1 },
+      ]),
+    ).toBe('13.5000')
   })
 
   it('maps pnl tone class', () => {

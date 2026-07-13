@@ -66,14 +66,14 @@
 
   /* Spacing */
   --ef-space-0: 0;
-  --ef-space-1: 0.25rem;
-  --ef-space-2: 0.5rem;
-  --ef-space-3: 0.75rem;
-  --ef-space-4: 1rem;
-  --ef-space-5: 1.25rem;
-  --ef-space-6: 1.5rem;
-  --ef-space-8: 2rem;
-  --ef-space-10: 2.5rem;
+  --ef-space-1: clamp(0.25rem, 0.2rem + 0.12vw, 0.32rem);
+  --ef-space-2: clamp(0.5rem, 0.42rem + 0.18vw, 0.62rem);
+  --ef-space-3: clamp(0.75rem, 0.62rem + 0.28vw, 0.94rem);
+  --ef-space-4: clamp(1rem, 0.82rem + 0.38vw, 1.25rem);
+  --ef-space-5: clamp(1.25rem, 1rem + 0.5vw, 1.6rem);
+  --ef-space-6: clamp(1.5rem, 1.18rem + 0.64vw, 1.95rem);
+  --ef-space-8: clamp(2rem, 1.6rem + 0.8vw, 2.6rem);
+  --ef-space-10: clamp(2.5rem, 2rem + 1vw, 3.25rem);
 
   /* Radius */
   --ef-radius-sm: 0.25rem;
@@ -97,15 +97,20 @@
   /* Typography */
   --ef-font-sans: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
   --ef-font-mono: "Cascadia Code", "Consolas", "SF Mono", ui-monospace, monospace;
-  --ef-text-xs: 0.6875rem;
-  --ef-text-sm: 0.75rem;
-  --ef-text-base: 0.8125rem;
-  --ef-text-md: 0.875rem;
-  --ef-text-lg: 1rem;
-  --ef-text-xl: 1.25rem;
+  --ef-text-xs: clamp(0.75rem, 0.7rem + 0.12vw, 0.82rem);
+  --ef-text-sm: clamp(0.8125rem, 0.75rem + 0.16vw, 0.9rem);
+  --ef-text-base: clamp(0.875rem, 0.8rem + 0.2vw, 1rem);
+  --ef-text-md: clamp(0.9375rem, 0.85rem + 0.24vw, 1.08rem);
+  --ef-text-lg: clamp(1.05rem, 0.94rem + 0.32vw, 1.22rem);
+  --ef-text-xl: clamp(1.28rem, 1.08rem + 0.52vw, 1.62rem);
   --ef-text-heading-weight: 700;
   --ef-text-body-weight: 400;
   --ef-text-label-weight: 600;
+  --ef-control-sm: clamp(30px, 1.55rem + 0.55vw, 38px);
+  --ef-control-md: clamp(36px, 1.85rem + 0.65vw, 46px);
+  --ef-control-icon-sm: clamp(30px, 1.55rem + 0.55vw, 38px);
+  --ef-control-icon-md: clamp(38px, 1.9rem + 0.8vw, 48px);
+  --ef-icon-size: clamp(1rem, 0.86rem + 0.36vw, 1.25rem);
   --font-sans: var(--ef-font-sans);
   --font-mono: var(--ef-font-mono);
 }

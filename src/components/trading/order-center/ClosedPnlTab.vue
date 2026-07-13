@@ -5,15 +5,14 @@ import { storeToRefs } from 'pinia'
 import TanstackDataTable from '../../common/TanstackDataTable.vue'
 import { tauriInvoke } from '../../../composables/useTauriCommand'
 import { useConnectionStore } from '../../../stores/connection'
-import { useLogStore } from '../../../stores/log'
 import { parseClosedPnlRecords, type ClosedPnlRecord } from '../../../utils/tradingRecords'
+import { reportError } from '../../../services/errorService'
 
 const props = defineProps<{
   active: boolean
 }>()
 
 const connectionStore = useConnectionStore()
-const logStore = useLogStore()
 const { connected } = storeToRefs(connectionStore)
 
 const records = ref<ClosedPnlRecord[]>([])
@@ -66,7 +65,7 @@ async function refresh(): Promise<void> {
     })
     records.value = parseClosedPnlRecords(payload)
   } catch (error) {
-    logStore.setError(error instanceof Error ? error.message : String(error))
+    reportError(error)
   } finally {
     loading.value = false
   }
@@ -92,7 +91,7 @@ watch(
 )
 
 function rowId(row: ClosedPnlRecord): string {
-  return `${row.symbol}:${row.closedTime}:${row.closedPnl}`
+  return row.id || `${row.symbol}:${row.closedTime}:${row.closedPnl}`
 }
 </script>
 

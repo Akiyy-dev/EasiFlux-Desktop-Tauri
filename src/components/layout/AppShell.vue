@@ -8,10 +8,6 @@ import Sidebar from './Sidebar.vue'
 import TradingLayout from './TradingLayout.vue'
 import DashboardPage from '../dashboard/DashboardPage.vue'
 
-defineProps<{
-  version: string
-}>()
-
 const emit = defineEmits<{
   openSettings: []
 }>()
@@ -39,12 +35,7 @@ function navigateTo(key: NavKey): void {
 
 <template>
   <div class="app-shell">
-    <TopBar
-      :version="version"
-      :active="active"
-      :title="pageTitle"
-      @open-settings="emit('openSettings')"
-    />
+    <TopBar :title="pageTitle" />
     <div class="workbench">
       <NavigationRail
         :active="active"
@@ -60,7 +51,6 @@ function navigateTo(key: NavKey): void {
       <section class="main ef-motion-page">
         <DashboardPage
           v-if="active === 'home'"
-          :version="version"
           @navigate="navigateTo"
         />
         <TradingLayout v-else-if="active === 'trading'" />
@@ -80,15 +70,15 @@ function navigateTo(key: NavKey): void {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  gap: 8px;
-  padding: 0 8px 8px;
+  gap: var(--ef-space-2);
+  padding: 0 var(--ef-space-2) var(--ef-space-2);
   overflow: hidden;
 }
 
 .workbench {
   display: flex;
   flex: 1;
-  gap: 8px;
+  gap: var(--ef-space-2);
   min-height: 0;
   overflow: hidden;
 }
@@ -99,7 +89,7 @@ function navigateTo(key: NavKey): void {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--ef-space-2);
   overflow: hidden;
 }
 
@@ -111,10 +101,10 @@ function navigateTo(key: NavKey): void {
 }
 
 .placeholder-body {
-  font-size: 13px;
+  font-size: var(--ef-text-base);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--ef-space-2);
 }
 
 .muted {

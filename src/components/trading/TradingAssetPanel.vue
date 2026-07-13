@@ -16,6 +16,7 @@ const { positions } = storeToRefs(positionStore)
 const usdtBalance = computed(() =>
   summary.value?.balances.find((balance) => balance.asset === 'USDT'),
 )
+const marginBalance = computed(() => usdtBalance.value?.frozen ?? summary.value?.balances[0]?.frozen)
 
 const symbolUnrealisedPnl = computed(() => {
   const rows = positions.value.filter((position) => position.symbol === activeSymbol.value)
@@ -51,7 +52,7 @@ const pnlClass = computed(() => {
       </div>
       <div class="item">
         <span class="label">持仓保证金</span>
-        <span class="value">--</span>
+        <span class="value">{{ marginBalance ?? '--' }} USDT</span>
       </div>
       <div class="item">
         <span class="label">未实现盈亏</span>
@@ -72,11 +73,11 @@ const pnlClass = computed(() => {
 <style scoped>
 .asset-panel {
   border-top: 1px solid var(--border-color);
-  padding: 10px 12px 12px;
+  padding: var(--ef-space-3) 0 0;
 }
 
 .title {
-  font-size: 11px;
+  font-size: var(--ef-text-xs);
   font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
@@ -87,7 +88,7 @@ const pnlClass = computed(() => {
 .grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px 12px;
+  gap: var(--ef-space-2) var(--ef-space-3);
 }
 
 .item {
@@ -97,12 +98,12 @@ const pnlClass = computed(() => {
 }
 
 .label {
-  font-size: 11px;
+  font-size: var(--ef-text-xs);
   color: var(--text-secondary);
 }
 
 .value {
-  font-size: 12px;
+  font-size: var(--ef-text-sm);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }

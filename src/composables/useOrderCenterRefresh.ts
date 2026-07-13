@@ -1,12 +1,11 @@
 import { onMounted, ref, toValue, watch, type MaybeRef } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useConnectionStore } from '../stores/connection'
-import { useLogStore } from '../stores/log'
-import { refreshPrivatePanels } from '../stores/privatePanels'
+import { refreshSyncTask } from '../services/dataSyncService'
+import { reportError } from '../services/errorService'
 
 export function useOrderCenterRefresh(active: MaybeRef<boolean>) {
   const connectionStore = useConnectionStore()
-  const logStore = useLogStore()
   const { connected } = storeToRefs(connectionStore)
   const loading = ref(false)
 
@@ -16,9 +15,9 @@ export function useOrderCenterRefresh(active: MaybeRef<boolean>) {
     }
     loading.value = true
     try {
-      await refreshPrivatePanels()
+      await refreshSyncTask('privatePanels')
     } catch (error) {
-      logStore.setError(error instanceof Error ? error.message : String(error))
+      reportError(error)
     } finally {
       loading.value = false
     }

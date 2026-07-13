@@ -129,6 +129,12 @@ pub struct AppConfig {
     pub risk_max_order_qty: String,
     pub risk_max_price_deviation_pct: String,
     pub risk_max_daily_orders: u32,
+    #[serde(default = "default_trading_day_timezone")]
+    pub trading_day_timezone: String,
+}
+
+fn default_trading_day_timezone() -> String {
+    crate::models::time::DEFAULT_TRADING_DAY_TIMEZONE.to_string()
 }
 
 impl Default for AppConfig {
@@ -150,6 +156,7 @@ impl Default for AppConfig {
             risk_max_order_qty: "100".to_string(),
             risk_max_price_deviation_pct: "5".to_string(),
             risk_max_daily_orders: 500,
+            trading_day_timezone: crate::models::time::DEFAULT_TRADING_DAY_TIMEZONE.to_string(),
         }
     }
 }
@@ -183,6 +190,29 @@ impl From<&AppConfig> for RiskConfig {
             enabled: config.risk_enabled,
         }
     }
+}
+
+pub fn environment_label(base_url: &str) -> &'static str {
+    match url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_string()))
+        .as_deref()
+    {
+        Some("api.easicoin.io") => "正式",
+        Some(_) => "开发",
+        None if base_url.contains("api.easicoin.io") => "正式",
+        None => "未知",
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentStatus {
+    pub base_url: String,
+    pub label: String,
+    pub reachable: bool,
+    pub checked_at: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

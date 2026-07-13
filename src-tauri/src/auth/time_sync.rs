@@ -33,6 +33,12 @@ impl TimeSync {
             .store(server_ms as i64 - local, Ordering::Relaxed);
     }
 
+    pub fn set_server_time_midpoint(&self, server_ms: u64, request_start_ms: u64, request_end_ms: u64) {
+        let midpoint = ((request_start_ms + request_end_ms) / 2) as i64;
+        self.offset_ms
+            .store(server_ms as i64 - midpoint, Ordering::Relaxed);
+    }
+
     pub fn offset_ms(&self) -> i64 {
         self.offset_ms.load(Ordering::Relaxed)
     }
@@ -114,6 +120,13 @@ mod tests {
         let before = sync.timestamp_ms();
         sync.set_server_time(before + 1000);
         assert_eq!(sync.offset_ms(), 1000);
+    }
+
+    #[test]
+    fn midpoint_offset_reduces_rtt_bias() {
+        let sync = TimeSync::new();
+        sync.set_server_time_midpoint(10_000, 4_000, 6_000);
+        assert_eq!(sync.offset_ms(), 5_000);
     }
 
     #[test]

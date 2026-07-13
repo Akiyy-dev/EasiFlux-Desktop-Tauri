@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ChevronLeft, ChevronRight } from 'lucide-vue-next'
+import { computed, ref, watch } from 'vue'
 import AppCard from '../ui/AppCard.vue'
 import AppIcon from '../ui/AppIcon.vue'
 import type { NavKey } from './NavigationRail.vue'
@@ -50,7 +51,20 @@ const sectionsByNav: Partial<Record<NavKey, SidebarSection[]>> = {
   ],
 }
 
-const sections = sectionsByNav[props.active] ?? []
+const sections = computed(() => sectionsByNav[props.active] ?? [])
+const activeSecondary = ref('')
+
+function firstSecondaryKey(): string {
+  return sections.value[0]?.items[0]?.key ?? ''
+}
+
+watch(
+  () => props.active,
+  () => {
+    activeSecondary.value = firstSecondaryKey()
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
@@ -83,8 +97,10 @@ const sections = sectionsByNav[props.active] ?? []
           v-for="item in section.items"
           :key="item.key"
           class="item-btn ef-motion-hover"
+          :class="{ active: activeSecondary === item.key }"
           type="button"
           :title="item.label"
+          @click="activeSecondary = item.key"
         >
           <span v-if="props.collapsed" class="dot" aria-hidden="true" />
           <span v-else class="label">{{ item.label }}</span>
@@ -180,6 +196,12 @@ const sections = sectionsByNav[props.active] ?? []
 
 .item-btn:hover {
   background: var(--accent);
+  color: var(--foreground);
+}
+
+.item-btn.active {
+  background: var(--accent);
+  border-color: var(--border);
   color: var(--foreground);
 }
 

@@ -1,26 +1,34 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { NForm, NFormItem, NInput, NInputNumber, NSwitch, useMessage } from 'naive-ui'
+import { NForm, NFormItem, NInput, NInputNumber, NSelect, NSwitch } from 'naive-ui'
 import { AppButton, AppDialog } from '../ui'
 import { tauriInvoke } from '../../composables/useTauriCommand'
 import { useConfigStore } from '../../stores/config'
 import { useConnectionStore } from '../../stores/connection'
 import { normalizeAccountId } from '../../utils/account'
 import type { ApiCredential } from '../../types/models'
+import { notifySuccess, notifyWarning, reportError } from '../../services/errorService'
 
 const props = defineProps<{ show: boolean }>()
 const emit = defineEmits<{ 'update:show': [boolean] }>()
 
 const configStore = useConfigStore()
 const connectionStore = useConnectionStore()
-const message = useMessage()
 
 const apiKey = ref('')
 const apiSecret = ref('')
 const baseUrl = ref('https://api.easicoin.io')
 const useWebsocket = ref(true)
 const tickerPollInterval = ref(1)
+const tradingDayTimezone = ref('Asia/Shanghai')
 const testing = ref(false)
+
+const timezoneOptions = [
+  { label: 'Asia/Shanghai (UTC+8)', value: 'Asia/Shanghai' },
+  { label: 'UTC', value: 'UTC' },
+  { label: 'America/New_York', value: 'America/New_York' },
+  { label: 'Europe/London', value: 'Europe/London' },
+]
 
 watch(
   () => props.show,
@@ -29,6 +37,7 @@ watch(
       baseUrl.value = 'https://api.easicoin.io'
       useWebsocket.value = configStore.config.useWebsocket
       tickerPollInterval.value = configStore.config.tickerPollInterval
+      tradingDayTimezone.value = configStore.config.tradingDayTimezone ?? 'Asia/Shanghai'
     }
   },
 )
@@ -48,6 +57,7 @@ async function saveConfigOnly(): Promise<void> {
       ...configStore.config,
       useWebsocket: useWebsocket.value,
       tickerPollInterval: Math.max(1, tickerPollInterval.value),
+      tradingDayTimezone: tradingDayTimezone.value,
     })
   }
 }
@@ -68,20 +78,20 @@ async function save(): Promise<void> {
   }
 
   await saveConfigOnly()
-  message.success('设置已保存')
+  notifySuccess('设置已保存')
 }
 
 async function test(): Promise<void> {
   if (!apiKey.value.trim() || !apiSecret.value.trim()) {
-    message.warning('测试连接需要填写 API Key 和 Secret')
+    notifyWarning('测试连接需要填写 API Key 和 Secret')
     return
   }
   testing.value = true
   try {
     await tauriInvoke('test_connection', { credential: buildCredential() })
-    message.success('连接测试成功')
+    notifySuccess('连接测试成功')
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    reportError(e)
   } finally {
     testing.value = false
   }
@@ -91,7 +101,7 @@ async function connect(): Promise<void> {
   try {
     await save()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    reportError(e)
     return
   }
   emit('update:show', false)
@@ -99,7 +109,7 @@ async function connect(): Promise<void> {
   try {
     await connectionStore.connect(useWebsocket.value, credential)
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    reportError(e)
   }
 }
 </script>
@@ -126,6 +136,9 @@ async function connect(): Promise<void> {
       </NFormItem>
       <NFormItem label="行情刷新间隔（秒）">
         <NInputNumber v-model:value="tickerPollInterval" :min="1" :step="1" style="width: 100%" />
+      </NFormItem>
+      <NFormItem label="交易日时区">
+        <NSelect v-model:value="tradingDayTimezone" :options="timezoneOptions" />
       </NFormItem>
     </NForm>
     <template #footer>

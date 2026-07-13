@@ -42,6 +42,8 @@ struct TomlConfig {
     risk_max_price_deviation_pct: String,
     #[serde(default = "default_daily")]
     risk_max_daily_orders: u32,
+    #[serde(default = "default_trading_day_timezone")]
+    trading_day_timezone: String,
 }
 
 fn default_symbol() -> String {
@@ -91,6 +93,9 @@ fn default_deviation() -> String {
 fn default_daily() -> u32 {
     500
 }
+fn default_trading_day_timezone() -> String {
+    crate::models::time::DEFAULT_TRADING_DAY_TIMEZONE.to_string()
+}
 
 impl From<TomlConfig> for AppConfig {
     fn from(t: TomlConfig) -> Self {
@@ -115,6 +120,7 @@ impl From<TomlConfig> for AppConfig {
             risk_max_order_qty: t.risk_max_order_qty,
             risk_max_price_deviation_pct: t.risk_max_price_deviation_pct,
             risk_max_daily_orders: t.risk_max_daily_orders,
+            trading_day_timezone: t.trading_day_timezone,
         }
     }
 }
@@ -138,6 +144,7 @@ impl From<&AppConfig> for TomlConfig {
             risk_max_order_qty: c.risk_max_order_qty.clone(),
             risk_max_price_deviation_pct: c.risk_max_price_deviation_pct.clone(),
             risk_max_daily_orders: c.risk_max_daily_orders,
+            trading_day_timezone: c.trading_day_timezone.clone(),
         }
     }
 }

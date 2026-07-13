@@ -15,6 +15,12 @@ import OrderPanel from '../trading/OrderPanel.vue'
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  overflow: hidden;
+}
+
+.right-panel :deep(.ef-card-body) {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
 }
 </style>

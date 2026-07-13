@@ -62,11 +62,32 @@ export function normalizePosition(raw: Position | Record<string, unknown>): Posi
   }
 }
 
+export function positionKey(position: Position): string {
+  return `${position.symbol}:${position.positionIdx ?? 0}`
+}
+
 export function normalizePositions(raw: unknown): Position[] {
   if (!Array.isArray(raw)) {
     return []
   }
-  return raw
-    .map((item) => normalizePosition(item as Record<string, unknown>))
-    .filter((position) => position.symbol.length > 0 && parseFloat(position.size) !== 0)
+  const unique = new Map<string, Position>()
+  for (const item of raw) {
+    const position = normalizePosition(item as Record<string, unknown>)
+    if (position.symbol.length === 0 || Number.parseFloat(position.size) === 0) {
+      continue
+    }
+    unique.set(positionKey(position), position)
+  }
+  return Array.from(unique.values())
+}
+
+export function positionRoiPct(position: Position): string {
+  const pnl = Number.parseFloat(position.unrealisedPnl)
+  const size = Math.abs(Number.parseFloat(position.size))
+  const entryPrice = Number.parseFloat(position.entryPrice)
+  const notional = size * entryPrice
+  if (!Number.isFinite(pnl) || !Number.isFinite(notional) || notional <= 0) {
+    return '--'
+  }
+  return `${((pnl / notional) * 100).toFixed(2)}%`
 }

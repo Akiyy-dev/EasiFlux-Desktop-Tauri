@@ -8,10 +8,6 @@ import DashboardRecentActivity from './DashboardRecentActivity.vue'
 import DashboardStatusBar from './DashboardStatusBar.vue'
 import type { DashboardNavTarget } from './types'
 
-defineProps<{
-  version: string
-}>()
-
 const emit = defineEmits<{
   navigate: [NavKey]
 }>()
@@ -32,7 +28,7 @@ function handleQuickNavigate(target: DashboardNavTarget | 'positions' | 'assets'
 <template>
   <div class="dashboard">
     <div class="dashboard-scroll">
-      <DashboardHero :version="version" />
+      <DashboardHero />
 
       <div class="dashboard-grid">
         <section class="primary-column">
@@ -47,7 +43,7 @@ function handleQuickNavigate(target: DashboardNavTarget | 'positions' | 'assets'
       </div>
     </div>
 
-    <DashboardStatusBar :version="version" />
+    <DashboardStatusBar />
   </div>
 </template>
 

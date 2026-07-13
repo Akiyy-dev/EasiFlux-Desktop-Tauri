@@ -1,6 +1,6 @@
 [package]
 name = "easiflux-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "EasiFlux Desktop - cryptocurrency contract trading client"
 authors = ["EasiFlux"]
 edition = "2021"
@@ -30,6 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 url = "2"
 rust_decimal = { version = "1", features = ["serde"] }
 dirs = "6"

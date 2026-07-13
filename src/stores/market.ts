@@ -3,8 +3,17 @@ import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import { parseInstrumentSymbols } from '../utils/instruments'
 import type { Depth, Kline, Ticker } from '../types/models'
+import { useAsyncState } from '../composables/useAsyncState'
 
 const INSTRUMENTS_CACHE_KEY = 'easiflux_instruments_v1'
+
+function intervalToMs(interval: string): number {
+  if (interval.toUpperCase() === 'D') {
+    return 86_400_000
+  }
+  const minutes = Number.parseInt(interval, 10)
+  return Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 60_000
+}
 
 export const useMarketStore = defineStore('market', () => {
   const activeSymbol = ref('BTCUSDT')
@@ -15,6 +24,8 @@ export const useMarketStore = defineStore('market', () => {
   const symbols = ref<string[]>([])
   const symbolsLoading = ref(false)
   let instrumentsFetchPromise: Promise<void> | null = null
+  const marketRequest = useAsyncState<null>()
+  const instrumentsRequest = useAsyncState<string[]>((value) => value.length === 0)
 
   function readCachedSymbols(): string[] {
     try {
@@ -57,7 +68,9 @@ export const useMarketStore = defineStore('market', () => {
           symbols.value = parsed
           writeCachedSymbols(parsed)
         }
+        instrumentsRequest.setData(parsed)
       } catch {
+        instrumentsRequest.setError('交易对加载失败')
         if (symbols.value.length === 0 && fallbackSymbols.length > 0) {
           symbols.value = [...fallbackSymbols]
         }
@@ -70,6 +83,9 @@ export const useMarketStore = defineStore('market', () => {
   }
 
   function setTicker(next: Ticker): void {
+    if (next.symbol && next.symbol !== activeSymbol.value) {
+      return
+    }
     ticker.value = next
   }
 
@@ -86,14 +102,57 @@ export const useMarketStore = defineStore('market', () => {
       klines.value = []
       return
     }
-    const first = next[0]
-    if (
-      first.symbol !== activeSymbol.value ||
-      first.interval !== klineInterval.value
-    ) {
+    const normalized = normalizeKlines(next)
+    if (normalized.length === 0) {
       return
     }
-    klines.value = next
+    klines.value = normalized
+  }
+
+  function normalizeKlines(next: Kline[]): Kline[] {
+    const byTime = new Map<number, Kline>()
+    for (const kline of next) {
+      if (
+        kline.symbol !== activeSymbol.value ||
+        kline.interval !== klineInterval.value ||
+        !Number.isFinite(kline.openTime) ||
+        kline.openTime <= 0
+      ) {
+        continue
+      }
+      byTime.set(kline.openTime, kline)
+    }
+
+    const sorted = Array.from(byTime.values()).sort((a, b) => a.openTime - b.openTime)
+    if (sorted.length < 2) {
+      return sorted
+    }
+
+    const intervalMs = intervalToMs(klineInterval.value)
+    const continuous: Kline[] = []
+    for (const kline of sorted) {
+      const previous = continuous[continuous.length - 1]
+      if (previous) {
+        let expected = previous.openTime + intervalMs
+        let inserted = 0
+        while (expected < kline.openTime && inserted < 500) {
+          continuous.push({
+            symbol: previous.symbol,
+            interval: previous.interval,
+            openTime: expected,
+            open: previous.close,
+            high: previous.close,
+            low: previous.close,
+            close: previous.close,
+            volume: '0',
+          })
+          expected += intervalMs
+          inserted += 1
+        }
+      }
+      continuous.push(kline)
+    }
+    return continuous
   }
 
   async function setActiveSymbol(symbol: string): Promise<void> {
@@ -102,6 +161,8 @@ export const useMarketStore = defineStore('market', () => {
     }
     clearKlines()
     activeSymbol.value = symbol
+    ticker.value = null
+    depth.value = null
     try {
       await tauriInvoke('set_active_symbol', { symbol })
     } catch (error) {
@@ -116,7 +177,10 @@ export const useMarketStore = defineStore('market', () => {
   }
 
   async function refreshMarket(): Promise<void> {
-    await tauriInvoke('refresh_market')
+    await marketRequest.run(async () => {
+      await tauriInvoke('refresh_market')
+      return null
+    })
   }
 
   return {
@@ -127,6 +191,11 @@ export const useMarketStore = defineStore('market', () => {
     klines,
     symbols,
     symbolsLoading,
+    marketLoading: marketRequest.loading,
+    marketError: marketRequest.error,
+    marketStatus: marketRequest.status,
+    instrumentsError: instrumentsRequest.error,
+    instrumentsStatus: instrumentsRequest.status,
     setTicker,
     setDepth,
     setKlines,

@@ -6,6 +6,7 @@ import { tauriInvoke } from '../../composables/useTauriCommand'
 import { useLogStore } from '../../stores/log'
 import { useConnectionStore } from '../../stores/connection'
 import type { ProbePrivateEndpointsResult } from '../../types/models'
+import { notifyWarning, reportError } from '../../services/errorService'
 
 const logStore = useLogStore()
 const connectionStore = useConnectionStore()
@@ -19,7 +20,7 @@ function formatTime(ts: number): string {
 
 async function runProbe(): Promise<void> {
   if (!connectionStore.connected) {
-    logStore.setError('请先连接账户后再运行接口诊断')
+    notifyWarning('请先连接账户后再运行接口诊断')
     return
   }
   probing.value = true
@@ -37,7 +38,7 @@ async function runProbe(): Promise<void> {
       logStore.addEntry({ level: endpoint.success ? 'info' : 'error', message: detail, timestamp: Date.now() })
     }
   } catch (error) {
-    logStore.setError(error instanceof Error ? error.message : String(error))
+    reportError(error)
   } finally {
     probing.value = false
   }

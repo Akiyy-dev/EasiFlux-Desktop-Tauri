@@ -9,6 +9,7 @@ use crate::api::{ApiClient, PublicApi};
 use crate::error::AppResult;
 use crate::events::EventEmitter;
 use crate::models::market::{Depth, Kline, Ticker};
+use crate::services::TimeService;
 use crate::storage::{CacheStore, KlineStore};
 
 const MAX_KLINES: usize = 200;
@@ -58,6 +59,7 @@ pub struct MarketService {
     cache: Arc<CacheStore>,
     kline_store: Arc<KlineStore>,
     emitter: EventEmitter,
+    time: Arc<TimeService>,
     active_symbol: Arc<RwLock<String>>,
     kline_interval: Arc<RwLock<String>>,
 }
@@ -68,12 +70,14 @@ impl MarketService {
         cache: Arc<CacheStore>,
         kline_store: Arc<KlineStore>,
         emitter: EventEmitter,
+        time: Arc<TimeService>,
     ) -> Self {
         Self {
             api,
             cache,
             kline_store,
             emitter,
+            time,
             active_symbol: Arc::new(RwLock::new("BTCUSDT".into())),
             kline_interval: Arc::new(RwLock::new("1".into())),
         }
@@ -125,7 +129,13 @@ impl MarketService {
         let sym = crate::api::response::get_str(value, &["symbol", "s"])
             .unwrap_or_else(|| symbol.to_string());
         let existing = self.cache.get_ticker(&sym);
-        let merged = merge_ticker(existing.as_ref(), value, symbol);
+        let mut merged = merge_ticker(existing.as_ref(), value, symbol);
+        if let Some(previous) = existing {
+            merged.funding_rate = previous.funding_rate;
+            merged.funding_rate_updated_at = previous.funding_rate_updated_at;
+            merged.funding_rate_error = previous.funding_rate_error;
+            merged.next_funding_time = previous.next_funding_time;
+        }
         self.cache.set_ticker(merged.clone());
         self.emitter.emit_ticker(merged);
     }
@@ -168,10 +178,52 @@ impl MarketService {
     }
 
     pub async fn fetch_ticker(&self, symbol: &str) -> AppResult<Ticker> {
-        let ticker = PublicApi::ticker(&self.api, symbol).await?;
+        let mut ticker = PublicApi::ticker(&self.api, symbol).await?;
+        if let Some(previous) = self.cache.get_ticker(symbol) {
+            ticker.funding_rate = previous.funding_rate;
+            ticker.funding_rate_updated_at = previous.funding_rate_updated_at;
+            ticker.funding_rate_error = previous.funding_rate_error;
+            ticker.next_funding_time = previous.next_funding_time;
+        } else if !ticker.funding_rate.is_empty() {
+            ticker.funding_rate_updated_at = Some(self.time.now_ms());
+        } else {
+            ticker.funding_rate_error = Some("资金费率缺失或超出合理范围".into());
+        }
         self.cache.set_ticker(ticker.clone());
         self.emitter.emit_ticker(ticker.clone());
         Ok(ticker)
+    }
+
+    pub async fn refresh_funding_rate(&self, symbol: &str) -> AppResult<()> {
+        match PublicApi::ticker(&self.api, symbol).await {
+            Ok(incoming) if !incoming.funding_rate.is_empty() => {
+                let mut ticker = self.cache.get_ticker(symbol).unwrap_or(incoming.clone());
+                ticker.funding_rate = incoming.funding_rate;
+                ticker.next_funding_time = incoming.next_funding_time;
+                ticker.funding_rate_updated_at = Some(self.time.now_ms());
+                ticker.funding_rate_error = None;
+                self.cache.set_ticker(ticker.clone());
+                self.emitter.emit_ticker(ticker);
+                Ok(())
+            }
+            Ok(_) => {
+                let message = "资金费率缺失或超出合理范围".to_string();
+                if let Some(mut ticker) = self.cache.get_ticker(symbol) {
+                    ticker.funding_rate_error = Some(message.clone());
+                    self.cache.set_ticker(ticker.clone());
+                    self.emitter.emit_ticker(ticker);
+                }
+                Err(crate::error::AppError::Internal(message))
+            }
+            Err(error) => {
+                if let Some(mut ticker) = self.cache.get_ticker(symbol) {
+                    ticker.funding_rate_error = Some(error.user_message());
+                    self.cache.set_ticker(ticker.clone());
+                    self.emitter.emit_ticker(ticker);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn fetch_depth(&self, symbol: &str) -> AppResult<Depth> {

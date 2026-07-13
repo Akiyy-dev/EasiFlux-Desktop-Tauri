@@ -4,17 +4,30 @@ import { storeToRefs } from 'pinia'
 import AppCard from '../ui/AppCard.vue'
 import ConnectionStatus from '../common/ConnectionStatus.vue'
 import MonoValue from '../ui/MonoValue.vue'
+import { useAppStore } from '../../stores/app'
 import { useConnectionStore } from '../../stores/connection'
-import { resolveApiEnvironmentLabel } from '../../utils/environment'
-
-const props = defineProps<{
-  version: string
-}>()
 
 const connectionStore = useConnectionStore()
+const appStore = useAppStore()
 const { connected } = storeToRefs(connectionStore)
+const { environment, environmentLoading, environmentError, version } = storeToRefs(appStore)
 
-const environmentLabel = computed(() => resolveApiEnvironmentLabel('https://api.easicoin.io'))
+const environmentLabel = computed(() => {
+  if (environmentLoading.value) {
+    return '检测中'
+  }
+  if (environmentError.value) {
+    return `检测失败: ${environmentError.value}`
+  }
+  const payload = environment.value?.data
+  if (!payload) {
+    return '未检测'
+  }
+  if (!payload.reachable) {
+    return payload.error ? `检测失败: ${payload.error}` : '检测失败'
+  }
+  return payload.label
+})
 </script>
 
 <template>
@@ -31,7 +44,7 @@ const environmentLabel = computed(() => resolveApiEnvironmentLabel('https://api.
       <div class="meta">
         <div class="meta-item">
           <span class="meta-label">版本</span>
-          <MonoValue class="meta-value" size="sm">v{{ props.version }}</MonoValue>
+          <MonoValue class="meta-value" size="sm">v{{ version }}</MonoValue>
         </div>
         <div class="meta-item">
           <span class="meta-label">环境</span>

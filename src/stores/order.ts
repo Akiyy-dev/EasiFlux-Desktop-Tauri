@@ -3,10 +3,13 @@ import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type { CancelAllOrdersRequest, CancelOrderRequest, Order, PlaceOrderRequest } from '../types/models'
 import { isTerminalOrderStatus, normalizeOrder, normalizeOrders } from '../utils/order'
+import { useAsyncState } from '../composables/useAsyncState'
 
 export const useOrderStore = defineStore('order', () => {
   const openOrders = ref<Order[]>([])
   const orderHistory = ref<Order[]>([])
+  const openOrdersRequest = useAsyncState<Order[]>((value) => value.length === 0)
+  const historyRequest = useAsyncState<Order[]>((value) => value.length === 0)
 
   function upsertOpenOrder(order: Order): void {
     const normalized = normalizeOrder(order)
@@ -47,15 +50,19 @@ export const useOrderStore = defineStore('order', () => {
   }
 
   async function refreshOrders(symbol?: string): Promise<void> {
-    const raw = await tauriInvoke<Order[]>('refresh_orders', { symbol: symbol ?? null })
+    const raw = await openOrdersRequest.run(() =>
+      tauriInvoke<Order[]>('refresh_orders', { symbol: symbol ?? null }),
+    )
     openOrders.value = normalizeOrders(raw)
   }
 
   async function refreshOrderHistory(symbol?: string, limit = 50): Promise<void> {
-    const raw = await tauriInvoke<Order[]>('refresh_order_history', {
-      symbol: symbol ?? null,
-      limit,
-    })
+    const raw = await historyRequest.run(() =>
+      tauriInvoke<Order[]>('refresh_order_history', {
+        symbol: symbol ?? null,
+        limit,
+      }),
+    )
     orderHistory.value = normalizeOrders(raw)
   }
 
@@ -74,6 +81,12 @@ export const useOrderStore = defineStore('order', () => {
   return {
     openOrders,
     orderHistory,
+    openOrdersLoading: openOrdersRequest.loading,
+    openOrdersError: openOrdersRequest.error,
+    openOrdersStatus: openOrdersRequest.status,
+    orderHistoryLoading: historyRequest.loading,
+    orderHistoryError: historyRequest.error,
+    orderHistoryStatus: historyRequest.status,
     upsertOrder,
     placeOrder,
     cancelOrder,
