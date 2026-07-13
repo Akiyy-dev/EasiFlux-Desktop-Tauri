@@ -100,7 +100,10 @@ pub async fn connect(
 
     }
 
-    state.scheduler.bootstrap_connection().await;
+    let scheduler = state.scheduler.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = scheduler.bootstrap_connection().await;
+    });
 
     Ok(())
 

@@ -98,24 +98,23 @@ impl WsManager {
         self.private_connected.load(Ordering::Relaxed)
     }
 
-    fn is_channel_fresh(&self, last_message_at: &AtomicU64, stale_ms: u64, connected: bool) -> bool {
+    fn is_channel_fresh(&self, last_message_at: &AtomicU64, stale_ms: u64) -> bool {
         let last = last_message_at.load(Ordering::Relaxed);
         if last == 0 {
-            // Connected but no push yet: trust WS during warmup instead of REST storm.
-            return connected;
+            return false;
         }
         let now = self.time_sync.local_timestamp_ms();
         now.saturating_sub(last) <= stale_ms
     }
 
     pub fn is_public_healthy(&self, stale_ms: u64) -> bool {
-        let connected = self.is_public_connected();
-        connected && self.is_channel_fresh(&self.last_public_message_at, stale_ms, connected)
+        self.is_public_connected()
+            && self.is_channel_fresh(&self.last_public_message_at, stale_ms)
     }
 
     pub fn is_private_healthy(&self, stale_ms: u64) -> bool {
-        let connected = self.is_private_connected();
-        connected && self.is_channel_fresh(&self.last_private_message_at, stale_ms, connected)
+        self.is_private_connected()
+            && self.is_channel_fresh(&self.last_private_message_at, stale_ms)
     }
 
     fn touch_public_message(&self) {

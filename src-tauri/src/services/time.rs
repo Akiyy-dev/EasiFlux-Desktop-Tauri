@@ -158,6 +158,8 @@ impl TimeService {
             }
         }
 
+        // Release the write lock before snapshot() acquires a read lock.
+        drop(meta);
         let snapshot = self.snapshot().await;
         self.emitter.emit_time_updated(&snapshot);
         Ok(snapshot)
