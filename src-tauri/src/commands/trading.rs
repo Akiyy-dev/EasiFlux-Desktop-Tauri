@@ -5,15 +5,21 @@ use crate::api::PrivateApi;
 use crate::error::AppResult;
 use crate::models::api_requests::{
     ApiAddMarginRequest, ApiCancelAllOrdersRequest, ApiCloseAllPositionsRequest,
-    ApiCreateTpslRequest, ApiReplaceOrderRequest, ApiReplaceTpslRequest,
-    ApiSetLeverageRequest, ApiSwitchMarginModeRequest, ApiSwitchSeparatePositionModeRequest,
+    ApiCreateTpslRequest, ApiReplaceOrderRequest, ApiReplaceTpslRequest, ApiSetLeverageRequest,
+    ApiSwitchMarginModeRequest, ApiSwitchSeparatePositionModeRequest,
 };
 use crate::models::trading::{CancelOrderRequest, Order, PlaceOrderRequest, PrivatePanelsSnapshot};
 use crate::state::AppState;
 
 #[tauri::command]
-pub async fn place_order(state: State<'_, AppState>, request: PlaceOrderRequest) -> AppResult<Order> {
-    let order = state.trading.place_order(request).await?;
+pub async fn place_order(
+    state: State<'_, AppState>,
+    request: PlaceOrderRequest,
+) -> AppResult<Order> {
+    let order = state
+        .trading
+        .place_order(state.account_lifecycle.as_ref(), request)
+        .await?;
     state.analytics.record_order(order.clone()).await;
     Ok(order)
 }
@@ -64,10 +70,7 @@ pub async fn refresh_private_panels(
 ) -> AppResult<PrivatePanelsSnapshot> {
     let sym = symbol.as_deref();
     let open_orders = state.trading.refresh_orders(sym).await?;
-    let order_history = state
-        .trading
-        .refresh_order_history(sym, Some(50))
-        .await?;
+    let order_history = state.trading.refresh_order_history(sym, Some(50)).await?;
     let positions = state.account.refresh_positions(sym).await?;
     for order in open_orders.iter().chain(order_history.iter()) {
         state.analytics.record_order(order.clone()).await;

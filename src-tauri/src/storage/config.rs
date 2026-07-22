@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
 use crate::models::config::{
-    AppConfig, ThemeMode, DEFAULT_WS_PRIVATE_URL, DEFAULT_WS_PUBLIC_URL, APP_NAME, CONFIG_FILENAME,
+    AppConfig, ThemeMode, APP_NAME, CONFIG_FILENAME, DEFAULT_WS_PRIVATE_URL, DEFAULT_WS_PUBLIC_URL,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,6 +162,11 @@ impl ConfigStore {
         Self {
             path: dir.join(CONFIG_FILENAME),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_path(path: PathBuf) -> Self {
+        Self { path }
     }
 
     pub fn load(&self) -> AppResult<AppConfig> {

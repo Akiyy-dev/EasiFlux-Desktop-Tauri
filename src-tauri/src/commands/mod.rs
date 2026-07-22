@@ -5,6 +5,7 @@ pub mod config;
 pub mod connection;
 pub mod diagnostic;
 pub mod market;
+pub mod risk;
 pub mod trading;
 
 pub use account::*;
@@ -14,4 +15,5 @@ pub use config::*;
 pub use connection::*;
 pub use diagnostic::*;
 pub use market::*;
+pub use risk::*;
 pub use trading::*;

@@ -61,6 +61,8 @@ pub fn run() {
             scheduler_run_task,
             get_config,
             save_config,
+            get_risk_status,
+            update_risk_config,
             save_credentials,
             has_credentials,
             save_window_size,

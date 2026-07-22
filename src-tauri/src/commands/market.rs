@@ -7,14 +7,22 @@ use crate::models::config::ConnectionStatus;
 use crate::models::market::{Depth, Kline, Ticker};
 use crate::state::AppState;
 
+mod config_update;
+#[cfg(not(test))]
+use config_update::persist_market_config_update;
+#[cfg(test)]
+pub(crate) use config_update::persist_market_config_update;
+
 #[tauri::command]
 pub async fn set_active_symbol(state: State<'_, AppState>, symbol: String) -> AppResult<()> {
-    state.market.set_active_symbol(&symbol).await;
-    {
-        let mut config = state.config.write().await;
-        config.active_symbol = symbol.clone();
-        state.config_store.save(&config)?;
-    }
+    persist_market_config_update(
+        state.account_lifecycle.as_ref(),
+        &state.config_store,
+        &state.config,
+        |config| config.active_symbol = symbol.clone(),
+        || state.market.set_active_symbol(&symbol),
+    )
+    .await?;
 
     let interval = state.market.kline_interval().await;
     if let Err(e) = state.market.restore_klines(&symbol, &interval) {
@@ -65,17 +73,17 @@ pub async fn set_active_symbol(state: State<'_, AppState>, symbol: String) -> Ap
 
 #[tauri::command]
 pub async fn set_kline_interval(state: State<'_, AppState>, interval: String) -> AppResult<()> {
-    state.market.set_kline_interval(&interval).await;
-    {
-        let mut config = state.config.write().await;
-        config.kline_interval = interval.clone();
-        state.config_store.save(&config)?;
-    }
+    persist_market_config_update(
+        state.account_lifecycle.as_ref(),
+        &state.config_store,
+        &state.config,
+        |config| config.kline_interval = interval.clone(),
+        || state.market.set_kline_interval(&interval),
+    )
+    .await?;
     let symbol = state.market.active_symbol().await;
     if let Err(e) = state.market.restore_klines(&symbol, &interval) {
-        state
-            .emitter
-            .emit_error(&format!("K线恢复失败: {}", e));
+        state.emitter.emit_error(&format!("K线恢复失败: {}", e));
     }
     state.market.backfill_gaps(&symbol, &interval).await?;
     if state.connection.status().await == ConnectionStatus::Connected {

@@ -33,6 +33,30 @@ export interface ApiCredential {
   label: string
 }
 
+export type RiskLedgerState = 'disabled' | 'ready' | 'unavailable'
+
+export interface RiskStatus {
+  enabled: boolean
+  maxOrderQty: string
+  maxPriceDeviationPct: string
+  maxDailyOrders: number
+  tradingDayTimezone: string
+  ledgerState: RiskLedgerState
+  tradingDay: string
+  occupiedOrders: number | null
+  remainingOrders: number | null
+  updatedAtMs: number | null
+  error: string | null
+}
+
+export interface UpdateRiskConfigRequest {
+  enabled: boolean
+  maxOrderQty: string
+  maxPriceDeviationPct: string
+  maxDailyOrders: number
+  tradingDayTimezone: string
+}
+
 export type CredentialState = 'present' | 'missing' | 'unavailable'
 
 export interface AccountProfile {

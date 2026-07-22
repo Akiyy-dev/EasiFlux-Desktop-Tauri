@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::error::AppError;
 use crate::models::config::{ConnectionStatus, RiskConfig};
-use crate::models::trading::PlaceOrderRequest;
+use crate::models::trading::{Order, PlaceOrderRequest};
+use crate::services::trading::execute_coordinated_reserved_order;
 use crate::services::RiskService;
 use crate::storage::RiskUsageStore;
 
@@ -218,4 +220,87 @@ async fn successful_switch_does_not_reset_global_risk_quota() {
         .unwrap();
     assert!(risk.reserve_order(&order, None, 1_700_000_000_000).is_err());
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn account_switch_waits_for_in_flight_order_lifecycle() {
+    let root = PathBuf::from(std::env::temp_dir()).join(format!(
+        "easiflux-account-switch-order-risk-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig {
+            max_daily_orders: 1,
+            ..RiskConfig::default()
+        },
+        RiskUsageStore::with_path(root.join("risk_usage.toml")),
+    )));
+    let coordinator = AccountLifecycleCoordinator::new();
+    let port = FakeLifecyclePort::new(ConnectionStatus::Connected);
+    let order = PlaceOrderRequest {
+        symbol: "BTCUSDT".into(),
+        side: "Buy".into(),
+        order_type: "Market".into(),
+        qty: "1".into(),
+        position_idx: 0,
+        price: None,
+        time_in_force: None,
+        order_link_id: None,
+        reduce_only: None,
+    };
+    let (release_submit, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+    let order_events = &port.events;
+
+    let order_lifecycle = execute_coordinated_reserved_order(
+        &coordinator,
+        &risk,
+        &order,
+        None,
+        || 1_700_000_000_000,
+        || async move {
+            order_events.lock().unwrap().push("order:submit".into());
+            wait_for_release.await.unwrap();
+            order_events.lock().unwrap().push("order:failed".into());
+            Err::<Order, AppError>(AppError::Trading("rejected".into()))
+        },
+    );
+    let switch = switch_account(&coordinator, &port, "backup", None);
+    tokio::pin!(order_lifecycle);
+    tokio::pin!(switch);
+
+    assert!(matches!(
+        futures_util::poll!(&mut order_lifecycle),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(port.events(), ["order:submit"]);
+    assert!(matches!(
+        futures_util::poll!(&mut switch),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(port.events(), ["order:submit"]);
+
+    release_submit.send(()).unwrap();
+    let order_result =
+        tokio::time::timeout(std::time::Duration::from_secs(1), order_lifecycle.as_mut())
+            .await
+            .expect("order lifecycle should finish after submission is released");
+    assert!(matches!(order_result, Err(AppError::Trading(_))));
+    tokio::time::timeout(std::time::Duration::from_secs(1), switch.as_mut())
+        .await
+        .expect("account switch should acquire the coordinator after order cleanup")
+        .unwrap();
+    assert_eq!(
+        port.events(),
+        [
+            "order:submit",
+            "order:failed",
+            "preflight:backup",
+            "disconnect",
+            "persist:backup",
+            "connect:backup"
+        ]
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
