@@ -167,6 +167,7 @@ pub struct RiskConfig {
     pub max_order_qty: String,
     pub max_price_deviation_pct: String,
     pub max_daily_orders: u32,
+    pub trading_day_timezone: String,
     pub enabled: bool,
 }
 
@@ -176,6 +177,7 @@ impl Default for RiskConfig {
             max_order_qty: "100".to_string(),
             max_price_deviation_pct: "5".to_string(),
             max_daily_orders: 500,
+            trading_day_timezone: crate::models::time::DEFAULT_TRADING_DAY_TIMEZONE.to_string(),
             enabled: true,
         }
     }
@@ -187,6 +189,7 @@ impl From<&AppConfig> for RiskConfig {
             max_order_qty: config.risk_max_order_qty.clone(),
             max_price_deviation_pct: config.risk_max_price_deviation_pct.clone(),
             max_daily_orders: config.risk_max_daily_orders,
+            trading_day_timezone: config.trading_day_timezone.clone(),
             enabled: config.risk_enabled,
         }
     }

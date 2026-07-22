@@ -27,7 +27,7 @@ const tabs = [
       <AppTabs v-model="activeTab" :items="tabs" class="order-center-tabs" />
     </template>
 
-    <div :key="activeTab" class="tab-body ef-motion-fade">
+    <div class="tab-body ef-motion-fade">
       <PositionsTab v-show="activeTab === 'positions'" :active="activeTab === 'positions'" />
       <OpenOrdersTab v-show="activeTab === 'open'" :active="activeTab === 'open'" />
       <OrderHistoryTab v-show="activeTab === 'history'" :active="activeTab === 'history'" />

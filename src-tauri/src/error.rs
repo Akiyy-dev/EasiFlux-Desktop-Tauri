@@ -13,6 +13,8 @@ pub enum AppError {
     Risk(String),
     #[error("配置错误: {0}")]
     Config(String),
+    #[error("存储错误: {0}")]
+    Storage(String),
     #[error("未连接")]
     NotConnected,
     #[error("内部错误: {0}")]

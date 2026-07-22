@@ -65,11 +65,13 @@ async function refresh(): Promise<void> {
 }
 
 onMounted(() => {
-  void refresh()
+  if (props.active) {
+    void refresh()
+  }
 })
 
 watch(connected, (isConnected) => {
-  if (isConnected) {
+  if (isConnected && props.active) {
     void refresh()
   }
 })

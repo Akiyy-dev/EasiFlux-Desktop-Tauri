@@ -23,6 +23,7 @@ export const useMarketStore = defineStore('market', () => {
   const klines = ref<Kline[]>([])
   const symbols = ref<string[]>([])
   const symbolsLoading = ref(false)
+  let instrumentsLoaded = false
   let instrumentsFetchPromise: Promise<void> | null = null
   const marketRequest = useAsyncState<null>()
   const instrumentsRequest = useAsyncState<string[]>((value) => value.length === 0)
@@ -58,6 +59,9 @@ export const useMarketStore = defineStore('market', () => {
     if (instrumentsFetchPromise) {
       return instrumentsFetchPromise
     }
+    if (instrumentsLoaded) {
+      return
+    }
 
     instrumentsFetchPromise = (async () => {
       symbolsLoading.value = true
@@ -67,6 +71,7 @@ export const useMarketStore = defineStore('market', () => {
         if (parsed.length > 0) {
           symbols.value = parsed
           writeCachedSymbols(parsed)
+          instrumentsLoaded = true
         }
         instrumentsRequest.setData(parsed)
       } catch {
@@ -75,6 +80,7 @@ export const useMarketStore = defineStore('market', () => {
           symbols.value = [...fallbackSymbols]
         }
       } finally {
+        instrumentsFetchPromise = null
         symbolsLoading.value = false
       }
     })()

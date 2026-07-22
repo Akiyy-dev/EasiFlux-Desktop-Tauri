@@ -6,12 +6,18 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::api::diagnostic::{warn_if_parse_empty, warn_if_raw_parsed_mismatch};
-use crate::api::mapper::{build_order_query_params, list_envelope_meta, parse_balances, parse_positions};
 use crate::api::endpoints;
+use crate::api::mapper::{
+    build_order_query_params, list_envelope_meta, parse_balances, parse_positions,
+};
+use crate::api::{ApiClient, PublicApi};
 use crate::error::AppResult;
 use crate::events::EventEmitter;
 use crate::models::account::AccountSummary;
-use crate::models::config::{environment_label, normalize_account_id, AppConfig, ConnectionStatus, EnvironmentStatus};
+use crate::models::config::{
+    environment_label, normalize_account_id, AppConfig, ConnectionStatus, EnvironmentStatus,
+    DEFAULT_BASE_URL,
+};
 use crate::models::trading::PrivatePanelsSnapshot;
 use crate::services::{
     ConnectionService, DailyPnlService, MarketService, TimeService, TradingService,
@@ -297,13 +303,9 @@ impl SchedulerService {
             let cfg = self.config.read().await;
             normalize_account_id(&cfg.active_account_id)
         };
-        let params = build_order_query_params(
-            None, None, None, None, None, None, None, None, None, None,
-        );
-        let payload = self
-            .api
-            .private_get(endpoints::BALANCES, params)
-            .await?;
+        let params =
+            build_order_query_params(None, None, None, None, None, None, None, None, None, None);
+        let payload = self.api.private_get(endpoints::BALANCES, params).await?;
         let balances = parse_balances(&payload);
         warn_if_parse_empty(&self.emitter, "account/balance", &payload, balances.len());
         let total_equity = balances
@@ -329,26 +331,20 @@ impl SchedulerService {
         let symbol = self.market.active_symbol().await;
         let sym = Some(symbol.as_str());
         let open_orders = self.trading.fetch_open_orders(sym).await?;
-        let order_history = self
-            .trading
-            .fetch_order_history(sym, Some(50))
-            .await?;
-        let params = build_order_query_params(
-            sym, None, None, None, None, None, None, None, None, None,
-        );
-        let payload = self
-            .api
-            .private_get(endpoints::POSITIONS, params)
-            .await?;
+        let order_history = self.trading.fetch_order_history(sym, Some(50)).await?;
+        let params =
+            build_order_query_params(sym, None, None, None, None, None, None, None, None, None);
+        let payload = self.api.private_get(endpoints::POSITIONS, params).await?;
         let meta = list_envelope_meta(&payload);
         let positions = parse_positions(&payload);
         warn_if_parse_empty(&self.emitter, "position/list", &payload, positions.len());
         warn_if_raw_parsed_mismatch(&self.emitter, "position/list", &meta, positions.len());
-        self.emitter.emit_private_panels_snapshot(PrivatePanelsSnapshot {
-            open_orders,
-            order_history,
-            positions,
-        });
+        self.emitter
+            .emit_private_panels_snapshot(PrivatePanelsSnapshot {
+                open_orders,
+                order_history,
+                positions,
+            });
         Ok(())
     }
 
@@ -387,41 +383,13 @@ impl SchedulerService {
     }
 
     async fn run_environment(&self) -> AppResult<()> {
-        let active_account_id = {
-            let config = self.config.read().await;
-            normalize_account_id(&config.active_account_id)
-        };
-        let credential = CredentialStore::load(&active_account_id)?;
-        let base_url = if let Some(credential) = credential.as_ref() {
-            credential.base_url.clone()
-        } else {
-            self.api.base_url().await
-        };
-        let base_url = if base_url.trim().is_empty() {
-            crate::models::config::DEFAULT_BASE_URL.to_string()
-        } else {
-            base_url
-        };
-        let checked_at = self.time.local_now_ms();
-        let status = match crate::api::PublicApi::server_time(&self.api).await {
-            Ok(_) => EnvironmentStatus {
-                label: environment_label(&base_url).to_string(),
-                base_url,
-                reachable: true,
-                checked_at,
-                error: None,
-            },
-            Err(error) => EnvironmentStatus {
-                label: environment_label(&base_url).to_string(),
-                base_url,
-                reachable: false,
-                checked_at,
-                error: Some(error.user_message()),
-            },
-        };
-        self.emitter.emit_environment_updated(&status);
-        *self.environment_status.write().await = status;
-        Ok(())
+        probe_environment(
+            &self.config,
+            &self.time,
+            &self.emitter,
+            &self.environment_status,
+        )
+        .await
     }
 }
 
@@ -468,13 +436,9 @@ impl SchedulerRefs {
             let cfg = self.config.read().await;
             normalize_account_id(&cfg.active_account_id)
         };
-        let params = build_order_query_params(
-            None, None, None, None, None, None, None, None, None, None,
-        );
-        let payload = self
-            .api
-            .private_get(endpoints::BALANCES, params)
-            .await?;
+        let params =
+            build_order_query_params(None, None, None, None, None, None, None, None, None, None);
+        let payload = self.api.private_get(endpoints::BALANCES, params).await?;
         let balances = parse_balances(&payload);
         warn_if_parse_empty(&self.emitter, "account/balance", &payload, balances.len());
         let total_equity = balances
@@ -500,26 +464,20 @@ impl SchedulerRefs {
         let symbol = self.market.active_symbol().await;
         let sym = Some(symbol.as_str());
         let open_orders = self.trading.fetch_open_orders(sym).await?;
-        let order_history = self
-            .trading
-            .fetch_order_history(sym, Some(50))
-            .await?;
-        let params = build_order_query_params(
-            sym, None, None, None, None, None, None, None, None, None,
-        );
-        let payload = self
-            .api
-            .private_get(endpoints::POSITIONS, params)
-            .await?;
+        let order_history = self.trading.fetch_order_history(sym, Some(50)).await?;
+        let params =
+            build_order_query_params(sym, None, None, None, None, None, None, None, None, None);
+        let payload = self.api.private_get(endpoints::POSITIONS, params).await?;
         let meta = list_envelope_meta(&payload);
         let positions = parse_positions(&payload);
         warn_if_parse_empty(&self.emitter, "position/list", &payload, positions.len());
         warn_if_raw_parsed_mismatch(&self.emitter, "position/list", &meta, positions.len());
-        self.emitter.emit_private_panels_snapshot(PrivatePanelsSnapshot {
-            open_orders,
-            order_history,
-            positions,
-        });
+        self.emitter
+            .emit_private_panels_snapshot(PrivatePanelsSnapshot {
+                open_orders,
+                order_history,
+                positions,
+            });
         Ok(())
     }
 
@@ -556,42 +514,57 @@ impl SchedulerRefs {
     }
 
     async fn run_environment(&self) -> AppResult<()> {
-        let active_account_id = {
-            let config = self.config.read().await;
-            normalize_account_id(&config.active_account_id)
-        };
-        let credential = CredentialStore::load(&active_account_id)?;
-        let base_url = if let Some(credential) = credential.as_ref() {
-            credential.base_url.clone()
-        } else {
-            self.api.base_url().await
-        };
-        let base_url = if base_url.trim().is_empty() {
-            crate::models::config::DEFAULT_BASE_URL.to_string()
-        } else {
-            base_url
-        };
-        let checked_at = self.time.local_now_ms();
-        let status = match crate::api::PublicApi::server_time(&self.api).await {
-            Ok(_) => EnvironmentStatus {
-                label: environment_label(&base_url).to_string(),
-                base_url,
-                reachable: true,
-                checked_at,
-                error: None,
-            },
-            Err(error) => EnvironmentStatus {
-                label: environment_label(&base_url).to_string(),
-                base_url,
-                reachable: false,
-                checked_at,
-                error: Some(error.user_message()),
-            },
-        };
-        self.emitter.emit_environment_updated(&status);
-        *self.environment_status.write().await = status;
-        Ok(())
+        probe_environment(
+            &self.config,
+            &self.time,
+            &self.emitter,
+            &self.environment_status,
+        )
+        .await
     }
+}
+
+async fn environment_probe_client(base_url: &str) -> ApiClient {
+    let client = ApiClient::new();
+    client.set_base_url(base_url).await;
+    client
+}
+
+async fn probe_environment(
+    config: &Arc<RwLock<AppConfig>>,
+    time: &Arc<TimeService>,
+    emitter: &EventEmitter,
+    environment_status: &Arc<RwLock<EnvironmentStatus>>,
+) -> AppResult<()> {
+    let active_account_id = {
+        let config = config.read().await;
+        normalize_account_id(&config.active_account_id)
+    };
+    let selected_base_url = CredentialStore::load(&active_account_id)?
+        .map(|credential| credential.base_url)
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+    let client = environment_probe_client(&selected_base_url).await;
+    let base_url = client.base_url().await;
+    let checked_at = time.local_now_ms();
+    let status = match PublicApi::server_time(&client).await {
+        Ok(_) => EnvironmentStatus {
+            label: environment_label(&base_url).to_string(),
+            base_url,
+            reachable: true,
+            checked_at,
+            error: None,
+        },
+        Err(error) => EnvironmentStatus {
+            label: environment_label(&base_url).to_string(),
+            base_url,
+            reachable: false,
+            checked_at,
+            error: Some(error.user_message()),
+        },
+    };
+    emitter.emit_environment_updated(&status);
+    *environment_status.write().await = status;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -603,5 +576,12 @@ mod tests {
         assert_eq!(TaskId::from_name("dailyPnl"), Some(TaskId::DailyPnl));
         assert_eq!(TaskId::from_name("account"), Some(TaskId::Balances));
         assert_eq!(TaskId::from_name("market"), Some(TaskId::MarketFallback));
+    }
+
+    #[tokio::test]
+    async fn environment_probe_client_uses_reported_base_url() {
+        let client = environment_probe_client("https://sandbox.example.test/").await;
+
+        assert_eq!(client.base_url().await, "https://sandbox.example.test");
     }
 }

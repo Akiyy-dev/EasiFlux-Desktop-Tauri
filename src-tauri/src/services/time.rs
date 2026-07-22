@@ -39,15 +39,30 @@ pub fn resolve_trading_day_timezone(tz: &str) -> String {
     }
 }
 
+pub fn trading_day_key(now_ms: u64, timezone: &str) -> String {
+    use chrono::{TimeZone, Utc};
+
+    let timezone = resolve_trading_day_timezone(timezone);
+    let tz = timezone
+        .parse::<chrono_tz::Tz>()
+        .unwrap_or(chrono_tz::Asia::Shanghai);
+    let now = Utc
+        .timestamp_millis_opt(now_ms as i64)
+        .single()
+        .unwrap_or_else(Utc::now);
+    now.with_timezone(&tz)
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
 pub fn trading_day_bounds(now_ms: u64, timezone: &str) -> (i64, i64) {
     use chrono::{TimeZone, Utc};
     use chrono_tz::Tz;
 
-    let tz: Tz = timezone
-        .parse()
-        .unwrap_or(chrono_tz::Asia::Shanghai);
-    let now = chrono::DateTime::<Utc>::from_timestamp_millis(now_ms as i64)
-        .unwrap_or_else(Utc::now);
+    let tz: Tz = timezone.parse().unwrap_or(chrono_tz::Asia::Shanghai);
+    let now =
+        chrono::DateTime::<Utc>::from_timestamp_millis(now_ms as i64).unwrap_or_else(Utc::now);
     let local = now.with_timezone(&tz);
     let start_naive = local.date_naive().and_hms_opt(0, 0, 0).unwrap();
     let start = tz
@@ -167,7 +182,8 @@ impl TimeService {
 
     pub async fn apply_server_time(&self, server_ms: u64) -> TimeSnapshot {
         let local = self.local_now_ms();
-        self.time_sync.set_server_time_midpoint(server_ms, local, local);
+        self.time_sync
+            .set_server_time_midpoint(server_ms, local, local);
         {
             let mut meta = self.meta.write().await;
             meta.sync_status = TimeSyncStatus::Synced;
@@ -189,7 +205,10 @@ mod tests {
     #[test]
     fn normalize_epoch_ms_handles_seconds_and_millis() {
         assert_eq!(normalize_epoch_ms(1_700_000_000), Some(1_700_000_000_000));
-        assert_eq!(normalize_epoch_ms(1_700_000_000_000), Some(1_700_000_000_000));
+        assert_eq!(
+            normalize_epoch_ms(1_700_000_000_000),
+            Some(1_700_000_000_000)
+        );
         assert_eq!(normalize_epoch_ms(42), None);
     }
 
@@ -209,5 +228,13 @@ mod tests {
             DEFAULT_TRADING_DAY_TIMEZONE
         );
         assert!(is_valid_iana_timezone("Asia/Shanghai"));
+    }
+
+    #[test]
+    fn trading_day_key_uses_configured_timezone() {
+        let now_ms = 1_784_565_000_000;
+
+        assert_eq!(trading_day_key(now_ms, "Asia/Shanghai"), "2026-07-21");
+        assert_eq!(trading_day_key(now_ms, "UTC"), "2026-07-20");
     }
 }
