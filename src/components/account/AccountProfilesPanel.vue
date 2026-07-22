@@ -1,17 +1,40 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { AppButton, AppDialog } from '../ui'
 import CredentialEditor from './CredentialEditor.vue'
+import AccountReconciliationStatus from './AccountReconciliationStatus.vue'
 import { useAccountProfilesStore } from '../../stores/accountProfiles'
 import type { AccountProfile } from '../../types/models'
 
 const store = useAccountProfilesStore()
+const accountActionsDisabled = computed(() => store.accountMutationsBlocked)
 const editorOpen = ref(false)
 const editorMode = ref<'create' | 'edit'>('create')
 const editing = ref<AccountProfile | null>(null)
 const deleteTarget = ref<AccountProfile | null>(null)
+const lastOperation = ref<'switch' | 'delete' | null>(null)
+const panelError = computed(() => {
+  if (deleteTarget.value) return null
+  if (store.switching || store.reconciliationError || store.recoveryError) return null
+  return lastOperation.value === 'switch'
+    ? store.switchError
+    : null
+})
+const deleteDialogError = computed(() =>
+  lastOperation.value === 'delete' ? store.deleteError : null,
+)
 
-onMounted(() => void store.refreshProfiles())
+onMounted(() => void store.refreshProfiles().catch(() => undefined))
+watch(
+  () => store.switching || Boolean(store.reconciliationError) || store.recoveryRequired,
+  (unhealthy) => {
+    if (unhealthy) editorOpen.value = false
+  },
+)
+
+function retryProfileList(): void {
+  void store.refreshProfiles().catch(() => undefined)
+}
 
 function addAccount(): void {
   editing.value = null
@@ -25,11 +48,35 @@ function editAccount(profile: AccountProfile): void {
   editorOpen.value = true
 }
 
+function openDelete(profile: AccountProfile): void {
+  deleteTarget.value = profile
+  lastOperation.value = 'delete'
+}
+
+function closeDelete(): void {
+  deleteTarget.value = null
+  if (lastOperation.value === 'delete') lastOperation.value = null
+}
+
+async function switchAccount(accountId: string): Promise<void> {
+  lastOperation.value = 'switch'
+  try {
+    await store.switchAccount(accountId)
+  } catch {
+    return
+  }
+}
+
 async function confirmDelete(): Promise<void> {
   const target = deleteTarget.value
   if (!target) return
-  await store.deleteAccount(target.accountId)
-  deleteTarget.value = null
+  lastOperation.value = 'delete'
+  try {
+    await store.deleteAccount(target.accountId)
+  } catch {
+    return
+  }
+  closeDelete()
 }
 </script>
 
@@ -37,13 +84,31 @@ async function confirmDelete(): Promise<void> {
   <section class="account-profiles">
     <header>
       <h2>Account profiles</h2>
-      <AppButton :disabled="store.mutating" @click="addAccount">
+      <AppButton :disabled="accountActionsDisabled" @click="addAccount">
         Add account
       </AppButton>
     </header>
-    <p v-if="store.listError" role="alert">
-      {{ store.listError }}
+    <AccountReconciliationStatus />
+    <p v-if="panelError" role="alert">
+      {{ panelError }}
     </p>
+    <div
+      v-if="store.listError && !store.switching && !store.reconciliationError
+        && !store.recoveryError"
+      class="profile-list-error"
+    >
+      <p role="alert">
+        {{ store.listError }}
+      </p>
+      <AppButton
+        data-testid="profile-list-retry"
+        size="sm"
+        :loading="store.loading"
+        @click="retryProfileList"
+      >
+        Retry profile refresh
+      </AppButton>
+    </div>
     <ul>
       <li v-for="profile in store.profiles" :key="profile.accountId">
         <div>
@@ -55,22 +120,24 @@ async function confirmDelete(): Promise<void> {
         </div>
         <div class="actions">
           <AppButton
-            :disabled="store.mutating || profile.credentialState === 'unavailable'"
+            :disabled="accountActionsDisabled || profile.credentialState === 'unavailable'"
             @click="editAccount(profile)"
           >
             Edit
           </AppButton>
           <AppButton
-            :disabled="store.mutating || profile.active || profile.credentialState !== 'present'"
-            @click="store.switchAccount(profile.accountId)"
+            :disabled="accountActionsDisabled || profile.active
+              || profile.credentialState !== 'present'"
+            @click="switchAccount(profile.accountId)"
           >
             Switch
           </AppButton>
           <AppButton
             :data-testid="`delete-${profile.accountId}`"
             variant="danger"
-            :disabled="store.mutating || profile.active || profile.credentialState === 'unavailable'"
-            @click="deleteTarget = profile"
+            :disabled="accountActionsDisabled || profile.active
+              || profile.credentialState === 'unavailable'"
+            @click="openDelete(profile)"
           >
             Delete
           </AppButton>
@@ -80,7 +147,8 @@ async function confirmDelete(): Promise<void> {
   </section>
 
   <CredentialEditor
-    :show="editorOpen"
+    :show="editorOpen && !store.switching && !store.reconciliationError
+      && !store.recoveryRequired"
     :mode="editorMode"
     :account-id="editing?.accountId ?? ''"
     :initial-label="editing?.label ?? ''"
@@ -92,19 +160,23 @@ async function confirmDelete(): Promise<void> {
   <AppDialog
     :show="Boolean(deleteTarget)"
     title="Delete account"
-    @update:show="!$event && (deleteTarget = null)"
+    @update:show="!$event && closeDelete()"
   >
     <p>
       Delete account {{ deleteTarget?.accountId }}?
     </p>
+    <p v-if="deleteDialogError" role="alert">
+      {{ deleteDialogError }}
+    </p>
     <template #footer>
-      <AppButton @click="deleteTarget = null">
+      <AppButton @click="closeDelete">
         Cancel
       </AppButton>
       <AppButton
         data-testid="confirm-delete"
         variant="danger"
         :loading="store.deleting"
+        :disabled="store.accountMutationsBlocked"
         @click="confirmDelete"
       >
         Confirm delete
@@ -115,13 +187,18 @@ async function confirmDelete(): Promise<void> {
 
 <style scoped>
 .account-profiles header,
-.actions {
+.actions,
+.profile-list-error {
   display: flex;
   align-items: center;
   gap: var(--ef-space-2);
 }
 .account-profiles header {
   justify-content: space-between;
+}
+.profile-list-error {
+  justify-content: space-between;
+  color: var(--ef-color-danger);
 }
 ul {
   display: grid;

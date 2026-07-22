@@ -27,20 +27,23 @@ struct ApiSnapshot {
     loss_count: u32,
 }
 
+#[derive(Default)]
+struct AnalyticsData {
+    orders: HashMap<String, Order>,
+    positions: HashMap<String, Position>,
+    snapshot: ApiSnapshot,
+}
+
 pub struct AnalyticsService {
     api: Arc<ApiClient>,
-    orders: Arc<RwLock<HashMap<String, Order>>>,
-    positions: Arc<RwLock<HashMap<String, Position>>>,
-    snapshot: Arc<RwLock<ApiSnapshot>>,
+    data: RwLock<AnalyticsData>,
 }
 
 impl AnalyticsService {
     pub fn new(api: Arc<ApiClient>) -> Self {
         Self {
             api,
-            orders: Arc::new(RwLock::new(HashMap::new())),
-            positions: Arc::new(RwLock::new(HashMap::new())),
-            snapshot: Arc::new(RwLock::new(ApiSnapshot::default())),
+            data: RwLock::new(AnalyticsData::default()),
         }
     }
 
@@ -49,14 +52,51 @@ impl AnalyticsService {
     }
 
     pub async fn record_order(&self, order: Order) {
-        let mut map = self.orders.write().await;
-        map.insert(order.order_id.clone(), order);
+        self.data
+            .write()
+            .await
+            .orders
+            .insert(order.order_id.clone(), order);
     }
 
     pub async fn record_position(&self, position: Position) {
         let key = Self::position_key(&position);
-        let mut map = self.positions.write().await;
-        map.insert(key, position);
+        self.data.write().await.positions.insert(key, position);
+    }
+
+    pub async fn clear_account_data(&self) {
+        *self.data.write().await = AnalyticsData::default();
+    }
+
+    async fn replace_account_data(
+        &self,
+        orders: Vec<Order>,
+        positions: Vec<Position>,
+        snapshot: ApiSnapshot,
+    ) {
+        let orders = orders
+            .into_iter()
+            .map(|order| (order.order_id.clone(), order))
+            .collect();
+        let positions = positions
+            .into_iter()
+            .map(|position| (Self::position_key(&position), position))
+            .collect();
+        *self.data.write().await = AnalyticsData {
+            orders,
+            positions,
+            snapshot,
+        };
+    }
+
+    async fn replace_after_success<F, Fut>(&self, load: F) -> AppResult<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = AppResult<(Vec<Order>, Vec<Position>, ApiSnapshot)>>,
+    {
+        let (orders, positions, snapshot) = load().await?;
+        self.replace_account_data(orders, positions, snapshot).await;
+        Ok(())
     }
 
     pub async fn refresh_from_api(&self, emitter: &EventEmitter) -> AppResult<()> {
@@ -64,6 +104,14 @@ impl AnalyticsService {
             return Ok(());
         }
 
+        self.replace_after_success(|| self.fetch_account_data(emitter))
+            .await
+    }
+
+    async fn fetch_account_data(
+        &self,
+        emitter: &EventEmitter,
+    ) -> AppResult<(Vec<Order>, Vec<Position>, ApiSnapshot)> {
         let history_payload = PrivateApi::orders(
             &self.api,
             None,
@@ -132,23 +180,16 @@ impl AnalyticsService {
             positions.len(),
         );
 
-        {
-            let mut pos_map = self.positions.write().await;
-            pos_map.clear();
-            for position in positions {
-                pos_map.insert(Self::position_key(&position), position);
-            }
-        }
-
-        let mut snapshot = ApiSnapshot::default();
-        snapshot.history_total = history_orders.len() as u32;
+        let mut snapshot = ApiSnapshot {
+            history_total: history_orders.len() as u32,
+            ..ApiSnapshot::default()
+        };
         for order in &history_orders {
             match order.status {
                 OrderStatus::Filled => snapshot.history_filled += 1,
                 OrderStatus::Cancelled => snapshot.history_cancelled += 1,
                 _ => {}
             }
-            self.record_order(order.clone()).await;
         }
 
         for fill in fills {
@@ -158,15 +199,18 @@ impl AnalyticsService {
         }
 
         for row in closed_rows {
-            let pnl_raw = get_str(row, &[
-                "closedPnl",
-                "closed_pnl",
-                "realisedPnl",
-                "realised_pnl",
-                "realizedPnl",
-                "realized_pnl",
-                "pnl",
-            ])
+            let pnl_raw = get_str(
+                row,
+                &[
+                    "closedPnl",
+                    "closed_pnl",
+                    "realisedPnl",
+                    "realised_pnl",
+                    "realizedPnl",
+                    "realized_pnl",
+                    "pnl",
+                ],
+            )
             .unwrap_or_else(|| "0".into());
             let pnl = Decimal::from_str(&pnl_raw).unwrap_or(Decimal::ZERO);
             snapshot.realized_pnl += pnl;
@@ -177,14 +221,14 @@ impl AnalyticsService {
             }
         }
 
-        *self.snapshot.write().await = snapshot;
-        Ok(())
+        Ok((history_orders, positions, snapshot))
     }
 
     pub async fn compute_stats(&self) -> TradeStats {
-        let orders = self.orders.read().await;
-        let positions = self.positions.read().await;
-        let snapshot = self.snapshot.read().await;
+        let data = self.data.read().await;
+        let orders = &data.orders;
+        let positions = &data.positions;
+        let snapshot = &data.snapshot;
 
         let session_total = orders.len() as u32;
         let session_filled = orders
@@ -235,5 +279,106 @@ impl AnalyticsService {
             win_count: snapshot.win_count,
             loss_count: snapshot.loss_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::AppError;
+
+    fn order(id: &str, qty: &str) -> Order {
+        Order {
+            order_id: id.into(),
+            symbol: "BTCUSDT".into(),
+            side: "Buy".into(),
+            order_type: "Limit".into(),
+            price: "100".into(),
+            qty: qty.into(),
+            status: OrderStatus::New,
+            order_link_id: None,
+            filled_qty: "0".into(),
+            avg_price: "0".into(),
+        }
+    }
+
+    fn position(symbol: &str, unrealised_pnl: &str) -> Position {
+        Position {
+            symbol: symbol.into(),
+            side: "Buy".into(),
+            size: "1".into(),
+            entry_price: "100".into(),
+            leverage: "1".into(),
+            unrealised_pnl: unrealised_pnl.into(),
+            position_idx: 0,
+        }
+    }
+
+    fn service() -> AnalyticsService {
+        AnalyticsService::new(Arc::new(ApiClient::new()))
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_commit_replaces_orders_and_positions_including_empty_lists() {
+        let analytics = service();
+        analytics.record_order(order("old", "9")).await;
+        analytics.record_position(position("OLDUSDT", "9")).await;
+
+        analytics
+            .replace_account_data(
+                vec![order("new", "2")],
+                vec![position("BTCUSDT", "7")],
+                ApiSnapshot::default(),
+            )
+            .await;
+
+        let replaced = analytics.compute_stats().await;
+        assert_eq!(replaced.total_orders, 1);
+        assert_eq!(replaced.total_volume, "2");
+        assert_eq!(replaced.unrealised_pnl, "7");
+
+        analytics
+            .replace_account_data(Vec::new(), Vec::new(), ApiSnapshot::default())
+            .await;
+        let empty = analytics.compute_stats().await;
+        assert_eq!(empty.total_orders, 0);
+        assert_eq!(empty.total_volume, "0");
+        assert_eq!(empty.unrealised_pnl, "0");
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_loader_preserves_the_previous_complete_snapshot() {
+        let analytics = service();
+        analytics.record_order(order("old", "3")).await;
+        analytics.record_position(position("BTCUSDT", "4")).await;
+
+        let result = analytics
+            .replace_after_success(|| async {
+                Err::<(Vec<Order>, Vec<Position>, ApiSnapshot), AppError>(AppError::Connection(
+                    "simulated fetch failure".into(),
+                ))
+            })
+            .await;
+
+        assert!(result.is_err());
+        let stats = analytics.compute_stats().await;
+        assert_eq!(stats.total_orders, 1);
+        assert_eq!(stats.total_volume, "3");
+        assert_eq!(stats.unrealised_pnl, "4");
+    }
+
+    #[tokio::test]
+    async fn clear_account_data_resets_all_account_bound_analytics_atomically() {
+        let analytics = service();
+        analytics.record_order(order("old", "5")).await;
+        analytics.record_position(position("BTCUSDT", "6")).await;
+
+        analytics.clear_account_data().await;
+
+        let stats = analytics.compute_stats().await;
+        assert_eq!(stats.total_orders, 0);
+        assert_eq!(stats.total_volume, "0");
+        assert_eq!(stats.unrealised_pnl, "0");
+        assert_eq!(stats.realized_pnl, "0");
     }
 }

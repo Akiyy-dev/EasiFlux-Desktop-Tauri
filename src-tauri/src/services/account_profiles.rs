@@ -5,6 +5,7 @@ mod switching;
 use crate::error::{AppError, AppResult};
 use crate::models::config::{ApiCredential, AppConfig, ConnectionStatus};
 use crate::storage::CredentialStore;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 pub(crate) use listing::build_account_profiles;
@@ -29,21 +30,39 @@ pub(crate) trait AccountLifecyclePort: Send + Sync {
         realtime: bool,
         credential: ApiCredential,
     ) -> AppResult<()>;
+    async fn activate_public_environment(&self, credential: &ApiCredential);
+    async fn clear_account_data(&self);
 }
 
 pub struct AccountLifecycleCoordinator {
-    mutation: tokio::sync::Mutex<()>,
+    // Tokio's fair, write-preferring queue prevents new reads from starving a
+    // pending account mutation while allowing independent snapshots to overlap.
+    lifecycle: tokio::sync::RwLock<()>,
+    session_epoch: AtomicU64,
 }
 
 impl AccountLifecycleCoordinator {
     pub fn new() -> Self {
         Self {
-            mutation: tokio::sync::Mutex::new(()),
+            lifecycle: tokio::sync::RwLock::new(()),
+            session_epoch: AtomicU64::new(0),
         }
     }
 
-    pub async fn mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.mutation.lock().await
+    pub async fn mutation_guard(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.lifecycle.write().await
+    }
+
+    pub async fn read_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.lifecycle.read().await
+    }
+
+    pub fn current_session_epoch(&self) -> u64 {
+        self.session_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn advance_session_epoch(&self) -> u64 {
+        self.session_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
 
@@ -62,6 +81,41 @@ where
     Fut: std::future::Future<Output = T>,
 {
     let _guard = coordinator.mutation_guard().await;
+    operation().await
+}
+
+pub(crate) async fn run_account_private_mutation<T, F, Fut>(
+    coordinator: &AccountLifecycleCoordinator,
+    operation: F,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    run_serialized_account_mutation(coordinator, operation).await
+}
+
+pub(crate) async fn run_account_private_operation<T, F, Fut>(
+    coordinator: &AccountLifecycleCoordinator,
+    operation: F,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let _guard = coordinator.read_guard().await;
+    operation().await
+}
+
+pub(crate) async fn run_account_public_operation<T, F, Fut>(
+    coordinator: &AccountLifecycleCoordinator,
+    operation: F,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let _guard = coordinator.read_guard().await;
     operation().await
 }
 

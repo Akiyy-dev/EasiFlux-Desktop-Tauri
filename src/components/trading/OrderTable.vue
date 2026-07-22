@@ -4,9 +4,10 @@ import { computed, h, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useOrderStore } from '../../stores/order'
 import { useConnectionStore } from '../../stores/connection'
+import { useAccountProfilesStore } from '../../stores/accountProfiles'
 import { refreshSyncTask } from '../../services/dataSyncService'
 import type { Order } from '../../types/models'
-import { reportError } from '../../services/errorService'
+import { notifyWarning, reportError } from '../../services/errorService'
 
 const TABLE_MAX_HEIGHT = 168
 
@@ -16,6 +17,7 @@ const props = defineProps<{
 
 const orderStore = useOrderStore()
 const connectionStore = useConnectionStore()
+const profilesStore = useAccountProfilesStore()
 const { openOrders, orderHistory } = storeToRefs(orderStore)
 
 const activeScope = ref<'open' | 'history'>('open')
@@ -39,7 +41,8 @@ const columns = [
         {
           size: 'tiny',
           quaternary: true,
-          disabled: row.status === 'Filled' || row.status === 'Cancelled',
+          disabled: row.status === 'Filled' || row.status === 'Cancelled'
+            || !connectionStore.connected || profilesStore.tradingBlocked,
           onClick: () => cancel(row),
         },
         { default: () => '撤单' },
@@ -59,6 +62,10 @@ const scopeLabel = computed(() =>
 )
 
 async function cancel(row: Order): Promise<void> {
+  if (profilesStore.tradingBlockedMessage) {
+    notifyWarning(profilesStore.tradingBlockedMessage)
+    return
+  }
   try {
     await orderStore.cancelOrder({ symbol: row.symbol, orderId: row.orderId })
     await refreshPanels()

@@ -1,0 +1,161 @@
+.order-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ef-space-2);
+  padding: var(--ef-space-3);
+  min-height: 0;
+  font-size: var(--ef-text-base);
+}
+
+.account-strip,
+.trade-card {
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-lg);
+  background: color-mix(in srgb, var(--card) 88%, var(--accent) 12%);
+}
+
+.account-strip {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--ef-space-2);
+  padding: var(--ef-space-3);
+}
+
+.account-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.account-item span,
+.action-hint,
+.field-row span,
+.slider-head {
+  color: var(--text-secondary);
+  font-size: var(--ef-text-sm);
+}
+
+.account-item strong {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--ef-text-base);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.align-right {
+  text-align: right;
+  align-items: flex-end;
+}
+
+.trade-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ef-space-3);
+  padding: var(--ef-space-3);
+}
+
+.section-title,
+.section-title > div {
+  display: flex;
+  align-items: center;
+}
+
+.section-title {
+  justify-content: space-between;
+  gap: var(--ef-space-2);
+}
+
+.section-title > div {
+  min-width: 0;
+  gap: var(--ef-space-2);
+}
+
+.section-title strong {
+  color: var(--text);
+  font-size: var(--ef-text-base);
+}
+
+.section-title span,
+.contract-summary span,
+.market-price-hint span {
+  color: var(--text-secondary);
+  font-size: var(--ef-text-sm);
+}
+
+.symbol-badge {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+}
+
+.direction-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--ef-space-2);
+}
+
+.direction-button {
+  min-height: 40px;
+  border-width: 1px;
+  font-weight: 700;
+}
+
+.buy-direction.active {
+  color: white;
+  border-color: var(--accent-green);
+  background: var(--accent-green);
+}
+
+.sell-direction.active {
+  color: white;
+  border-color: var(--accent-red);
+  background: var(--accent-red);
+}
+
+.contract-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--ef-space-2);
+  padding: var(--ef-space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-md);
+  background: color-mix(in srgb, var(--card) 94%, var(--accent) 6%);
+}
+
+.contract-summary > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.contract-summary strong,
+.market-price-hint strong {
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--ef-text-sm);
+  text-overflow: ellipsis;
+}
+
+.market-price-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ef-space-2);
+  min-height: 34px;
+  padding: 0 var(--ef-space-2);
+  border: 1px dashed var(--border);
+  border-radius: var(--ef-radius-md);
+}
+
+.quick-percent {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--ef-space-1);
+}

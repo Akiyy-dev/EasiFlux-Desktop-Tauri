@@ -161,6 +161,11 @@ impl ConnectionService {
 
     ) -> AppResult<()> {
 
+        if !start_realtime {
+            self.ws.stop().await;
+            self.emitter.emit_websocket("disconnected");
+        }
+
         let credential = match credential {
 
             Some(mut c) => {
@@ -226,7 +231,6 @@ impl ConnectionService {
 
 
         self.api.set_credential(credential.clone()).await;
-
         let snapshot = self.time.sync().await?;
         if snapshot.sync_status == TimeSyncStatus::Failed {
             return Err(AppError::Connection(
@@ -291,6 +295,7 @@ impl ConnectionService {
     pub async fn disconnect(&self) {
 
         self.ws.stop().await;
+        self.emitter.emit_websocket("disconnected");
 
         self.api.clear_credential().await;
 
@@ -337,5 +342,3 @@ impl ConnectionService {
     }
 
 }
-
-

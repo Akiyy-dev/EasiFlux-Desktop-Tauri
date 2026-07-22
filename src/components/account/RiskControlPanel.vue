@@ -59,7 +59,12 @@ async function refresh(): Promise<void> {
           {{ ledgerLabel }}
         </strong>
       </div>
-      <AppButton data-testid="refresh-risk" :loading="store.reading" @click="refresh">
+      <AppButton
+        data-testid="refresh-risk"
+        :disabled="store.saving"
+        :loading="store.reading"
+        @click="refresh"
+      >
         Refresh status
       </AppButton>
     </header>
@@ -108,7 +113,12 @@ async function refresh(): Promise<void> {
       <p v-if="store.updateError" class="warning" role="alert">
         {{ store.updateError }}
       </p>
-      <AppButton data-testid="save-risk" :loading="store.saving" @click="save">
+      <AppButton
+        data-testid="save-risk"
+        :disabled="store.reading"
+        :loading="store.saving"
+        @click="save"
+      >
         Save changes
       </AppButton>
     </form>

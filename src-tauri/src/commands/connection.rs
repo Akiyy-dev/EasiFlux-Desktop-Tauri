@@ -86,3 +86,10 @@ pub async fn get_connection_status(
 ) -> AppResult<crate::models::config::ConnectionStatus> {
     Ok(state.connection.status().await)
 }
+
+#[tauri::command]
+pub async fn get_websocket_status(
+    state: State<'_, AppState>,
+) -> AppResult<crate::models::config::ConnectionStatus> {
+    Ok(state.emitter.websocket_status())
+}

@@ -8,26 +8,35 @@ use crate::error::AppResult;
 use crate::models::account::{AccountSummary, Balance, FundingBalance};
 use crate::models::api_requests::ApiTransferRequest;
 use crate::models::trading::{Position, TradeStats};
+use crate::services::account_profiles::{
+    run_account_private_mutation, run_account_private_operation,
+};
 use crate::state::AppState;
 
 #[tauri::command]
 pub async fn refresh_account(state: State<'_, AppState>) -> AppResult<AccountSummary> {
-    let (account_id, symbol) = {
-        let config = state.config.read().await;
-        (
-            config.active_account_id.clone(),
-            config.active_symbol.clone(),
-        )
-    };
-    state
-        .account
-        .refresh_account(&account_id, Some(&symbol))
-        .await
+    run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        let (account_id, symbol) = {
+            let config = state.config.read().await;
+            (
+                config.active_account_id.clone(),
+                config.active_symbol.clone(),
+            )
+        };
+        state
+            .account
+            .refresh_account(&account_id, Some(&symbol))
+            .await
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn refresh_balances(state: State<'_, AppState>) -> AppResult<Vec<Balance>> {
-    state.account.refresh_balances().await
+    run_account_private_operation(state.account_lifecycle.as_ref(), || {
+        state.account.refresh_balances()
+    })
+    .await
 }
 
 #[tauri::command]
@@ -35,17 +44,23 @@ pub async fn refresh_positions(
     state: State<'_, AppState>,
     symbol: Option<String>,
 ) -> AppResult<Vec<Position>> {
-    state.account.refresh_positions(symbol.as_deref()).await
+    run_account_private_operation(state.account_lifecycle.as_ref(), || {
+        state.account.refresh_positions(symbol.as_deref())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn get_trade_stats(state: State<'_, AppState>) -> AppResult<TradeStats> {
-    if let Err(e) = state.analytics.refresh_from_api(&state.emitter).await {
-        state
-            .emitter
-            .emit_error(&format!("分析数据刷新失败: {}", e.user_message()));
-    }
-    Ok(state.analytics.compute_stats().await)
+    run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        if let Err(e) = state.analytics.refresh_from_api(&state.emitter).await {
+            state
+                .emitter
+                .emit_error(&format!("分析数据刷新失败: {}", e.user_message()));
+        }
+        Ok(state.analytics.compute_stats().await)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -55,11 +70,14 @@ pub async fn export_trade_log(state: State<'_, AppState>) -> AppResult<String> {
 
 #[tauri::command]
 pub async fn fetch_funding_balances(state: State<'_, AppState>) -> AppResult<Vec<FundingBalance>> {
-    let payload = PrivateApi::funding_balances(&state.api).await?;
-    let meta = list_envelope_meta(&payload);
-    let balances = parse_funding_balances(&payload);
-    warn_if_raw_parsed_mismatch(&state.emitter, "funding/balances", &meta, balances.len());
-    Ok(balances)
+    run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        let payload = PrivateApi::funding_balances(&state.api).await?;
+        let meta = list_envelope_meta(&payload);
+        let balances = parse_funding_balances(&payload);
+        warn_if_raw_parsed_mismatch(&state.emitter, "funding/balances", &meta, balances.len());
+        Ok(balances)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -67,12 +85,18 @@ pub async fn transfer_funds(
     state: State<'_, AppState>,
     request: ApiTransferRequest,
 ) -> AppResult<Value> {
-    PrivateApi::transfer_funds(&state.api, &request).await
+    run_account_private_mutation(state.account_lifecycle.as_ref(), || {
+        PrivateApi::transfer_funds(&state.api, &request)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn fetch_user_id(state: State<'_, AppState>) -> AppResult<Value> {
-    PrivateApi::user_id(&state.api).await
+    run_account_private_operation(state.account_lifecycle.as_ref(), || {
+        PrivateApi::user_id(&state.api)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -84,13 +108,15 @@ pub async fn fetch_transfer_history(
     page_num: Option<u32>,
     page_size: Option<u32>,
 ) -> AppResult<Value> {
-    PrivateApi::transfer_history(
-        &state.api,
-        start_time,
-        end_time,
-        coin.as_deref(),
-        page_num,
-        page_size,
-    )
+    run_account_private_operation(state.account_lifecycle.as_ref(), || {
+        PrivateApi::transfer_history(
+            &state.api,
+            start_time,
+            end_time,
+            coin.as_deref(),
+            page_num,
+            page_size,
+        )
+    })
     .await
 }

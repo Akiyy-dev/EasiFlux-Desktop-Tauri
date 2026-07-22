@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -15,6 +16,21 @@ use super::response::{error_message, is_sign_error, is_success_response, is_time
 
 /// Ordered query pairs for private GET signing (SDK insertion order).
 pub type QueryParams = Vec<(String, String)>;
+
+#[derive(Debug, Clone, Copy)]
+struct HttpTimeoutPolicy {
+    connect: Duration,
+    request: Duration,
+}
+
+impl HttpTimeoutPolicy {
+    const fn production() -> Self {
+        Self {
+            connect: Duration::from_secs(5),
+            request: Duration::from_secs(15),
+        }
+    }
+}
 
 pub fn normalize_base_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
@@ -36,9 +52,15 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new() -> Self {
+        Self::with_timeout_policy(HttpTimeoutPolicy::production())
+    }
+
+    fn with_timeout_policy(timeout_policy: HttpTimeoutPolicy) -> Self {
         Self {
             http: Client::builder()
                 .user_agent("EasiFlux-Desktop/0.3.0")
+                .connect_timeout(timeout_policy.connect)
+                .timeout(timeout_policy.request)
                 .build()
                 .expect("http client"),
             base_url: Arc::new(RwLock::new(DEFAULT_BASE_URL.to_string())),
@@ -248,6 +270,62 @@ mod tests {
         client.set_base_url(" https://sandbox.example.test/ ").await;
 
         assert_eq!(client.base_url().await, "https://sandbox.example.test");
+    }
+
+    #[test]
+    fn production_http_timeouts_are_explicit_and_bounded() {
+        let policy = HttpTimeoutPolicy::production();
+
+        assert_eq!(policy.connect, std::time::Duration::from_secs(5));
+        assert_eq!(policy.request, std::time::Duration::from_secs(15));
+        assert!(policy.connect < policy.request);
+    }
+
+    #[tokio::test]
+    async fn stalled_response_is_cancelled_by_total_request_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        listener
+            .set_nonblocking(true)
+            .expect("make test listener nonblocking");
+        let address = listener.local_addr().expect("test listener address");
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((_socket, _)) => {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "test server did not receive the request"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept request: {error}"),
+                }
+            }
+        });
+        let request_timeout = std::time::Duration::from_millis(40);
+        let client = ApiClient::with_timeout_policy(HttpTimeoutPolicy {
+            connect: std::time::Duration::from_secs(1),
+            request: request_timeout,
+        });
+        client.set_base_url(&format!("http://{address}")).await;
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.public_get("/stalled", HashMap::new()),
+        )
+        .await
+        .expect("the configured request timeout should terminate the call");
+        let elapsed = started.elapsed();
+        server.join().expect("test server should exit");
+
+        assert!(matches!(result, Err(AppError::Connection(_))));
+        assert!(elapsed < std::time::Duration::from_millis(200));
     }
 
     #[test]

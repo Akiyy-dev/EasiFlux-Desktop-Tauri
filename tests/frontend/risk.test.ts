@@ -3,10 +3,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { useRiskStore } from '../../src/stores/risk'
 import { useConfigStore } from '../../src/stores/config'
-import type { RiskStatus, UpdateRiskConfigRequest } from '../../src/types/models'
+import type { AppConfig, RiskStatus, UpdateRiskConfigRequest } from '../../src/types/models'
 import { validateRiskConfig } from '../../src/utils/risk'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
+  return { promise, resolve, reject }
+}
 
 const ready: RiskStatus = {
   enabled: true,
@@ -118,5 +125,260 @@ describe('risk validator and store', () => {
         tradingDayTimezone: 'UTC',
       }),
     })
+  })
+
+  it('invalidates an older config fetch when a risk save becomes authoritative', async () => {
+    const initial: AppConfig = {
+      activeSymbol: 'BTCUSDT', activeAccountId: 'primary', watchlistSymbols: ['BTCUSDT'],
+      theme: 'dark', klineInterval: '15', useWebsocket: true,
+      wsPublicUrl: 'wss://example.test/public', wsPrivateUrl: 'wss://example.test/private',
+      tickerPollInterval: 1, windowWidth: 1200, windowHeight: 800, accounts: ['primary'],
+      riskEnabled: true, riskMaxOrderQty: '10', riskMaxPriceDeviationPct: '5',
+      riskMaxDailyOrders: 100, tradingDayTimezone: 'Asia/Shanghai',
+    }
+    const staleFetch = deferred<AppConfig>()
+    const saved = {
+      ...ready,
+      enabled: false,
+      maxOrderQty: '25.5',
+      maxPriceDeviationPct: '2',
+      maxDailyOrders: 20,
+      tradingDayTimezone: 'UTC',
+    }
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'get_config') return staleFetch.promise
+      if (command === 'update_risk_config') return Promise.resolve(saved)
+      return Promise.resolve(undefined)
+    })
+    const config = useConfigStore()
+    config.config = initial
+
+    const oldFetch = config.fetchConfig()
+    expect(config.loading).toBe(true)
+    await useRiskStore().save(request({
+      enabled: false,
+      maxOrderQty: '25.5',
+      maxPriceDeviationPct: '2',
+      maxDailyOrders: 20,
+      tradingDayTimezone: 'UTC',
+    }))
+
+    expect(config.loading).toBe(false)
+    expect(config.config).toEqual({
+      ...initial,
+      riskEnabled: false,
+      riskMaxOrderQty: '25.5',
+      riskMaxPriceDeviationPct: '2',
+      riskMaxDailyOrders: 20,
+      tradingDayTimezone: 'UTC',
+    })
+
+    staleFetch.resolve({
+      ...initial,
+      windowWidth: 900,
+      riskEnabled: true,
+      riskMaxOrderQty: '1',
+      riskMaxPriceDeviationPct: '1',
+      riskMaxDailyOrders: 1,
+      tradingDayTimezone: 'Europe/London',
+    })
+    await oldFetch
+
+    expect(config.config?.windowWidth).toBe(1200)
+    expect(config.config).toEqual(expect.objectContaining({
+      riskEnabled: false,
+      riskMaxOrderQty: '25.5',
+      riskMaxPriceDeviationPct: '2',
+      riskMaxDailyOrders: 20,
+      tradingDayTimezone: 'UTC',
+    }))
+  })
+
+  it('finishes an earlier refresh before starting save and keeps the saved snapshot', async () => {
+    const refreshed = { ...ready, occupiedOrders: 13, remainingOrders: 487 }
+    const saved = { ...ready, maxOrderQty: '25.5', maxDailyOrders: 20,
+      tradingDayTimezone: 'UTC' }
+    const refreshGate = deferred<RiskStatus>()
+    const saveGate = deferred<RiskStatus>()
+    const calls: string[] = []
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      calls.push(command)
+      if (command === 'get_risk_status') return refreshGate.promise
+      if (command === 'update_risk_config') return saveGate.promise
+      return Promise.resolve(undefined)
+    })
+    const config = useConfigStore()
+    config.config = {
+      activeSymbol: 'BTCUSDT', activeAccountId: 'primary', watchlistSymbols: ['BTCUSDT'],
+      theme: 'dark', klineInterval: '15', useWebsocket: true,
+      wsPublicUrl: '', wsPrivateUrl: '', tickerPollInterval: 1,
+      windowWidth: 1200, windowHeight: 800, accounts: ['primary'],
+      riskEnabled: true, riskMaxOrderQty: '10', riskMaxPriceDeviationPct: '5',
+      riskMaxDailyOrders: 100, tradingDayTimezone: 'Asia/Shanghai',
+    }
+    const store = useRiskStore()
+
+    const refreshPromise = store.refresh()
+    const savePromise = store.save(request({ maxOrderQty: '25.5', maxDailyOrders: 20 }))
+
+    expect(calls).toEqual(['get_risk_status'])
+    expect(store.reading).toBe(true)
+    expect(store.saving).toBe(false)
+
+    refreshGate.resolve(refreshed)
+    await refreshPromise
+    await Promise.resolve()
+    expect(calls).toEqual(['get_risk_status', 'update_risk_config'])
+    expect(store.reading).toBe(false)
+    expect(store.saving).toBe(true)
+
+    saveGate.resolve(saved)
+    await savePromise
+    expect(store.status).toEqual(saved)
+    expect(config.config).toEqual(expect.objectContaining({
+      riskEnabled: saved.enabled,
+      riskMaxOrderQty: saved.maxOrderQty,
+      riskMaxPriceDeviationPct: saved.maxPriceDeviationPct,
+      riskMaxDailyOrders: saved.maxDailyOrders,
+      tradingDayTimezone: saved.tradingDayTimezone,
+    }))
+  })
+
+  it('finishes an earlier save before starting refresh and keeps the refreshed snapshot', async () => {
+    const saved = { ...ready, maxOrderQty: '25.5' }
+    const refreshed = { ...saved, occupiedOrders: 14, remainingOrders: 486 }
+    const saveGate = deferred<RiskStatus>()
+    const refreshGate = deferred<RiskStatus>()
+    const calls: string[] = []
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      calls.push(command)
+      if (command === 'update_risk_config') return saveGate.promise
+      if (command === 'get_risk_status') return refreshGate.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useRiskStore()
+
+    const savePromise = store.save(request({ maxOrderQty: '25.5' }))
+    const refreshPromise = store.refresh()
+
+    expect(calls).toEqual(['update_risk_config'])
+    expect(store.saving).toBe(true)
+    expect(store.reading).toBe(false)
+
+    saveGate.resolve(saved)
+    await savePromise
+    await Promise.resolve()
+    expect(calls).toEqual(['update_risk_config', 'get_risk_status'])
+    expect(store.saving).toBe(false)
+    expect(store.reading).toBe(true)
+
+    refreshGate.resolve(refreshed)
+    await refreshPromise
+    expect(store.status).toEqual(refreshed)
+    expect(store.reading).toBe(false)
+  })
+
+  it('continues the queue after failure without stale loading cleanup', async () => {
+    const refreshGate = deferred<RiskStatus>()
+    const saved = { ...ready, maxOrderQty: '30' }
+    const saveGate = deferred<RiskStatus>()
+    const calls: string[] = []
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      calls.push(command)
+      if (command === 'get_risk_status') return refreshGate.promise
+      if (command === 'update_risk_config') return saveGate.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useRiskStore()
+
+    const refreshPromise = store.refresh()
+    const savePromise = store.save(request({ maxOrderQty: '30' }))
+    refreshGate.reject(new Error('refresh failed'))
+
+    await expect(refreshPromise).rejects.toThrow('refresh failed')
+    await Promise.resolve()
+    expect(calls).toEqual(['get_risk_status', 'update_risk_config'])
+    expect(store.readError).toBeNull()
+    expect(store.updateError).toBeNull()
+    expect(store.reading).toBe(false)
+    expect(store.saving).toBe(true)
+
+    saveGate.resolve(saved)
+    await savePromise
+    expect(store.status).toEqual(saved)
+    expect(store.saving).toBe(false)
+  })
+
+  it('clears a save failure when the queued refresh becomes current', async () => {
+    const saveGate = deferred<RiskStatus>()
+    const refreshGate = deferred<RiskStatus>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'update_risk_config') return saveGate.promise
+      if (command === 'get_risk_status') return refreshGate.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useRiskStore()
+    const savePromise = store.save(request()).catch((error: unknown) => error)
+    const refreshPromise = store.refresh().catch((error: unknown) => error)
+
+    saveGate.reject(new Error('save failed'))
+    expect(await savePromise).toEqual(new Error('save failed'))
+    await Promise.resolve()
+    expect(store.saving).toBe(false)
+    expect(store.reading).toBe(true)
+    expect(store.updateError).toBeNull()
+    expect(store.readError).toBeNull()
+
+    refreshGate.reject(new Error('refresh failed'))
+    expect(await refreshPromise).toEqual(new Error('refresh failed'))
+    expect(store.readError).toBe('refresh failed')
+    expect(store.updateError).toBeNull()
+  })
+
+  it('orders invalid save side effects as the only current error without backend invocation', async () => {
+    const refreshGate = deferred<RiskStatus>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'get_risk_status') return refreshGate.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useRiskStore()
+    const refreshPromise = store.refresh().catch((error: unknown) => error)
+    const invalidPromise = store.save(request({ maxOrderQty: '0' }))
+      .catch((error: unknown) => error)
+
+    expect(store.updateError).toBeNull()
+    expect(tauriInvoke).toHaveBeenCalledTimes(1)
+
+    refreshGate.reject(new Error('refresh failed'))
+    expect(await refreshPromise).toEqual(new Error('refresh failed'))
+    expect(await invalidPromise).toBeInstanceOf(Error)
+    expect(store.readError).toBeNull()
+    expect(store.updateError).not.toBeNull()
+    expect(tauriInvoke).toHaveBeenCalledTimes(1)
+  })
+
+  it('serializes multiple refreshes in their invocation order', async () => {
+    const first = deferred<RiskStatus>()
+    const second = deferred<RiskStatus>()
+    const calls: string[] = []
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      calls.push(command)
+      return calls.length === 1 ? first.promise : second.promise
+    })
+    const store = useRiskStore()
+
+    const firstPromise = store.refresh()
+    const secondPromise = store.refresh()
+    expect(calls).toEqual(['get_risk_status'])
+
+    first.resolve({ ...ready, occupiedOrders: 13 })
+    await firstPromise
+    await Promise.resolve()
+    expect(calls).toEqual(['get_risk_status', 'get_risk_status'])
+
+    const latest = { ...ready, occupiedOrders: 14 }
+    second.resolve(latest)
+    await secondPromise
+    expect(store.status).toEqual(latest)
   })
 })

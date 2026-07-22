@@ -7,6 +7,8 @@ use super::{
     AccountLifecyclePort,
 };
 
+pub(crate) const ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER: &str = "ACCOUNT_SWITCH_RECOVERY_REQUIRED";
+
 pub(crate) async fn switch_account<P: AccountLifecyclePort>(
     coordinator: &AccountLifecycleCoordinator,
     port: &P,
@@ -22,6 +24,7 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
         return Ok(AccountSwitchResult {
             active_account_id: former_id,
             connected: former_status == ConnectionStatus::Connected,
+            session_epoch: coordinator.current_session_epoch(),
         });
     }
     let accounts = normalize_account_ids(&former_config.accounts, &former_id);
@@ -39,6 +42,7 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
 
     let mut target_config = former_config.clone();
     target_config.active_account_id = target_id.clone();
+    target_config.accounts = accounts;
     if let Err(primary) = port.persist_config(&target_config) {
         return Err(rollback_switch(
             port,
@@ -63,10 +67,15 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
             )
             .await);
         }
+    } else {
+        port.activate_public_environment(&target_credential).await;
     }
+    port.clear_account_data().await;
+    let session_epoch = coordinator.advance_session_epoch();
     Ok(AccountSwitchResult {
         active_account_id: target_id,
         connected: former_status == ConnectionStatus::Connected,
+        session_epoch,
     })
 }
 
@@ -99,9 +108,9 @@ async fn rollback_switch<P: AccountLifecyclePort>(
     if rollback_errors.is_empty() {
         primary
     } else {
+        port.disconnect().await;
         AppError::Internal(format!(
-            "{}; rollback failed: {}",
-            primary,
+            "{ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER}: {primary}; rollback failed: {}",
             rollback_errors.join("; ")
         ))
     }

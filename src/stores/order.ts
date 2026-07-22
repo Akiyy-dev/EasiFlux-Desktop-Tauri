@@ -4,12 +4,18 @@ import { tauriInvoke } from '../composables/useTauriCommand'
 import type { CancelAllOrdersRequest, CancelOrderRequest, Order, PlaceOrderRequest } from '../types/models'
 import { isTerminalOrderStatus, normalizeOrder, normalizeOrders } from '../utils/order'
 import { useAsyncState } from '../composables/useAsyncState'
+import { assertTradingMutationAllowed } from '../utils/tradingMutationGuard'
+import { useAccountProfilesStore } from './accountProfiles'
 
 export const useOrderStore = defineStore('order', () => {
   const openOrders = ref<Order[]>([])
   const orderHistory = ref<Order[]>([])
   const openOrdersRequest = useAsyncState<Order[]>((value) => value.length === 0)
   const historyRequest = useAsyncState<Order[]>((value) => value.length === 0)
+
+  function assertCanMutate(): void {
+    assertTradingMutationAllowed(useAccountProfilesStore().tradingBlockedMessage)
+  }
 
   function upsertOpenOrder(order: Order): void {
     const normalized = normalizeOrder(order)
@@ -33,37 +39,39 @@ export const useOrderStore = defineStore('order', () => {
   }
 
   async function placeOrder(request: PlaceOrderRequest): Promise<Order> {
+    assertCanMutate()
     const order = normalizeOrder(await tauriInvoke<Order>('place_order', { request }))
     upsertOpenOrder(order)
     return order
   }
 
   async function cancelOrder(request: CancelOrderRequest): Promise<Order> {
+    assertCanMutate()
     const order = normalizeOrder(await tauriInvoke<Order>('cancel_order', { request }))
     upsertOpenOrder(order)
     return order
   }
 
   async function cancelAllOrders(request: CancelAllOrdersRequest = {}): Promise<void> {
+    assertCanMutate()
     await tauriInvoke('cancel_all_orders', { request })
-    await refreshOrders(request.symbol)
   }
 
   async function refreshOrders(symbol?: string): Promise<void> {
-    const raw = await openOrdersRequest.run(() =>
-      tauriInvoke<Order[]>('refresh_orders', { symbol: symbol ?? null }),
+    await openOrdersRequest.run(
+      () => tauriInvoke<Order[]>('refresh_orders', { symbol: symbol ?? null }),
+      (raw) => { openOrders.value = normalizeOrders(raw) },
     )
-    openOrders.value = normalizeOrders(raw)
   }
 
   async function refreshOrderHistory(symbol?: string, limit = 50): Promise<void> {
-    const raw = await historyRequest.run(() =>
-      tauriInvoke<Order[]>('refresh_order_history', {
+    await historyRequest.run(
+      () => tauriInvoke<Order[]>('refresh_order_history', {
         symbol: symbol ?? null,
         limit,
       }),
+      (raw) => { orderHistory.value = normalizeOrders(raw) },
     )
-    orderHistory.value = normalizeOrders(raw)
   }
 
   async function refreshAll(symbol?: string): Promise<void> {

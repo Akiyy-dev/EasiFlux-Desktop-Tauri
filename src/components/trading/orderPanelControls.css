@@ -1,0 +1,69 @@
+.validation-message {
+  padding: var(--ef-space-2);
+  border: 1px solid color-mix(in srgb, var(--accent-red) 55%, var(--border));
+  border-radius: var(--ef-radius-md);
+  color: var(--accent-red);
+  background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+  font-size: var(--ef-text-sm);
+}
+
+.trade-tabs,
+.order-type {
+  width: 100%;
+}
+
+.field-row,
+.slider-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ef-space-1);
+}
+
+.slider-head,
+.action-hint {
+  display: flex;
+  justify-content: space-between;
+}
+
+.action-hint {
+  gap: var(--ef-space-2);
+}
+
+.buy-btn {
+  background: var(--accent-green);
+  border-color: var(--accent-green);
+}
+
+.sell-btn {
+  background: var(--accent-red);
+  border-color: var(--accent-red);
+}
+
+.submit-button {
+  min-height: clamp(38px, 2rem + 0.7vw, 48px);
+  font-weight: 700;
+}
+
+.order-panel :deep(.n-radio-button),
+.order-panel :deep(.n-input) {
+  font-size: var(--ef-text-sm);
+}
+
+.order-panel :deep(.n-radio-button__state-border) {
+  border-radius: var(--ef-radius-md);
+}
+
+@media (max-width: 1180px) {
+  .account-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .align-right {
+    align-items: flex-start;
+    text-align: left;
+  }
+
+  .contract-summary {
+    grid-template-columns: 1fr 1fr;
+  }
+}

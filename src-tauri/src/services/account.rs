@@ -1,28 +1,37 @@
 use std::sync::Arc;
 
 use crate::api::diagnostic::{warn_if_parse_empty, warn_if_raw_parsed_mismatch};
-use crate::api::mapper::{build_order_query_params, parse_balances, parse_positions};
 use crate::api::endpoints;
+use crate::api::mapper::{build_order_query_params, parse_balances, parse_positions};
 use crate::api::ApiClient;
 use crate::error::AppResult;
 use crate::events::EventEmitter;
 use crate::models::account::{AccountSummary, Balance};
 use crate::models::trading::Position;
+use crate::services::AnalyticsService;
 
 pub struct AccountService {
     api: Arc<ApiClient>,
     emitter: EventEmitter,
+    analytics: Arc<AnalyticsService>,
 }
 
 impl AccountService {
-    pub fn new(api: Arc<ApiClient>, emitter: EventEmitter) -> Self {
-        Self { api, emitter }
+    pub fn new(
+        api: Arc<ApiClient>,
+        emitter: EventEmitter,
+        analytics: Arc<AnalyticsService>,
+    ) -> Self {
+        Self {
+            api,
+            emitter,
+            analytics,
+        }
     }
 
     pub async fn refresh_balances(&self) -> AppResult<Vec<Balance>> {
-        let params = build_order_query_params(
-            None, None, None, None, None, None, None, None, None, None,
-        );
+        let params =
+            build_order_query_params(None, None, None, None, None, None, None, None, None, None);
         let payload = self.api.private_get(endpoints::BALANCES, params).await?;
         let balances = parse_balances(&payload);
         warn_if_parse_empty(&self.emitter, "account/balance", &payload, balances.len());
@@ -33,18 +42,8 @@ impl AccountService {
     }
 
     pub async fn refresh_positions(&self, symbol: Option<&str>) -> AppResult<Vec<Position>> {
-        let params = build_order_query_params(
-            symbol,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let params =
+            build_order_query_params(symbol, None, None, None, None, None, None, None, None, None);
         let payload = self.api.private_get(endpoints::POSITIONS, params).await?;
         let meta = crate::api::mapper::list_envelope_meta(&payload);
         let positions = parse_positions(&payload);
@@ -52,6 +51,7 @@ impl AccountService {
         warn_if_raw_parsed_mismatch(&self.emitter, "position/list", &meta, positions.len());
         for position in &positions {
             self.emitter.emit_position(position.clone());
+            self.analytics.record_position(position.clone()).await;
         }
         Ok(positions)
     }

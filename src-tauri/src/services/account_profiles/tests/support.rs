@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use crate::error::{AppError, AppResult};
-use crate::models::config::{ApiCredential, AppConfig, ConnectionStatus, DEFAULT_BASE_URL};
+use crate::models::config::{ApiCredential, AppConfig, ConnectionStatus};
 
 use super::super::{AccountLifecyclePort, AccountProfileListPort, CredentialRepository};
 
@@ -10,6 +11,7 @@ use super::super::{AccountLifecyclePort, AccountProfileListPort, CredentialRepos
 pub(super) struct FailurePlan {
     pub preflight: bool,
     pub target_connect: bool,
+    pub former_connect: bool,
     pub persist_for: Option<String>,
     pub restore_persist: bool,
     pub credential_load_for: Option<String>,
@@ -21,8 +23,13 @@ pub(super) struct FakeLifecyclePort {
     pub credentials: Mutex<HashMap<String, ApiCredential>>,
     pub status: Mutex<ConnectionStatus>,
     pub events: Mutex<Vec<String>>,
+    analytics_clears: AtomicUsize,
+    public_base_url: Mutex<String>,
+    public_has_credential: AtomicBool,
+    public_environment_activations: AtomicUsize,
     pub failures: Mutex<FailurePlan>,
     pub delay_effects: bool,
+    pub delay_connect: bool,
     profile_load_sync: Mutex<Option<(String, Arc<Barrier>, Arc<Barrier>)>>,
 }
 
@@ -41,8 +48,13 @@ impl FakeLifecyclePort {
             credentials: Mutex::new(credentials),
             status: Mutex::new(status),
             events: Mutex::new(Vec::new()),
+            analytics_clears: AtomicUsize::new(0),
+            public_base_url: Mutex::new(credential("primary").base_url),
+            public_has_credential: AtomicBool::new(status == ConnectionStatus::Connected),
+            public_environment_activations: AtomicUsize::new(0),
             failures: Mutex::new(FailurePlan::default()),
             delay_effects: false,
+            delay_connect: false,
             profile_load_sync: Mutex::new(None),
         }
     }
@@ -53,6 +65,22 @@ impl FakeLifecyclePort {
 
     pub fn runtime_config(&self) -> AppConfig {
         self.runtime.lock().unwrap().clone()
+    }
+
+    pub fn analytics_clear_count(&self) -> usize {
+        self.analytics_clears.load(Ordering::SeqCst)
+    }
+
+    pub fn public_base_url(&self) -> String {
+        self.public_base_url.lock().unwrap().clone()
+    }
+
+    pub fn public_has_credential(&self) -> bool {
+        self.public_has_credential.load(Ordering::SeqCst)
+    }
+
+    pub fn public_environment_activation_count(&self) -> usize {
+        self.public_environment_activations.load(Ordering::SeqCst)
     }
 
     pub fn persisted_config(&self) -> AppConfig {
@@ -73,7 +101,7 @@ fn credential(label: &str) -> ApiCredential {
     ApiCredential {
         api_key: format!("{label}-key"),
         api_secret: format!("{label}-secret"),
-        base_url: DEFAULT_BASE_URL.into(),
+        base_url: format!("https://{label}.example.test"),
         label: label.into(),
     }
 }
@@ -182,22 +210,44 @@ impl AccountLifecyclePort for FakeLifecyclePort {
     async fn disconnect(&self) {
         self.events.lock().unwrap().push("disconnect".into());
         *self.status.lock().unwrap() = ConnectionStatus::Disconnected;
+        self.public_has_credential.store(false, Ordering::SeqCst);
     }
 
     async fn connect(
         &self,
         account_id: &str,
         _realtime: bool,
-        _credential: ApiCredential,
+        credential: ApiCredential,
     ) -> AppResult<()> {
         self.events
             .lock()
             .unwrap()
             .push(format!("connect:{account_id}"));
-        if self.failures.lock().unwrap().target_connect && account_id == "backup" {
+        *self.public_base_url.lock().unwrap() = credential.normalize().base_url;
+        self.public_has_credential.store(true, Ordering::SeqCst);
+        if self.delay_connect {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let failures = self.failures.lock().unwrap();
+        if failures.target_connect && account_id == "backup" {
             return Err(AppError::Connection("target connection failed".into()));
         }
+        if failures.former_connect && account_id == "primary" {
+            return Err(AppError::Connection("former connection failed".into()));
+        }
+        drop(failures);
         *self.status.lock().unwrap() = ConnectionStatus::Connected;
         Ok(())
+    }
+
+    async fn clear_account_data(&self) {
+        self.analytics_clears.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn activate_public_environment(&self, credential: &ApiCredential) {
+        *self.public_base_url.lock().unwrap() = credential.clone().normalize().base_url;
+        self.public_has_credential.store(false, Ordering::SeqCst);
+        self.public_environment_activations
+            .fetch_add(1, Ordering::SeqCst);
     }
 }

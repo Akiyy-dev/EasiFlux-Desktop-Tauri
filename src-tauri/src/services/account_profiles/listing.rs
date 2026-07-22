@@ -9,7 +9,7 @@ pub(crate) async fn list_account_profiles_transaction<P: AccountProfileListPort>
     coordinator: &AccountLifecycleCoordinator,
     port: &P,
 ) -> Vec<AccountProfile> {
-    let _guard = coordinator.mutation_guard().await;
+    let _guard = coordinator.read_guard().await;
     let config = port.read_profile_config().await;
     build_account_profiles(&config.accounts, &config.active_account_id, port)
 }

@@ -6,11 +6,12 @@ import TanstackDataTable from '../../common/TanstackDataTable.vue'
 import { AppButton } from '../../ui'
 import { useOrderCenterRefresh } from '../../../composables/useOrderCenterRefresh'
 import { useConnectionStore } from '../../../stores/connection'
+import { useAccountProfilesStore } from '../../../stores/accountProfiles'
 import { useOrderStore } from '../../../stores/order'
 import { refreshSyncTask } from '../../../services/dataSyncService'
 import type { Order } from '../../../types/models'
 import { filterOpenOrders, type OpenOrderScope } from '../../../utils/orderFilters'
-import { reportError } from '../../../services/errorService'
+import { notifyWarning, reportError } from '../../../services/errorService'
 
 const props = defineProps<{
   active: boolean
@@ -18,6 +19,7 @@ const props = defineProps<{
 
 const orderStore = useOrderStore()
 const connectionStore = useConnectionStore()
+const profilesStore = useAccountProfilesStore()
 const { openOrders } = storeToRefs(orderStore)
 const { loading, refresh } = useOrderCenterRefresh(computed(() => props.active))
 
@@ -36,6 +38,10 @@ const scopedOrders = computed(() => filterOpenOrders(openOrders.value, scope.val
 const columnHelper = createColumnHelper<Order>()
 
 async function cancelOne(row: Order): Promise<void> {
+  if (profilesStore.tradingBlockedMessage) {
+    notifyWarning(profilesStore.tradingBlockedMessage)
+    return
+  }
   actionLoading.value = true
   try {
     await orderStore.cancelOrder({ symbol: row.symbol, orderId: row.orderId })
@@ -49,6 +55,10 @@ async function cancelOne(row: Order): Promise<void> {
 }
 
 async function batchCancel(rows: Order[]): Promise<void> {
+  if (profilesStore.tradingBlockedMessage) {
+    notifyWarning(profilesStore.tradingBlockedMessage)
+    return
+  }
   if (rows.length === 0) {
     return
   }
@@ -67,6 +77,10 @@ async function batchCancel(rows: Order[]): Promise<void> {
 }
 
 async function cancelAll(): Promise<void> {
+  if (profilesStore.tradingBlockedMessage) {
+    notifyWarning(profilesStore.tradingBlockedMessage)
+    return
+  }
   actionLoading.value = true
   try {
     await orderStore.cancelAllOrders({})
@@ -96,7 +110,7 @@ const columns = [
         {
           variant: 'ghost',
           size: 'sm',
-          disabled: !connectionStore.connected || actionLoading.value,
+          disabled: !connectionStore.connected || profilesStore.tradingBlocked || actionLoading.value,
           onClick: () => void cancelOne(row.original),
         },
         { default: () => '撤单' },
@@ -143,7 +157,7 @@ function rowId(row: Order): string {
         <AppButton
           size="sm"
           variant="ghost"
-          :disabled="!connectionStore.connected || selectedRows.length === 0 || actionLoading"
+          :disabled="!connectionStore.connected || profilesStore.tradingBlocked || selectedRows.length === 0 || actionLoading"
           @click="batchCancel(selectedRows).then(() => clearSelection())"
         >
           批量撤单
@@ -151,7 +165,7 @@ function rowId(row: Order): string {
         <AppButton
           size="sm"
           variant="danger"
-          :disabled="!connectionStore.connected || scopedOrders.length === 0 || actionLoading"
+          :disabled="!connectionStore.connected || profilesStore.tradingBlocked || scopedOrders.length === 0 || actionLoading"
           @click="cancelAll"
         >
           一键全部撤单

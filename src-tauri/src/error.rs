@@ -1,7 +1,8 @@
 use serde::Serialize;
+use std::fmt::Display;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum AppError {
     #[error("认证失败: {0}")]
     Auth(String),
@@ -46,7 +47,32 @@ impl From<reqwest::Error> for AppError {
 
 impl From<keyring::Error> for AppError {
     fn from(value: keyring::Error) -> Self {
-        AppError::Config(value.to_string())
+        map_keyring_error(value)
+    }
+}
+
+pub(crate) fn credential_backend_error(_reason: impl Display) -> AppError {
+    AppError::Auth("系统凭据存储不可用，请稍后重试".into())
+}
+
+pub(crate) fn map_keyring_error(error: keyring::Error) -> AppError {
+    tracing::warn!(
+        error_kind = keyring_error_kind(&error),
+        "credential backend operation failed"
+    );
+    credential_backend_error(error)
+}
+
+fn keyring_error_kind(error: &keyring::Error) -> &'static str {
+    match error {
+        keyring::Error::PlatformFailure(_) => "platform_failure",
+        keyring::Error::NoStorageAccess(_) => "no_storage_access",
+        keyring::Error::NoEntry => "no_entry",
+        keyring::Error::BadEncoding(_) => "bad_encoding",
+        keyring::Error::TooLong(_, _) => "attribute_too_long",
+        keyring::Error::Invalid(_, _) => "invalid_attribute",
+        keyring::Error::Ambiguous(_) => "ambiguous_entry",
+        _ => "unknown",
     }
 }
 
@@ -65,5 +91,43 @@ impl From<toml::de::Error> for AppError {
 impl From<toml::ser::Error> for AppError {
     fn from(value: toml::ser::Error) -> Self {
         AppError::Config(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_private_detail_is_hidden(error: &AppError, private_detail: &str) {
+        assert!(matches!(error, AppError::Auth(_)));
+        for rendered in [
+            error.to_string(),
+            error.user_message(),
+            serde_json::to_string(error).unwrap(),
+        ] {
+            assert!(!rendered.contains(private_detail));
+            assert!(!rendered.contains("raw-key"));
+            assert!(!rendered.contains("raw-secret"));
+        }
+    }
+
+    #[test]
+    fn keyring_backend_detail_is_never_exposed_to_the_ui() {
+        const PRIVATE_DETAIL: &str =
+            "synthetic backend failure: credential=raw api_key=raw-key secret=raw-secret";
+        let backend = std::io::Error::other(PRIVATE_DETAIL);
+
+        let error = AppError::from(keyring::Error::PlatformFailure(Box::new(backend)));
+
+        assert_private_detail_is_hidden(&error, PRIVATE_DETAIL);
+    }
+
+    #[test]
+    fn credential_backend_mapper_ignores_display_detail() {
+        const PRIVATE_DETAIL: &str = "backend api_key=raw-key secret=raw-secret";
+
+        let error = credential_backend_error(PRIVATE_DETAIL);
+
+        assert_private_detail_is_hidden(&error, PRIVATE_DETAIL);
     }
 }

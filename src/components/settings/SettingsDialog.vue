@@ -1,146 +1,184 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
-import { NForm, NFormItem, NInput, NInputNumber, NSwitch } from 'naive-ui'
+import { computed, ref, watch } from 'vue'
+import { NForm, NFormItem, NInputNumber, NSwitch } from 'naive-ui'
+import CredentialEditor from '../account/CredentialEditor.vue'
+import AccountReconciliationStatus from '../account/AccountReconciliationStatus.vue'
 import { AppButton, AppDialog } from '../ui'
-import { tauriInvoke } from '../../composables/useTauriCommand'
+import { useAccountProfilesStore } from '../../stores/accountProfiles'
 import { useConfigStore } from '../../stores/config'
 import { useConnectionStore } from '../../stores/connection'
-import { normalizeAccountId } from '../../utils/account'
-import type { ApiCredential } from '../../types/models'
-import { notifySuccess, notifyWarning, reportError } from '../../services/errorService'
-
+import { notifySuccess, reportError } from '../../services/errorService'
+import type { AppConfig } from '../../types/models'
 const props = defineProps<{ show: boolean }>()
 const emit = defineEmits<{ 'update:show': [boolean] }>()
-
+const accountProfilesStore = useAccountProfilesStore()
 const configStore = useConfigStore()
 const connectionStore = useConnectionStore()
-
-const apiKey = ref('')
-const apiSecret = ref('')
-const baseUrl = ref('https://api.easicoin.io')
+const editorOpen = ref(false)
+const applyingCredentialSave = ref(false)
 const useWebsocket = ref(true)
 const tickerPollInterval = ref(1)
-const testing = ref(false)
-
+const flowError = ref<string | null>(null)
+const activeAccountId = computed(() => accountProfilesStore.activeAccountId)
+const activeProfile = computed(() =>
+  accountProfilesStore.profiles.find((profile) => profile.accountId === activeAccountId.value),
+)
+const profileLabel = computed(() => activeProfile.value?.label ?? activeAccountId.value)
+const profileBaseUrl = computed(() =>
+  activeProfile.value?.baseUrl ?? 'https://api.easicoin.io',
+)
+const canOpenEditor = computed(() => Boolean(activeProfile.value)
+  && !accountProfilesStore.switching
+  && !accountProfilesStore.loading
+  && !accountProfilesStore.listError
+  && !accountProfilesStore.reconciliationLoading
+  && !accountProfilesStore.reconciliationError
+  && !accountProfilesStore.recoveryRequired
+  && activeProfile.value?.credentialState !== 'unavailable')
+const profileStatus = computed(() => {
+  if (accountProfilesStore.switching && !accountProfilesStore.reconciliationLoading) {
+    return 'Switching account'
+  }
+  if (accountProfilesStore.reconciliationLoading || accountProfilesStore.reconciliationError) {
+    return null
+  }
+  if (accountProfilesStore.loading) return 'Loading account profile'
+  if (!activeProfile.value) return 'Active account profile is unavailable'
+  if (activeProfile.value.credentialState === 'unavailable') {
+    return 'Credential storage is unavailable'
+  }
+  if (activeProfile.value.credentialState === 'missing') return 'Credentials are required'
+  return null
+})
 watch(
   () => props.show,
   (visible) => {
-    if (visible && configStore.config) {
-      baseUrl.value = 'https://api.easicoin.io'
+    if (!visible) {
+      editorOpen.value = false
+      applyingCredentialSave.value = false
+      flowError.value = null
+      return
+    }
+    editorOpen.value = false
+    applyingCredentialSave.value = false
+    flowError.value = null
+    if (configStore.config) {
       useWebsocket.value = configStore.config.useWebsocket
       tickerPollInterval.value = configStore.config.tickerPollInterval
     }
+    void accountProfilesStore.refreshProfiles().catch(reportError)
+  },
+  { immediate: true },
+)
+watch(
+  () => accountProfilesStore.switching
+    || Boolean(accountProfilesStore.reconciliationError)
+    || accountProfilesStore.recoveryRequired,
+  (unhealthy) => {
+    if (unhealthy) editorOpen.value = false
   },
 )
-
-function buildCredential(): ApiCredential {
-  return {
-    apiKey: apiKey.value.trim(),
-    apiSecret: apiSecret.value.trim(),
-    baseUrl: baseUrl.value.trim(),
-    label: 'default',
+async function saveGeneralSettings(): Promise<void> {
+  if (!configStore.config) {
+    await configStore.fetchConfig()
   }
+  const currentConfig = configStore.config as AppConfig | null
+  if (!currentConfig) throw new Error('Settings configuration is unavailable')
+  await configStore.saveConfig({
+    ...currentConfig,
+    useWebsocket: useWebsocket.value,
+    tickerPollInterval: Math.max(1, tickerPollInterval.value),
+  })
 }
-
-async function saveConfigOnly(): Promise<void> {
-  if (configStore.config) {
-    await configStore.saveConfig({
-      ...configStore.config,
-      useWebsocket: useWebsocket.value,
-      tickerPollInterval: Math.max(1, tickerPollInterval.value),
-    })
-  }
-}
-
-async function save(): Promise<void> {
-  const accountId = normalizeAccountId(configStore.config?.activeAccountId)
-  const key = apiKey.value.trim()
-  const secret = apiSecret.value.trim()
-
-  if (key || secret) {
-    await configStore.saveCredentials({
-      accountId,
-      apiKey: key,
-      apiSecret: secret,
-      baseUrl: baseUrl.value.trim(),
-      label: 'default',
-    })
-  }
-
-  await saveConfigOnly()
-  notifySuccess('设置已保存')
-}
-
-async function test(): Promise<void> {
-  if (!apiKey.value.trim() || !apiSecret.value.trim()) {
-    notifyWarning('测试连接需要填写 API Key 和 Secret')
-    return
-  }
-  testing.value = true
+async function handleCredentialSaved(): Promise<void> {
+  applyingCredentialSave.value = true
+  flowError.value = null
   try {
-    await tauriInvoke('test_connection', { credential: buildCredential() })
-    notifySuccess('连接测试成功')
-  } catch (e) {
-    reportError(e)
-  } finally {
-    testing.value = false
+    await saveGeneralSettings()
+    await connectionStore.connect(useWebsocket.value)
+    notifySuccess('Settings saved')
+    emit('update:show', false)
+  } catch (error) {
+    flowError.value = reportError(error)
+    applyingCredentialSave.value = false
+    editorOpen.value = false
   }
 }
-
-async function connect(): Promise<void> {
-  try {
-    await save()
-  } catch (e) {
-    reportError(e)
-    return
-  }
-  emit('update:show', false)
-  const credential = apiSecret.value.trim() ? buildCredential() : undefined
-  try {
-    await connectionStore.connect(useWebsocket.value, credential)
-  } catch (e) {
-    reportError(e)
-  }
+function openEditor(): void {
+  if (!canOpenEditor.value) return
+  flowError.value = null
+  editorOpen.value = true
 }
 </script>
-
 <template>
-  <AppDialog :show="show" title="API 设置" @update:show="emit('update:show', $event)">
+  <AppDialog
+    :show="props.show && !editorOpen && !applyingCredentialSave"
+    title="API settings"
+    @update:show="emit('update:show', $event)"
+  >
+    <section class="account-summary">
+      <div>
+        <span>Current account</span>
+        <strong>{{ profileLabel }}</strong>
+        <small>{{ activeAccountId }} / {{ profileBaseUrl }}</small>
+      </div>
+      <AppButton
+        :disabled="!canOpenEditor"
+        @click="openEditor"
+      >
+        Edit credentials
+      </AppButton>
+    </section>
+    <AccountReconciliationStatus />
+    <p
+      v-if="!accountProfilesStore.switching
+        && !accountProfilesStore.reconciliationError
+        && accountProfilesStore.listError"
+      role="alert"
+    >
+      {{ accountProfilesStore.listError }}
+    </p>
+    <p v-else-if="profileStatus" class="status-message">
+      {{ profileStatus }}
+    </p>
+    <p v-if="flowError" role="alert">
+      {{ flowError }}
+    </p>
     <NForm label-placement="top">
-      <NFormItem label="API Key">
-        <NInput v-model:value="apiKey" type="password" show-password-on="click" />
-      </NFormItem>
-      <NFormItem label="API Secret">
-        <NInput
-          v-model:value="apiSecret"
-          type="password"
-          show-password-on="click"
-          placeholder="留空则保留已保存的 Secret"
-        />
-      </NFormItem>
-      <NFormItem label="Base URL">
-        <NInput v-model:value="baseUrl" />
-      </NFormItem>
-      <NFormItem label="WebSocket 实时推送">
+      <NFormItem label="WebSocket realtime updates">
         <NSwitch v-model:value="useWebsocket" />
       </NFormItem>
-      <NFormItem label="行情刷新间隔（秒）">
-        <NInputNumber v-model:value="tickerPollInterval" :min="1" :step="1" style="width: 100%" />
+      <NFormItem label="Ticker polling interval (seconds)">
+        <NInputNumber
+          v-model:value="tickerPollInterval"
+          :min="1"
+          :step="1"
+          style="width: 100%"
+        />
       </NFormItem>
     </NForm>
     <template #footer>
       <div class="footer">
-        <AppButton variant="ghost" :loading="testing" @click="test">测试连接</AppButton>
-        <AppButton variant="primary" @click="connect">保存并连接</AppButton>
+        <AppButton variant="primary" :disabled="!canOpenEditor" @click="openEditor">
+          Save credentials and connect
+        </AppButton>
       </div>
     </template>
   </AppDialog>
+  <CredentialEditor
+    v-if="activeProfile"
+    :show="editorOpen
+      && !applyingCredentialSave
+      && !accountProfilesStore.switching
+      && !accountProfilesStore.reconciliationError
+      && !accountProfilesStore.recoveryRequired"
+    mode="edit"
+    :account-id="activeProfile.accountId"
+    :initial-label="activeProfile.label"
+    :initial-base-url="activeProfile.baseUrl"
+    :require-credentials="activeProfile.credentialState === 'missing'"
+    @saved="handleCredentialSaved"
+    @update:show="editorOpen = $event"
+  />
 </template>
-
-<style scoped>
-.footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--ef-space-2);
-}
-</style>
+<style scoped src="./SettingsDialog.css"></style>

@@ -3,17 +3,30 @@ import { computed, ref } from 'vue'
 import AppCard from '../ui/AppCard.vue'
 import TopBar from './TopBar.vue'
 import NavigationRail from './NavigationRail.vue'
-import type { NavKey } from './NavigationRail.vue'
 import Sidebar from './Sidebar.vue'
 import TradingLayout from './TradingLayout.vue'
+import AccountCenterPage from '../account/AccountCenterPage.vue'
 import DashboardPage from '../dashboard/DashboardPage.vue'
+import type {
+  AccountSection,
+  NavigationTarget,
+  NavKey,
+  NonAccountSection,
+  SidebarSectionKey,
+  SidebarTarget,
+} from '../../types/navigation'
 
 const emit = defineEmits<{
   openSettings: []
 }>()
 
-const active = ref<NavKey>('home')
+const activePage = ref<NavKey>('home')
+const activeAccountSection = ref<AccountSection>('api')
+const activeSecondary = ref<NonAccountSection>('welcome')
 const sidebarCollapsed = ref(false)
+const sidebarTarget = computed<SidebarTarget>(() => activePage.value === 'account'
+  ? { page: 'account', section: activeAccountSection.value }
+  : { page: activePage.value, section: activeSecondary.value })
 
 const pageTitle = computed(() => {
   const map: Record<NavKey, string> = {
@@ -25,11 +38,36 @@ const pageTitle = computed(() => {
     plugins: '插件',
     settings: '设置',
   }
-  return map[active.value]
+  return map[activePage.value]
 })
 
-function navigateTo(key: NavKey): void {
-  active.value = key
+function isAccountSection(value: string): value is AccountSection {
+  return value === 'api' || value === 'assets' || value === 'risk'
+}
+
+function isNonAccountSection(value: string): value is NonAccountSection {
+  return value === 'welcome' || value === 'updates' || value === 'installed'
+    || value === 'market' || value === 'manage'
+}
+
+function navigateTo(target: NavKey | NavigationTarget): void {
+  const normalized = typeof target === 'string' ? { page: target } : target
+  activePage.value = normalized.page
+  if (normalized.page === 'account' && normalized.section) {
+    activeAccountSection.value = normalized.section
+  } else if (normalized.page === 'home') {
+    activeSecondary.value = 'welcome'
+  } else if (normalized.page === 'plugins') {
+    activeSecondary.value = 'installed'
+  }
+}
+
+function selectSection(section: SidebarSectionKey): void {
+  if (activePage.value === 'account' && isAccountSection(section)) {
+    activeAccountSection.value = section
+    return
+  }
+  if (isNonAccountSection(section)) activeSecondary.value = section
 }
 </script>
 
@@ -38,26 +76,35 @@ function navigateTo(key: NavKey): void {
     <TopBar :title="pageTitle" />
     <div class="workbench">
       <NavigationRail
-        :active="active"
+        :active="activePage"
         @select="navigateTo"
         @open-settings="emit('openSettings')"
       />
       <Sidebar
-        :active="active"
+        :target="sidebarTarget"
         :collapsed="sidebarCollapsed"
+        @select-section="selectSection"
         @toggle-collapsed="sidebarCollapsed = !sidebarCollapsed"
       />
 
       <section class="main ef-motion-page">
         <DashboardPage
-          v-if="active === 'home'"
+          v-if="activePage === 'home'"
           @navigate="navigateTo"
         />
-        <TradingLayout v-else-if="active === 'trading'" />
+        <TradingLayout v-else-if="activePage === 'trading'" />
+        <AccountCenterPage
+          v-else-if="activePage === 'account'"
+          :active-section="activeAccountSection"
+        />
         <AppCard v-else :title="pageTitle" class="placeholder">
           <div class="placeholder-body">
-            <div class="muted">该页面将在后续 PRD 中逐步迁移实现。</div>
-            <div class="muted">当前已保留交易功能入口：左侧选择“交易”。</div>
+            <div class="muted">
+              该页面将在后续 PRD 中逐步迁移实现。
+            </div>
+            <div class="muted">
+              当前已保留交易功能入口：左侧选择“交易”。
+            </div>
           </div>
         </AppCard>
       </section>

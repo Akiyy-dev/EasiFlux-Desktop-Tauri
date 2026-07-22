@@ -9,7 +9,8 @@ use crate::api::{ApiClient, PublicApi};
 use crate::error::AppResult;
 use crate::events::EventEmitter;
 use crate::models::market::{Depth, Kline, Ticker};
-use crate::services::TimeService;
+use crate::services::account_profiles::run_account_public_operation;
+use crate::services::{AccountLifecycleCoordinator, TimeService};
 use crate::storage::{CacheStore, KlineStore};
 
 const MAX_KLINES: usize = 200;
@@ -39,11 +40,7 @@ pub fn merge_kline_updates(klines: &mut Vec<Kline>, updates: &[Kline], interval_
         return false;
     }
 
-    let mut map: BTreeMap<i64, Kline> = klines
-        .iter()
-        .cloned()
-        .map(|k| (k.open_time, k))
-        .collect();
+    let mut map: BTreeMap<i64, Kline> = klines.iter().cloned().map(|k| (k.open_time, k)).collect();
     for update in updates {
         if update.open_time <= 0 {
             continue;
@@ -60,6 +57,7 @@ pub struct MarketService {
     kline_store: Arc<KlineStore>,
     emitter: EventEmitter,
     time: Arc<TimeService>,
+    account_lifecycle: Arc<AccountLifecycleCoordinator>,
     active_symbol: Arc<RwLock<String>>,
     kline_interval: Arc<RwLock<String>>,
 }
@@ -71,6 +69,7 @@ impl MarketService {
         kline_store: Arc<KlineStore>,
         emitter: EventEmitter,
         time: Arc<TimeService>,
+        account_lifecycle: Arc<AccountLifecycleCoordinator>,
     ) -> Self {
         Self {
             api,
@@ -78,6 +77,7 @@ impl MarketService {
             kline_store,
             emitter,
             time,
+            account_lifecycle,
             active_symbol: Arc::new(RwLock::new("BTCUSDT".into())),
             kline_interval: Arc::new(RwLock::new("1".into())),
         }
@@ -158,21 +158,23 @@ impl MarketService {
         }
 
         if let Err(e) = self.persist_and_emit(symbol, interval, &klines) {
-            self.emitter
-                .emit_error(&format!("K线持久化失败: {}", e));
+            self.emitter.emit_error(&format!("K线持久化失败: {}", e));
         }
         false
     }
 
     pub fn schedule_kline_backfill(self: &Arc<Self>, symbol: &str, interval: &str) {
         let market = Arc::clone(self);
+        let account_lifecycle = Arc::clone(&self.account_lifecycle);
         let symbol = symbol.to_string();
         let interval = interval.to_string();
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = market.backfill_gaps(&symbol, &interval).await {
-                market
-                    .emitter
-                    .emit_error(&format!("K线回填失败: {}", e));
+            if let Err(e) = run_guarded_kline_backfill(account_lifecycle.as_ref(), || {
+                market.backfill_gaps(&symbol, &interval)
+            })
+            .await
+            {
+                market.emitter.emit_error(&format!("K线回填失败: {}", e));
             }
         });
     }
@@ -290,10 +292,23 @@ impl MarketService {
     }
 }
 
+async fn run_guarded_kline_backfill<F, Fut>(
+    coordinator: &AccountLifecycleCoordinator,
+    backfill: F,
+) -> AppResult<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
+    run_account_public_operation(coordinator, backfill).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::market::Kline;
+    use crate::services::AccountLifecycleCoordinator;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn sample_kline(open_time: i64, close: &str) -> Kline {
         Kline {
@@ -359,5 +374,31 @@ mod tests {
         );
         assert!(needs_backfill);
         assert_eq!(klines.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn detached_backfill_waits_for_the_account_lifecycle_guard() {
+        let coordinator = AccountLifecycleCoordinator::new();
+        let held_guard = coordinator.mutation_guard().await;
+        let called = AtomicBool::new(false);
+
+        let backfill = run_guarded_kline_backfill(&coordinator, || async {
+            called.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        tokio::pin!(backfill);
+
+        assert!(matches!(
+            futures_util::poll!(&mut backfill),
+            std::task::Poll::Pending
+        ));
+        assert!(!called.load(Ordering::SeqCst));
+
+        drop(held_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), backfill.as_mut())
+            .await
+            .expect("detached backfill should run after the lifecycle guard is released")
+            .unwrap();
+        assert!(called.load(Ordering::SeqCst));
     }
 }

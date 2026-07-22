@@ -13,20 +13,20 @@ export function applyPrivatePanelsSnapshot(snapshot: PrivatePanelsSnapshot): voi
 }
 
 export async function refreshPrivatePanels(): Promise<PrivatePanelsSnapshot> {
-  await tauriInvoke('scheduler_run_task', { task: 'privatePanels', force: true })
-  const data = privatePanelsState.state.value.data
-  if (data) {
-    return data
-  }
-  const orderStore = useOrderStore()
-  const positionStore = usePositionStore()
-  const snapshot: PrivatePanelsSnapshot = {
-    openOrders: orderStore.openOrders,
-    orderHistory: orderStore.orderHistory,
-    positions: positionStore.positions,
-  }
-  privatePanelsState.setData(snapshot)
-  return snapshot
+  return privatePanelsState.run(async () => {
+    await tauriInvoke('scheduler_run_task', { task: 'privatePanels', force: true })
+    const data = privatePanelsState.state.value.data
+    if (data) {
+      return data
+    }
+    const orderStore = useOrderStore()
+    const positionStore = usePositionStore()
+    return {
+      openOrders: orderStore.openOrders,
+      orderHistory: orderStore.orderHistory,
+      positions: positionStore.positions,
+    }
+  })
 }
 
 export function usePrivatePanelsState() {

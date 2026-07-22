@@ -12,6 +12,7 @@ function toMessage(error: unknown): string {
 }
 
 export function useAsyncState<T>(isEmpty?: (value: T) => boolean) {
+  let generation = 0
   const state = ref<AsyncState<T>>({
     status: 'idle',
     data: null,
@@ -19,7 +20,7 @@ export function useAsyncState<T>(isEmpty?: (value: T) => boolean) {
     updatedAt: null,
   })
 
-  function setLoading(): void {
+  function commitLoading(): void {
     state.value = {
       ...state.value,
       status: 'loading',
@@ -27,7 +28,7 @@ export function useAsyncState<T>(isEmpty?: (value: T) => boolean) {
     }
   }
 
-  function setData(data: T): void {
+  function commitData(data: T): void {
     const empty = isEmpty ? isEmpty(data) : false
     state.value = {
       status: empty ? 'empty' : 'success',
@@ -37,7 +38,7 @@ export function useAsyncState<T>(isEmpty?: (value: T) => boolean) {
     }
   }
 
-  function setError(error: unknown): string {
+  function commitError(error: unknown): string {
     const message = toMessage(error)
     state.value = {
       ...state.value,
@@ -48,7 +49,23 @@ export function useAsyncState<T>(isEmpty?: (value: T) => boolean) {
     return message
   }
 
+  function setLoading(): void {
+    generation += 1
+    commitLoading()
+  }
+
+  function setData(data: T): void {
+    generation += 1
+    commitData(data)
+  }
+
+  function setError(error: unknown): string {
+    generation += 1
+    return commitError(error)
+  }
+
   function reset(): void {
+    generation += 1
     state.value = {
       status: 'idle',
       data: null,
@@ -57,14 +74,20 @@ export function useAsyncState<T>(isEmpty?: (value: T) => boolean) {
     }
   }
 
-  async function run(task: () => Promise<T>): Promise<T> {
-    setLoading()
+  async function run(task: () => Promise<T>, onLatest?: (data: T) => void): Promise<T> {
+    const requestGeneration = ++generation
+    commitLoading()
     try {
       const result = await task()
-      setData(result)
+      if (requestGeneration === generation) {
+        commitData(result)
+        onLatest?.(result)
+      }
       return result
     } catch (error) {
-      setError(error)
+      if (requestGeneration === generation) {
+        commitError(error)
+      }
       throw error
     }
   }

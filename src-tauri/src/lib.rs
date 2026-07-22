@@ -72,6 +72,7 @@ pub fn run() {
             connect,
             disconnect,
             get_connection_status,
+            get_websocket_status,
             test_connection,
             set_active_symbol,
             set_kline_interval,

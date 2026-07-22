@@ -1,0 +1,29 @@
+.account-summary,
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ef-space-2);
+}
+
+.account-summary > div {
+  display: grid;
+  gap: 3px;
+}
+
+.account-summary span,
+.account-summary small {
+  color: var(--muted-foreground);
+}
+
+.account-summary small {
+  overflow-wrap: anywhere;
+}
+
+.status-message {
+  color: var(--muted-foreground);
+}
+
+[role='alert'] {
+  color: var(--ef-color-danger);
+}

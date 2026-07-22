@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod config;
+mod config_persistence;
 pub mod credentials;
 pub mod kline_store;
 pub mod risk_usage;

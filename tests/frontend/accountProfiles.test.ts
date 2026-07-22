@@ -83,11 +83,12 @@ describe('account profile store', () => {
     expect(store.config).toEqual(authoritative)
   })
 
-  it('tracks save independently and refreshes only after success', async () => {
-    const pending = deferred<void>()
+  it('resolves a committed save while profile refresh continues independently', async () => {
+    const pendingSave = deferred<void>()
+    const pendingRefresh = deferred<AccountProfile[]>()
     vi.mocked(tauriInvoke).mockImplementation((command) => {
-      if (command === 'save_credentials') return pending.promise
-      if (command === 'list_account_profiles') return Promise.resolve([profile])
+      if (command === 'save_credentials') return pendingSave.promise
+      if (command === 'list_account_profiles') return pendingRefresh.promise
       return Promise.resolve(undefined)
     })
     const store = useAccountProfilesStore()
@@ -100,11 +101,17 @@ describe('account profile store', () => {
     })
     expect(store.saving).toBe(true)
     expect(tauriInvoke).not.toHaveBeenCalledWith('list_account_profiles')
-    pending.resolve()
+    pendingSave.resolve()
     await saving
     expect(store.saving).toBe(false)
     expect(store.saveError).toBeNull()
     expect(tauriInvoke).toHaveBeenCalledWith('list_account_profiles')
+    expect(store.loading).toBe(true)
+
+    pendingRefresh.reject(new Error('profile refresh failed'))
+    await vi.waitFor(() => expect(store.loading).toBe(false))
+    expect(store.listError).toBe('profile refresh failed')
+    expect(store.saveError).toBeNull()
   })
 
   it('clears account-bound state only after a successful switch resolves', async () => {
@@ -137,7 +144,7 @@ describe('account profile store', () => {
     expect(store.switching).toBe(true)
     expect(account.summary?.accountId).toBe('primary')
     expect(orders.openOrders).toHaveLength(1)
-    pending.resolve({ activeAccountId: 'backup', connected: true })
+    pending.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
     await switching
     expect(account.summary).toBeNull()
     expect(account.balances).toEqual([])
@@ -181,6 +188,21 @@ describe('account profile store', () => {
       .mockResolvedValueOnce([])
     await store.deleteAccount('primary')
     expect(store.profiles).toEqual([])
+  })
+
+  it('resolves a committed delete even when its background refresh fails', async () => {
+    const store = useAccountProfilesStore()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'delete_account') return Promise.resolve(undefined)
+      if (command === 'list_account_profiles') {
+        return Promise.reject(new Error('refresh after delete failed'))
+      }
+      return Promise.resolve(undefined)
+    })
+
+    await expect(store.deleteAccount('backup')).resolves.toBeUndefined()
+    await vi.waitFor(() => expect(store.listError).toBe('refresh after delete failed'))
+    expect(store.deleteError).toBeNull()
   })
 })
 

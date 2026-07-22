@@ -134,12 +134,13 @@ async fn disabling_risk_waits_for_failed_order_release_and_clears_disk_quota() {
         &coordinator,
         &risk,
         &order_request,
-        None,
+        || None,
         || NOW_MS,
         || async move {
             wait_for_release.await.unwrap();
             Err::<Order, AppError>(AppError::Trading("rejected".into()))
         },
+        |_| async {},
     );
     tokio::pin!(order);
     assert!(matches!(

@@ -1,23 +1,71 @@
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter};
 
 use crate::models::account::AccountSummary;
+use crate::models::config::{ConnectionStatus, EnvironmentStatus};
 use crate::models::market::{Depth, Kline, Ticker};
 use crate::models::time::{DailyPnlSnapshot, TimeSnapshot};
 use crate::models::trading::{Order, Position, PrivatePanelsSnapshot};
-use crate::services::AnalyticsService;
-use crate::models::config::EnvironmentStatus;
+use crate::services::AccountLifecycleCoordinator;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountSessionEvent<T> {
+    session_epoch: u64,
+    payload: T,
+}
+
+#[derive(Clone, Default)]
+struct WebsocketStatusTracker {
+    status: Arc<AtomicU8>,
+}
+
+impl WebsocketStatusTracker {
+    fn record(&self, status: &str) {
+        let value = match status {
+            "disconnected" => 0,
+            "connecting" => 1,
+            "connected" => 2,
+            "error" => 3,
+            _ => return,
+        };
+        self.status.store(value, Ordering::Release);
+    }
+
+    fn status(&self) -> ConnectionStatus {
+        match self.status.load(Ordering::Acquire) {
+            1 => ConnectionStatus::Connecting,
+            2 => ConnectionStatus::Connected,
+            3 => ConnectionStatus::Error,
+            _ => ConnectionStatus::Disconnected,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct EventEmitter {
     app: AppHandle,
-    analytics: Arc<AnalyticsService>,
+    account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    websocket_status: WebsocketStatusTracker,
 }
 
 impl EventEmitter {
-    pub fn new(app: AppHandle, analytics: Arc<AnalyticsService>) -> Self {
-        Self { app, analytics }
+    pub fn new(app: AppHandle, account_lifecycle: Arc<AccountLifecycleCoordinator>) -> Self {
+        Self {
+            app,
+            account_lifecycle,
+            websocket_status: WebsocketStatusTracker::default(),
+        }
+    }
+
+    fn emit_account_session<T: serde::Serialize + ?Sized>(&self, event: &str, payload: &T) {
+        let envelope = AccountSessionEvent {
+            session_epoch: self.account_lifecycle.current_session_epoch(),
+            payload,
+        };
+        let _ = self.app.emit(event, &envelope);
     }
 
     pub fn emit_app_ready(&self, version: &str) {
@@ -25,13 +73,18 @@ impl EventEmitter {
     }
 
     pub fn emit_connection(&self, status: &str) {
-        let _ = self.app.emit("connection:status", status);
+        self.emit_account_session("connection:status", status);
         self.emit_log("info", &format!("API 连接状态: {}", status));
     }
 
     pub fn emit_websocket(&self, status: &str) {
-        let _ = self.app.emit("websocket:status", status);
+        self.websocket_status.record(status);
+        self.emit_account_session("websocket:status", status);
         self.emit_log("info", &format!("WebSocket 状态: {}", status));
+    }
+
+    pub fn websocket_status(&self) -> ConnectionStatus {
+        self.websocket_status.status()
     }
 
     pub fn emit_ticker(&self, ticker: Ticker) {
@@ -47,25 +100,23 @@ impl EventEmitter {
     }
 
     pub fn emit_order(&self, order: Order) {
-        let _ = self.app.emit("order:updated", &order);
-        let analytics = self.analytics.clone();
-        let tracked = order.clone();
-        tauri::async_runtime::spawn(async move {
-            analytics.record_order(tracked).await;
-        });
+        self.emit_order_event(&order);
+    }
+
+    fn emit_order_event(&self, order: &Order) {
+        self.emit_account_session("order:updated", order);
     }
 
     pub fn emit_position(&self, position: Position) {
-        let _ = self.app.emit("position:updated", &position);
-        let analytics = self.analytics.clone();
-        let tracked = position.clone();
-        tauri::async_runtime::spawn(async move {
-            analytics.record_position(tracked).await;
-        });
+        self.emit_position_event(&position);
+    }
+
+    fn emit_position_event(&self, position: &Position) {
+        self.emit_account_session("position:updated", position);
     }
 
     pub fn emit_balance(&self, balance: crate::models::account::Balance) {
-        let _ = self.app.emit("balance:updated", &balance);
+        self.emit_account_session("balance:updated", &balance);
     }
 
     pub fn emit_time_updated(&self, snapshot: &TimeSnapshot) {
@@ -73,19 +124,19 @@ impl EventEmitter {
     }
 
     pub fn emit_account_snapshot(&self, snapshot: AccountSummary) {
-        let _ = self.app.emit("account:snapshot", &snapshot);
+        self.emit_account_session("account:snapshot", &snapshot);
     }
 
     pub fn emit_private_panels_snapshot(&self, snapshot: PrivatePanelsSnapshot) {
-        let _ = self.app.emit("private-panels:snapshot", &snapshot);
+        self.emit_account_session("private-panels:snapshot", &snapshot);
     }
 
     pub fn emit_daily_pnl_updated(&self, snapshot: &DailyPnlSnapshot) {
-        let _ = self.app.emit("daily-pnl:updated", snapshot);
+        self.emit_account_session("daily-pnl:updated", snapshot);
     }
 
     pub fn emit_environment_updated(&self, status: &EnvironmentStatus) {
-        let _ = self.app.emit("environment:updated", status);
+        self.emit_account_session("environment:updated", status);
     }
 
     pub fn emit_error(&self, message: &str) {
@@ -102,5 +153,51 @@ impl EventEmitter {
                 "timestamp": chrono::Utc::now().timestamp_millis(),
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::models::config::ConnectionStatus;
+
+    use super::{AccountSessionEvent, WebsocketStatusTracker};
+
+    #[test]
+    fn account_session_event_serializes_a_camel_case_epoch_envelope() {
+        let envelope = AccountSessionEvent {
+            session_epoch: 7,
+            payload: json!({ "orderId": "old-order" }),
+        };
+
+        assert_eq!(
+            serde_json::to_value(envelope).unwrap(),
+            json!({
+                "sessionEpoch": 7,
+                "payload": { "orderId": "old-order" },
+            })
+        );
+    }
+
+    #[test]
+    fn websocket_status_tracker_keeps_the_latest_recognized_runtime_state() {
+        let tracker = WebsocketStatusTracker::default();
+        let observer = tracker.clone();
+        assert_eq!(tracker.status(), ConnectionStatus::Disconnected);
+
+        for expected in [
+            ConnectionStatus::Connecting,
+            ConnectionStatus::Error,
+            ConnectionStatus::Connected,
+            ConnectionStatus::Disconnected,
+        ] {
+            tracker.record(&format!("{expected:?}").to_lowercase());
+            assert_eq!(observer.status(), expected);
+        }
+
+        tracker.record("connected");
+        tracker.record("unknown");
+        assert_eq!(observer.status(), ConnectionStatus::Connected);
     }
 }

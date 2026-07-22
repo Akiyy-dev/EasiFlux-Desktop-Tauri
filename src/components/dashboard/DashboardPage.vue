@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { NavKey } from '../layout/NavigationRail.vue'
+import type { NavigationTarget, NavKey } from '../../types/navigation'
 import DashboardHero from './DashboardHero.vue'
 import DashboardAssetOverview from './DashboardAssetOverview.vue'
 import DashboardQuickActions from './DashboardQuickActions.vue'
@@ -9,7 +9,7 @@ import DashboardStatusBar from './DashboardStatusBar.vue'
 import type { DashboardNavTarget } from './types'
 
 const emit = defineEmits<{
-  navigate: [NavKey]
+  navigate: [NavKey | NavigationTarget]
 }>()
 
 function handleQuickNavigate(target: DashboardNavTarget | 'positions' | 'assets'): void {
@@ -18,7 +18,7 @@ function handleQuickNavigate(target: DashboardNavTarget | 'positions' | 'assets'
     return
   }
   if (target === 'assets') {
-    emit('navigate', 'account')
+    emit('navigate', { page: 'account', section: 'assets' })
     return
   }
   emit('navigate', target)

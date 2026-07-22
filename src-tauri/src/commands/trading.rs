@@ -1,50 +1,25 @@
+mod mutations;
+
+pub use mutations::*;
+
 use serde_json::Value;
 use tauri::State;
 
 use crate::api::PrivateApi;
 use crate::error::AppResult;
-use crate::models::api_requests::{
-    ApiAddMarginRequest, ApiCancelAllOrdersRequest, ApiCloseAllPositionsRequest,
-    ApiCreateTpslRequest, ApiReplaceOrderRequest, ApiReplaceTpslRequest, ApiSetLeverageRequest,
-    ApiSwitchMarginModeRequest, ApiSwitchSeparatePositionModeRequest,
-};
-use crate::models::trading::{CancelOrderRequest, Order, PlaceOrderRequest, PrivatePanelsSnapshot};
+use crate::models::trading::{Order, PrivatePanelsSnapshot};
+use crate::services::account_profiles::run_account_private_operation;
 use crate::state::AppState;
-
-#[tauri::command]
-pub async fn place_order(
-    state: State<'_, AppState>,
-    request: PlaceOrderRequest,
-) -> AppResult<Order> {
-    let order = state
-        .trading
-        .place_order(state.account_lifecycle.as_ref(), request)
-        .await?;
-    state.analytics.record_order(order.clone()).await;
-    Ok(order)
-}
-
-#[tauri::command]
-pub async fn cancel_order(
-    state: State<'_, AppState>,
-    request: CancelOrderRequest,
-) -> AppResult<Order> {
-    let order = state.trading.cancel_order(request).await?;
-    state.analytics.record_order(order.clone()).await;
-    Ok(order)
-}
 
 #[tauri::command]
 pub async fn refresh_orders(
     state: State<'_, AppState>,
     symbol: Option<String>,
 ) -> AppResult<Vec<Order>> {
-    let sym = symbol.as_deref();
-    let orders = state.trading.refresh_orders(sym).await?;
-    for order in &orders {
-        state.analytics.record_order(order.clone()).await;
-    }
-    Ok(orders)
+    run_account_private_operation(state.account_lifecycle.as_ref(), || {
+        state.trading.refresh_orders(symbol.as_deref())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -53,14 +28,17 @@ pub async fn refresh_order_history(
     symbol: Option<String>,
     limit: Option<u32>,
 ) -> AppResult<Vec<Order>> {
-    let orders = state
-        .trading
-        .refresh_order_history(symbol.as_deref(), limit)
-        .await?;
-    for order in &orders {
-        state.analytics.record_order(order.clone()).await;
-    }
-    Ok(orders)
+    run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        let orders = state
+            .trading
+            .refresh_order_history(symbol.as_deref(), limit)
+            .await?;
+        for order in &orders {
+            state.analytics.record_order(order.clone()).await;
+        }
+        Ok(orders)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -68,37 +46,21 @@ pub async fn refresh_private_panels(
     state: State<'_, AppState>,
     symbol: Option<String>,
 ) -> AppResult<PrivatePanelsSnapshot> {
-    let sym = symbol.as_deref();
-    let open_orders = state.trading.refresh_orders(sym).await?;
-    let order_history = state.trading.refresh_order_history(sym, Some(50)).await?;
-    let positions = state.account.refresh_positions(sym).await?;
-    for order in open_orders.iter().chain(order_history.iter()) {
-        state.analytics.record_order(order.clone()).await;
-    }
-    for position in &positions {
-        state.analytics.record_position(position.clone()).await;
-    }
-    Ok(PrivatePanelsSnapshot {
-        open_orders,
-        order_history,
-        positions,
+    run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        let sym = symbol.as_deref();
+        let open_orders = state.trading.refresh_orders(sym).await?;
+        let order_history = state.trading.refresh_order_history(sym, Some(50)).await?;
+        let positions = state.account.refresh_positions(sym).await?;
+        for order in &order_history {
+            state.analytics.record_order(order.clone()).await;
+        }
+        Ok(PrivatePanelsSnapshot {
+            open_orders,
+            order_history,
+            positions,
+        })
     })
-}
-
-#[tauri::command]
-pub async fn cancel_all_orders(
-    state: State<'_, AppState>,
-    request: ApiCancelAllOrdersRequest,
-) -> AppResult<Value> {
-    PrivateApi::cancel_all_orders(&state.api, &request).await
-}
-
-#[tauri::command]
-pub async fn replace_order(
-    state: State<'_, AppState>,
-    request: ApiReplaceOrderRequest,
-) -> AppResult<Value> {
-    PrivateApi::replace_order(&state.api, &request).await
+    .await
 }
 
 #[tauri::command]
@@ -112,16 +74,18 @@ pub async fn fetch_orders(
     limit: Option<u32>,
     cursor: Option<String>,
 ) -> AppResult<Value> {
-    PrivateApi::orders(
-        &state.api,
-        symbol.as_deref(),
-        coin.as_deref(),
-        order_id.as_deref(),
-        order_link_id.as_deref(),
-        order_filter.as_deref(),
-        limit,
-        cursor.as_deref(),
-    )
+    run_account_private_operation(state.account_lifecycle.as_ref(), || {
+        PrivateApi::orders(
+            &state.api,
+            symbol.as_deref(),
+            coin.as_deref(),
+            order_id.as_deref(),
+            order_link_id.as_deref(),
+            order_filter.as_deref(),
+            limit,
+            cursor.as_deref(),
+        )
+    })
     .await
 }
 
@@ -137,17 +101,19 @@ pub async fn fetch_trade_fills(
     limit: Option<u32>,
     cursor: Option<String>,
 ) -> AppResult<Value> {
-    PrivateApi::trade_fills(
-        &state.api,
-        symbol.as_deref(),
-        coin.as_deref(),
-        order_id.as_deref(),
-        start_time,
-        end_time,
-        exec_type.as_deref(),
-        limit,
-        cursor.as_deref(),
-    )
+    run_account_private_operation(state.account_lifecycle.as_ref(), || {
+        PrivateApi::trade_fills(
+            &state.api,
+            symbol.as_deref(),
+            coin.as_deref(),
+            order_id.as_deref(),
+            start_time,
+            end_time,
+            exec_type.as_deref(),
+            limit,
+            cursor.as_deref(),
+        )
+    })
     .await
 }
 
@@ -157,31 +123,10 @@ pub async fn fetch_fee_rate(
     symbol: Option<String>,
     coin: Option<String>,
 ) -> AppResult<Value> {
-    PrivateApi::fee_rate(&state.api, symbol.as_deref(), coin.as_deref()).await
-}
-
-#[tauri::command]
-pub async fn set_leverage(
-    state: State<'_, AppState>,
-    request: ApiSetLeverageRequest,
-) -> AppResult<Value> {
-    PrivateApi::set_leverage(&state.api, &request).await
-}
-
-#[tauri::command]
-pub async fn add_margin(
-    state: State<'_, AppState>,
-    request: ApiAddMarginRequest,
-) -> AppResult<Value> {
-    PrivateApi::add_margin(&state.api, &request).await
-}
-
-#[tauri::command]
-pub async fn close_all_positions(
-    state: State<'_, AppState>,
-    request: ApiCloseAllPositionsRequest,
-) -> AppResult<Value> {
-    PrivateApi::close_all_positions(&state.api, &request).await
+    run_account_private_operation(state.account_lifecycle.as_ref(), || {
+        PrivateApi::fee_rate(&state.api, symbol.as_deref(), coin.as_deref())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -194,46 +139,16 @@ pub async fn fetch_closed_pnl(
     limit: Option<u32>,
     cursor: Option<String>,
 ) -> AppResult<Value> {
-    PrivateApi::closed_pnl(
-        &state.api,
-        symbol.as_deref(),
-        coin.as_deref(),
-        start_time,
-        end_time,
-        limit,
-        cursor.as_deref(),
-    )
+    run_account_private_operation(state.account_lifecycle.as_ref(), || {
+        PrivateApi::closed_pnl(
+            &state.api,
+            symbol.as_deref(),
+            coin.as_deref(),
+            start_time,
+            end_time,
+            limit,
+            cursor.as_deref(),
+        )
+    })
     .await
-}
-
-#[tauri::command]
-pub async fn create_tpsl(
-    state: State<'_, AppState>,
-    request: ApiCreateTpslRequest,
-) -> AppResult<Value> {
-    PrivateApi::create_tpsl(&state.api, &request).await
-}
-
-#[tauri::command]
-pub async fn replace_tpsl(
-    state: State<'_, AppState>,
-    request: ApiReplaceTpslRequest,
-) -> AppResult<Value> {
-    PrivateApi::replace_tpsl(&state.api, &request).await
-}
-
-#[tauri::command]
-pub async fn switch_margin_mode(
-    state: State<'_, AppState>,
-    request: ApiSwitchMarginModeRequest,
-) -> AppResult<Value> {
-    PrivateApi::switch_margin_mode(&state.api, &request).await
-}
-
-#[tauri::command]
-pub async fn switch_separate_position_mode(
-    state: State<'_, AppState>,
-    request: ApiSwitchSeparatePositionModeRequest,
-) -> AppResult<Value> {
-    PrivateApi::switch_separate_position_mode(&state.api, &request).await
 }

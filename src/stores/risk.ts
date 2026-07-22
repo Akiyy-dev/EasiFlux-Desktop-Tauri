@@ -16,20 +16,57 @@ export const useRiskStore = defineStore('risk', () => {
   const readError = ref<string | null>(null)
   const updateError = ref<string | null>(null)
 
-  async function refresh(): Promise<void> {
-    reading.value = true
-    readError.value = null
+  interface QueuedOperation {
+    run: () => Promise<void>
+    resolve: () => void
+    reject: (error: unknown) => void
+  }
+
+  const operations: QueuedOperation[] = []
+  let draining = false
+
+  async function drainOperations(): Promise<void> {
+    if (draining) return
+    draining = true
     try {
-      status.value = await tauriInvoke<RiskStatus>('get_risk_status')
-    } catch (error) {
-      readError.value = message(error)
-      throw error
+      while (operations.length > 0) {
+        const operation = operations.shift()!
+        try {
+          await operation.run()
+          operation.resolve()
+        } catch (error) {
+          operation.reject(error)
+        }
+      }
     } finally {
-      reading.value = false
+      draining = false
     }
   }
 
-  async function save(draft: UpdateRiskConfigRequest): Promise<void> {
+  function enqueue(operation: () => Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      operations.push({ run: operation, resolve, reject })
+      void drainOperations()
+    })
+  }
+
+  function refresh(): Promise<void> {
+    return enqueue(async () => {
+      reading.value = true
+      readError.value = null
+      updateError.value = null
+      try {
+        status.value = await tauriInvoke<RiskStatus>('get_risk_status')
+      } catch (error) {
+        readError.value = message(error)
+        throw error
+      } finally {
+        reading.value = false
+      }
+    })
+  }
+
+  function save(draft: UpdateRiskConfigRequest): Promise<void> {
     const request = {
       ...draft,
       maxOrderQty: draft.maxOrderQty.trim(),
@@ -37,31 +74,34 @@ export const useRiskStore = defineStore('risk', () => {
       tradingDayTimezone: draft.tradingDayTimezone.trim(),
     }
     const validationError = validateRiskConfig(request)
-    if (validationError) {
-      updateError.value = validationError
-      throw new Error(validationError)
-    }
-    saving.value = true
-    updateError.value = null
-    try {
-      status.value = await tauriInvoke<RiskStatus>('update_risk_config', { request })
-      const configStore = useConfigStore()
-      if (configStore.config) {
-        configStore.config = {
-          ...configStore.config,
-          riskEnabled: status.value.enabled,
-          riskMaxOrderQty: status.value.maxOrderQty,
-          riskMaxPriceDeviationPct: status.value.maxPriceDeviationPct,
-          riskMaxDailyOrders: status.value.maxDailyOrders,
-          tradingDayTimezone: status.value.tradingDayTimezone,
-        }
+
+    return enqueue(async () => {
+      readError.value = null
+      updateError.value = null
+      if (validationError) {
+        updateError.value = validationError
+        throw new Error(validationError)
       }
-    } catch (error) {
-      updateError.value = message(error)
-      throw error
-    } finally {
-      saving.value = false
-    }
+
+      saving.value = true
+      try {
+        const updated = await tauriInvoke<RiskStatus>('update_risk_config', { request })
+        status.value = updated
+        const configStore = useConfigStore()
+        configStore.adoptRiskConfig({
+          riskEnabled: updated.enabled,
+          riskMaxOrderQty: updated.maxOrderQty,
+          riskMaxPriceDeviationPct: updated.maxPriceDeviationPct,
+          riskMaxDailyOrders: updated.maxDailyOrders,
+          tradingDayTimezone: updated.tradingDayTimezone,
+        })
+      } catch (error) {
+        updateError.value = message(error)
+        throw error
+      } finally {
+        saving.value = false
+      }
+    })
   }
 
   return { status, reading, saving, readError, updateError, refresh, save }

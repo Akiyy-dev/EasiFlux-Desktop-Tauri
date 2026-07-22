@@ -8,6 +8,12 @@ import type { RiskStatus } from '../../src/types/models'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
 const ready: RiskStatus = {
   enabled: true,
   maxOrderQty: '100',
@@ -113,5 +119,30 @@ describe('RiskControlPanel', () => {
     expect(tauriInvoke).toHaveBeenCalledWith('update_risk_config', {
       request: expect.objectContaining({ enabled: true }),
     })
+  })
+
+  it('cross-disables refresh and save while the other operation is active', async () => {
+    useRiskStore().status = ready
+    const saveGate = deferred<RiskStatus>()
+    const refreshGate = deferred<RiskStatus>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'update_risk_config') return saveGate.promise
+      if (command === 'get_risk_status') return refreshGate.promise
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mount(RiskControlPanel, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+
+    await wrapper.get('[data-testid="save-risk"]').trigger('click')
+    expect(wrapper.get('[data-testid="refresh-risk"]').attributes('disabled')).toBeDefined()
+
+    saveGate.resolve(ready)
+    await flushPromises()
+    await wrapper.get('[data-testid="refresh-risk"]').trigger('click')
+    expect(wrapper.get('[data-testid="save-risk"]').attributes('disabled')).toBeDefined()
+
+    refreshGate.resolve(ready)
+    await flushPromises()
   })
 })

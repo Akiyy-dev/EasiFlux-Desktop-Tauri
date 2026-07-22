@@ -2,22 +2,64 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type { AppConfig, SaveCredentialRequest } from '../types/models'
+import { normalizeAccountId } from '../utils/account'
+
+type RiskConfigFields = Pick<
+  AppConfig,
+  | 'riskEnabled'
+  | 'riskMaxOrderQty'
+  | 'riskMaxPriceDeviationPct'
+  | 'riskMaxDailyOrders'
+  | 'tradingDayTimezone'
+>
 
 export const useConfigStore = defineStore('config', () => {
   const config = ref<AppConfig | null>(null)
   const loading = ref(false)
+  let latestFetchRequest = 0
+  let authoritativeActiveAccountId: string | null = null
 
-  async function fetchConfig(): Promise<void> {
+  function withAuthoritativeAccount(next: AppConfig): AppConfig {
+    return authoritativeActiveAccountId
+      ? { ...next, activeAccountId: authoritativeActiveAccountId }
+      : next
+  }
+
+  async function fetchConfig(): Promise<AppConfig> {
+    const requestId = ++latestFetchRequest
     loading.value = true
     try {
-      config.value = await tauriInvoke<AppConfig>('get_config')
+      const result = withAuthoritativeAccount(await tauriInvoke<AppConfig>('get_config'))
+      if (requestId === latestFetchRequest) config.value = result
+      return result
     } finally {
-      loading.value = false
+      if (requestId === latestFetchRequest) loading.value = false
     }
   }
 
   async function saveConfig(next: AppConfig): Promise<void> {
-    config.value = await tauriInvoke<AppConfig>('save_config', { config: next })
+    const requestId = ++latestFetchRequest
+    const result = withAuthoritativeAccount(
+      await tauriInvoke<AppConfig>('save_config', { config: next }),
+    )
+    if (requestId === latestFetchRequest) config.value = result
+  }
+
+  function adoptActiveAccountId(accountId: string): void {
+    authoritativeActiveAccountId = normalizeAccountId(accountId)
+    latestFetchRequest += 1
+    loading.value = false
+    if (config.value) {
+      config.value = { ...config.value, activeAccountId: authoritativeActiveAccountId }
+    }
+  }
+
+  function adoptRiskConfig(risk: RiskConfigFields): void {
+    latestFetchRequest += 1
+    loading.value = false
+    if (config.value) {
+      config.value = { ...config.value, ...risk }
+    }
   }
 
   async function saveCredentials(req: SaveCredentialRequest): Promise<void> {
@@ -28,5 +70,14 @@ export const useConfigStore = defineStore('config', () => {
     return tauriInvoke<boolean>('has_credentials', { accountId })
   }
 
-  return { config, loading, fetchConfig, saveConfig, saveCredentials, hasCredentials }
+  return {
+    config,
+    loading,
+    fetchConfig,
+    saveConfig,
+    adoptActiveAccountId,
+    adoptRiskConfig,
+    saveCredentials,
+    hasCredentials,
+  }
 })

@@ -9,16 +9,8 @@ import {
   User,
 } from 'lucide-vue-next'
 import type { FunctionalComponent } from 'vue'
+import type { NavKey } from '../../types/navigation'
 import { AppButton, AppCard, AppIcon } from '../ui'
-
-export type NavKey =
-  | 'home'
-  | 'trading'
-  | 'charts'
-  | 'news'
-  | 'account'
-  | 'plugins'
-  | 'settings'
 
 const props = defineProps<{
   active: NavKey

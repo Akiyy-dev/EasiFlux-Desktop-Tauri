@@ -46,7 +46,8 @@ impl AppState {
         let kline_store = Arc::new(KlineStore::new());
         let trade_log = Arc::new(TradeLogStore::new());
         let analytics = Arc::new(AnalyticsService::new(api.clone()));
-        let emitter = EventEmitter::new(app.clone(), analytics.clone());
+        let account_lifecycle = Arc::new(AccountLifecycleCoordinator::new());
+        let emitter = EventEmitter::new(app.clone(), account_lifecycle.clone());
 
         let time_sync = api.time_sync();
         let ws = Arc::new(WsManager::new(emitter.clone(), time_sync.clone()));
@@ -58,6 +59,7 @@ impl AppState {
             kline_store,
             emitter.clone(),
             time.clone(),
+            account_lifecycle.clone(),
         ));
         ws.set_market(market.clone());
         let connection = Arc::new(ConnectionService::new(
@@ -76,8 +78,13 @@ impl AppState {
             cache.clone(),
             emitter.clone(),
             time.clone(),
+            analytics.clone(),
         ));
-        let account = Arc::new(AccountService::new(api.clone(), emitter.clone()));
+        let account = Arc::new(AccountService::new(
+            api.clone(),
+            emitter.clone(),
+            analytics.clone(),
+        ));
         let daily_pnl = Arc::new(DailyPnlService::new(
             api.clone(),
             time.clone(),
@@ -102,10 +109,10 @@ impl AppState {
             emitter.clone(),
             api.clone(),
             environment_status.clone(),
+            account_lifecycle.clone(),
         ));
 
         let plugins = Arc::new(RwLock::new(PluginRegistry::new()));
-        let account_lifecycle = Arc::new(AccountLifecycleCoordinator::new());
 
         Ok(Self {
             config_store,

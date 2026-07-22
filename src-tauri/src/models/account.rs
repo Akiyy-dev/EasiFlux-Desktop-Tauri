@@ -23,6 +23,7 @@ pub struct AccountProfile {
 pub struct AccountSwitchResult {
     pub active_account_id: String,
     pub connected: bool,
+    pub session_epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

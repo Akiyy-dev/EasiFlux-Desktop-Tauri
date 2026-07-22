@@ -1,70 +1,22 @@
 <script setup lang="ts">
 import { ChevronLeft, ChevronRight } from 'lucide-vue-next'
-import { computed, ref, watch } from 'vue'
+import { computed } from 'vue'
 import AppCard from '../ui/AppCard.vue'
 import AppIcon from '../ui/AppIcon.vue'
-import type { NavKey } from './NavigationRail.vue'
+import type { SidebarSectionKey, SidebarTarget } from '../../types/navigation'
+import { sectionsByNav } from './sidebarSections'
 
 const props = defineProps<{
-  active: NavKey
+  target: SidebarTarget
   collapsed: boolean
 }>()
 
 const emit = defineEmits<{
   toggleCollapsed: []
+  selectSection: [section: SidebarSectionKey]
 }>()
 
-type SidebarSection = {
-  title: string
-  items: Array<{ key: string; label: string }>
-}
-
-const sectionsByNav: Partial<Record<NavKey, SidebarSection[]>> = {
-  home: [
-    {
-      title: 'EasiFlux',
-      items: [
-        { key: 'welcome', label: '欢迎页' },
-        { key: 'updates', label: '最近更新' },
-      ],
-    },
-  ],
-  plugins: [
-    {
-      title: '插件',
-      items: [
-        { key: 'installed', label: '已安装插件' },
-        { key: 'market', label: '插件市场' },
-        { key: 'manage', label: '插件管理' },
-      ],
-    },
-  ],
-  account: [
-    {
-      title: '账户',
-      items: [
-        { key: 'api', label: 'API 管理' },
-        { key: 'assets', label: '资产总览' },
-        { key: 'risk', label: '风险控制' },
-      ],
-    },
-  ],
-}
-
-const sections = computed(() => sectionsByNav[props.active] ?? [])
-const activeSecondary = ref('')
-
-function firstSecondaryKey(): string {
-  return sections.value[0]?.items[0]?.key ?? ''
-}
-
-watch(
-  () => props.active,
-  () => {
-    activeSecondary.value = firstSecondaryKey()
-  },
-  { immediate: true },
-)
+const sections = computed(() => sectionsByNav[props.target.page] ?? [])
 </script>
 
 <template>
@@ -78,7 +30,9 @@ watch(
   >
     <template #header>
       <div class="sidebar-head">
-        <div v-if="!props.collapsed" class="sidebar-title">导航</div>
+        <div v-if="!props.collapsed" class="sidebar-title">
+          导航
+        </div>
         <button
           class="collapse-btn ef-motion-hover ef-motion-press"
           type="button"
@@ -92,15 +46,17 @@ watch(
 
     <div class="sidebar-body">
       <section v-for="section in sections" :key="section.title" class="section">
-        <div v-if="!props.collapsed" class="section-title">{{ section.title }}</div>
+        <div v-if="!props.collapsed" class="section-title">
+          {{ section.title }}
+        </div>
         <button
           v-for="item in section.items"
           :key="item.key"
           class="item-btn ef-motion-hover"
-          :class="{ active: activeSecondary === item.key }"
+          :class="{ active: props.target.section === item.key }"
           type="button"
           :title="item.label"
-          @click="activeSecondary = item.key"
+          @click="emit('selectSection', item.key)"
         >
           <span v-if="props.collapsed" class="dot" aria-hidden="true" />
           <span v-else class="label">{{ item.label }}</span>

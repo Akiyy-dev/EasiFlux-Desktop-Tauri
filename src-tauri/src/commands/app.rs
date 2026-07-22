@@ -3,6 +3,7 @@ use tauri::{AppHandle, State};
 use crate::error::AppResult;
 use crate::models::config::EnvironmentStatus;
 use crate::models::time::TimeSnapshot;
+use crate::services::account_profiles::run_account_public_operation;
 use crate::state::AppState;
 
 #[derive(serde::Serialize)]
@@ -31,7 +32,9 @@ pub fn get_version(app: AppHandle) -> String {
 
 #[tauri::command]
 pub async fn get_server_time(state: State<'_, AppState>) -> AppResult<u64> {
-    let snapshot = state.time.sync().await?;
+    let snapshot =
+        run_account_public_operation(state.account_lifecycle.as_ref(), || state.time.sync())
+            .await?;
     Ok(snapshot.server_time_ms)
 }
 
@@ -42,7 +45,7 @@ pub async fn get_time_snapshot(state: State<'_, AppState>) -> AppResult<TimeSnap
 
 #[tauri::command]
 pub async fn sync_time_now(state: State<'_, AppState>) -> AppResult<TimeSnapshot> {
-    state.time.sync().await
+    run_account_public_operation(state.account_lifecycle.as_ref(), || state.time.sync()).await
 }
 
 #[tauri::command]

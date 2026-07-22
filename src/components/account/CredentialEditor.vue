@@ -6,6 +6,7 @@ import { tauriInvoke } from '../../composables/useTauriCommand'
 import { useAccountProfilesStore } from '../../stores/accountProfiles'
 import { normalizeAccountId } from '../../utils/account'
 import { validateCredentialDraft } from '../../utils/credentials'
+import { reportError } from '../../services/errorService'
 
 const props = withDefaults(defineProps<{
   show: boolean
@@ -27,17 +28,23 @@ const baseUrl = ref('')
 const apiKey = ref('')
 const apiSecret = ref('')
 const validationError = ref<string | null>(null)
+const operationError = ref<string | null>(null)
 const testing = ref(false)
 const hasCompletePair = computed(() => Boolean(apiKey.value.trim() && apiSecret.value.trim()))
 
 watch(() => props.show, (show) => {
-  if (!show) return
+  if (!show) {
+    apiKey.value = ''
+    apiSecret.value = ''
+    return
+  }
   draftAccountId.value = props.accountId
   label.value = props.initialLabel
   baseUrl.value = props.initialBaseUrl || 'https://api.easicoin.io'
   apiKey.value = ''
   apiSecret.value = ''
   validationError.value = null
+  operationError.value = null
 }, { immediate: true })
 
 function validate(): string | null {
@@ -50,21 +57,27 @@ function validate(): string | null {
 
 async function save(): Promise<void> {
   validationError.value = validate()
+  operationError.value = null
   if (validationError.value) return
   const normalizedId = normalizeAccountId(draftAccountId.value)
-  await store.saveCredentials({
-    accountId: normalizedId,
-    apiKey: apiKey.value.trim(),
-    apiSecret: apiSecret.value.trim(),
-    label: label.value.trim(),
-    baseUrl: baseUrl.value.trim(),
-  })
-  emit('saved', normalizedId)
-  emit('update:show', false)
+  try {
+    await store.saveCredentials({
+      accountId: normalizedId,
+      apiKey: apiKey.value.trim(),
+      apiSecret: apiSecret.value.trim(),
+      label: label.value.trim(),
+      baseUrl: baseUrl.value.trim(),
+    })
+    emit('saved', normalizedId)
+    emit('update:show', false)
+  } catch (error) {
+    operationError.value = reportError(error)
+  }
 }
 
 async function testConnection(): Promise<void> {
   if (!hasCompletePair.value) return
+  operationError.value = null
   testing.value = true
   try {
     await tauriInvoke('test_connection', {
@@ -75,6 +88,8 @@ async function testConnection(): Promise<void> {
         baseUrl: baseUrl.value.trim(),
       },
     })
+  } catch (error) {
+    operationError.value = reportError(error)
   } finally {
     testing.value = false
   }
@@ -103,12 +118,15 @@ async function testConnection(): Promise<void> {
       <NFormItem label="API Secret">
         <NInput v-model:value="apiSecret" type="password" />
       </NFormItem>
-      <p v-if="validationError" role="alert">
-        {{ validationError }}
+      <p v-if="validationError || operationError" role="alert">
+        {{ validationError || operationError }}
       </p>
     </NForm>
     <template #footer>
       <div class="actions">
+        <AppButton @click="emit('update:show', false)">
+          Cancel
+        </AppButton>
         <AppButton v-if="hasCompletePair" :loading="testing" @click="testConnection">
           Test connection
         </AppButton>

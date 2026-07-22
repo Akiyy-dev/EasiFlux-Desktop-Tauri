@@ -13,6 +13,10 @@ struct StateLifecyclePort<'a> {
     state: &'a AppState,
 }
 
+async fn activate_public_base_url(api: &crate::api::ApiClient, credential: &ApiCredential) {
+    api.set_base_url(&credential.base_url).await;
+}
+
 impl CredentialRepository for StateLifecyclePort<'_> {
     fn load(&self, account_id: &str) -> AppResult<Option<ApiCredential>> {
         KeyringCredentialRepository.load(account_id)
@@ -82,6 +86,14 @@ impl AccountLifecyclePort for StateLifecyclePort<'_> {
             .connect(account_id, realtime, &symbol, Some(credential))
             .await
     }
+
+    async fn activate_public_environment(&self, credential: &ApiCredential) {
+        activate_public_base_url(self.state.api.as_ref(), credential).await;
+    }
+
+    async fn clear_account_data(&self) {
+        self.state.analytics.clear_account_data().await;
+    }
 }
 
 #[tauri::command]
@@ -124,4 +136,28 @@ pub(crate) async fn save_credentials_transaction(
 ) -> AppResult<()> {
     let port = StateLifecyclePort { state };
     account_profiles::save_credentials(state.account_lifecycle.as_ref(), &port, request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::activate_public_base_url;
+    use crate::api::ApiClient;
+    use crate::models::config::ApiCredential;
+
+    #[tokio::test]
+    async fn public_environment_activation_changes_url_without_installing_credentials() {
+        let api = ApiClient::new();
+        api.set_base_url("https://source.example.test").await;
+        let target = ApiCredential {
+            api_key: "target-key".into(),
+            api_secret: "target-secret".into(),
+            base_url: " https://target.example.test/ ".into(),
+            label: "target".into(),
+        };
+
+        activate_public_base_url(&api, &target).await;
+
+        assert_eq!(api.base_url().await, "https://target.example.test");
+        assert!(!api.has_credential().await);
+    }
 }

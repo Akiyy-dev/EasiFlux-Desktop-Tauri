@@ -16,16 +16,18 @@ use super::support::FakeLifecyclePort;
 #[tokio::test]
 async fn switching_to_active_account_is_idempotent() {
     let port = FakeLifecyclePort::new(ConnectionStatus::Connected);
-    let result = switch_account(
-        &AccountLifecycleCoordinator::new(),
-        &port,
-        " primary ",
-        None,
-    )
-    .await
-    .unwrap();
+    let coordinator = AccountLifecycleCoordinator::new();
+    let result = switch_account(&coordinator, &port, " primary ", None)
+        .await
+        .unwrap();
     assert_eq!(result.active_account_id, "primary");
     assert!(result.connected);
+    assert_eq!(result.session_epoch, 0);
+    assert_eq!(coordinator.current_session_epoch(), 0);
+    assert_eq!(port.analytics_clear_count(), 0);
+    assert_eq!(port.public_base_url(), "https://primary.example.test");
+    assert!(port.public_has_credential());
+    assert_eq!(port.public_environment_activation_count(), 0);
     assert!(port.events().is_empty());
 }
 
@@ -49,6 +51,10 @@ async fn target_validation_and_preflight_leave_source_untouched() {
         assert_eq!(port.runtime_config().active_account_id, "primary");
         assert_eq!(port.persisted_config().active_account_id, "primary");
         assert_eq!(*port.status.lock().unwrap(), ConnectionStatus::Connected);
+        assert_eq!(port.analytics_clear_count(), 0);
+        assert_eq!(port.public_base_url(), "https://primary.example.test");
+        assert!(port.public_has_credential());
+        assert_eq!(port.public_environment_activation_count(), 0);
         assert!(!port.events().iter().any(|event| event == "disconnect"));
     }
 }
@@ -56,13 +62,60 @@ async fn target_validation_and_preflight_leave_source_untouched() {
 #[tokio::test]
 async fn disconnected_switch_persists_without_reconnecting() {
     let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
-    let result = switch_account(&AccountLifecycleCoordinator::new(), &port, "backup", None)
+    let coordinator = AccountLifecycleCoordinator::new();
+    let result = switch_account(&coordinator, &port, "backup", None)
         .await
         .unwrap();
     assert!(!result.connected);
+    assert_eq!(result.session_epoch, 1);
+    assert_eq!(coordinator.current_session_epoch(), 1);
+    assert_eq!(port.analytics_clear_count(), 1);
+    assert_eq!(port.public_base_url(), "https://backup.example.test");
+    assert!(!port.public_has_credential());
+    assert_eq!(port.public_environment_activation_count(), 1);
     assert_eq!(
         port.events(),
         ["preflight:backup", "disconnect", "persist:backup"]
+    );
+}
+
+#[tokio::test]
+async fn non_connected_transitional_states_activate_only_the_target_public_environment() {
+    for status in [ConnectionStatus::Error, ConnectionStatus::Connecting] {
+        let port = FakeLifecyclePort::new(status);
+        let coordinator = AccountLifecycleCoordinator::new();
+
+        let result = switch_account(&coordinator, &port, "backup", None)
+            .await
+            .unwrap();
+
+        assert!(!result.connected);
+        assert_eq!(result.session_epoch, 1);
+        assert_eq!(coordinator.current_session_epoch(), 1);
+        assert_eq!(port.analytics_clear_count(), 1);
+        assert_eq!(port.public_base_url(), "https://backup.example.test");
+        assert!(!port.public_has_credential());
+        assert_eq!(port.public_environment_activation_count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn successful_switch_persists_the_repaired_account_list() {
+    let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
+    port.runtime.lock().unwrap().accounts = vec![" backup ".into(), "backup".into()];
+    port.persisted.lock().unwrap().accounts = vec![" backup ".into(), "backup".into()];
+
+    switch_account(&AccountLifecycleCoordinator::new(), &port, "backup", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        port.persisted_config().accounts,
+        vec!["primary".to_string(), "backup".to_string()]
+    );
+    assert_eq!(
+        port.runtime_config().accounts,
+        vec!["primary".to_string(), "backup".to_string()]
     );
 }
 
@@ -78,6 +131,10 @@ async fn connected_switch_disconnects_persists_and_reconnects() {
     .await
     .unwrap();
     assert!(result.connected);
+    assert_eq!(port.analytics_clear_count(), 1);
+    assert_eq!(port.public_base_url(), "https://backup.example.test");
+    assert!(port.public_has_credential());
+    assert_eq!(port.public_environment_activation_count(), 0);
     assert_eq!(
         port.events(),
         [
@@ -92,13 +149,19 @@ async fn connected_switch_disconnects_persists_and_reconnects() {
 #[tokio::test]
 async fn target_connect_failure_rolls_back_config_and_connection() {
     let port = FakeLifecyclePort::new(ConnectionStatus::Connected);
+    let coordinator = AccountLifecycleCoordinator::new();
     port.failures.lock().unwrap().target_connect = true;
-    let error = switch_account(&AccountLifecycleCoordinator::new(), &port, "backup", None)
+    let error = switch_account(&coordinator, &port, "backup", None)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("target connection failed"));
     assert_eq!(port.runtime_config().active_account_id, "primary");
     assert_eq!(port.persisted_config().active_account_id, "primary");
+    assert_eq!(coordinator.current_session_epoch(), 0);
+    assert_eq!(port.analytics_clear_count(), 0);
+    assert_eq!(port.public_base_url(), "https://primary.example.test");
+    assert!(port.public_has_credential());
+    assert_eq!(port.public_environment_activation_count(), 0);
     assert_eq!(
         port.events(),
         [
@@ -113,20 +176,115 @@ async fn target_connect_failure_rolls_back_config_and_connection() {
 }
 
 #[tokio::test]
-async fn rollback_failure_combines_primary_and_rollback_context() {
+async fn target_persist_failure_rolls_back_without_advancing_the_epoch() {
     let port = FakeLifecyclePort::new(ConnectionStatus::Connected);
-    {
-        let mut failures = port.failures.lock().unwrap();
-        failures.target_connect = true;
-        failures.restore_persist = true;
-    }
-    let error = switch_account(&AccountLifecycleCoordinator::new(), &port, "backup", None)
+    let coordinator = AccountLifecycleCoordinator::new();
+    port.failures.lock().unwrap().persist_for = Some("backup".into());
+
+    let error = switch_account(&coordinator, &port, "backup", None)
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("target connection failed"));
-    assert!(error.contains("rollback"));
-    assert!(error.contains("persist primary failed"));
+        .unwrap_err();
+
+    assert!(error.to_string().contains("persist backup failed"));
+    assert_eq!(coordinator.current_session_epoch(), 0);
+    assert_eq!(port.analytics_clear_count(), 0);
+    assert_eq!(port.public_base_url(), "https://primary.example.test");
+    assert!(port.public_has_credential());
+    assert_eq!(port.public_environment_activation_count(), 0);
+    assert_eq!(port.runtime_config().active_account_id, "primary");
+    assert_eq!(port.persisted_config().active_account_id, "primary");
+    assert_eq!(*port.status.lock().unwrap(), ConnectionStatus::Connected);
+}
+
+#[tokio::test]
+async fn disconnected_persist_failure_keeps_the_source_public_environment() {
+    let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
+    let coordinator = AccountLifecycleCoordinator::new();
+    port.failures.lock().unwrap().persist_for = Some("backup".into());
+
+    assert!(switch_account(&coordinator, &port, "backup", None)
+        .await
+        .is_err());
+
+    assert_eq!(coordinator.current_session_epoch(), 0);
+    assert_eq!(port.analytics_clear_count(), 0);
+    assert_eq!(port.public_base_url(), "https://primary.example.test");
+    assert!(!port.public_has_credential());
+    assert_eq!(port.public_environment_activation_count(), 0);
+}
+
+#[tokio::test]
+async fn epoch_advances_once_only_after_target_connection_commits() {
+    let mut raw = FakeLifecyclePort::new(ConnectionStatus::Connected);
+    raw.delay_connect = true;
+    let port = raw;
+    let coordinator = AccountLifecycleCoordinator::new();
+    let switching = switch_account(&coordinator, &port, "backup", None);
+    tokio::pin!(switching);
+
+    assert!(matches!(
+        futures_util::poll!(&mut switching),
+        std::task::Poll::Pending
+    ));
+    assert!(port.events().iter().any(|event| event == "connect:backup"));
+    assert_eq!(coordinator.current_session_epoch(), 0);
+
+    let result = switching.await.unwrap();
+    assert_eq!(result.session_epoch, 1);
+    assert_eq!(coordinator.current_session_epoch(), 1);
+}
+
+#[tokio::test]
+async fn failed_switch_restores_the_former_account_list_verbatim() {
+    let port = FakeLifecyclePort::new(ConnectionStatus::Connected);
+    let former_accounts = vec![" backup ".to_string(), "backup".to_string()];
+    port.runtime.lock().unwrap().accounts = former_accounts.clone();
+    port.persisted.lock().unwrap().accounts = former_accounts.clone();
+    port.failures.lock().unwrap().target_connect = true;
+
+    assert!(
+        switch_account(&AccountLifecycleCoordinator::new(), &port, "backup", None)
+            .await
+            .is_err()
+    );
+
+    assert_eq!(port.persisted_config().accounts, former_accounts);
+    assert_eq!(port.runtime_config().accounts, former_accounts);
+}
+
+#[tokio::test]
+async fn rollback_failure_requires_recovery_and_finishes_disconnected() {
+    for (restore_persist, former_connect) in [(true, false), (false, true)] {
+        let port = FakeLifecyclePort::new(ConnectionStatus::Connected);
+        let coordinator = AccountLifecycleCoordinator::new();
+        {
+            let mut failures = port.failures.lock().unwrap();
+            failures.target_connect = true;
+            failures.restore_persist = restore_persist;
+            failures.former_connect = former_connect;
+        }
+
+        let error = switch_account(&coordinator, &port, "backup", None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ACCOUNT_SWITCH_RECOVERY_REQUIRED:"));
+        assert!(error.contains("target connection failed"));
+        let rollback_detail = if restore_persist {
+            "persist primary failed"
+        } else {
+            "former connection failed"
+        };
+        assert!(error.contains(rollback_detail));
+        assert_eq!(coordinator.current_session_epoch(), 0);
+        assert_eq!(port.analytics_clear_count(), 0);
+        assert_eq!(port.public_base_url(), "https://primary.example.test");
+        assert!(!port.public_has_credential());
+        assert_eq!(port.public_environment_activation_count(), 0);
+        assert_eq!(*port.status.lock().unwrap(), ConnectionStatus::Disconnected);
+        assert_eq!(port.events().last().map(String::as_str), Some("disconnect"));
+    }
 }
 
 #[tokio::test]
@@ -257,7 +415,7 @@ async fn account_switch_waits_for_in_flight_order_lifecycle() {
         &coordinator,
         &risk,
         &order,
-        None,
+        || None,
         || 1_700_000_000_000,
         || async move {
             order_events.lock().unwrap().push("order:submit".into());
@@ -265,6 +423,7 @@ async fn account_switch_waits_for_in_flight_order_lifecycle() {
             order_events.lock().unwrap().push("order:failed".into());
             Err::<Order, AppError>(AppError::Trading("rejected".into()))
         },
+        |_| async {},
     );
     let switch = switch_account(&coordinator, &port, "backup", None);
     tokio::pin!(order_lifecycle);

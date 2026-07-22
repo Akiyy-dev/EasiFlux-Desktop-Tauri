@@ -5,7 +5,8 @@ import AppShell from './components/layout/AppShell.vue'
 import ErrorToastBridge from './components/common/ErrorToastBridge.vue'
 import SettingsDialog from './components/settings/SettingsDialog.vue'
 import { naiveThemeOverrides } from './constants/naiveTheme'
-import { useTauriEvent, whenTauriListenersReady } from './composables/useTauriEvent'
+import { useTauriEvent, whenTauriListenersReady } from './composables/useTauriEvent'
+import { useAccountSessionEvent } from './composables/useAccountSessionEvent'
 import { useAppStore } from './stores/app'
 import { useConfigStore } from './stores/config'
 import { useConnectionStore } from './stores/connection'
@@ -57,12 +58,12 @@ useTauriEvent<string>('app:ready', (version) => {
   appStore.markReady(version)
 })
 
-useTauriEvent<string>('connection:status', (status) => {
+useAccountSessionEvent<string>('connection:status', (status) => {
   connectionStore.setStatus(status)
   onConnectionStatusChanged(status)
 })
 
-useTauriEvent<string>('websocket:status', (status) => {
+useAccountSessionEvent<string>('websocket:status', (status) => {
   connectionStore.setWsStatus(status)
   onWebsocketStatusChanged(status)
 })
@@ -79,34 +80,34 @@ useTauriEvent<Kline[]>('market:kline', (klines) => {
   marketStore.setKlines(klines)
 })
 
-useTauriEvent<Order>('order:updated', (order) => {
+useAccountSessionEvent<Order>('order:updated', (order) => {
   orderStore.upsertOrder(order)
 })
 
-useTauriEvent<Position>('position:updated', (position) => {
+useAccountSessionEvent<Position>('position:updated', (position) => {
   positionStore.upsertPosition(position)
 })
 
-useTauriEvent<Balance>('balance:updated', (balance) => {
+useAccountSessionEvent<Balance>('balance:updated', (balance) => {
   accountStore.setBalance(balance)
 })
 
-useTauriEvent<AccountSummary>('account:snapshot', (snapshot) => {
+useAccountSessionEvent<AccountSummary>('account:snapshot', (snapshot) => {
   accountStore.applySnapshot(snapshot)
 })
 
-useTauriEvent<PrivatePanelsSnapshot>('private-panels:snapshot', (snapshot) => {
+useAccountSessionEvent<PrivatePanelsSnapshot>('private-panels:snapshot', (snapshot) => {
   applyPrivatePanelsSnapshot(snapshot)
   orderStore.setOpenOrders(normalizeOrders(snapshot.openOrders))
   orderStore.setOrderHistory(normalizeOrders(snapshot.orderHistory))
   positionStore.setPositions(normalizePositions(snapshot.positions))
 })
 
-useTauriEvent<DailyPnlSnapshot>('daily-pnl:updated', (snapshot) => {
+useAccountSessionEvent<DailyPnlSnapshot>('daily-pnl:updated', (snapshot) => {
   accountStore.applyDailyPnlSnapshot(snapshot)
 })
 
-useTauriEvent<EnvironmentStatus>('environment:updated', (status) => {
+useAccountSessionEvent<EnvironmentStatus>('environment:updated', (status) => {
   appStore.applyEnvironment(status)
 })
 
@@ -173,5 +174,4 @@ onMounted(async () => {
       <SettingsDialog v-model:show="showSettings" />
     </NMessageProvider>
   </NConfigProvider>
-</template>
-
+</template>

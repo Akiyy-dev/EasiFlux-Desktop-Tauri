@@ -70,6 +70,12 @@ export interface AccountProfile {
 export interface AccountSwitchResult {
   activeAccountId: string
   connected: boolean
+  sessionEpoch: number
+}
+
+export interface AccountSessionEvent<T> {
+  sessionEpoch: number
+  payload: T
 }
 
 export interface SaveCredentialRequest {
