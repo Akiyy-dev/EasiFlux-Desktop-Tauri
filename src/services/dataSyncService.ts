@@ -28,7 +28,11 @@ export function syncRunning(): boolean {
   return false
 }
 
-export async function refreshSyncTask(name: SyncTaskName, force = false): Promise<void> {
+export async function refreshSyncTask(
+  name: SyncTaskName,
+  force = false,
+  rethrow = false,
+): Promise<void> {
   if (inFlight.has(name)) {
     return
   }
@@ -37,6 +41,7 @@ export async function refreshSyncTask(name: SyncTaskName, force = false): Promis
     await tauriInvoke('scheduler_run_task', { task: name, force })
   } catch (error) {
     useLogStore().setError(`${TASK_LABELS[name]}刷新失败: ${formatError(error)}`)
+    if (rethrow) throw error
   } finally {
     inFlight.delete(name)
   }

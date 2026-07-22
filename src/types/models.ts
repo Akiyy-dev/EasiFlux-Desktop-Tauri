@@ -101,6 +101,13 @@ export interface Balance {
   total: string
 }
 
+export interface FundingBalance {
+  asset: string
+  available: string
+  frozen: string
+  total: string
+}
+
 export interface AccountSummary {
   accountId: string
   balances: Balance[]

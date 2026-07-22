@@ -34,6 +34,15 @@ pub struct Balance {
     pub total: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FundingBalance {
+    pub asset: String,
+    pub available: String,
+    pub frozen: String,
+    pub total: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountSummary {

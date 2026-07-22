@@ -34,14 +34,14 @@ pub fn warn_if_raw_parsed_mismatch(
     meta: &ListEnvelopeMeta,
     parsed_count: usize,
 ) {
-    if meta.raw_count == 0 || parsed_count > 0 {
+    if meta.raw_count == parsed_count {
         return;
     }
     emitter.emit_log(
         "warn",
         &format!(
-            "{endpoint} API 返回 {} 条原始记录但解析后为 0 条 (envelope={})",
-            meta.raw_count, meta.hint
+            "{endpoint} API returned {} raw records but parsed {} (envelope={})",
+            meta.raw_count, parsed_count, meta.hint
         ),
     );
 }

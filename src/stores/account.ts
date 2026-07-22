@@ -1,10 +1,12 @@
 import { defineStore } from 'pinia'
 
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 
-import type { AccountSummary, Balance, DailyPnlSnapshot } from '../types/models'
+import type { AccountSummary, Balance, DailyPnlSnapshot, FundingBalance } from '../types/models'
 
 import { useAsyncState } from '../composables/useAsyncState'
+
+import { tauriInvoke } from '../composables/useTauriCommand'
 
 import { refreshSyncTask } from '../services/dataSyncService'
 
@@ -60,6 +62,10 @@ export const useAccountStore = defineStore('account', () => {
 
   const dailyPnlRequest = useAsyncState<DailyPnlSnapshot>()
 
+  const fundingRequest = useAsyncState<FundingBalance[]>((value) => value.length === 0)
+
+  const fundingBalances = computed(() => fundingRequest.state.value.data ?? [])
+
 
 
   function setBalance(balance: Balance): void {
@@ -102,9 +108,9 @@ export const useAccountStore = defineStore('account', () => {
 
 
 
-  async function refreshAccount(): Promise<void> {
+  async function refreshAccount(rethrow = false): Promise<void> {
 
-    await refreshSyncTask('account', true)
+    await refreshSyncTask('account', true, rethrow)
 
     if (summary.value) {
 
@@ -116,9 +122,15 @@ export const useAccountStore = defineStore('account', () => {
 
 
 
-  async function refreshDailyPnl(): Promise<void> {
+  async function refreshDailyPnl(rethrow = false): Promise<void> {
 
-    await refreshSyncTask('dailyPnl', true)
+    await refreshSyncTask('dailyPnl', true, rethrow)
+
+  }
+
+  async function refreshFundingBalances(): Promise<void> {
+
+    await fundingRequest.run(() => tauriInvoke<FundingBalance[]>('fetch_funding_balances'))
 
   }
 
@@ -127,6 +139,7 @@ export const useAccountStore = defineStore('account', () => {
     balances.value = []
     request.reset()
     dailyPnlRequest.reset()
+    fundingRequest.reset()
   }
 
 
@@ -151,6 +164,14 @@ export const useAccountStore = defineStore('account', () => {
 
     dailyPnlStatus: dailyPnlRequest.status,
 
+    fundingBalances,
+
+    fundingLoading: fundingRequest.loading,
+
+    fundingError: fundingRequest.error,
+
+    fundingStatus: fundingRequest.status,
+
     setBalance,
 
     applySnapshot,
@@ -160,6 +181,7 @@ export const useAccountStore = defineStore('account', () => {
     refreshAccount,
 
     refreshDailyPnl,
+    refreshFundingBalances,
     clearAccountData,
 
   }

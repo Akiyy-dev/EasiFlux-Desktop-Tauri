@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::str::FromStr;
 
 use crate::models::api_requests::{ApiCancelOrderRequest, ApiOrderRequest};
-use crate::models::account::Balance;
+use crate::models::account::{Balance, FundingBalance};
 use crate::models::market::{Depth, DepthLevel, Kline, Ticker};
 use crate::models::trading::{Order, OrderStatus, Position};
 
@@ -394,6 +394,49 @@ pub fn parse_balance(value: &Value) -> Balance {
 
 pub fn parse_balances(payload: &Value) -> Vec<Balance> {
     extract_list(payload).iter().map(|v| parse_balance(v)).collect()
+}
+
+const FUNDING_ASSET_KEYS: &[&str] = &["coin", "currency", "asset"];
+const FUNDING_AVAILABLE_KEYS: &[&str] = &["availableBalance", "available", "available_balance"];
+const FUNDING_FROZEN_KEYS: &[&str] = &["frozenBalance", "frozen", "locked"];
+const FUNDING_TOTAL_KEYS: &[&str] = &["totalBalance", "walletBalance", "balance", "total"];
+
+pub fn parse_funding_balances(payload: &Value) -> Vec<FundingBalance> {
+    let (items, _) = extract_list_with_meta(payload);
+    items
+        .into_iter()
+        .filter_map(|value| {
+            let asset = get_str(value, FUNDING_ASSET_KEYS)?;
+            if asset.trim().is_empty() {
+                return None;
+            }
+
+            let available = get_str(value, FUNDING_AVAILABLE_KEYS);
+            let frozen = get_str(value, FUNDING_FROZEN_KEYS);
+            let total = get_str(value, FUNDING_TOTAL_KEYS);
+            if available.is_none() && frozen.is_none() && total.is_none() {
+                return None;
+            }
+
+            let available = available.unwrap_or_else(|| "0".into());
+            let frozen = frozen.unwrap_or_else(|| "0".into());
+            let total = match total {
+                Some(total) => total,
+                None => {
+                    let available = Decimal::from_str(available.trim()).ok()?;
+                    let frozen = Decimal::from_str(frozen.trim()).ok()?;
+                    (available + frozen).to_string()
+                }
+            };
+
+            Some(FundingBalance {
+                asset: asset.trim().to_string(),
+                available,
+                frozen,
+                total,
+            })
+        })
+        .collect()
 }
 
 pub fn build_kline_params(
@@ -867,6 +910,57 @@ mod tests {
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].size, "0.5");
         assert_eq!(positions[0].position_idx, 1);
+    }
+
+    #[test]
+    fn parse_funding_balance_aliases_and_skips_rows_without_asset() {
+        let payload = json!({
+            "data": { "rows": [
+                { "coin": "USDT", "availableBalance": "8", "frozenBalance": "2", "totalBalance": "10" },
+                { "currency": "BTC", "available": 1.25, "locked": 0.25, "walletBalance": 1.5 },
+                { "available": "99" }
+            ]}
+        });
+        let balances = parse_funding_balances(&payload);
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[1].total, "1.5");
+    }
+
+    #[test]
+    fn parse_funding_balances_supports_array_and_list_envelopes() {
+        let array = json!({
+            "data": [
+                { "asset": "ETH", "available_balance": 3, "frozen": 2, "balance": 5 }
+            ]
+        });
+        let list = json!({
+            "data": { "list": [
+                { "coin": "USDC", "available": "4", "frozenBalance": "1", "total": "5" }
+            ]}
+        });
+
+        assert_eq!(parse_funding_balances(&array)[0].total, "5");
+        assert_eq!(parse_funding_balances(&list)[0].asset, "USDC");
+    }
+
+    #[test]
+    fn parse_funding_balances_defaults_and_derives_only_valid_rows() {
+        let payload = json!({
+            "data": { "rows": [
+                { "asset": "USDT", "available": "8", "locked": "2" },
+                { "asset": "BTC", "available": "not-a-number", "frozen": "1" },
+                { "asset": "ETH" },
+                { "asset": "", "total": "1" }
+            ]}
+        });
+
+        let balances = parse_funding_balances(&payload);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].available, "8");
+        assert_eq!(balances[0].frozen, "2");
+        assert_eq!(balances[0].total, "10");
+        assert!(parse_funding_balances(&json!({ "data": { "rows": [] } })).is_empty());
     }
 
     #[test]

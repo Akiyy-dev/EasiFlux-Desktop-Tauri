@@ -1,9 +1,11 @@
 use serde_json::Value;
 use tauri::State;
 
+use crate::api::diagnostic::warn_if_raw_parsed_mismatch;
+use crate::api::mapper::{list_envelope_meta, parse_funding_balances};
 use crate::api::PrivateApi;
 use crate::error::AppResult;
-use crate::models::account::{AccountSummary, Balance};
+use crate::models::account::{AccountSummary, Balance, FundingBalance};
 use crate::models::api_requests::ApiTransferRequest;
 use crate::models::trading::{Position, TradeStats};
 use crate::state::AppState;
@@ -12,7 +14,10 @@ use crate::state::AppState;
 pub async fn refresh_account(state: State<'_, AppState>) -> AppResult<AccountSummary> {
     let (account_id, symbol) = {
         let config = state.config.read().await;
-        (config.active_account_id.clone(), config.active_symbol.clone())
+        (
+            config.active_account_id.clone(),
+            config.active_symbol.clone(),
+        )
     };
     state
         .account
@@ -45,16 +50,16 @@ pub async fn get_trade_stats(state: State<'_, AppState>) -> AppResult<TradeStats
 
 #[tauri::command]
 pub async fn export_trade_log(state: State<'_, AppState>) -> AppResult<String> {
-    Ok(state
-        .trade_log
-        .export_path()
-        .to_string_lossy()
-        .to_string())
+    Ok(state.trade_log.export_path().to_string_lossy().to_string())
 }
 
 #[tauri::command]
-pub async fn fetch_funding_balances(state: State<'_, AppState>) -> AppResult<Value> {
-    PrivateApi::funding_balances(&state.api).await
+pub async fn fetch_funding_balances(state: State<'_, AppState>) -> AppResult<Vec<FundingBalance>> {
+    let payload = PrivateApi::funding_balances(&state.api).await?;
+    let meta = list_envelope_meta(&payload);
+    let balances = parse_funding_balances(&payload);
+    warn_if_raw_parsed_mismatch(&state.emitter, "funding/balances", &meta, balances.len());
+    Ok(balances)
 }
 
 #[tauri::command]
