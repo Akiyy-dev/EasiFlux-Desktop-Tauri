@@ -33,6 +33,21 @@ export interface ApiCredential {
   label: string
 }
 
+export type CredentialState = 'present' | 'missing' | 'unavailable'
+
+export interface AccountProfile {
+  accountId: string
+  label: string
+  baseUrl: string
+  credentialState: CredentialState
+  active: boolean
+}
+
+export interface AccountSwitchResult {
+  activeAccountId: string
+  connected: boolean
+}
+
 export interface SaveCredentialRequest {
   accountId: string
   apiKey: string

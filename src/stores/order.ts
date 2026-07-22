@@ -78,6 +78,13 @@ export const useOrderStore = defineStore('order', () => {
     orderHistory.value = next
   }
 
+  function clearOrders(): void {
+    openOrders.value = []
+    orderHistory.value = []
+    openOrdersRequest.reset()
+    historyRequest.reset()
+  }
+
   return {
     openOrders,
     orderHistory,
@@ -96,5 +103,6 @@ export const useOrderStore = defineStore('order', () => {
     refreshAll,
     setOpenOrders,
     setOrderHistory,
+    clearOrders,
   }
 })

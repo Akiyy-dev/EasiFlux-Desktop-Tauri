@@ -17,8 +17,7 @@ export const useConfigStore = defineStore('config', () => {
   }
 
   async function saveConfig(next: AppConfig): Promise<void> {
-    await tauriInvoke('save_config', { config: next })
-    config.value = next
+    config.value = await tauriInvoke<AppConfig>('save_config', { config: next })
   }
 
   async function saveCredentials(req: SaveCredentialRequest): Promise<void> {

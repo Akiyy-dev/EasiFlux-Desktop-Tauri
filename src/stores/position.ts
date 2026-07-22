@@ -37,6 +37,11 @@ export const usePositionStore = defineStore('position', () => {
     positions.value = normalizePositions(raw)
   }
 
+  function clearPositions(): void {
+    positions.value = []
+    request.reset()
+  }
+
   return {
     positions,
     loading: request.loading,
@@ -45,5 +50,6 @@ export const usePositionStore = defineStore('position', () => {
     upsertPosition,
     setPositions,
     refreshPositions,
+    clearPositions,
   }
 })

@@ -7,8 +7,8 @@ use crate::events::EventEmitter;
 use crate::models::config::{AppConfig, EnvironmentStatus};
 use crate::plugin::PluginRegistry;
 use crate::services::{
-    AccountService, AnalyticsService, ConnectionService, DailyPnlService, MarketService,
-    RiskService, SchedulerService, TimeService, TradingService,
+    AccountLifecycleCoordinator, AccountService, AnalyticsService, ConnectionService,
+    DailyPnlService, MarketService, RiskService, SchedulerService, TimeService, TradingService,
 };
 use crate::storage::{CacheStore, ConfigStore, KlineStore, TradeLogStore};
 use crate::ws::WsManager;
@@ -31,6 +31,7 @@ pub struct AppState {
     pub daily_pnl: Arc<DailyPnlService>,
     pub scheduler: Arc<SchedulerService>,
     pub environment_status: Arc<RwLock<EnvironmentStatus>>,
+    pub account_lifecycle: Arc<AccountLifecycleCoordinator>,
 }
 
 impl AppState {
@@ -104,6 +105,7 @@ impl AppState {
         ));
 
         let plugins = Arc::new(RwLock::new(PluginRegistry::new()));
+        let account_lifecycle = Arc::new(AccountLifecycleCoordinator::new());
 
         Ok(Self {
             config_store,
@@ -123,6 +125,7 @@ impl AppState {
             daily_pnl,
             scheduler,
             environment_status,
+            account_lifecycle,
         })
     }
 }

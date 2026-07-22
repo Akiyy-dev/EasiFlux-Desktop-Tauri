@@ -41,3 +41,7 @@ export function replacePrivatePanels(snapshot: PrivatePanelsSnapshot): void {
   orderStore.setOrderHistory(normalizeOrders(snapshot.orderHistory))
   positionStore.setPositions(normalizePositions(snapshot.positions))
 }
+
+export function clearPrivatePanels(): void {
+  privatePanelsState.reset()
+}

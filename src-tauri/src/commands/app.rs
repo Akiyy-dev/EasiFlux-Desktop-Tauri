@@ -56,6 +56,9 @@ pub async fn scheduler_run_task(
     task: String,
     force: Option<bool>,
 ) -> AppResult<()> {
+    if task == "bootstrap" {
+        return state.scheduler.bootstrap_connection().await;
+    }
     let task_id = crate::services::scheduler::TaskId::from_name(&task)
         .ok_or_else(|| crate::error::AppError::Internal(format!("未知调度任务: {task}")))?;
     state

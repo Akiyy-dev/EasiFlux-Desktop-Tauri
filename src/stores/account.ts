@@ -122,6 +122,13 @@ export const useAccountStore = defineStore('account', () => {
 
   }
 
+  function clearAccountData(): void {
+    summary.value = null
+    balances.value = []
+    request.reset()
+    dailyPnlRequest.reset()
+  }
+
 
 
   return {
@@ -153,6 +160,7 @@ export const useAccountStore = defineStore('account', () => {
     refreshAccount,
 
     refreshDailyPnl,
+    clearAccountData,
 
   }
 

@@ -1,4 +1,5 @@
 pub mod account;
+pub mod account_profiles;
 pub mod analytics;
 pub mod connection;
 pub mod daily_pnl;
@@ -9,6 +10,7 @@ pub mod time;
 pub mod trading;
 
 pub use account::AccountService;
+pub use account_profiles::AccountLifecycleCoordinator;
 pub use analytics::AnalyticsService;
 pub use connection::ConnectionService;
 pub use daily_pnl::DailyPnlService;

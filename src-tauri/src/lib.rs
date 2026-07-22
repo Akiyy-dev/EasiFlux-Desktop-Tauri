@@ -41,9 +41,8 @@ pub fn run() {
 
             if let Some(window) = app.get_webview_window("main") {
                 let state: tauri::State<AppState> = app.state();
-                let config = tauri::async_runtime::block_on(async {
-                    state.config.read().await.clone()
-                });
+                let config =
+                    tauri::async_runtime::block_on(async { state.config.read().await.clone() });
                 let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize {
                     width: config.window_width as f64,
                     height: config.window_height as f64,
@@ -65,6 +64,9 @@ pub fn run() {
             save_credentials,
             has_credentials,
             save_window_size,
+            list_account_profiles,
+            switch_account,
+            delete_account,
             connect,
             disconnect,
             get_connection_status,
