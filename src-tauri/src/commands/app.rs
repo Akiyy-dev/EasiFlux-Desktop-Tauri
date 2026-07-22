@@ -47,7 +47,6 @@ pub async fn sync_time_now(state: State<'_, AppState>) -> AppResult<TimeSnapshot
 
 #[tauri::command]
 pub async fn get_environment_status(state: State<'_, AppState>) -> AppResult<EnvironmentStatus> {
-    state.scheduler.run_now(crate::services::scheduler::TaskId::Environment, true).await?;
     Ok(state.environment_status.read().await.clone())
 }
 
@@ -59,5 +58,8 @@ pub async fn scheduler_run_task(
 ) -> AppResult<()> {
     let task_id = crate::services::scheduler::TaskId::from_name(&task)
         .ok_or_else(|| crate::error::AppError::Internal(format!("未知调度任务: {task}")))?;
-    state.scheduler.run_now(task_id, force.unwrap_or(false)).await
+    state
+        .scheduler
+        .run_now(task_id, force.unwrap_or(false))
+        .await
 }

@@ -74,6 +74,7 @@ impl AppState {
             trade_log.clone(),
             cache.clone(),
             emitter.clone(),
+            time.clone(),
         ));
         let account = Arc::new(AccountService::new(api.clone(), emitter.clone()));
         let daily_pnl = Arc::new(DailyPnlService::new(

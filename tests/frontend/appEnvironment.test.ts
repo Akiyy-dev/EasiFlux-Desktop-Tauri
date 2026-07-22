@@ -27,10 +27,11 @@ describe('app environment detection', () => {
 
     await Promise.all([store.refreshEnvironment(true), store.refreshEnvironment(true)])
 
-    expect(tauriInvoke).toHaveBeenCalledWith('scheduler_run_task', {
-      task: 'environment',
-      force: true,
-    })
+    expect(vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)).toEqual([
+      'scheduler_run_task',
+      'get_environment_status',
+    ])
+    expect(tauriInvoke).toHaveBeenCalledTimes(2)
     expect(store.environment.data?.label).toBe('正式')
     expect(store.environmentLoading).toBe(false)
   })

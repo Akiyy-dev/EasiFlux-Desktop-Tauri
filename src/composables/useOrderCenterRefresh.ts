@@ -24,11 +24,13 @@ export function useOrderCenterRefresh(active: MaybeRef<boolean>) {
   }
 
   onMounted(() => {
-    void refresh()
+    if (toValue(active)) {
+      void refresh()
+    }
   })
 
   watch(connected, (isConnected) => {
-    if (isConnected) {
+    if (isConnected && toValue(active)) {
       void refresh()
     }
   })

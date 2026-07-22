@@ -68,6 +68,10 @@ impl ApiClient {
         *self.signer.write().await = None;
     }
 
+    pub async fn set_base_url(&self, base_url: &str) {
+        *self.base_url.write().await = normalize_base_url(base_url);
+    }
+
     pub async fn has_credential(&self) -> bool {
         self.credential.read().await.is_some()
     }
@@ -76,17 +80,17 @@ impl ApiClient {
         self.base_url.read().await.clone()
     }
 
-    pub async fn public_get(&self, path: &str, params: HashMap<String, String>) -> AppResult<Value> {
+    pub async fn public_get(
+        &self,
+        path: &str,
+        params: HashMap<String, String>,
+    ) -> AppResult<Value> {
         let url = format!("{}{}", self.base_url().await, path);
         let response = self.http.get(&url).query(&params).send().await?;
         self.parse_response(response).await
     }
 
-    pub async fn private_get(
-        &self,
-        path: &str,
-        params: QueryParams,
-    ) -> AppResult<Value> {
+    pub async fn private_get(&self, path: &str, params: QueryParams) -> AppResult<Value> {
         self.ensure_time_sync().await?;
         match self.private_get_once(path, &params).await {
             Ok(v) => Ok(v),
@@ -98,11 +102,7 @@ impl ApiClient {
         }
     }
 
-    async fn private_get_once(
-        &self,
-        path: &str,
-        params: &QueryParams,
-    ) -> AppResult<Value> {
+    async fn private_get_once(&self, path: &str, params: &QueryParams) -> AppResult<Value> {
         let query = encode_query(params);
         let headers = self.sign_headers(&query, "").await?;
         let base = format!("{}{}", self.base_url().await, path);
@@ -155,11 +155,7 @@ impl ApiClient {
     }
 
     async fn force_time_sync(&self) -> AppResult<()> {
-        sync_from_server(
-            self.time_sync.as_ref(),
-            PublicApi::server_time(self),
-        )
-        .await
+        sync_from_server(self.time_sync.as_ref(), PublicApi::server_time(self)).await
     }
 
     async fn sign_headers(&self, query: &str, body: &str) -> AppResult<Vec<(String, String)>> {
@@ -170,11 +166,7 @@ impl ApiClient {
             .clone()
             .ok_or(AppError::Auth("未配置 API 凭据".into()))?;
         let payload = if body.is_empty() { query } else { body };
-        Ok(signer.prepare_headers(
-            self.time_sync.timestamp_ms(),
-            RECV_WINDOW_MS,
-            payload,
-        ))
+        Ok(signer.prepare_headers(self.time_sync.timestamp_ms(), RECV_WINDOW_MS, payload))
     }
 
     async fn parse_response(&self, response: reqwest::Response) -> AppResult<Value> {
@@ -248,6 +240,15 @@ mod tests {
     use super::*;
     use crate::auth::Signer;
     use crate::models::config::RECV_WINDOW_MS;
+
+    #[tokio::test]
+    async fn set_base_url_normalizes_public_request_target() {
+        let client = ApiClient::new();
+
+        client.set_base_url(" https://sandbox.example.test/ ").await;
+
+        assert_eq!(client.base_url().await, "https://sandbox.example.test");
+    }
 
     #[test]
     fn encode_query_preserves_insertion_order() {
