@@ -12,6 +12,7 @@ dist
 dist-ssr
 target
 tmp
+.worktrees/
 *.local
 
 # Editor directories and files
