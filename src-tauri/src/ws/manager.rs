@@ -26,8 +26,8 @@ use super::topics::{
 const HEARTBEAT_SECS: u64 = 15;
 const RECONNECT_SECS: u64 = 3;
 const PRIVATE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
-const PRIVATE_AUTH_ERROR: &str = "Private WebSocket authentication failed";
-const PRIVATE_SUBSCRIPTION_ERROR: &str = "Private WebSocket subscription failed";
+const PRIVATE_AUTH_ERROR: &str = "私有 WebSocket 鉴权失败";
+const PRIVATE_SUBSCRIPTION_ERROR: &str = "私有 WebSocket 订阅失败";
 
 #[derive(Clone, Copy)]
 enum FreshnessDomain {
@@ -387,7 +387,7 @@ async fn run_public_loop(
             Ok(()) => connected.store(false, Ordering::Relaxed),
             Err(e) => {
                 connected.store(false, Ordering::Relaxed);
-                tracing::warn!("Public WS error: {}", e);
+                tracing::warn!("公共 WebSocket 错误：{}", e);
                 emitter.emit_websocket("error");
             }
         }
@@ -434,8 +434,8 @@ async fn run_private_loop(
             Ok(()) => connected.store(false, Ordering::Relaxed),
             Err(e) => {
                 connected.store(false, Ordering::Relaxed);
-                tracing::warn!("Private WS error: {}", e);
-                emitter.emit_error(&format!("Private WebSocket: {}", e));
+                tracing::warn!("私有 WebSocket 错误：{}", e);
+                emitter.emit_error(&format!("私有 WebSocket 异常：{}", e));
                 emitter.emit_websocket("error");
             }
         }
@@ -493,7 +493,7 @@ async fn run_public_session(
                             handle_message(&value, symbol, emitter, market, Some(freshness));
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => return Err("closed".into()),
+                    Some(Ok(Message::Close(_))) | None => return Err("连接已关闭".into()),
                     Some(Err(e)) => return Err(e.to_string()),
                     _ => {}
                 }
@@ -651,7 +651,7 @@ async fn run_private_session(
                             handle_message(&value, symbol, emitter, market, Some(freshness));
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => return Err("closed".into()),
+                    Some(Ok(Message::Close(_))) | None => return Err("连接已关闭".into()),
                     Some(Err(e)) => return Err(e.to_string()),
                     _ => {}
                 }
@@ -997,6 +997,8 @@ mod tests {
 
     #[test]
     fn private_auth_ack_requires_an_explicit_compatible_success() {
+        assert_eq!(PRIVATE_AUTH_ERROR, "私有 WebSocket 鉴权失败");
+        assert_eq!(PRIVATE_SUBSCRIPTION_ERROR, "私有 WebSocket 订阅失败");
         for response in [
             json!({"op": "auth", "success": true}),
             json!({"request": {"op": "auth"}, "code": 0}),

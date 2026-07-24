@@ -4,7 +4,7 @@ import { AppButton, AppDialog } from '../ui'
 import CredentialEditor from './CredentialEditor.vue'
 import AccountReconciliationStatus from './AccountReconciliationStatus.vue'
 import { useAccountProfilesStore } from '../../stores/accountProfiles'
-import type { AccountProfile } from '../../types/models'
+import type { AccountProfile, CredentialState } from '../../types/models'
 
 const store = useAccountProfilesStore()
 const accountActionsDisabled = computed(() => store.accountMutationsBlocked)
@@ -58,6 +58,14 @@ function closeDelete(): void {
   if (lastOperation.value === 'delete') lastOperation.value = null
 }
 
+function credentialStateLabel(state: CredentialState): string {
+  return {
+    present: '已配置',
+    missing: '未配置',
+    unavailable: '不可用',
+  }[state]
+}
+
 async function switchAccount(accountId: string): Promise<void> {
   lastOperation.value = 'switch'
   try {
@@ -83,9 +91,9 @@ async function confirmDelete(): Promise<void> {
 <template>
   <section class="account-profiles">
     <header>
-      <h2>Account profiles</h2>
+      <h2>账户管理</h2>
       <AppButton :disabled="accountActionsDisabled" @click="addAccount">
-        Add account
+        添加账户
       </AppButton>
     </header>
     <AccountReconciliationStatus />
@@ -106,7 +114,7 @@ async function confirmDelete(): Promise<void> {
         :loading="store.loading"
         @click="retryProfileList"
       >
-        Retry profile refresh
+        重试刷新账户
       </AppButton>
     </div>
     <ul>
@@ -115,22 +123,22 @@ async function confirmDelete(): Promise<void> {
           <strong>{{ profile.label }}</strong>
           <span>{{ profile.accountId }}</span>
           <span>{{ profile.baseUrl }}</span>
-          <span>{{ profile.credentialState }}</span>
-          <span v-if="profile.active">active</span>
+          <span>{{ credentialStateLabel(profile.credentialState) }}</span>
+          <span v-if="profile.active">当前账户</span>
         </div>
         <div class="actions">
           <AppButton
             :disabled="accountActionsDisabled || profile.credentialState === 'unavailable'"
             @click="editAccount(profile)"
           >
-            Edit
+            编辑
           </AppButton>
           <AppButton
             :disabled="accountActionsDisabled || profile.active
               || profile.credentialState !== 'present'"
             @click="switchAccount(profile.accountId)"
           >
-            Switch
+            切换
           </AppButton>
           <AppButton
             :data-testid="`delete-${profile.accountId}`"
@@ -139,7 +147,7 @@ async function confirmDelete(): Promise<void> {
               || profile.credentialState === 'unavailable'"
             @click="openDelete(profile)"
           >
-            Delete
+            删除
           </AppButton>
         </div>
       </li>
@@ -159,18 +167,18 @@ async function confirmDelete(): Promise<void> {
 
   <AppDialog
     :show="Boolean(deleteTarget)"
-    title="Delete account"
+    title="删除账户"
     @update:show="!$event && closeDelete()"
   >
     <p>
-      Delete account {{ deleteTarget?.accountId }}?
+      确定删除账户 {{ deleteTarget?.accountId }} 吗？
     </p>
     <p v-if="deleteDialogError" role="alert">
       {{ deleteDialogError }}
     </p>
     <template #footer>
       <AppButton @click="closeDelete">
-        Cancel
+        取消
       </AppButton>
       <AppButton
         data-testid="confirm-delete"
@@ -179,7 +187,7 @@ async function confirmDelete(): Promise<void> {
         :disabled="store.accountMutationsBlocked"
         @click="confirmDelete"
       >
-        Confirm delete
+        确认删除
       </AppButton>
     </template>
   </AppDialog>

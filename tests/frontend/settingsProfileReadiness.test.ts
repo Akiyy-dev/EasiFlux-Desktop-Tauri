@@ -55,8 +55,8 @@ describe('settings profile readiness', () => {
 
   function editorEntryButtons(wrapper: ReturnType<typeof mountSettings>) {
     return wrapper.findAll('button').filter((button) =>
-      button.text() === 'Edit credentials'
-        || button.text() === 'Save credentials and connect')
+      button.text() === '编辑凭据'
+        || button.text() === '保存凭据并连接')
   }
 
   it('blocks both entry points until the sanitized active profile is loaded', async () => {
@@ -64,7 +64,7 @@ describe('settings profile readiness', () => {
     vi.mocked(tauriInvoke).mockReturnValueOnce(pending.promise)
     const wrapper = mountSettings()
 
-    expect(wrapper.text()).toContain('Loading account profile')
+    expect(wrapper.text()).toContain('正在加载账户配置')
     expect(editorEntryButtons(wrapper)).toHaveLength(2)
     expect(editorEntryButtons(wrapper)
       .every((button) => button.attributes('disabled') !== undefined))
@@ -73,7 +73,7 @@ describe('settings profile readiness', () => {
 
     pending.resolve([profile])
     await flushPromises()
-    const edit = wrapper.findAll('button').find((button) => button.text() === 'Edit credentials')
+    const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
     await edit!.trigger('click')
     const editor = wrapper.getComponent(CredentialEditor)
     expect(editor.props()).toMatchObject({
@@ -87,7 +87,7 @@ describe('settings profile readiness', () => {
     const wrapper = mountSettings()
     await flushPromises()
 
-    expect(wrapper.text()).toContain('Credential storage is unavailable')
+    expect(wrapper.text()).toContain('凭据存储不可用')
     expect(editorEntryButtons(wrapper)
       .every((button) => button.attributes('disabled') !== undefined))
       .toBe(true)

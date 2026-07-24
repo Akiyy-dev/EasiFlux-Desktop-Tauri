@@ -30,12 +30,12 @@ watch(() => props.active, (active) => {
 }, { immediate: true })
 
 const ledgerLabel = computed(() => ({
-  disabled: 'Disabled', ready: 'Ready', unavailable: 'Unavailable',
+  disabled: '已停用', ready: '正常', unavailable: '不可用',
 }[store.status?.ledgerState ?? 'unavailable']))
 const usage = computed(() => {
   const status = store.status
   if (!status || status.occupiedOrders === null || status.remainingOrders === null) return '--'
-  return `${status.occupiedOrders} occupied · ${status.remainingOrders} remaining`
+  return `${status.occupiedOrders} 已占用 · ${status.remainingOrders} 剩余`
 })
 const updatedAt = computed(() => store.status?.updatedAtMs
   ? new Date(store.status.updatedAtMs).toLocaleString()
@@ -51,10 +51,10 @@ async function refresh(): Promise<void> {
 </script>
 
 <template>
-  <AppCard title="Daily risk control">
+  <AppCard title="每日风控">
     <header class="risk-header">
       <div>
-        <span class="eyebrow">Application-wide quota</span>
+        <span class="eyebrow">应用全局额度</span>
         <strong data-testid="ledger-state" :class="`ledger-${store.status?.ledgerState ?? 'unavailable'}`">
           {{ ledgerLabel }}
         </strong>
@@ -65,7 +65,7 @@ async function refresh(): Promise<void> {
         :loading="store.reading"
         @click="refresh"
       >
-        Refresh status
+        刷新状态
       </AppButton>
     </header>
 
@@ -77,35 +77,35 @@ async function refresh(): Promise<void> {
     </p>
 
     <dl class="ledger-strip">
-      <div><dt>Trading day</dt><dd>{{ store.status?.tradingDay ?? '--' }}</dd></div>
+      <div><dt>交易日</dt><dd>{{ store.status?.tradingDay ?? '--' }}</dd></div>
       <div>
-        <dt>Daily usage</dt>
+        <dt>当日额度</dt>
         <dd data-testid="risk-usage">
           {{ usage }}
         </dd>
       </div>
-      <div><dt>Updated</dt><dd>{{ updatedAt }}</dd></div>
+      <div><dt>更新时间</dt><dd>{{ updatedAt }}</dd></div>
     </dl>
 
     <form class="risk-form" @submit.prevent="save">
       <label class="toggle-row">
-        <span>Enable order risk checks</span>
+        <span>启用下单风控检查</span>
         <input v-model="draft.enabled" type="checkbox">
       </label>
       <label>
-        <span>Maximum order quantity</span>
+        <span>最大单笔下单数量</span>
         <input v-model="draft.maxOrderQty" data-testid="max-order-qty" inputmode="decimal">
       </label>
       <label>
-        <span>Maximum price deviation (%)</span>
+        <span>最大价格偏离（%）</span>
         <input v-model="draft.maxPriceDeviationPct" inputmode="decimal">
       </label>
       <label>
-        <span>Maximum daily orders</span>
+        <span>每日最大下单次数</span>
         <input v-model.number="draft.maxDailyOrders" type="number" min="1" step="1">
       </label>
       <label>
-        <span>Trading day timezone</span>
+        <span>交易日时区</span>
         <select v-model="draft.tradingDayTimezone">
           <option v-for="timezone in timezones" :key="timezone" :value="timezone">{{ timezone }}</option>
         </select>
@@ -119,7 +119,7 @@ async function refresh(): Promise<void> {
         :loading="store.saving"
         @click="save"
       >
-        Save changes
+        保存更改
       </AppButton>
     </form>
   </AppCard>

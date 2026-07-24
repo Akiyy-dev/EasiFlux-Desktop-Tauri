@@ -6,17 +6,21 @@ use super::support::FakeLifecyclePort;
 #[tokio::test]
 async fn delete_rejects_active_and_only_accounts() {
     let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
-    assert!(
+    assert_eq!(
         delete_account(&AccountLifecycleCoordinator::new(), &port, "primary")
             .await
-            .is_err()
+            .unwrap_err()
+            .to_string(),
+        "配置错误: 不能删除当前账户"
     );
-    port.runtime.lock().unwrap().accounts = vec!["spare".into()];
-    port.runtime.lock().unwrap().active_account_id = "spare".into();
-    assert!(
+    port.runtime.lock().unwrap().accounts = vec!["primary".into()];
+    port.runtime.lock().unwrap().active_account_id = "primary".into();
+    assert_eq!(
         delete_account(&AccountLifecycleCoordinator::new(), &port, "spare")
             .await
-            .is_err()
+            .unwrap_err()
+            .to_string(),
+        "配置错误: 不能删除唯一账户"
     );
     assert!(port.events().is_empty());
 }
@@ -52,13 +56,19 @@ fn draft(account_id: &str, key: &str, secret: &str) -> SaveCredentialRequest {
 async fn save_requires_complete_pairs_and_preserves_existing_blank_pair() {
     let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
     let coordinator = AccountLifecycleCoordinator::new();
-    assert!(save_credentials(&coordinator, &port, draft("new", "", ""))
-        .await
-        .is_err());
-    assert!(
+    assert_eq!(
+        save_credentials(&coordinator, &port, draft("new", "", ""))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "认证失败: 新账户必须填写 API 访问密钥和签名密钥"
+    );
+    assert_eq!(
         save_credentials(&coordinator, &port, draft("backup", "new", ""))
             .await
-            .is_err()
+            .unwrap_err()
+            .to_string(),
+        "认证失败: API 访问密钥和签名密钥必须同时填写"
     );
     save_credentials(&coordinator, &port, draft("backup", "", ""))
         .await

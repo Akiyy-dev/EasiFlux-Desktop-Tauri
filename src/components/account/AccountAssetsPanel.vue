@@ -6,6 +6,7 @@ import { useAccountStore } from '../../stores/account'
 import { useConnectionStore } from '../../stores/connection'
 import { usePositionStore } from '../../stores/position'
 import { sumUnrealisedPnl } from '../../utils/dashboardAssets'
+import type { ConnectionStatus } from '../../types/models'
 
 const props = withDefaults(defineProps<{ active?: boolean }>(), { active: true })
 
@@ -28,6 +29,21 @@ function formatUpdatedAt(value: number | null): string {
   return value ? new Date(value).toLocaleTimeString() : '--'
 }
 
+function connectionStatusLabel(status: ConnectionStatus): string {
+  return {
+    disconnected: '已断开',
+    connecting: '连接中',
+    connected: '已连接',
+    error: '连接异常',
+  }[status]
+}
+
+function positionSideLabel(side: string): string {
+  if (side === 'Buy') return '买入'
+  if (side === 'Sell') return '卖出'
+  return '未知方向'
+}
+
 function runSection(task: () => Promise<void>): void {
   void task().catch(() => undefined)
 }
@@ -48,7 +64,7 @@ watch(() => props.active, (active) => {
 <template>
   <AppCard title="资产概览">
     <header class="panel-header">
-      <span>连接状态：{{ connectionStore.status }}</span>
+      <span>连接状态：{{ connectionStatusLabel(connectionStore.status) }}</span>
       <AppButton data-testid="refresh-assets" :disabled="!connectionStore.connected" :loading="refreshing" @click="refresh">
         刷新
       </AppButton>
@@ -104,7 +120,7 @@ watch(() => props.active, (active) => {
         <p>未实现盈亏：{{ unrealisedPnl }}</p>
         <ul>
           <li v-for="position in positions" :key="`${position.symbol}:${position.positionIdx ?? 0}`">
-            {{ position.symbol }} {{ position.side }} {{ position.size }}，未实现盈亏 {{ position.unrealisedPnl }}
+            {{ position.symbol }} {{ positionSideLabel(position.side) }} {{ position.size }}，未实现盈亏 {{ position.unrealisedPnl }}
           </li>
         </ul>
       </template>

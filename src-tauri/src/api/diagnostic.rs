@@ -3,7 +3,9 @@ use serde_json::Value;
 use crate::events::EventEmitter;
 
 use super::mapper::list_envelope_meta;
-use super::response::{describe_data_shape, first_object_keys, payload_has_content, ListEnvelopeMeta};
+use super::response::{
+    describe_data_shape, first_object_keys, payload_has_content, ListEnvelopeMeta,
+};
 
 pub fn warn_if_parse_empty(
     emitter: &EventEmitter,
@@ -20,7 +22,7 @@ pub fn warn_if_parse_empty(
     emitter.emit_log(
         "warn",
         &format!(
-            "{endpoint} 响应成功但解析为空: envelope={}, data_type={data_type}, data_keys=[{}], first_item_keys=[{}]",
+            "{endpoint} 响应成功但解析为空：响应结构={}，数据类型={data_type}，数据字段=[{}]，首项字段=[{}]",
             meta.hint,
             data_keys.join(","),
             first_keys.join(",")
@@ -40,7 +42,7 @@ pub fn warn_if_raw_parsed_mismatch(
     emitter.emit_log(
         "warn",
         &format!(
-            "{endpoint} API returned {} raw records but parsed {} (envelope={})",
+            "{endpoint} API 返回 {} 条原始记录，但仅解析出 {} 条（响应结构={}）",
             meta.raw_count, parsed_count, meta.hint
         ),
     );

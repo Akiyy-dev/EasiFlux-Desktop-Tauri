@@ -87,6 +87,7 @@ fn unreadable_enabled_ledger_returns_scrubbed_unavailable_status() {
     assert_eq!(status.occupied_orders, None);
     assert_eq!(status.remaining_orders, None);
     let error = status.error.unwrap();
+    assert_eq!(error, "风控用量账本不可用，请检查本地存储权限或文件格式。");
     assert!(!error.contains(path.to_string_lossy().as_ref()));
     assert!(!error.contains("toml"));
     cleanup_test_files(&path);
@@ -128,6 +129,24 @@ fn enabling_after_disabled_reloads_and_keeps_fail_closed_behavior() {
 
 #[test]
 fn strict_config_validation_rejects_invalid_values() {
+    assert_eq!(
+        validate_risk_config(&RiskConfig {
+            max_order_qty: "abc".into(),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string(),
+        "配置错误: 最大单笔下单数量格式无效"
+    );
+    assert_eq!(
+        validate_risk_config(&RiskConfig {
+            trading_day_timezone: "Invalid/Zone".into(),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string(),
+        "配置错误: 交易日时区无效"
+    );
     for value in ["0", "-1", "abc"] {
         assert!(validate_risk_config(&RiskConfig {
             max_order_qty: value.into(),

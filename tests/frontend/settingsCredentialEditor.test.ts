@@ -81,12 +81,12 @@ describe('settings credential editor integration', () => {
   it('saves general settings then connects using stored Keyring credentials', async () => {
     const wrapper = mountSettings()
     await flushPromises()
-    const edit = wrapper.findAll('button').find((button) => button.text() === 'Edit credentials')
+    const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
     await edit!.trigger('click')
     expect(wrapper.findAll('[data-testid="dialog"]')).toHaveLength(1)
     expect(wrapper.getComponent(CredentialEditor).props('show')).toBe(true)
 
-    const save = wrapper.findAll('button').find((button) => button.text() === 'Save')
+    const save = wrapper.findAll('button').find((button) => button.text() === '保存')
     await save!.trigger('click')
     await flushPromises()
 
@@ -103,13 +103,13 @@ describe('settings credential editor integration', () => {
   it('hides settings while editing and restores it after cancel', async () => {
     const wrapper = mountSettings()
     await flushPromises()
-    const edit = wrapper.findAll('button').find((button) => button.text() === 'Edit credentials')
+    const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
     await edit!.trigger('click')
 
-    expect(wrapper.text()).not.toContain('Ticker polling interval')
-    const cancel = wrapper.findAll('button').find((button) => button.text() === 'Cancel')
+    expect(wrapper.text()).not.toContain('行情轮询间隔')
+    const cancel = wrapper.findAll('button').find((button) => button.text() === '取消')
     await cancel!.trigger('click')
-    expect(wrapper.text()).toContain('Ticker polling interval')
+    expect(wrapper.text()).toContain('行情轮询间隔')
   })
 })
 
@@ -158,7 +158,7 @@ describe('credential draft lifetime', () => {
     const secrets = wrapper.findAll('input[type="password"]')
     await secrets[0].setValue('draft-key')
     await secrets[1].setValue('draft-secret')
-    const save = wrapper.findAll('button').find((button) => button.text() === 'Save')
+    const save = wrapper.findAll('button').find((button) => button.text() === '保存')
     await save!.trigger('click')
     await flushPromises()
 

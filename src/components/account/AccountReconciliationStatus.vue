@@ -14,7 +14,7 @@ const store = useAccountProfilesStore()
     <span>{{ store.recoveryError }}</span>
   </div>
   <p v-else-if="store.reconciliationLoading" role="status">
-    Synchronizing switched account...
+    正在同步已切换的账户…
   </p>
   <div
     v-else-if="store.reconciliationError"
@@ -27,7 +27,7 @@ const store = useAccountProfilesStore()
       size="sm"
       @click="store.retryReconciliation"
     >
-      Retry synchronization
+      重试同步
     </AppButton>
   </div>
 </template>

@@ -37,17 +37,17 @@ const canOpenEditor = computed(() => Boolean(activeProfile.value)
   && activeProfile.value?.credentialState !== 'unavailable')
 const profileStatus = computed(() => {
   if (accountProfilesStore.switching && !accountProfilesStore.reconciliationLoading) {
-    return 'Switching account'
+    return '正在切换账户'
   }
   if (accountProfilesStore.reconciliationLoading || accountProfilesStore.reconciliationError) {
     return null
   }
-  if (accountProfilesStore.loading) return 'Loading account profile'
-  if (!activeProfile.value) return 'Active account profile is unavailable'
+  if (accountProfilesStore.loading) return '正在加载账户配置'
+  if (!activeProfile.value) return '当前账户配置不可用'
   if (activeProfile.value.credentialState === 'unavailable') {
-    return 'Credential storage is unavailable'
+    return '凭据存储不可用'
   }
-  if (activeProfile.value.credentialState === 'missing') return 'Credentials are required'
+  if (activeProfile.value.credentialState === 'missing') return '需要配置账户凭据'
   return null
 })
 watch(
@@ -83,7 +83,7 @@ async function saveGeneralSettings(): Promise<void> {
     await configStore.fetchConfig()
   }
   const currentConfig = configStore.config as AppConfig | null
-  if (!currentConfig) throw new Error('Settings configuration is unavailable')
+  if (!currentConfig) throw new Error('设置配置不可用')
   await configStore.saveConfig({
     ...currentConfig,
     useWebsocket: useWebsocket.value,
@@ -96,7 +96,7 @@ async function handleCredentialSaved(): Promise<void> {
   try {
     await saveGeneralSettings()
     await connectionStore.connect(useWebsocket.value)
-    notifySuccess('Settings saved')
+    notifySuccess('设置已保存')
     emit('update:show', false)
   } catch (error) {
     flowError.value = reportError(error)
@@ -113,12 +113,12 @@ function openEditor(): void {
 <template>
   <AppDialog
     :show="props.show && !editorOpen && !applyingCredentialSave"
-    title="API settings"
+    title="API 设置"
     @update:show="emit('update:show', $event)"
   >
     <section class="account-summary">
       <div>
-        <span>Current account</span>
+        <span>当前账户</span>
         <strong>{{ profileLabel }}</strong>
         <small>{{ activeAccountId }} / {{ profileBaseUrl }}</small>
       </div>
@@ -126,7 +126,7 @@ function openEditor(): void {
         :disabled="!canOpenEditor"
         @click="openEditor"
       >
-        Edit credentials
+        编辑凭据
       </AppButton>
     </section>
     <AccountReconciliationStatus />
@@ -145,10 +145,10 @@ function openEditor(): void {
       {{ flowError }}
     </p>
     <NForm label-placement="top">
-      <NFormItem label="WebSocket realtime updates">
+      <NFormItem label="WebSocket 实时更新">
         <NSwitch v-model:value="useWebsocket" />
       </NFormItem>
-      <NFormItem label="Ticker polling interval (seconds)">
+      <NFormItem label="行情轮询间隔（秒）">
         <NInputNumber
           v-model:value="tickerPollInterval"
           :min="1"
@@ -160,7 +160,7 @@ function openEditor(): void {
     <template #footer>
       <div class="footer">
         <AppButton variant="primary" :disabled="!canOpenEditor" @click="openEditor">
-          Save credentials and connect
+          保存凭据并连接
         </AppButton>
       </div>
     </template>

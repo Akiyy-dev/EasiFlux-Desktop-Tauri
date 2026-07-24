@@ -63,6 +63,17 @@ describe('risk validator and store', () => {
     expect(tauriInvoke).not.toHaveBeenCalled()
   })
 
+  it('returns Chinese validation messages', () => {
+    expect(validateRiskConfig(request({ maxOrderQty: '0' })))
+      .toBe('最大单笔下单数量必须是大于 0 的十进制数。')
+    expect(validateRiskConfig(request({ maxPriceDeviationPct: '-1' })))
+      .toBe('最大价格偏离必须是非负十进制数。')
+    expect(validateRiskConfig(request({ maxDailyOrders: 0 })))
+      .toBe('每日最大下单次数必须是正整数。')
+    expect(validateRiskConfig(request({ tradingDayTimezone: '   ' })))
+      .toBe('交易日时区不能为空。')
+  })
+
   it('refreshes status through the read-only command', async () => {
     vi.mocked(tauriInvoke).mockResolvedValueOnce(ready)
     const store = useRiskStore()

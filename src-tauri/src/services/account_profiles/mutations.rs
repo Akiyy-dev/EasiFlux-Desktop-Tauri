@@ -17,28 +17,24 @@ pub(crate) async fn delete_account<P: AccountLifecyclePort>(
     let target = normalize_account_id(account_id);
     let accounts = normalize_account_ids(&config.accounts, &active);
     if target == active {
-        return Err(AppError::Config(
-            "The active account cannot be deleted".into(),
-        ));
+        return Err(AppError::Config("不能删除当前账户".into()));
     }
     if accounts.len() <= 1 {
-        return Err(AppError::Config(
-            "The only account cannot be deleted".into(),
-        ));
+        return Err(AppError::Config("不能删除唯一账户".into()));
     }
     if !accounts.contains(&target) {
-        return Err(AppError::Config("Account profile does not exist".into()));
+        return Err(AppError::Config("账户配置不存在".into()));
     }
     let former_credential = safe_load(port, &target)?;
     port.delete_credential(&target)
-        .map_err(|_| AppError::Auth("Account credentials could not be deleted".into()))?;
+        .map_err(|_| AppError::Auth("删除账户凭据失败".into()))?;
     let mut next = config.clone();
     next.accounts = accounts.into_iter().filter(|id| id != &target).collect();
     if let Err(primary) = port.persist_config(&next) {
         if let Some(credential) = former_credential {
             if port.save_credential(&target, &credential).is_err() {
                 return Err(AppError::Internal(format!(
-                    "{}; rollback failed: credentials could not be restored",
+                    "{}；回滚失败：无法恢复账户凭据",
                     primary
                 )));
             }
@@ -63,15 +59,13 @@ pub(crate) async fn save_credentials<P: AccountLifecyclePort>(
     let api_key = request.api_key.trim();
     let api_secret = request.api_secret.trim();
     if api_key.is_empty() != api_secret.is_empty() {
-        return Err(AppError::Auth(
-            "API key and secret must be provided together".into(),
-        ));
+        return Err(AppError::Auth("API 访问密钥和签名密钥必须同时填写".into()));
     }
     let mut credential = if api_key.is_empty() && configured {
         valid_credential(existing.clone())?
     } else if api_key.is_empty() {
         return Err(AppError::Auth(
-            "API key and secret are required for a new account".into(),
+            "新账户必须填写 API 访问密钥和签名密钥".into(),
         ));
     } else {
         ApiCredential {
@@ -89,7 +83,7 @@ pub(crate) async fn save_credentials<P: AccountLifecyclePort>(
         credential.label = account_id.clone();
     }
     port.save_credential(&account_id, &credential)
-        .map_err(|_| AppError::Auth("Account credentials could not be saved".into()))?;
+        .map_err(|_| AppError::Auth("保存账户凭据失败".into()))?;
 
     let mut next = config.clone();
     next.accounts = configured_accounts;
@@ -103,7 +97,7 @@ pub(crate) async fn save_credentials<P: AccountLifecyclePort>(
         };
         if rollback_failed {
             return Err(AppError::Internal(format!(
-                "{}; rollback failed: credentials could not be restored",
+                "{}；回滚失败：无法恢复账户凭据",
                 primary
             )));
         }

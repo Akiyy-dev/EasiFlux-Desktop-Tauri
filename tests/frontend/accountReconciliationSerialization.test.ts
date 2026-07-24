@@ -57,7 +57,7 @@ describe('account reconciliation serialization', () => {
     await store.switchAccount('backup')
     expect(store.reconciliationError).not.toBeNull()
 
-    await expect(store.switchAccount('tertiary')).rejects.toThrow('temporarily unavailable')
+    await expect(store.switchAccount('tertiary')).rejects.toThrow('暂时无法更改账户')
     expect(switchCalls).toBe(1)
     await store.retryReconciliation()
     expect(store.reconciliationError).toBeNull()

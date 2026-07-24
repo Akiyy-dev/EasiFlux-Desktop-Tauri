@@ -27,11 +27,11 @@ import {
 
 const ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER = 'ACCOUNT_SWITCH_RECOVERY_REQUIRED'
 const ACCOUNT_SWITCH_RECOVERY_MESSAGE =
-  'Account switch recovery is required. Trading and account changes are disabled; restart the application before continuing.'
+  '账户切换需要恢复。交易和账户变更已禁用，请重启应用后继续。'
 const ACCOUNT_PROFILE_REFRESH_MESSAGE =
-  'Account profiles must be refreshed before making another account change.'
+  '请先刷新账户列表，再进行其他账户操作。'
 const ACCOUNT_MUTATION_BLOCKED_MESSAGE =
-  'Account changes are temporarily unavailable while account state is synchronizing.'
+  '账户状态正在同步，暂时无法更改账户。'
 
 function sanitizeProfile(profile: AccountProfile): AccountProfile {
   return {
@@ -211,7 +211,7 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
   }
 
   async function switchAccount(accountId: string): Promise<AccountSwitchResult> {
-    if (switching.value) throw new Error('Account switch is already in progress')
+    if (switching.value) throw new Error('账户切换正在进行中')
     assertAccountMutationAllowed()
     const previousContext = reconciliationContext
     const previousFailures = [...reconciliationFailedSteps.value]

@@ -151,17 +151,17 @@ pub(super) fn safe_load<P: AccountLifecyclePort>(
     account_id: &str,
 ) -> AppResult<Option<ApiCredential>> {
     port.load_credential(account_id)
-        .map_err(|_| AppError::Auth("Account credentials are unavailable".into()))
+        .map_err(|_| AppError::Auth("账户凭据不可用".into()))
 }
 
 pub(super) fn valid_credential(value: Option<ApiCredential>) -> AppResult<ApiCredential> {
     let credential = value
-        .ok_or_else(|| AppError::Auth("Account credentials are missing".into()))?
+        .ok_or_else(|| AppError::Auth("未找到账户凭据".into()))?
         .normalize();
     if credential.is_valid() {
         Ok(credential)
     } else {
-        Err(AppError::Auth("Account credentials are unavailable".into()))
+        Err(AppError::Auth("账户凭据不可用".into()))
     }
 }
 

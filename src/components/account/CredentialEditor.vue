@@ -99,23 +99,23 @@ async function testConnection(): Promise<void> {
 <template>
   <AppDialog
     :show="show"
-    :title="mode === 'create' ? 'Add account' : 'Edit account'"
+    :title="mode === 'create' ? '添加账户' : '编辑账户'"
     @update:show="emit('update:show', $event)"
   >
     <NForm label-placement="top">
-      <NFormItem label="Account ID">
+      <NFormItem label="账户 ID">
         <NInput v-model:value="draftAccountId" :disabled="mode !== 'create'" />
       </NFormItem>
-      <NFormItem label="Label">
+      <NFormItem label="账户名称">
         <NInput v-model:value="label" />
       </NFormItem>
-      <NFormItem label="Base URL">
+      <NFormItem label="API 基础地址">
         <NInput v-model:value="baseUrl" />
       </NFormItem>
-      <NFormItem label="API Key">
+      <NFormItem label="API 访问密钥">
         <NInput v-model:value="apiKey" type="password" />
       </NFormItem>
-      <NFormItem label="API Secret">
+      <NFormItem label="API 签名密钥">
         <NInput v-model:value="apiSecret" type="password" />
       </NFormItem>
       <p v-if="validationError || operationError" role="alert">
@@ -125,13 +125,13 @@ async function testConnection(): Promise<void> {
     <template #footer>
       <div class="actions">
         <AppButton @click="emit('update:show', false)">
-          Cancel
+          取消
         </AppButton>
         <AppButton v-if="hasCompletePair" :loading="testing" @click="testConnection">
-          Test connection
+          测试连接
         </AppButton>
         <AppButton variant="primary" :loading="store.saving" @click="save">
-          Save
+          保存
         </AppButton>
       </div>
     </template>

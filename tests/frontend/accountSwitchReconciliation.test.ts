@@ -40,10 +40,10 @@ describe('post-switch reconciliation', () => {
   })
 
   const failures = [
-    ['config', 'get_config', 'Configuration refresh failed'],
-    ['profiles', 'list_account_profiles', 'Account profile refresh failed'],
-    ['connection', 'get_connection_status', 'Connection status refresh failed'],
-    ['bootstrap', 'scheduler_run_task', 'Account data bootstrap failed'],
+    ['config', 'get_config', '配置刷新失败'],
+    ['profiles', 'list_account_profiles', '账户配置刷新失败'],
+    ['connection', 'get_connection_status', '连接状态刷新失败'],
+    ['bootstrap', 'scheduler_run_task', '账户数据初始化失败'],
   ] as const
 
   it.each(failures)(
@@ -80,7 +80,7 @@ describe('post-switch reconciliation', () => {
       const shouldBlockTrading = step === 'connection' || step === 'bootstrap'
       expect(store.tradingBlocked).toBe(shouldBlockTrading)
       if (shouldBlockTrading) {
-        expect(store.tradingBlockedMessage).toContain('synchronization failed')
+        expect(store.tradingBlockedMessage).toContain('账户同步失败')
       } else {
         expect(store.tradingBlockedMessage).toBeNull()
       }
@@ -235,7 +235,7 @@ describe('post-switch reconciliation', () => {
     expect(store.recoveryRequired).toBe(true)
     expect(store.accountMutationsBlocked).toBe(true)
     expect(store.tradingBlocked).toBe(true)
-    expect(store.tradingBlockedMessage).toContain('recovery')
+    expect(store.tradingBlockedMessage).toContain('需要恢复')
     expect(connection.wsStatus).toBe('disconnected')
 
     await store.refreshProfiles()
@@ -249,7 +249,7 @@ describe('post-switch reconciliation', () => {
     expect(accepted).toBe(false)
     expect(connection.wsStatus).toBe('disconnected')
     expect(store.accountMutationsBlocked).toBe(true)
-    await expect(store.deleteAccount('backup')).rejects.toThrow('recovery')
+    await expect(store.deleteAccount('backup')).rejects.toThrow('需要恢复')
     expect(vi.mocked(tauriInvoke).mock.calls
       .filter(([command]) => command === 'delete_account')).toHaveLength(0)
   })
@@ -358,7 +358,7 @@ describe('post-switch reconciliation', () => {
       pendingConfig.resolve(backupConfig)
       await switching
       expect(mutationError).toBeInstanceOf(Error)
-      expect((mutationError as Error).message).toContain('temporarily unavailable')
+      expect((mutationError as Error).message).toContain('暂时无法更改账户')
       const command = mutation === 'save' ? 'save_credentials' : 'delete_account'
       expect(vi.mocked(tauriInvoke).mock.calls
         .filter(([called]) => called === command)).toHaveLength(0)

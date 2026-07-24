@@ -100,10 +100,10 @@ describe('account-switch trading mutation guard', () => {
 
     await expect(store.placeOrder({
       symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.1',
-    })).rejects.toThrow('Account switch in progress')
+    })).rejects.toThrow('账户切换中')
     await expect(store.cancelOrder({ symbol: 'BTCUSDT', orderId: 'order-1' }))
-      .rejects.toThrow('Account switch in progress')
-    await expect(store.cancelAllOrders()).rejects.toThrow('Account switch in progress')
+      .rejects.toThrow('账户切换中')
+    await expect(store.cancelAllOrders()).rejects.toThrow('账户切换中')
     expect(privateMutationCalls()).toEqual([])
 
     await finishSwitch(pending, switching)
@@ -172,18 +172,18 @@ describe('account-switch trading mutation guard', () => {
 
     expect(profilesStore.switching).toBe(false)
     expect(profilesStore.tradingBlocked).toBe(true)
-    expect(profilesStore.tradingBlockedMessage).toContain('synchronization failed')
+    expect(profilesStore.tradingBlockedMessage).toContain('账户同步失败')
     expect(panel.canSubmit.value).toBe(false)
     const orderPanel = mount(OrderPanel, { global: { plugins: [pinia] } })
     const blockedMessage = orderPanel.get('[data-testid="trading-blocked-message"]')
     expect(blockedMessage.attributes('role')).toBe('alert')
-    expect(blockedMessage.text()).toContain('synchronization failed')
+    expect(blockedMessage.text()).toContain('账户同步失败')
     await expect(orderStore.placeOrder({
       symbol: 'BTCUSDT', side: 'Buy', orderType: 'Limit', qty: '0.1', price: '60000',
-    })).rejects.toThrow('synchronization failed')
+    })).rejects.toThrow('账户同步失败')
     await expect(orderStore.cancelOrder({ symbol: 'BTCUSDT', orderId: 'order-1' }))
-      .rejects.toThrow('synchronization failed')
-    await expect(orderStore.cancelAllOrders()).rejects.toThrow('synchronization failed')
+      .rejects.toThrow('账户同步失败')
+    await expect(orderStore.cancelAllOrders()).rejects.toThrow('账户同步失败')
     await panel.submit()
     expect(privateMutationCalls()).toEqual([])
 

@@ -52,9 +52,7 @@ pub async fn connect(
             state.market.set_active_symbol(&symbol).await;
             state.market.set_kline_interval(&kline_interval).await;
             if let Err(error) = state.market.restore_klines(&symbol, &kline_interval) {
-                state
-                    .emitter
-                    .emit_error(&format!("Kline restore failed: {error}"));
+                state.emitter.emit_error(&format!("K 线恢复失败：{error}"));
             }
             Ok::<(), crate::error::AppError>(())
         },

@@ -49,6 +49,20 @@ describe('AccountProfilesPanel mutation failures', () => {
     })
   }
 
+  it('renders account controls and credential state in Chinese', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(profiles)
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('账户管理')
+    expect(wrapper.text()).toContain('添加账户')
+    expect(wrapper.text()).toContain('已配置')
+    expect(wrapper.text()).toContain('当前账户')
+    expect(wrapper.text()).toContain('编辑')
+    expect(wrapper.text()).toContain('切换')
+    expect(wrapper.text()).toContain('删除')
+  })
+
   it('renders switchError and consumes a rejected switch without changing profiles', async () => {
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'list_account_profiles') return Promise.resolve(profiles)
@@ -59,7 +73,7 @@ describe('AccountProfilesPanel mutation failures', () => {
     await flushPromises()
     const before = [...useAccountProfilesStore().profiles]
     const backupRow = wrapper.findAll('li').find((row) => row.text().includes('backup'))
-    const switchButton = backupRow!.findAll('button').find((button) => button.text() === 'Switch')
+    const switchButton = backupRow!.findAll('button').find((button) => button.text() === '切换')
     await switchButton!.trigger('click')
     await flushPromises()
 

@@ -410,6 +410,7 @@ describe('AccountAssetsPanel', () => {
 
     await wrapper.vm.$nextTick()
 
+    expect(wrapper.text()).toContain('连接状态：已断开')
     expect(wrapper.text()).toContain('连接账户后刷新')
     expect(tauriInvoke).not.toHaveBeenCalled()
   })
@@ -462,6 +463,8 @@ describe('AccountAssetsPanel', () => {
       expect(wrapper.text()).toContain('account unavailable')
       expect(wrapper.text()).toContain('daily PnL unavailable')
       expect(wrapper.text()).toContain('BTCUSDT')
+      expect(wrapper.text()).toContain('买入')
+      expect(wrapper.text()).not.toContain(' Buy ')
       expect(wrapper.text()).toContain('USDT')
     })
     expect(wrapper.get('[data-testid="asset-contract"]').attributes('data-state')).toBe('error')

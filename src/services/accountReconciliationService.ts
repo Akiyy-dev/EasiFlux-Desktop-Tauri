@@ -10,10 +10,10 @@ export interface AccountReconciliationTask {
 }
 
 const FAILURE_LABELS: Record<AccountReconciliationStep, string> = {
-  config: 'Configuration refresh failed',
-  profiles: 'Account profile refresh failed',
-  connection: 'Connection status refresh failed',
-  bootstrap: 'Account data bootstrap failed',
+  config: '配置刷新失败',
+  profiles: '账户配置刷新失败',
+  connection: '连接状态刷新失败',
+  bootstrap: '账户数据初始化失败',
 }
 
 export async function collectReconciliationFailures(
@@ -29,6 +29,6 @@ export function formatReconciliationError(
   steps: AccountReconciliationStep[],
 ): string | null {
   if (steps.length === 0) return null
-  const details = steps.map((step) => FAILURE_LABELS[step]).join('; ')
-  return `Account switched, but synchronization is incomplete: ${details}. Retry synchronization.`
+  const details = steps.map((step) => FAILURE_LABELS[step]).join('；')
+  return `账户已切换，但同步未完成：${details}。请重试同步。`
 }

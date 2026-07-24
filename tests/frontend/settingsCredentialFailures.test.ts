@@ -51,7 +51,7 @@ describe('CredentialEditor failures', () => {
     vi.mocked(tauriInvoke).mockRejectedValueOnce(new Error('save credential failed'))
     const wrapper = mountEditor()
     await wrapper.findAll('input')[1].setValue('Changed label')
-    const save = wrapper.findAll('button').find((button) => button.text() === 'Save')
+    const save = wrapper.findAll('button').find((button) => button.text() === '保存')
     await save!.trigger('click')
     await flushPromises()
 
@@ -66,7 +66,7 @@ describe('CredentialEditor failures', () => {
     const wrapper = mountEditor()
     await wrapper.findAll('input')[3].setValue('draft-key')
     await wrapper.findAll('input')[4].setValue('draft-secret')
-    const test = wrapper.findAll('button').find((button) => button.text() === 'Test connection')
+    const test = wrapper.findAll('button').find((button) => button.text() === '测试连接')
     await test!.trigger('click')
     await flushPromises()
 
@@ -85,7 +85,7 @@ describe('CredentialEditor failures', () => {
       return Promise.resolve(undefined)
     })
     const wrapper = mountEditor()
-    const save = wrapper.findAll('button').find((button) => button.text() === 'Save')
+    const save = wrapper.findAll('button').find((button) => button.text() === '保存')
 
     await save!.trigger('click')
     await flushPromises()
@@ -117,9 +117,9 @@ describe('settings config failures', () => {
 
   async function saveThroughEditor(wrapper: ReturnType<typeof mountSettings>) {
     await flushPromises()
-    const edit = wrapper.findAll('button').find((button) => button.text() === 'Edit credentials')
+    const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
     await edit!.trigger('click')
-    const save = wrapper.findAll('button').find((button) => button.text() === 'Save')
+    const save = wrapper.findAll('button').find((button) => button.text() === '保存')
     await save!.trigger('click')
     await flushPromises()
   }

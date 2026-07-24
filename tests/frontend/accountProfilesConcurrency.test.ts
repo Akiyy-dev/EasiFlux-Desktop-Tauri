@@ -76,7 +76,7 @@ describe('account profile refresh concurrency', () => {
     expect(store.profiles).toEqual([freshProfile])
     expect(store.listError).toBeNull()
     expect(store.loading).toBe(false)
-    const edit = settings.findAll('button').find((button) => button.text() === 'Edit credentials')
+    const edit = settings.findAll('button').find((button) => button.text() === '编辑凭据')
     expect(edit?.attributes('disabled')).toBeUndefined()
     expect(settings.getComponent(CredentialEditor).props()).toMatchObject({
       initialLabel: 'Fresh', initialBaseUrl: 'https://fresh.example',
@@ -135,7 +135,7 @@ describe('account profile refresh concurrency', () => {
     }
 
     await expect(store.saveCredentials(request)).rejects.toThrow(
-      'Account profiles must be refreshed',
+      '请先刷新账户列表',
     )
     expect(tauriInvoke).not.toHaveBeenCalledWith('save_credentials', expect.anything())
     expect(listCall).toBe(1)

@@ -6,8 +6,7 @@ use crate::models::trading::PlaceOrderRequest;
 use crate::services::time::{resolve_trading_day_timezone, trading_day_key};
 use crate::storage::{RiskUsage, RiskUsageStore};
 
-const LEDGER_UNAVAILABLE_MESSAGE: &str =
-    "Risk usage ledger is unavailable. Check local storage permissions or file format.";
+const LEDGER_UNAVAILABLE_MESSAGE: &str = "风控用量账本不可用，请检查本地存储权限或文件格式。";
 
 mod status;
 mod validation;

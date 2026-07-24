@@ -58,7 +58,7 @@ pub(crate) fn credential_backend_error(_reason: impl Display) -> AppError {
 pub(crate) fn map_keyring_error(error: keyring::Error) -> AppError {
     tracing::warn!(
         error_kind = keyring_error_kind(&error),
-        "credential backend operation failed"
+        "系统凭据存储操作失败"
     );
     credential_backend_error(error)
 }

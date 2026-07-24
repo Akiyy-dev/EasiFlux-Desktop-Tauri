@@ -50,20 +50,44 @@ describe('RiskControlPanel', () => {
     expect(tauriInvoke).toHaveBeenCalledWith('get_risk_status')
   })
 
-  it('renders unavailable and disabled ledger states without fake zero usage', async () => {
-    const store = useRiskStore()
-    store.status = { ...ready, ledgerState: 'unavailable', occupiedOrders: null,
-      remainingOrders: null, error: 'Risk usage ledger is unavailable.' }
+  it('renders the daily risk controls in Chinese', () => {
+    useRiskStore().status = ready
     const wrapper = mount(RiskControlPanel, {
       props: { active: false }, global: { plugins: [pinia] },
     })
-    expect(wrapper.text()).toContain('Risk usage ledger is unavailable.')
+
+    for (const label of [
+      '每日风控',
+      '应用全局额度',
+      '刷新状态',
+      '交易日',
+      '当日额度',
+      '更新时间',
+      '启用下单风控检查',
+      '最大单笔下单数量',
+      '最大价格偏离（%）',
+      '每日最大下单次数',
+      '交易日时区',
+      '保存更改',
+    ]) {
+      expect(wrapper.text()).toContain(label)
+    }
+  })
+
+  it('renders unavailable and disabled ledger states without fake zero usage', async () => {
+    const store = useRiskStore()
+    store.status = { ...ready, ledgerState: 'unavailable', occupiedOrders: null,
+      remainingOrders: null, error: '风控用量账本不可用。' }
+    const wrapper = mount(RiskControlPanel, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+    expect(wrapper.text()).toContain('风控用量账本不可用。')
     expect(wrapper.get('[data-testid="risk-usage"]').text()).toContain('--')
 
     store.status = { ...ready, enabled: false, ledgerState: 'disabled',
       occupiedOrders: null, remainingOrders: null, updatedAtMs: null }
     await flushPromises()
-    expect(wrapper.get('[data-testid="ledger-state"]').text()).toContain('Disabled')
+    expect(wrapper.get('[data-testid="ledger-state"]').text()).toContain('已停用')
     expect(wrapper.get('[data-testid="risk-usage"]').text()).toContain('--')
   })
 
@@ -101,7 +125,7 @@ describe('RiskControlPanel', () => {
     await wrapper.get('[data-testid="refresh-risk"]').trigger('click')
     await flushPromises()
     expect(useRiskStore().status).toEqual(refreshed)
-    expect(wrapper.get('[data-testid="risk-usage"]').text()).toContain('13 occupied')
+    expect(wrapper.get('[data-testid="risk-usage"]').text()).toContain('13 已占用')
   })
 
   it('sends enabled true when enabling a disabled snapshot', async () => {

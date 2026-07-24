@@ -8,10 +8,10 @@ export function validateCredentialDraft(draft: CredentialDraftValidation): strin
   const hasKey = draft.apiKey.trim().length > 0
   const hasSecret = draft.apiSecret.trim().length > 0
   if (hasKey !== hasSecret) {
-    return 'API key and secret must be provided together'
+    return 'API 访问密钥和签名密钥必须同时填写'
   }
   if (draft.mode === 'create' && !hasKey) {
-    return 'API key and secret are required for a new account'
+    return '新账户必须填写 API 访问密钥和签名密钥'
   }
   return null
 }

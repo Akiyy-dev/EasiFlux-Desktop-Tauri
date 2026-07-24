@@ -36,9 +36,9 @@ where
 {
     let paths = ConfigPaths::new(path);
     let candidates = [
-        ("main", paths.main.as_path()),
-        ("temp", paths.temp.as_path()),
-        ("backup", paths.backup.as_path()),
+        ("主配置", paths.main.as_path()),
+        ("临时副本", paths.temp.as_path()),
+        ("备份", paths.backup.as_path()),
     ];
     let mut invalid_candidates = Vec::new();
 
@@ -68,7 +68,7 @@ where
         Ok(None)
     } else {
         Err(AppError::Config(format!(
-            "配置文件及恢复副本均不可用: {}",
+            "配置文件及恢复副本均不可用：{}",
             invalid_candidates.join("、")
         )))
     }
@@ -122,7 +122,7 @@ fn replace_existing_main(paths: &ConfigPaths) -> AppResult<()> {
             tracing::warn!(
                 replace_error = %replace_error,
                 restore_error = %restore_error,
-                "failed to replace config and restore its previous main file"
+                "替换配置文件失败，且无法恢复原主配置文件"
             );
         }
         return Err(replace_error.into());

@@ -8,27 +8,21 @@ use crate::services::time::is_valid_iana_timezone;
 
 pub fn validate_risk_config(config: &RiskConfig) -> AppResult<()> {
     let max_qty = Decimal::from_str(&config.max_order_qty)
-        .map_err(|_| AppError::Config("Invalid maximum order quantity".into()))?;
+        .map_err(|_| AppError::Config("最大单笔下单数量格式无效".into()))?;
     if max_qty <= Decimal::ZERO {
-        return Err(AppError::Config(
-            "Maximum order quantity must be greater than 0".into(),
-        ));
+        return Err(AppError::Config("最大单笔下单数量必须大于 0".into()));
     }
 
     let max_deviation = Decimal::from_str(&config.max_price_deviation_pct)
-        .map_err(|_| AppError::Config("Invalid maximum price deviation".into()))?;
+        .map_err(|_| AppError::Config("最大价格偏离格式无效".into()))?;
     if max_deviation < Decimal::ZERO {
-        return Err(AppError::Config(
-            "Maximum price deviation cannot be negative".into(),
-        ));
+        return Err(AppError::Config("最大价格偏离不能为负数".into()));
     }
     if config.max_daily_orders == 0 {
-        return Err(AppError::Config(
-            "Maximum daily orders must be greater than 0".into(),
-        ));
+        return Err(AppError::Config("每日最大下单次数必须大于 0".into()));
     }
     if !is_valid_iana_timezone(&config.trading_day_timezone) {
-        return Err(AppError::Config("Invalid trading day timezone".into()));
+        return Err(AppError::Config("交易日时区无效".into()));
     }
     Ok(())
 }

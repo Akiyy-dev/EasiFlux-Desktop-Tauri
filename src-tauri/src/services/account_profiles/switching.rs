@@ -29,7 +29,7 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
     }
     let accounts = normalize_account_ids(&former_config.accounts, &former_id);
     if !accounts.contains(&target_id) {
-        return Err(AppError::Config("Account profile does not exist".into()));
+        return Err(AppError::Config("账户配置不存在".into()));
     }
     let target_credential = valid_credential(safe_load(port, &target_id)?)?;
     port.preflight(&target_credential).await?;
@@ -110,7 +110,7 @@ async fn rollback_switch<P: AccountLifecyclePort>(
     } else {
         port.disconnect().await;
         AppError::Internal(format!(
-            "{ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER}: {primary}; rollback failed: {}",
+            "{ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER}: {primary}；回滚失败：{}",
             rollback_errors.join("; ")
         ))
     }
