@@ -106,19 +106,23 @@ describe('chart workspace page integration', () => {
     expect(wrapper.get('[data-testid="trading-layout"]').element).toBe(first)
   })
 
-  it('waits for page flush and applies only the latest navigation intent', async () => {
+  it('navigates immediately while the previous chart flush is still pending', async () => {
+    const wrapper = mountShell()
+    await selectPage(wrapper, 'charts')
     const pending = deferred<void>()
     vi.mocked(flushActiveChartWorkspace).mockReturnValueOnce(pending.promise)
-    const wrapper = mountShell()
 
-    wrapper.findComponent(NavigationRail).vm.$emit('select', 'charts')
     wrapper.findComponent(NavigationRail).vm.$emit('select', 'account')
-    await flushPromises()
+    await wrapper.vm.$nextTick()
 
-    expect(wrapper.find('[data-testid="account-page"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="account-page"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="chart-workspace-page"]').isVisible()).toBe(false)
+    expect(wrapper.findComponent(NavigationRail).props('active')).toBe('account')
+
     pending.resolve()
     await flushPromises()
     expect(wrapper.find('[data-testid="account-page"]').exists()).toBe(true)
+    expect(wrapper.findComponent(NavigationRail).props('active')).toBe('account')
   })
 
   it('reports a page flush failure and still navigates', async () => {

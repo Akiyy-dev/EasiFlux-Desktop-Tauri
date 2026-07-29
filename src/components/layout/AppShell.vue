@@ -30,8 +30,6 @@ const tradingVisited = ref(false)
 const activeAccountSection = ref<AccountSection>('api')
 const activeSecondary = ref<NonAccountSection>('welcome')
 const sidebarCollapsed = ref(false)
-let navigationGeneration = 0
-let navigationTail: Promise<void> = Promise.resolve()
 
 useChartWorkspaceAutosaveHost()
 const sidebarTarget = computed<SidebarTarget>(() => activePage.value === 'account'
@@ -75,19 +73,11 @@ function applyNavigation(target: NavigationTarget): void {
 
 function navigateTo(target: NavKey | NavigationTarget): Promise<void> {
   const normalized = typeof target === 'string' ? { page: target } : target
-  const generation = ++navigationGeneration
-  const transition = navigationTail.then(async () => {
-    if (generation !== navigationGeneration) return
-    try {
-      await flushActiveChartWorkspace('page')
-    } catch (error) {
-      reportError(error, '图表页面切换前保存失败')
-    }
-    if (generation !== navigationGeneration) return
-    applyNavigation(normalized)
+  const flush = flushActiveChartWorkspace('page').catch((error: unknown) => {
+    reportError(error, '图表页面切换前保存失败')
   })
-  navigationTail = transition.catch(() => undefined)
-  return transition
+  applyNavigation(normalized)
+  return flush
 }
 
 function selectSection(section: SidebarSectionKey): void {

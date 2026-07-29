@@ -11,8 +11,8 @@ export function useChartWorkspaceAutosaveHost(): ChartWorkspaceAutosave {
   const autosave = new ChartWorkspaceAutosave({
     save: saveChartWorkspace,
     report: (context, error) => { reportError(error, context) },
-    setInterval: globalThis.setInterval,
-    clearInterval: globalThis.clearInterval,
+    setInterval: globalThis.setInterval.bind(globalThis) as typeof globalThis.setInterval,
+    clearInterval: globalThis.clearInterval.bind(globalThis) as typeof globalThis.clearInterval,
   })
   const flusher = registerChartWorkspaceFlusher((reason) => autosave.flush(reason))
   provide(chartWorkspaceAutosaveKey, autosave)
