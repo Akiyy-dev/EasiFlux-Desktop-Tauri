@@ -141,3 +141,25 @@ pub fn run() {
             }
         });
 }
+
+#[cfg(test)]
+mod capability_tests {
+    use tauri::ipc::Origin;
+
+    #[test]
+    fn main_window_can_force_close_after_chart_workspace_flush() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+
+        let access = context.runtime_authority_mut().resolve_access(
+            "plugin:window|destroy",
+            "main",
+            "main",
+            &Origin::Local,
+        );
+
+        assert!(
+            access.is_some(),
+            "main window must be allowed to destroy itself after the close guard flushes chart workspaces"
+        );
+    }
+}
