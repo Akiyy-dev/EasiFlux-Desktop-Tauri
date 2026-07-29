@@ -9,6 +9,7 @@ import type { AppConfig, Balance } from '../../src/types/models'
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   listeners: new Map<string, (payload: unknown) => void>(),
+  closeGuard: vi.fn(),
 }))
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: mocks.invoke }))
@@ -17,6 +18,9 @@ vi.mock('../../src/composables/useTauriEvent', () => ({
   useTauriEvent: (event: string, handler: (payload: unknown) => void) => {
     mocks.listeners.set(event, handler)
   },
+}))
+vi.mock('../../src/composables/useChartWorkspaceCloseGuard', () => ({
+  useChartWorkspaceCloseGuard: mocks.closeGuard,
 }))
 vi.mock('../../src/components/layout/AppShell.vue', () => ({
   default: { template: '<div />' },
@@ -42,6 +46,7 @@ describe('App account-bound event handlers', () => {
     const pinia = createPinia()
     setActivePinia(pinia)
     mocks.listeners.clear()
+    mocks.closeGuard.mockReset()
     mocks.invoke.mockReset()
     mocks.invoke.mockImplementation((command: string) => {
       if (command === 'get_config') return Promise.resolve(config)
@@ -50,6 +55,10 @@ describe('App account-bound event handlers', () => {
       return Promise.resolve(undefined)
     })
     shallowMount(App, { global: { plugins: [pinia] } })
+  })
+
+  it('installs the application close guard exactly once', () => {
+    expect(mocks.closeGuard).toHaveBeenCalledOnce()
   })
 
   it('does not write a stale balance event into the account store', () => {

@@ -9,12 +9,19 @@ import DashboardQuickActions from '../../src/components/dashboard/DashboardQuick
 import AppShell from '../../src/components/layout/AppShell.vue'
 import NavigationRail from '../../src/components/layout/NavigationRail.vue'
 import Sidebar from '../../src/components/layout/Sidebar.vue'
+import TopBar from '../../src/components/layout/TopBar.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { useConnectionStore } from '../../src/stores/connection'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
 vi.mock('../../src/components/layout/TradingLayout.vue', () => ({
   default: { template: '<div data-testid="trading-layout" />' },
+}))
+vi.mock('../../src/components/market/KlineChart.vue', () => ({
+  default: { name: 'KlineChart', template: '<div data-testid="kline-chart" />' },
+}))
+vi.mock('../../src/composables/useChartWorkspaceAutosaveHost', () => ({
+  useChartWorkspaceAutosaveHost: vi.fn(),
 }))
 
 describe('account navigation', () => {
@@ -107,5 +114,21 @@ describe('account navigation', () => {
     await wrapper.getComponent(NavigationRail).get('.rail-bottom button').trigger('click')
 
     expect(wrapper.emitted('openSettings')).toHaveLength(1)
+  })
+
+  it('keeps primary navigation mounted and hides Sidebar only for charts', async () => {
+    const wrapper = mountShell()
+    const topBar = wrapper.getComponent(TopBar).element
+    const navigationRail = wrapper.getComponent(NavigationRail).element
+
+    await wrapper.getComponent(NavigationRail).findAll('.rail-top button')[2]!.trigger('click')
+    await flushPromises()
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(false)
+    expect(wrapper.getComponent(TopBar).element).toBe(topBar)
+    expect(wrapper.getComponent(NavigationRail).element).toBe(navigationRail)
+
+    await wrapper.getComponent(NavigationRail).findAll('.rail-top button')[4]!.trigger('click')
+    await flushPromises()
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(true)
   })
 })

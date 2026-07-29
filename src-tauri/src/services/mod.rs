@@ -1,6 +1,7 @@
 pub mod account;
 pub mod account_profiles;
 pub mod analytics;
+pub mod chart_workspace;
 pub mod connection;
 pub mod daily_pnl;
 pub mod market;
@@ -12,6 +13,7 @@ pub mod trading;
 pub use account::AccountService;
 pub use account_profiles::AccountLifecycleCoordinator;
 pub use analytics::AnalyticsService;
+pub use chart_workspace::ChartWorkspaceService;
 pub use connection::ConnectionService;
 pub use daily_pnl::DailyPnlService;
 pub use market::MarketService;

@@ -1,8 +1,9 @@
 pub mod account;
 pub mod api_requests;
+pub mod chart_workspace;
 pub mod config;
 pub mod diagnostic;
 pub mod market;
 pub mod risk;
-pub mod trading;
 pub mod time;
+pub mod trading;

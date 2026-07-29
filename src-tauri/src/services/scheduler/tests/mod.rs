@@ -10,6 +10,88 @@ fn task_id_parses_frontend_names() {
     assert_eq!(TaskId::from_name("dailyPnl"), Some(TaskId::DailyPnl));
     assert_eq!(TaskId::from_name("account"), Some(TaskId::Balances));
     assert_eq!(TaskId::from_name("market"), Some(TaskId::MarketFallback));
+    assert_eq!(TaskId::from_name("kline"), Some(TaskId::KlineFlush));
+}
+
+#[test]
+fn kline_flush_is_five_seconds_and_not_in_connection_bootstrap() {
+    assert_eq!(TaskId::KlineFlush.interval(), Some(Duration::from_secs(5)));
+    assert!(!bootstrap_tasks(true).contains(&TaskId::KlineFlush));
+    assert!(!bootstrap_tasks(false).contains(&TaskId::KlineFlush));
+}
+
+#[test]
+fn kline_flush_bypasses_account_lifecycle_coordination() {
+    assert!(!TaskId::KlineFlush.requires_account_lifecycle());
+    assert!(TaskId::MarketFallback.requires_account_lifecycle());
+}
+
+#[tokio::test]
+async fn kline_flush_executes_while_account_mutation_guard_is_held() {
+    let coordinator = AccountLifecycleCoordinator::new();
+    let _mutation_guard = coordinator.mutation_guard().await;
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran_by_task = Arc::clone(&ran);
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        execute_task_with_account_lifecycle(&coordinator, TaskId::KlineFlush, move || async move {
+            ran_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }),
+    )
+    .await
+    .expect("KlineFlush must not wait for account lifecycle coordination")
+    .unwrap();
+
+    assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn kline_flush_delays_its_first_tick_while_existing_tasks_remain_immediate() {
+    assert_eq!(first_tick_delay(TaskId::KlineFlush), Duration::from_secs(5));
+    assert_eq!(first_tick_delay(TaskId::MarketFallback), Duration::ZERO);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kline_flush_attempts_every_dirty_key_before_returning_a_joined_storage_error() {
+    use crate::models::chart_workspace::ChartWorkspaceKey;
+    use crate::models::market::Kline;
+    use crate::services::ChartWorkspaceService;
+    use crate::storage::{ChartStateStore, KlineStore};
+
+    let root = std::env::temp_dir().join(format!(
+        "easiflux-scheduler-kline-flush-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let kline_dir = root.join("klines");
+    let kline_store = Arc::new(KlineStore::with_dir(kline_dir.clone()));
+    let bad = ChartWorkspaceKey::parse("AAA", "1").unwrap();
+    let good = ChartWorkspaceKey::parse("BBB", "1").unwrap();
+    let sample = |key: &ChartWorkspaceKey| Kline {
+        symbol: key.symbol.clone(),
+        interval: key.interval.clone(),
+        open_time: 1,
+        open: "1".into(),
+        high: "2".into(),
+        low: "0.5".into(),
+        close: "1.5".into(),
+        volume: "10".into(),
+    };
+    kline_store.upsert_bars(&bad, &[sample(&bad)]).unwrap();
+    kline_store.upsert_bars(&good, &[sample(&good)]).unwrap();
+    std::fs::create_dir_all(kline_dir.join("AAA_1.jsonl")).unwrap();
+    let service = Arc::new(ChartWorkspaceService::new(
+        kline_store,
+        Arc::new(ChartStateStore::with_root(root.join("state"))),
+        Arc::new(|_| {}),
+    ));
+
+    let result = execute_kline_flush(service).await;
+
+    assert!(matches!(result, Err(AppError::Storage(_))));
+    assert!(kline_dir.join("BBB_1.jsonl").is_file());
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

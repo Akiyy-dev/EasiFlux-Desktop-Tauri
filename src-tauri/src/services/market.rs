@@ -2,18 +2,37 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::api::mapper::merge_ticker;
 use crate::api::{ApiClient, PublicApi};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::events::EventEmitter;
+use crate::models::chart_workspace::ChartWorkspaceKey;
+use crate::models::config::DEFAULT_KLINE_LIMIT;
 use crate::models::market::{Depth, Kline, Ticker};
 use crate::services::account_profiles::run_account_public_operation;
 use crate::services::{AccountLifecycleCoordinator, TimeService};
 use crate::storage::{CacheStore, KlineStore};
 
-const MAX_KLINES: usize = 200;
+const MAX_DISPLAY_KLINES: usize = 200;
+const MAX_RANGE_FETCH_KLINES: u32 = 500;
+
+struct BufferedKlineUpdate {
+    display: Vec<Kline>,
+    changed: bool,
+    needs_backfill: bool,
+}
+
+fn requested_kline_limit(limit: Option<u32>) -> u32 {
+    limit
+        .unwrap_or(DEFAULT_KLINE_LIMIT)
+        .clamp(1, MAX_RANGE_FETCH_KLINES)
+}
+
+fn chart_key(symbol: &str, interval: &str) -> AppResult<ChartWorkspaceKey> {
+    ChartWorkspaceKey::parse(symbol, interval).map_err(AppError::Storage)
+}
 
 pub fn interval_to_ms(interval: &str) -> i64 {
     match interval {
@@ -26,15 +45,24 @@ pub fn interval_to_ms(interval: &str) -> i64 {
     }
 }
 
-fn trim_display_klines(mut klines: Vec<Kline>) -> Vec<Kline> {
-    if klines.len() > MAX_KLINES {
-        let start = klines.len() - MAX_KLINES;
-        klines = klines.split_off(start);
-    }
-    klines
+fn buffer_display_klines(
+    store: &KlineStore,
+    key: &ChartWorkspaceKey,
+    bars: &[Kline],
+) -> AppResult<BufferedKlineUpdate> {
+    let merge = store.upsert_bars(key, bars)?;
+    let display = store.load_range(key, None, None, MAX_DISPLAY_KLINES)?;
+    let needs_backfill =
+        !KlineStore::detect_gaps(&display, interval_to_ms(&key.interval)).is_empty();
+    Ok(BufferedKlineUpdate {
+        display,
+        changed: merge.changed,
+        needs_backfill,
+    })
 }
 
 /// Upsert WS/REST bars and detect timeline gaps needing REST backfill.
+#[allow(dead_code)]
 pub fn merge_kline_updates(klines: &mut Vec<Kline>, updates: &[Kline], interval_ms: i64) -> bool {
     if updates.is_empty() {
         return false;
@@ -58,8 +86,8 @@ pub struct MarketService {
     emitter: EventEmitter,
     time: Arc<TimeService>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
-    active_symbol: Arc<RwLock<String>>,
-    kline_interval: Arc<RwLock<String>>,
+    chart_context: Arc<RwLock<ChartWorkspaceKey>>,
+    context_mutation: Mutex<()>,
 }
 
 impl MarketService {
@@ -70,6 +98,7 @@ impl MarketService {
         emitter: EventEmitter,
         time: Arc<TimeService>,
         account_lifecycle: Arc<AccountLifecycleCoordinator>,
+        initial_chart_context: ChartWorkspaceKey,
     ) -> Self {
         Self {
             api,
@@ -78,50 +107,78 @@ impl MarketService {
             emitter,
             time,
             account_lifecycle,
-            active_symbol: Arc::new(RwLock::new("BTCUSDT".into())),
-            kline_interval: Arc::new(RwLock::new("1".into())),
+            chart_context: Arc::new(RwLock::new(initial_chart_context)),
+            context_mutation: Mutex::new(()),
         }
     }
 
-    pub async fn set_active_symbol(&self, symbol: &str) {
-        *self.active_symbol.write().await = symbol.to_string();
-        self.cache.touch_symbol(symbol);
+    pub(crate) async fn chart_context_mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.context_mutation.lock().await
     }
 
-    pub async fn active_symbol(&self) -> String {
-        self.active_symbol.read().await.clone()
+    pub async fn chart_context(&self) -> ChartWorkspaceKey {
+        self.chart_context.read().await.clone()
     }
 
-    pub async fn set_kline_interval(&self, interval: &str) {
-        *self.kline_interval.write().await = interval.to_string();
+    pub async fn replace_runtime_chart_context(&self, key: ChartWorkspaceKey) {
+        self.cache.touch_symbol(&key.symbol);
+        *self.chart_context.write().await = key;
     }
 
-    pub async fn kline_interval(&self) -> String {
-        self.kline_interval.read().await.clone()
-    }
-
-    fn persist_and_emit(&self, symbol: &str, interval: &str, bars: &[Kline]) -> AppResult<()> {
-        let stored = self.kline_store.upsert_bars(symbol, interval, bars)?;
-        let display = trim_display_klines(stored);
-        self.cache.set_klines(symbol, interval, display.clone());
-        self.emitter.emit_klines(&display);
+    #[allow(dead_code)]
+    pub async fn set_active_symbol(&self, symbol: &str) -> AppResult<()> {
+        let current = self.chart_context().await;
+        let key = chart_key(symbol, &current.interval)?;
+        self.replace_runtime_chart_context(key).await;
         Ok(())
     }
 
-    pub fn restore_klines(&self, symbol: &str, interval: &str) -> AppResult<()> {
-        let stored = self.kline_store.load(symbol, interval)?;
+    pub async fn active_symbol(&self) -> String {
+        self.chart_context.read().await.symbol.clone()
+    }
+
+    #[allow(dead_code)]
+    pub async fn set_kline_interval(&self, interval: &str) -> AppResult<()> {
+        let current = self.chart_context().await;
+        let key = chart_key(&current.symbol, interval)?;
+        self.replace_runtime_chart_context(key).await;
+        Ok(())
+    }
+
+    pub async fn kline_interval(&self) -> String {
+        self.chart_context.read().await.interval.clone()
+    }
+
+    pub async fn load_local_klines(&self, key: &ChartWorkspaceKey) -> AppResult<Vec<Kline>> {
+        let store = Arc::clone(&self.kline_store);
+        let key = key.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            store.load_range(&key, None, None, MAX_DISPLAY_KLINES)
+        })
+        .await
+        .map_err(|error| AppError::Internal(format!("K线本地读取任务失败: {error}")))?
+    }
+
+    pub fn publish_local_klines(&self, key: &ChartWorkspaceKey, bars: Vec<Kline>) {
+        self.cache
+            .set_klines(&key.symbol, &key.interval, bars.clone());
+        self.emitter.emit_klines(&bars);
+    }
+
+    pub async fn restore_klines(&self, symbol: &str, interval: &str) -> AppResult<()> {
+        let key = chart_key(symbol, interval)?;
+        let stored = self.load_local_klines(&key).await?;
         if stored.is_empty() {
             return Ok(());
         }
-        let display = trim_display_klines(stored);
-        self.cache.set_klines(symbol, interval, display.clone());
-        self.emitter.emit_klines(&display);
+        self.publish_local_klines(&key, stored);
         Ok(())
     }
 
     pub async fn backfill_gaps(&self, symbol: &str, interval: &str) -> AppResult<()> {
-        let bars = PublicApi::klines(&self.api, symbol, interval, 200, None, None).await?;
-        self.persist_and_emit(symbol, interval, &bars)?;
+        let key = chart_key(symbol, interval)?;
+        self.fetch_kline_range(&key, None, None, Some(DEFAULT_KLINE_LIMIT))
+            .await?;
         Ok(())
     }
 
@@ -145,22 +202,28 @@ impl MarketService {
             return false;
         }
 
-        let interval_ms = interval_to_ms(interval);
-        let mut klines = self
-            .cache
-            .get_klines(symbol, interval)
-            .or_else(|| self.kline_store.load(symbol, interval).ok())
-            .unwrap_or_default();
-        let needs_backfill = merge_kline_updates(&mut klines, &updates, interval_ms);
-
-        if needs_backfill {
-            return true;
+        let key = match chart_key(symbol, interval) {
+            Ok(key) => key,
+            Err(error) => {
+                self.emitter.emit_error(&error.to_string());
+                return false;
+            }
+        };
+        match buffer_display_klines(&self.kline_store, &key, &updates) {
+            Ok(update) => {
+                if update.changed {
+                    self.cache
+                        .set_klines(symbol, interval, update.display.clone());
+                    self.emitter.emit_klines(&update.display);
+                }
+                update.needs_backfill
+            }
+            Err(error) => {
+                self.emitter
+                    .emit_error(&format!("K线内存缓冲失败: {error}"));
+                false
+            }
         }
-
-        if let Err(e) = self.persist_and_emit(symbol, interval, &klines) {
-            self.emitter.emit_error(&format!("K线持久化失败: {}", e));
-        }
-        false
     }
 
     pub fn schedule_kline_backfill(self: &Arc<Self>, symbol: &str, interval: &str) {
@@ -234,13 +297,38 @@ impl MarketService {
         Ok(depth)
     }
 
+    pub async fn fetch_kline_range(
+        &self,
+        key: &ChartWorkspaceKey,
+        start: Option<i64>,
+        end: Option<i64>,
+        limit: Option<u32>,
+    ) -> AppResult<Vec<Kline>> {
+        let requested = requested_kline_limit(limit);
+        let rest =
+            PublicApi::klines(&self.api, &key.symbol, &key.interval, requested, start, end).await?;
+        let store = Arc::clone(&self.kline_store);
+        let key_for_store = key.clone();
+        let (update, result) = tauri::async_runtime::spawn_blocking(move || {
+            let update = buffer_display_klines(&store, &key_for_store, &rest)?;
+            let result = store.load_range(&key_for_store, start, end, requested as usize)?;
+            Ok::<_, AppError>((update, result))
+        })
+        .await
+        .map_err(|error| AppError::Internal(format!("K线范围读取任务失败: {error}")))??;
+        if update.changed {
+            self.cache
+                .set_klines(&key.symbol, &key.interval, update.display.clone());
+            self.emitter.emit_klines(&update.display);
+        }
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
     pub async fn fetch_klines(&self, symbol: &str, interval: &str) -> AppResult<Vec<Kline>> {
-        let rest = PublicApi::klines(&self.api, symbol, interval, 200, None, None).await?;
-        self.persist_and_emit(symbol, interval, &rest)?;
-        Ok(self
-            .cache
-            .get_klines(symbol, interval)
-            .unwrap_or_else(|| trim_display_klines(rest)))
+        let key = chart_key(symbol, interval)?;
+        self.fetch_kline_range(&key, None, None, Some(DEFAULT_KLINE_LIMIT))
+            .await
     }
 
     pub async fn refresh_ticker_depth(&self, symbol: &str) -> AppResult<()> {
@@ -265,7 +353,7 @@ impl MarketService {
     }
 
     pub async fn refresh_klines(&self, symbol: &str) -> AppResult<()> {
-        let interval = self.kline_interval.read().await.clone();
+        let interval = self.chart_context.read().await.interval.clone();
         if let Err(e) = self.backfill_gaps(symbol, &interval).await {
             let message = format!("K线刷新失败: {}", e);
             self.emitter.emit_error(&message);
@@ -308,7 +396,16 @@ mod tests {
     use super::*;
     use crate::models::market::Kline;
     use crate::services::AccountLifecycleCoordinator;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "easiflux-market-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
 
     fn sample_kline(open_time: i64, close: &str) -> Kline {
         Kline {
@@ -321,6 +418,54 @@ mod tests {
             close: close.into(),
             volume: "1".into(),
         }
+    }
+
+    #[test]
+    fn market_update_marks_store_dirty_without_immediate_disk_write() {
+        let dir = test_dir("market-buffer");
+        let store = KlineStore::with_dir(dir.clone());
+        let key = ChartWorkspaceKey::parse("BTCUSDT", "1").unwrap();
+
+        let update = buffer_display_klines(&store, &key, &[sample_kline(1_000, "2")]).unwrap();
+
+        assert_eq!(update.display.len(), 1);
+        assert!(update.changed);
+        assert!(!dir.join("BTCUSDT_1.jsonl").exists());
+    }
+
+    #[test]
+    fn market_display_remains_limited_to_latest_two_hundred() {
+        let store = KlineStore::with_dir(test_dir("display-limit"));
+        let key = ChartWorkspaceKey::parse("BTCUSDT", "1").unwrap();
+        let updates = (1..=240)
+            .map(|time| sample_kline(time, &time.to_string()))
+            .collect::<Vec<_>>();
+
+        let update = buffer_display_klines(&store, &key, &updates).unwrap();
+
+        assert_eq!(update.display.len(), 200);
+        assert_eq!(update.display.first().unwrap().open_time, 41);
+    }
+
+    #[test]
+    fn unchanged_market_update_does_not_request_an_identical_snapshot() {
+        let store = KlineStore::with_dir(test_dir("unchanged-update"));
+        let key = ChartWorkspaceKey::parse("BTCUSDT", "1").unwrap();
+        let bar = sample_kline(1_000, "2");
+
+        assert!(
+            buffer_display_klines(&store, &key, std::slice::from_ref(&bar))
+                .unwrap()
+                .changed
+        );
+        assert!(!buffer_display_klines(&store, &key, &[bar]).unwrap().changed);
+    }
+
+    #[test]
+    fn ranged_history_limit_defaults_and_clamps_to_supported_bounds() {
+        assert_eq!(requested_kline_limit(None), 200);
+        assert_eq!(requested_kline_limit(Some(0)), 1);
+        assert_eq!(requested_kline_limit(Some(501)), 500);
     }
 
     #[test]

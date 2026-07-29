@@ -21,8 +21,8 @@ use crate::models::config::{
 use crate::models::time::{TimeSnapshot, TimeSyncStatus};
 use crate::models::trading::PrivatePanelsSnapshot;
 use crate::services::{
-    AccountLifecycleCoordinator, ConnectionService, DailyPnlService, MarketService, TimeService,
-    TradingService,
+    AccountLifecycleCoordinator, ChartWorkspaceService, ConnectionService, DailyPnlService,
+    MarketService, TimeService, TradingService,
 };
 use crate::storage::CredentialStore;
 use crate::ws::WsManager;
@@ -36,6 +36,7 @@ const INTERVAL_BALANCES: Duration = Duration::from_secs(7);
 const INTERVAL_PRIVATE_PANELS: Duration = Duration::from_secs(4);
 const INTERVAL_DAILY_PNL: Duration = Duration::from_secs(60);
 const INTERVAL_MARKET_FALLBACK: Duration = Duration::from_secs(1);
+const INTERVAL_KLINE_FLUSH: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskId {
@@ -45,6 +46,7 @@ pub enum TaskId {
     PrivatePanels,
     DailyPnl,
     MarketFallback,
+    KlineFlush,
     Environment,
 }
 
@@ -57,6 +59,7 @@ impl TaskId {
             "privatePanels" => Some(Self::PrivatePanels),
             "dailyPnl" => Some(Self::DailyPnl),
             "market" | "marketFallback" => Some(Self::MarketFallback),
+            "kline" | "klineFlush" => Some(Self::KlineFlush),
             "environment" => Some(Self::Environment),
             _ => None,
         }
@@ -70,6 +73,7 @@ impl TaskId {
             Self::PrivatePanels => Some(INTERVAL_PRIVATE_PANELS),
             Self::DailyPnl => Some(INTERVAL_DAILY_PNL),
             Self::MarketFallback => Some(INTERVAL_MARKET_FALLBACK),
+            Self::KlineFlush => Some(INTERVAL_KLINE_FLUSH),
             Self::Environment => None,
         }
     }
@@ -82,8 +86,21 @@ impl TaskId {
             Self::PrivatePanels => "订单/持仓",
             Self::DailyPnl => "今日盈亏",
             Self::MarketFallback => "行情快照",
+            Self::KlineFlush => "K线持久化",
             Self::Environment => "环境检测",
         }
+    }
+
+    fn requires_account_lifecycle(self) -> bool {
+        self != Self::KlineFlush
+    }
+}
+
+fn first_tick_delay(task: TaskId) -> Duration {
+    if task == TaskId::KlineFlush {
+        task.interval().expect("periodic task has an interval")
+    } else {
+        Duration::ZERO
     }
 }
 
@@ -181,14 +198,38 @@ where
 
 async fn execute_task_with_account_lifecycle<F, Fut>(
     coordinator: &AccountLifecycleCoordinator,
-    _task: TaskId,
+    task: TaskId,
     operation: F,
 ) -> AppResult<()>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = AppResult<()>>,
 {
-    crate::services::account_profiles::run_account_public_operation(coordinator, operation).await
+    if task.requires_account_lifecycle() {
+        crate::services::account_profiles::run_account_public_operation(coordinator, operation)
+            .await
+    } else {
+        operation().await
+    }
+}
+
+async fn execute_kline_flush(service: Arc<ChartWorkspaceService>) -> AppResult<()> {
+    let outcomes = tokio::task::spawn_blocking(move || service.flush_dirty_klines())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let failures = outcomes
+        .into_iter()
+        .filter_map(|(key, result)| {
+            result
+                .err()
+                .map(|error| format!("{}_{}: {error}", key.symbol, key.interval))
+        })
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Storage(failures.join("; ")))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -296,6 +337,7 @@ impl TaskRuntime {
 pub struct SchedulerService {
     time: Arc<TimeService>,
     market: Arc<MarketService>,
+    chart_workspace: Arc<ChartWorkspaceService>,
     trading: Arc<TradingService>,
     daily_pnl: Arc<DailyPnlService>,
     connection: Arc<ConnectionService>,
@@ -315,6 +357,7 @@ impl SchedulerService {
     pub fn new(
         time: Arc<TimeService>,
         market: Arc<MarketService>,
+        chart_workspace: Arc<ChartWorkspaceService>,
         trading: Arc<TradingService>,
         daily_pnl: Arc<DailyPnlService>,
         connection: Arc<ConnectionService>,
@@ -333,6 +376,7 @@ impl SchedulerService {
             TaskId::PrivatePanels,
             TaskId::DailyPnl,
             TaskId::MarketFallback,
+            TaskId::KlineFlush,
             TaskId::Environment,
         ] {
             tasks.insert(id, TaskRuntime::new());
@@ -340,6 +384,7 @@ impl SchedulerService {
         Self {
             time,
             market,
+            chart_workspace,
             trading,
             daily_pnl,
             connection,
@@ -367,6 +412,7 @@ impl SchedulerService {
             TaskId::PrivatePanels,
             TaskId::DailyPnl,
             TaskId::MarketFallback,
+            TaskId::KlineFlush,
         ] {
             if let Some(interval) = id.interval() {
                 self.spawn_periodic(id, interval).await;
@@ -419,7 +465,12 @@ impl SchedulerService {
         let scheduler = self.clone_refs();
         let run_state = runtime.run_state.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+            let start = if task == TaskId::KlineFlush {
+                tokio::time::Instant::now() + first_tick_delay(task)
+            } else {
+                tokio::time::Instant::now()
+            };
+            let mut ticker = tokio::time::interval_at(start, interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
@@ -437,6 +488,7 @@ impl SchedulerService {
         SchedulerRefs {
             time: self.time.clone(),
             market: self.market.clone(),
+            chart_workspace: self.chart_workspace.clone(),
             trading: self.trading.clone(),
             daily_pnl: self.daily_pnl.clone(),
             connection: self.connection.clone(),
@@ -467,6 +519,7 @@ impl SchedulerService {
             TaskId::PrivatePanels => self.run_private_panels(mode).await,
             TaskId::DailyPnl => self.daily_pnl.refresh().await.map(|_| ()),
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
+            TaskId::KlineFlush => execute_kline_flush(self.chart_workspace.clone()).await,
             TaskId::Environment => self.run_environment().await,
         }
     }
@@ -590,6 +643,7 @@ impl SchedulerService {
 struct SchedulerRefs {
     time: Arc<TimeService>,
     market: Arc<MarketService>,
+    chart_workspace: Arc<ChartWorkspaceService>,
     trading: Arc<TradingService>,
     daily_pnl: Arc<DailyPnlService>,
     connection: Arc<ConnectionService>,
@@ -623,6 +677,7 @@ impl SchedulerRefs {
             TaskId::PrivatePanels => self.run_private_panels(mode).await,
             TaskId::DailyPnl => self.daily_pnl.refresh().await.map(|_| ()),
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
+            TaskId::KlineFlush => execute_kline_flush(self.chart_workspace.clone()).await,
             TaskId::Environment => self.run_environment().await,
         }
     }

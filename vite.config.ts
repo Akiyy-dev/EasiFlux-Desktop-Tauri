@@ -11,9 +11,17 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [vue(), react(), tailwindcss()],
   resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "./src"),
-    },
+    alias: [
+      {
+        find: /^klinecharts$/,
+        replacement: path.resolve(__dirname, "./node_modules/klinecharts/dist/index.esm.js"),
+      },
+      {
+        find: "@",
+        replacement: path.resolve(__dirname, "./src"),
+      },
+    ],
+    dedupe: ["klinecharts"],
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
