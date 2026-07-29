@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.4.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.3.0...easiflux-desktop-tauri-v0.4.0) (2026-07-29)
+
+
+### Features
+
+* **account:** add account profile lifecycle ([5ca48e8](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/5ca48e8285489326213001efd3d5a2296c67de54))
+* **account:** add read-only asset overview ([f87fc64](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/f87fc64cbbba8e637746e11cadc73c3887c0358e))
+* **architecture:** unify data sync and realtime recovery ([93a850e](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/93a850e00b3ed7224f849b035c424cae3c3752aa))
+* **architecture:** unify data sync and realtime recovery ([adca1a2](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/adca1a2d5462b94fa89e830407c68938b826e020)), closes [#9](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/issues/9)
+* **chart:** add KLineCharts workspace ([953f633](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/953f633bd058ff87b71cc593843567b44c0598f0))
+* **chart:** add KLineCharts workspace ([482e0ce](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/482e0ceb8c54147b7f0bba56eb7eb2bc8fec3eb2))
+* **risk:** expose configurable daily risk status ([4a05b72](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/4a05b7258e04ba0e4dc5d025fe028ea4ca811174))
+* **time:** implement global time service and unified scheduler ([9c39345](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/9c393459460cc7bc5ed97bc04c723726dbf479f9))
+* **ui:** add app shell navigation layout ([17b6276](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/17b6276678817f21352cf1e2ec6ab38feeb30c11))
+* **ui:** add dashboard home page ([713d417](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/713d4177eb3bf671a615c428c18f3e02279b380e))
+* **ui:** add TanStack order center tables ([3d1b68b](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/3d1b68bc1c334c53a4ab463a4b46b72adf81d489))
+* **ui:** enhance dashboard functionality and user experience ([0600a1c](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/0600a1c545eb0768895a08a9f7ee53d1449d2f20))
+* **ui:** establish design system foundation ([6cb15e7](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/6cb15e7db8a41b458ed5f2f87d7d40f1ec22d66b))
+* **ui:** formalize design system tokens and components ([a8a7ec8](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/a8a7ec84220aa3f69f2983dc244ce19d8da67d16))
+* **ui:** integrate account and risk center navigation ([700a0a5](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/700a0a572d1da20778ecb2f86ba888586823b2dc))
+* **ui:** redesign trading page layout ([6fbf9ee](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/6fbf9eeaa4269c82adc150461f9b2fdb9f502b46))
+* **ui:** scaffold React design system foundation ([f4423f4](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/f4423f4d2fd2fac2f9358fd25431f7a615d7dcf1))
+* **ui:** upgrade kline chart and trading panel ([64a95d8](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/64a95d882c200c3a78e7691187d96d6cfd634b08))
+* **ui:** Vue trading UI refactor with design system ([6b6a81d](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/6b6a81dcb725ef7b0d311ec5e51fe85c085f34ee))
+
+
+### Bug Fixes
+
+* **app:** harden risk controls and refresh flows ([fff993c](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/fff993c2ce3600cfa11b049b32107a955e6be4d5))
+* **app:** harden risk controls and refresh flows ([5aa496b](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/5aa496b3427b360aff80e94183991f37deee4dab))
+* **chart:** allow closing after workspace flush ([18b2f96](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/18b2f96a267eeb3204d08abc5b37abf5e3714aa6))
+* **chart:** restore navigation and chart mounting ([3a858b0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/3a858b04e6c0b6a9f9e5612367781763a14c67c7))
+* **connection:** unblock account initialization ([82fcdf9](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/82fcdf9d6f39e83cad4d7f7b0321a2aaff9075c6))
+* **i18n:** localize account and risk center copy ([24353f9](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/24353f984887ace987c4afc3e29da44516436282))
+
 ## [0.3.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.2.0...easiflux-desktop-tauri-v0.3.0) (2026-07-05)
 
 
