@@ -7,6 +7,10 @@ import Sidebar from './Sidebar.vue'
 import TradingLayout from './TradingLayout.vue'
 import AccountCenterPage from '../account/AccountCenterPage.vue'
 import DashboardPage from '../dashboard/DashboardPage.vue'
+import ChartWorkspacePage from '../chart/ChartWorkspacePage.vue'
+import { useChartWorkspaceAutosaveHost } from '../../composables/useChartWorkspaceAutosaveHost'
+import { flushActiveChartWorkspace } from '../../services/chartWorkspaceFlushRegistry'
+import { reportError } from '../../services/errorService'
 import type {
   AccountSection,
   NavigationTarget,
@@ -21,9 +25,13 @@ const emit = defineEmits<{
 }>()
 
 const activePage = ref<NavKey>('home')
+const chartsVisited = ref(false)
+const tradingVisited = ref(false)
 const activeAccountSection = ref<AccountSection>('api')
 const activeSecondary = ref<NonAccountSection>('welcome')
 const sidebarCollapsed = ref(false)
+
+useChartWorkspaceAutosaveHost()
 const sidebarTarget = computed<SidebarTarget>(() => activePage.value === 'account'
   ? { page: 'account', section: activeAccountSection.value }
   : { page: activePage.value, section: activeSecondary.value })
@@ -50,16 +58,26 @@ function isNonAccountSection(value: string): value is NonAccountSection {
     || value === 'market' || value === 'manage'
 }
 
-function navigateTo(target: NavKey | NavigationTarget): void {
-  const normalized = typeof target === 'string' ? { page: target } : target
-  activePage.value = normalized.page
-  if (normalized.page === 'account' && normalized.section) {
-    activeAccountSection.value = normalized.section
-  } else if (normalized.page === 'home') {
+function applyNavigation(target: NavigationTarget): void {
+  activePage.value = target.page
+  if (target.page === 'charts') chartsVisited.value = true
+  if (target.page === 'trading') tradingVisited.value = true
+  if (target.page === 'account' && target.section) {
+    activeAccountSection.value = target.section
+  } else if (target.page === 'home') {
     activeSecondary.value = 'welcome'
-  } else if (normalized.page === 'plugins') {
+  } else if (target.page === 'plugins') {
     activeSecondary.value = 'installed'
   }
+}
+
+function navigateTo(target: NavKey | NavigationTarget): Promise<void> {
+  const normalized = typeof target === 'string' ? { page: target } : target
+  const flush = flushActiveChartWorkspace('page').catch((error: unknown) => {
+    reportError(error, '图表页面切换前保存失败')
+  })
+  applyNavigation(normalized)
+  return flush
 }
 
 function selectSection(section: SidebarSectionKey): void {
@@ -81,6 +99,7 @@ function selectSection(section: SidebarSectionKey): void {
         @open-settings="emit('openSettings')"
       />
       <Sidebar
+        v-if="activePage !== 'charts'"
         :target="sidebarTarget"
         :collapsed="sidebarCollapsed"
         @select-section="selectSection"
@@ -92,12 +111,25 @@ function selectSection(section: SidebarSectionKey): void {
           v-if="activePage === 'home'"
           @navigate="navigateTo"
         />
-        <TradingLayout v-else-if="activePage === 'trading'" />
+        <TradingLayout
+          v-if="tradingVisited"
+          v-show="activePage === 'trading'"
+          :active="activePage === 'trading'"
+        />
+        <ChartWorkspacePage
+          v-if="chartsVisited"
+          v-show="activePage === 'charts'"
+          :active="activePage === 'charts'"
+        />
         <AccountCenterPage
-          v-else-if="activePage === 'account'"
+          v-if="activePage === 'account'"
           :active-section="activeAccountSection"
         />
-        <AppCard v-else :title="pageTitle" class="placeholder">
+        <AppCard
+          v-if="activePage === 'news' || activePage === 'plugins' || activePage === 'settings'"
+          :title="pageTitle"
+          class="placeholder"
+        >
           <div class="placeholder-body">
             <div class="muted">
               该页面将在后续 PRD 中逐步迁移实现。

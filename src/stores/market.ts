@@ -3,7 +3,11 @@ import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import { parseInstrumentSymbols } from '../utils/instruments'
 import type { Depth, Kline, Ticker } from '../types/models'
+import type { ChartWorkspaceKey } from '../types/chartWorkspace'
 import { useAsyncState } from '../composables/useAsyncState'
+import { normalizeChartWorkspaceKey } from '../utils/chartWorkspace'
+import { flushActiveChartWorkspace } from '../services/chartWorkspaceFlushRegistry'
+import { reportError } from '../services/errorService'
 
 const INSTRUMENTS_CACHE_KEY = 'easiflux_instruments_v1'
 
@@ -13,6 +17,10 @@ function intervalToMs(interval: string): number {
   }
   const minutes = Number.parseInt(interval, 10)
   return Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 60_000
+}
+
+export function sameChartKey(first: ChartWorkspaceKey, second: ChartWorkspaceKey): boolean {
+  return first.symbol === second.symbol && first.interval === second.interval
 }
 
 export const useMarketStore = defineStore('market', () => {
@@ -27,6 +35,11 @@ export const useMarketStore = defineStore('market', () => {
   let instrumentsFetchPromise: Promise<void> | null = null
   const marketRequest = useAsyncState<null>()
   const instrumentsRequest = useAsyncState<string[]>((value) => value.length === 0)
+  let latestContextGeneration = 0
+  let contextTransitionTail: Promise<void> = Promise.resolve()
+  let backendContext: ChartWorkspaceKey | null = null
+  let backendKlines: Kline[] = []
+  let backendSeeded = false
 
   function readCachedSymbols(): string[] {
     try {
@@ -161,25 +174,75 @@ export const useMarketStore = defineStore('market', () => {
     return continuous
   }
 
-  async function setActiveSymbol(symbol: string): Promise<void> {
-    if (symbol === activeSymbol.value) {
-      return
-    }
-    clearKlines()
-    activeSymbol.value = symbol
-    ticker.value = null
-    depth.value = null
-    try {
-      await tauriInvoke('set_active_symbol', { symbol })
-    } catch (error) {
-      throw error instanceof Error ? error : new Error(String(error))
-    }
+  function setChartContext(next: ChartWorkspaceKey): Promise<void> {
+    const key = normalizeChartWorkspaceKey(next)
+    const generation = ++latestContextGeneration
+    const transition = contextTransitionTail.then(async () => {
+      if (generation !== latestContextGeneration) {
+        return
+      }
+
+      backendContext ??= normalizeChartWorkspaceKey({
+        symbol: activeSymbol.value,
+        interval: klineInterval.value,
+      })
+      if (!backendSeeded) {
+        backendKlines = [...klines.value]
+        backendSeeded = true
+      }
+
+      if (sameChartKey(key, backendContext)) {
+        activeSymbol.value = key.symbol
+        klineInterval.value = key.interval
+        klines.value = backendKlines
+        return
+      }
+
+      try {
+        await flushActiveChartWorkspace('context')
+      } catch (error) {
+        reportError(error, '图表上下文切换前保存失败')
+      }
+      if (generation !== latestContextGeneration) {
+        return
+      }
+
+      let restored: Kline[]
+      try {
+        restored = await tauriInvoke<Kline[]>('set_chart_context', {
+          symbol: key.symbol,
+          interval: key.interval,
+        })
+      } catch (error) {
+        if (generation !== latestContextGeneration) {
+          return
+        }
+        throw error
+      }
+
+      backendContext = key
+      backendKlines = restored
+      if (generation !== latestContextGeneration) {
+        return
+      }
+
+      activeSymbol.value = key.symbol
+      klineInterval.value = key.interval
+      klines.value = restored
+      ticker.value = null
+      depth.value = null
+    })
+
+    contextTransitionTail = transition.catch(() => undefined)
+    return transition
   }
 
-  async function setKlineInterval(interval: string): Promise<void> {
-    clearKlines()
-    await tauriInvoke('set_kline_interval', { interval })
-    klineInterval.value = interval
+  function setActiveSymbol(symbol: string): Promise<void> {
+    return setChartContext({ symbol, interval: klineInterval.value })
+  }
+
+  function setKlineInterval(interval: string): Promise<void> {
+    return setChartContext({ symbol: activeSymbol.value, interval })
   }
 
   async function refreshMarket(): Promise<void> {
@@ -206,6 +269,7 @@ export const useMarketStore = defineStore('market', () => {
     setDepth,
     setKlines,
     clearKlines,
+    setChartContext,
     setActiveSymbol,
     setKlineInterval,
     refreshMarket,

@@ -14,6 +14,8 @@ const configStore = useConfigStore()
 const marketStore = useMarketStore()
 const { config } = storeToRefs(configStore)
 
+defineProps<{ active: boolean }>()
+
 onMounted(() => {
   void marketStore.loadInstruments(config.value?.watchlistSymbols ?? [])
 })
@@ -25,7 +27,7 @@ onMounted(() => {
 
     <div class="trading-main">
       <AppCard title="K 线" flush class="chart-panel">
-        <KlineChart />
+        <KlineChart mode="trading" :active="active" />
       </AppCard>
 
       <AppCard title="深度" flush class="depth-panel">

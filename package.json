@@ -13,7 +13,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@klinecharts/pro": "^0.1.1",
+    "@klinecharts/pro": "0.1.1",
     "@radix-ui/react-slot": "^1.3.0",
     "@tanstack/react-table": "^8.21.3",
     "@tanstack/vue-table": "^8.21.3",

@@ -76,6 +76,9 @@ pub fn run() {
             test_connection,
             set_active_symbol,
             set_kline_interval,
+            set_chart_context,
+            load_chart_workspace,
+            save_chart_workspace,
             refresh_market,
             refresh_funding_rate,
             fetch_ticker,
@@ -125,6 +128,38 @@ pub fn run() {
                 tauri::async_runtime::block_on(async {
                     state.scheduler.stop().await;
                 });
+                for (key, result) in state.chart_workspace.flush_dirty_klines() {
+                    if let Err(error) = result {
+                        tracing::error!(
+                            symbol = %key.symbol,
+                            interval = %key.interval,
+                            %error,
+                            "final kline flush failed"
+                        );
+                    }
+                }
             }
         });
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use tauri::ipc::Origin;
+
+    #[test]
+    fn main_window_can_force_close_after_chart_workspace_flush() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+
+        let access = context.runtime_authority_mut().resolve_access(
+            "plugin:window|destroy",
+            "main",
+            "main",
+            &Origin::Local,
+        );
+
+        assert!(
+            access.is_some(),
+            "main window must be allowed to destroy itself after the close guard flushes chart workspaces"
+        );
+    }
 }

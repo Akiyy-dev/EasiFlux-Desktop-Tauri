@@ -1,6 +1,7 @@
 pub mod account;
 pub mod account_profiles;
 pub mod app;
+pub mod chart_workspace;
 pub mod config;
 pub mod connection;
 pub mod diagnostic;
@@ -11,6 +12,7 @@ pub mod trading;
 pub use account::*;
 pub use account_profiles::*;
 pub use app::*;
+pub use chart_workspace::*;
 pub use config::*;
 pub use connection::*;
 pub use diagnostic::*;

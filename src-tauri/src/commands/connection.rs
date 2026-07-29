@@ -1,6 +1,7 @@
 use tauri::State;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
+use crate::models::chart_workspace::ChartWorkspaceKey;
 use crate::models::config::{normalize_account_id, ApiCredential};
 use crate::state::AppState;
 
@@ -40,6 +41,13 @@ pub async fn connect(
                     config.kline_interval.clone(),
                 )
             };
+            let chart_context =
+                ChartWorkspaceKey::parse(&symbol, &kline_interval).map_err(AppError::Storage)?;
+            state.market.load_local_klines(&chart_context).await?;
+            state
+                .market
+                .replace_runtime_chart_context(chart_context)
+                .await;
             state
                 .connection
                 .connect(
@@ -49,9 +57,7 @@ pub async fn connect(
                     credential,
                 )
                 .await?;
-            state.market.set_active_symbol(&symbol).await;
-            state.market.set_kline_interval(&kline_interval).await;
-            if let Err(error) = state.market.restore_klines(&symbol, &kline_interval) {
+            if let Err(error) = state.market.restore_klines(&symbol, &kline_interval).await {
                 state.emitter.emit_error(&format!("K 线恢复失败：{error}"));
             }
             Ok::<(), crate::error::AppError>(())

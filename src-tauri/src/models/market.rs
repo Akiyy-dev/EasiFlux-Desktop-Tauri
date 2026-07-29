@@ -53,7 +53,7 @@ pub struct Depth {
     pub asks: Vec<DepthLevel>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Kline {
     pub symbol: String,

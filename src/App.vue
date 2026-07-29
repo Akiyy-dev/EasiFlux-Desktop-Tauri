@@ -7,6 +7,7 @@ import SettingsDialog from './components/settings/SettingsDialog.vue'
 import { naiveThemeOverrides } from './constants/naiveTheme'
 import { useTauriEvent, whenTauriListenersReady } from './composables/useTauriEvent'
 import { useAccountSessionEvent } from './composables/useAccountSessionEvent'
+import { useChartWorkspaceCloseGuard } from './composables/useChartWorkspaceCloseGuard'
 import { useAppStore } from './stores/app'
 import { useConfigStore } from './stores/config'
 import { useConnectionStore } from './stores/connection'
@@ -48,7 +49,9 @@ const accountStore = useAccountStore()
 const logStore = useLogStore()
 const timeStore = useTimeStore()
 
-const showSettings = ref(false)
+const showSettings = ref(false)
+
+useChartWorkspaceCloseGuard()
 
 function reportError(context: string, error: unknown): void {
   reportGlobalError(error, context)
