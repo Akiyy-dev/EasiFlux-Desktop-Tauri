@@ -439,14 +439,13 @@ async fn concurrent_waiter_timeout_does_not_finalize_owner_shutdown() {
     assert_eq!(rig.service.status().kind, NewsStatusKind::Stopped);
 }
 
-async fn wait_for_gate(gate: &BlockingGate) {
-    for _ in 0..200 {
-        if gate.entered() {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!("blocking commit did not begin");
+async fn wait_for_gate(gate: &Arc<BlockingGate>) {
+    let gate = gate.clone();
+    let entered =
+        tokio::task::spawn_blocking(move || gate.wait_until_entered(Duration::from_secs(5)))
+            .await
+            .expect("blocking gate waiter panicked");
+    assert!(entered, "blocking commit did not begin");
 }
 
 async fn assert_stopped(service: &NewsService) {

@@ -148,6 +148,15 @@ impl BlockingGate {
         self.state.lock().unwrap().0
     }
 
+    pub(super) fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.0)
+            .unwrap();
+        state.0
+    }
+
     pub(super) fn release(&self) {
         let mut state = self.state.lock().unwrap();
         state.1 = true;
