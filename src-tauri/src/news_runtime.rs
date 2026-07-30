@@ -11,7 +11,10 @@ use crate::services::news::ports::{
     NewsEventSink, NewsRepository, NewsRepositoryFactory, NewsTokenStoreFactory,
 };
 use crate::services::NewsService;
-use crate::storage::{KeyringNewsTokenStore, NewsDatabase, NewsTokenStore, NewsTokenStoreError};
+use crate::storage::{
+    FallbackNewsTokenStore, KeyringNewsTokenStore, NewsApiToken, NewsDatabase, NewsTokenStore,
+    NewsTokenStoreError,
+};
 
 const NEWS_MESSAGES_PATH: &str = "api/public/v1/messages";
 
@@ -136,6 +139,46 @@ where
     ))
 }
 
+pub(crate) fn assemble_recoverable_news_with_fallback<OpenDatabase, BuildTokenStore, BuildClient>(
+    source: Result<NewsSource, NewsSourceConfigError>,
+    embedded_token: Option<&'static str>,
+    event_sink: Arc<dyn NewsEventSink>,
+    open_database: OpenDatabase,
+    build_token_store: BuildTokenStore,
+    build_client: BuildClient,
+) -> Arc<NewsService>
+where
+    OpenDatabase: Fn() -> Result<Arc<dyn NewsRepository>, crate::storage::NewsStorageError>
+        + Send
+        + Sync
+        + 'static,
+    BuildTokenStore:
+        Fn() -> Result<Arc<dyn NewsTokenStore>, NewsTokenStoreError> + Send + Sync + 'static,
+    BuildClient: FnOnce(Url) -> Result<Arc<dyn NewsPageFetcher>, ()>,
+{
+    let embedded_token =
+        embedded_token.filter(|value| NewsApiToken::parse(value.as_bytes()).is_ok());
+    let source = if embedded_token.is_some() {
+        source
+    } else {
+        Err(NewsSourceConfigError)
+    };
+
+    assemble_recoverable_news_with(
+        source,
+        event_sink,
+        open_database,
+        move || {
+            let fallback = embedded_token
+                .and_then(|value| NewsApiToken::parse(value.as_bytes()).ok())
+                .ok_or(NewsTokenStoreError::Keyring)?;
+            let keyring = build_token_store().ok();
+            Ok(Arc::new(FallbackNewsTokenStore::new(keyring, fallback)) as Arc<dyn NewsTokenStore>)
+        },
+        build_client,
+    )
+}
+
 pub(crate) fn build_news_service(
     app: &tauri::AppHandle,
     event_sink: Arc<dyn NewsEventSink>,
@@ -145,8 +188,9 @@ pub(crate) fn build_news_service(
         option_env!("EASIFLUX_NEWS_SOURCE_EPOCH"),
     );
     let app = app.clone();
-    assemble_recoverable_news_with(
+    assemble_recoverable_news_with_fallback(
         source,
+        option_env!("EASIFLUX_NEWS_API_TOKEN"),
         event_sink,
         move || {
             let directory = app

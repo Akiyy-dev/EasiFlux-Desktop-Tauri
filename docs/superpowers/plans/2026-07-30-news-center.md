@@ -4,7 +4,7 @@
 
 **Goal:** Build PRD-09 as an app-wide, Rust-owned news synchronizer backed by the fixed TG-forwarder public API, a durable SQLite cache, and a Jin10-inspired Vue timeline that intentionally omits source identity and media type.
 
-**Architecture:** Rust owns build-time source configuration, Keyring token access, defensive HTTP polling, source-bound SQLite state, lifecycle, retry policy, commands, and events. Vue/Pinia only reads local snapshots, coordinates unread/scroll state, opens safe links through Tauri, and renders a focused timeline while polling continues outside the page lifecycle. The initial historical import is transactionally hidden until complete and becomes the seen baseline.
+**Architecture:** Rust owns build-time source/default-token configuration, optional Keyring token override, defensive HTTP polling, source-bound SQLite state, lifecycle, retry policy, commands, and events. Vue/Pinia only reads local snapshots, coordinates unread/scroll state, opens safe links through Tauri, and renders a focused timeline while polling continues outside the page lifecycle. The initial historical import is transactionally hidden until complete and becomes the seen baseline.
 
 **Tech Stack:** Tauri 2, Rust stable, Tokio, reqwest, rusqlite (bundled), keyring 3 native persistent backends, SHA-256, Vue 3, TypeScript strict, Pinia, Naive UI, Vitest, Vue Test Utils.
 
@@ -13,17 +13,17 @@
 - Work only in the `news/createnewscenter` linked worktree and preserve unrelated changes.
 - `origin/main`, local `main`, and the branch base were verified at `953f633bd058ff87b71cc593843567b44c0598f0` before implementation.
 - The only upstream source is the built-in TG-forwarder endpoint `GET /api/public/v1/messages`; no source selector or endpoint editor appears in the UI.
-- Release builds require `EASIFLUX_NEWS_API_BASE_URL` and `EASIFLUX_NEWS_SOURCE_EPOCH`; the URL must be HTTPS without credentials, query, or fragment, and the epoch must match `[A-Za-z0-9._-]{1,64}`. Debug/test may additionally use HTTP only for `localhost`, `127.0.0.1`, or `[::1]`.
+- Release builds require `EASIFLUX_NEWS_API_BASE_URL`, `EASIFLUX_NEWS_SOURCE_EPOCH`, and `EASIFLUX_NEWS_API_TOKEN`; the URL must be HTTPS without credentials, query, or fragment, the epoch must match `[A-Za-z0-9._-]{1,64}`, and the token must form a valid raw Bearer token. Debug/test may omit all three and may additionally use HTTP only for loopback hosts.
 - The source fingerprint is SHA-256 of normalized base URL, one NUL byte, and source epoch. A mismatch pauses news sync and never merges or resets the old cursor automatically.
-- The API token is provisioned only into Keyring service `easiflux_desktop_tauri_news`, entry `news_api_token`; it never enters Vue, command-line arguments, environment variables, temporary files, logs, or release artifacts.
-- `set` provisioning reads a bounded secret from no-echo terminal input or stdin; `delete` requires the exact service and entry selectors.
+- The default API token is supplied as a GitHub Repository Secret and embedded at compile time. GitHub protects the build input, not the distributed binary; use only a least-privilege credential approved for client distribution.
+- A valid Keyring value at service `easiflux_desktop_tauri_news`, entry `news_api_token`, overrides the embedded default. Missing/unavailable/malformed Keyring data falls back to the embedded value. `set` and guarded `delete` remain optional future override operations and are never called automatically.
 - HTTP uses a 5-second connect timeout, 15-second request timeout, disabled redirects, an 8 MiB response-body cap, and a 256 KiB per-message text cap.
 - API validation requires positive signed-64-bit delivery IDs, IDs greater than the request cursor, unique IDs in a page, at most the requested limit, RFC3339 timestamps with an explicit zone, and exact cursor semantics.
 - SQLite is the local source of truth for UI reads. Each page inserts messages, advances the cursor, updates initial-sync state, and updates seen baseline in one transaction.
 - The first historical import is hidden until caught up; retained partial data resumes after restart; completed historical import is marked seen and does not create a large unread count.
 - History is retained indefinitely. List page size is 50; older history is explicitly loaded in pages of 50; unread is counted from rows and capped in Rust to `100`, whose presentation is `99+`.
 - Polling is app-wide: caught-up cadence is about 3 seconds; `has_more` continues immediately; transient backoff is 3/6/12/24/48/60 seconds and honors a larger `Retry-After` up to 60 seconds.
-- Missing/invalid credentials, deployment/source configuration, contract violations, and storage errors pause only news and keep completed cached history readable.
+- Invalid active credentials, deployment/source/default-token configuration, contract violations, and storage errors pause only news and keep completed cached history readable.
 - Shutdown requests the poller to stop and waits no longer than 20 seconds.
 - UI content is local time with seconds plus text only. It must not show source username, source/chat/message IDs, or media type. Blank text renders `该消息暂无可展示的文本内容`.
 - Only `http:` and `https:` links may be opened with the system browser. Never use `v-html`.
@@ -44,8 +44,8 @@
 - `src-tauri/src/news_provision.rs`: independently testable provisioning command parser and runner.
 - `src-tauri/src/bin/easiflux-news-provision.rs`: minimal same-user utility entrypoint.
 - `.github/workflows/tauri-build-reusable.yml`: compiles and uploads the per-platform provisioning utility alongside app artifacts.
-- `.github/workflows/release.yml` and `.github/workflows/release-please.yml`: pass protected non-secret repository variables to the reusable build.
-- `docs/news-deployment.md`: operator contract for source variables and same-user token set/status/delete.
+- `.github/workflows/release.yml` and `.github/workflows/release-please.yml`: pass named repository secrets for host/token and the protected source-epoch variable to the reusable build.
+- `docs/news-deployment.md`: operator contract for embedded credentials, their extraction boundary, and optional same-user Keyring override set/status/delete.
 
 ### Rust news domain
 
@@ -83,7 +83,7 @@
 - Modify: `src-tauri/Cargo.toml`
 
 **Interfaces:**
-- Produces: `validate_news_build_config(profile, base_url, source_epoch) -> Result<Option<NewsBuildConfig>, NewsBuildConfigError>` and compile-time `EASIFLUX_NEWS_API_BASE_URL` / `EASIFLUX_NEWS_SOURCE_EPOCH` values.
+- Produces: `validate_news_build_config(profile, base_url, source_epoch, api_token) -> Result<Option<NewsBuildConfig>, NewsBuildConfigError>` and compile-time `EASIFLUX_NEWS_API_BASE_URL` / `EASIFLUX_NEWS_SOURCE_EPOCH` / `EASIFLUX_NEWS_API_TOKEN` values.
 - Consumes later: `NewsService::from_app` reads values using `option_env!` and computes the source fingerprint.
 
 - [ ] **Step 1: Write failing pure validation tests**
@@ -111,7 +111,7 @@ Expected: FAIL because `build_support/news_build_config.rs` and its exported typ
 
 - [ ] **Step 3: Implement the pure validator and wire the build script**
 
-Add `url = "2"` as a build dependency. In `build.rs`, print both `cargo:rerun-if-env-changed` lines, invoke the pure validator using `PROFILE`, and emit normalized values with `cargo:rustc-env`; panic with stable category-only text in release and emit no values for an unconfigured debug build.
+Add `url = "2"` as a build dependency. In `build.rs`, print `cargo:rerun-if-env-changed` for the base URL, source epoch, and API token names; invoke the pure validator using `PROFILE`; and let `option_env!` read the compilation-step environment directly. Never emit host or token values through Cargo instructions. Panic with stable category-only text for invalid/partial configuration, while permitting an entirely unconfigured debug/test build.
 
 - [ ] **Step 4: Run focused tests GREEN**
 
@@ -263,7 +263,7 @@ Run the Task 4 focused command and require all database cases PASS.
 
 - [ ] **Step 1: Write failing paused/live/retry state-machine tests with paused Tokio time**
 
-Cover unconfigured debug source -> `deploymentMisconfigured`; absent token -> `notConfigured`; Keyring failure -> `credentialStoreUnavailable`; initial sync hidden and immediate `limit=100` pagination; caught-up 3-second sleep; 3/6/12/24/48/60 backoff reset after success; Retry-After max/cap; 401 -> `credentialInvalid`; 422, permanent 4xx, and contract error -> `contractError`; 408/429/5xx/network/timeout -> `retrying`; DB error -> `storageError`; manual recheck/retry wake-up; event emission after commit only; emit failure does not roll back; one poller under repeated start; operation without trading credentials/connection/page mount; blocking database work routed through `spawn_blocking`; and stop completes within a test timeout.
+Cover unconfigured debug source -> `deploymentMisconfigured`; token-store absence/failure states at the generic service boundary; initial sync hidden and immediate `limit=100` pagination; caught-up 3-second sleep; 3/6/12/24/48/60 backoff reset after success; Retry-After max/cap; 401 -> `credentialInvalid`; 422, permanent 4xx, and contract error -> `contractError`; 408/429/5xx/network/timeout -> `retrying`; DB error -> `storageError`; manual recheck/retry wake-up; event emission after commit only; emit failure does not roll back; one poller under repeated start; operation without trading credentials/connection/page mount; blocking database work routed through `spawn_blocking`; and stop completes within a test timeout. Task 12 adds the production runtime's embedded-token fallback contract.
 
 ```rust
 #[tokio::test(start_paused = true)]
@@ -448,13 +448,13 @@ Run the Step 2 command and require PASS.
 - Create: `tests/frontend/newsReleaseWorkflow.test.ts`
 
 **Interfaces:**
-- Reusable workflow inputs: `news_api_base_url` and `news_source_epoch`.
-- Caller values: `${{ vars.EASIFLUX_NEWS_API_BASE_URL }}` and `${{ vars.EASIFLUX_NEWS_SOURCE_EPOCH }}`.
-- Release asset: `easiflux-news-provision-<host-triple>[.exe]` plus SHA-256; never contains a token.
+- Reusable workflow named secrets: `news_api_base_url` and `news_api_token`; input: `news_source_epoch`.
+- Caller values: `${{ secrets.EASIFLUX_NEWS_API_BASE_URL }}`, `${{ secrets.EASIFLUX_NEWS_API_TOKEN }}`, and `${{ vars.EASIFLUX_NEWS_SOURCE_EPOCH }}`.
+- Release asset: `easiflux-news-provision-<host-triple>[.exe]` plus SHA-256; the tool never prints or returns a token.
 
 - [ ] **Step 1: Add failing static workflow assertions**
 
-Create `tests/frontend/newsReleaseWorkflow.test.ts` using `node:fs/promises` to load all three workflow YAML files. Assert both required inputs are passed to app and utility build steps, no `NEWS_API_TOKEN` variable exists, Linux installs `libdbus-1-dev`, utility assets are host-triple named, checksummed, and uploaded without `--clobber`.
+Create `tests/frontend/newsReleaseWorkflow.test.ts` using `node:fs/promises` to load all three workflow YAML files. Assert the required named secrets and epoch input are passed only through app/utility compilation environments, no secret is interpolated into a run script, Linux installs `libdbus-1-dev`, and utility assets are host-triple named, checksummed, and uploaded without `--clobber`.
 
 - [ ] **Step 2: Run the focused workflow test and observe RED**
 
@@ -464,7 +464,7 @@ Expected: FAIL because the reusable inputs and provisioning asset steps are miss
 
 - [ ] **Step 3: Implement reusable inputs and per-platform utility upload**
 
-Pass protected non-secret variables from both callers. Set them only on compilation steps, build the utility in release mode, derive the host triple, copy the executable to the deterministic asset name, generate SHA-256 using platform-appropriate tooling, and upload both files to the same tag without `--clobber`. Add `libdbus-1-dev` to Linux dependencies required by the persistent Keyring backend.
+Pass host/token as named repository secrets and the epoch as a protected variable from both callers. Set them only on compilation steps, build the utility in release mode, derive the host triple, copy the executable to the deterministic asset name, generate SHA-256 using platform-appropriate tooling, and upload both files to the same tag without `--clobber`. Add `libdbus-1-dev` to Linux dependencies required by the optional persistent Keyring override.
 
 - [ ] **Step 4: Run workflow test GREEN**
 
@@ -512,13 +512,37 @@ Run in one PowerShell process:
 ```powershell
 $env:EASIFLUX_NEWS_API_BASE_URL='https://news.example.invalid'
 $env:EASIFLUX_NEWS_SOURCE_EPOCH='verification-v1'
+$env:EASIFLUX_NEWS_API_TOKEN='verification-token'
 cargo build --release --manifest-path src-tauri/Cargo.toml --bin easiflux-news-provision
 pnpm tauri build
 ```
 
-Expected: provisioning utility and all configured Tauri bundles build successfully; no token is required.
+Expected: provisioning utility and all configured Tauri bundles build successfully with a fake compile-time token; the token does not appear in build output.
 
-- [ ] **Step 4: Run repository hygiene checks**
+### Task 12: Embed the release token and retain an optional Keyring override
+
+**Files:**
+- Modify: `src-tauri/build_support/news_build_config.rs`
+- Modify: `src-tauri/build.rs`
+- Modify: `src-tauri/tests/news_build_config.rs`
+- Modify: `src-tauri/src/storage/news_token.rs`
+- Modify: `src-tauri/src/storage/news_token_tests.rs`
+- Modify: `src-tauri/src/news_runtime.rs`
+- Modify: `src-tauri/src/news_runtime_tests.rs`
+- Modify: all three release workflows and `tests/frontend/newsReleaseWorkflow.test.ts`
+- Modify: this plan, the design specification, and `docs/news-deployment.md`
+
+**Behavior:**
+- Release builds require a valid embedded token alongside the fixed host and epoch.
+- A valid Keyring token overrides the embedded token; no entry, Keyring failure, or malformed stored data falls back to the embedded value.
+- The app never launches `easiflux-news-provision`; the retained tool can explicitly set/delete the future override.
+- Build scripts and workflow run blocks never print or interpolate host/token values.
+
+- [x] Write and observe failing build-config, runtime fallback, and workflow contract tests.
+- [x] Implement the minimum build/runtime/workflow changes and make focused tests green.
+- [x] Update operator/design documentation, run full frontend/Rust verification, perform a secret-leak scan, and independently review the delta.
+
+- [x] **Step 4: Run repository hygiene checks**
 
 Run:
 
@@ -527,8 +551,8 @@ git diff --check
 git status --short --branch
 ```
 
-Expected: no whitespace errors; only intentional PRD-09 files are changed/untracked; no commit exists.
+Expected: no whitespace errors; only intentional PRD-09 content differs. The second-stage delta remains uncommitted on top of baseline commit `13f8876`.
 
-- [ ] **Step 5: Perform one independent whole-branch review and fix findings in one wave**
+- [x] **Step 5: Perform one independent whole-branch review and fix findings in one wave**
 
 Compare implementation against every acceptance criterion in `docs/superpowers/specs/2026-07-30-news-center-design.md`, inspect secret handling/source binding/poller concurrency/scroll and unread semantics first, repair all confirmed findings with focused RED/GREEN tests, and rerun every affected gate plus the final full test/build set.

@@ -2,7 +2,7 @@
 
 日期：2026-07-30
 
-状态：设计章节已由用户逐项确认，等待整篇规格复核
+状态：已实现；2026-07-30 按用户后续决策更新凭据交付方式
 
 工作分支：`news/createnewscenter`
 
@@ -13,9 +13,9 @@
 本规格以用户在本轮明确提供并逐项确认的要求为权威。实现不得用产品偏好替换这些决策。
 
 - 新闻数据只来自固定内置的 [Akiyy-dev/TG-forwarder](https://github.com/Akiyy-dev/TG-forwarder) 实例，不提供数据源切换、添加或编辑界面。
-- 数据源基础地址在构建/发布时固化；每个客户端所需 Bearer Token 由部署或安装流程写入系统 Keyring，不提供 Token 配置 UI。
+- 数据源基础地址和默认 Bearer Token 在构建/发布时固化；首次启动不要求配置 Token，也不提供 Token 配置 UI。保留独立 Keyring 工具作为未来可选覆盖方式。
 - 新闻同步独立于 EasiCoin 账户、登录和交易连接；只要应用进程运行，就持续同步，包括新闻页未打开或窗口最小化时。
-- 首次成功配置后从 `cursor=0` 开始拉取 TG-forwarder 当前 API 可见的全部历史；完成后按游标增量同步。
+- 首次启动同步时从 `cursor=0` 开始拉取 TG-forwarder 当前 API 可见的全部历史；完成后按游标增量同步。
 - 所有已同步历史永久保存在本地，不按数量或日期自动清理。
 - 追平后约每 3 秒轮询一次；`has_more=true` 时立即拉取下一页；瞬时错误采用 3、6、12、24、48、60 秒退避，上限 60 秒。
 - 只使用 TG-forwarder 当前公开 API，不要求修改 TG-forwarder，也不增加本地来源映射。
@@ -26,7 +26,7 @@
 - 仅识别正文中的 `http://` 和 `https://` 链接；点击后调用系统默认浏览器，不在应用内打开 WebView。
 - 用户位于列表顶部时，新消息实时插入；用户正在阅读较早内容时，保持当前位置并显示“有 N 条新消息”，点击后回到顶部。
 - 主导航“新闻”入口显示数字未读角标，超过 99 显示 `99+`；用户查看到最新位置后清除已看到的未读。
-- Keyring 中没有 Token 时只禁用新闻模块；其他应用功能继续工作。新闻页显示“新闻服务未配置”，轮询暂停，并提供“重新检查”。
+- Keyring 中没有覆盖 Token 时使用构建期内嵌 Token；Keyring 不可用不阻止新闻启动。固定地址、epoch 或内嵌 Token 缺失时只禁用新闻模块，其他功能继续工作。
 - PRD-09 不发送操作系统通知；系统通知留给 PRD-13 通知中心。
 - 持久化方案采用 Rust 独立 `NewsService` 和 SQLite，不使用 JSONL、`localStorage` 或 IndexedDB 作为权威数据源。
 
@@ -57,8 +57,8 @@ Rust API 模型只接收本模块需要的 `delivery_id`、`created_at` 和 `tex
 ### 3.1 目标
 
 - 在桌面应用中提供稳定、低干扰、适合持续阅读的实时新闻流。
-- 在不暴露 Token 的前提下，由 Rust 完成鉴权、轮询、重试、去重和本地持久化。
-- 首次完整同步上游可见历史，之后即使离线、Token 缺失或接口暂时失败也能阅读本地缓存。
+- Token 不进入前端、日志或本地业务数据，由 Rust 完成鉴权、轮询、重试、去重和本地持久化；构建期内嵌值对客户端持有者不构成秘密。
+- 首次完整同步上游可见历史，之后即使离线、内嵌配置失效或接口暂时失败也能阅读本地缓存。
 - 对批次写入和游标推进提供原子性，确保重启后不丢消息、不重复展示。
 - 明确定义首次同步、未读、前台插入、滚动位置保持和手动分页语义。
 - 新闻故障只影响新闻模块，不影响行情、交易、账户或其他页面。
@@ -109,7 +109,7 @@ SQLite 使用 `rusqlite` 的 bundled SQLite 构建，以免依赖用户机器上
 - `stores/news.ts`：状态、最新 50 条、已加载旧页、待查看新消息数、未读角标和命令调用协调。该 store 由 `AppShell` 初始化，而不是等新闻页首次打开，保证主导航角标始终更新。
 - `components/news/NewsCenterPage.vue`：新闻页面容器、加载态/故障态、滚动容器和首屏协调。
 - `components/news/NewsTimeline.vue`：日期分隔、时间列、正文和手动加载更多。
-- `components/news/NewsStatusBar.vue`：紧凑显示“正在同步 / 实时 / 重试中 / 新闻服务未配置”等状态及允许的恢复操作。
+- `components/news/NewsStatusBar.vue`：紧凑显示“正在同步 / 实时 / 重试中 / 部署配置错误”等状态及允许的恢复操作。
 - `components/news/NewMessagesBanner.vue`：阅读较早内容时显示待查看新消息数。
 - `utils/newsLinks.ts`：把纯文本安全切分为普通文字与 `http(s)` 链接，不生成或注入 HTML。
 
@@ -117,7 +117,7 @@ SQLite 使用 `rusqlite` 的 bundled SQLite 构建，以免依赖用户机器上
 
 1. Tauri `setup` 阶段尝试打开并迁移新闻数据库，创建唯一 `NewsService`；失败只写入新闻的 `storageError` 状态，不能让 Tauri setup 失败或阻止主应用启动。
 2. 服务从数据库恢复游标、首次同步完成标记和已读水位。
-3. 服务校验构建期固定地址并读取 Keyring Token；条件满足时立即启动唯一 poller，不等待 Vue 挂载新闻页。
+3. 服务校验构建期固定地址、epoch 和内嵌 Token；若同一用户 Keyring 中存在合法覆盖值则优先使用，否则使用内嵌 Token，并立即启动唯一 poller，不等待 Vue 挂载新闻页。
 4. `AppShell` 初始化 news store 时先注册两个事件监听，再读取包含未读数和最新 ID 的状态快照；事件与快照按最新 ID 对账，以覆盖 Rust 早于 Vue 启动或初始化期间提交消息的竞态。`AppShell` 把角标值传给始终挂载的 `NavigationRail`，新闻消息页只在进入新闻页面时读取。
 5. 窗口最小化、切换页面或新闻组件卸载不停止 poller。
 6. `NewsService` 保存 poller 的 `JoinHandle`。现有 `RunEvent::Exit` 调用有界的 `news.stop_and_join()`：取消等待/网络请求，不再开启新请求，并等待正在执行的 SQLite 事务提交或回滚；最长等待 20 秒。超时退出仍只能丢弃未提交页，SQLite 原子事务和旧游标必须保持一致。
@@ -126,34 +126,35 @@ SQLite 使用 `rusqlite` 的 bundled SQLite 构建，以免依赖用户机器上
 
 ### 5.1 固定基础地址
 
-- 发布流程通过构建环境变量 `EASIFLUX_NEWS_API_BASE_URL` 注入唯一 TG-forwarder 基础地址，并通过非秘密的 `EASIFLUX_NEWS_SOURCE_EPOCH` 标识该上游 delivery 命名空间版本；Rust 用 `option_env!` 把两者固化到产物中。
-- 正式 release 打包把任一变量缺失、epoch 为空或地址不合法视为打包错误；普通 debug/test 构建可以省略，并在运行时进入无恢复按钮的 `deploymentMisconfigured`，以便无真实服务和 Token 时继续本地开发及测试。
+- 发布流程从 GitHub Repository Secrets 读取 `EASIFLUX_NEWS_API_BASE_URL` 和 `EASIFLUX_NEWS_API_TOKEN`，并通过 Repository Variable `EASIFLUX_NEWS_SOURCE_EPOCH` 标识该上游 delivery 命名空间版本；Rust 用 `option_env!` 把三者固化到产物中。
+- 正式 release 打包把任一值缺失、Token 语法非法、epoch 为空或地址不合法视为打包错误；普通 debug/test 构建可以全部省略，并在运行时进入无恢复按钮的 `deploymentMisconfigured`，以便无真实服务时继续本地开发及测试。
 - 地址不是运行时配置，不写入 `config.toml`、SQLite、Pinia 或浏览器存储，也不提供修改命令。
 - 启动时使用 `url::Url` 解析和规范化基础地址，再安全拼接 `api/public/v1/messages`，不使用字符串直接拼接用户输入。
 - release 构建只接受 `https`。debug 构建仅为本地测试额外允许 host 为 `localhost`、`127.0.0.1` 或 `[::1]` 的 `http` 地址。
-- 地址或 epoch 缺失、校验失败时，新闻显示“新闻数据源未内置，请使用正确的安装包”，不启动 poller，也不显示“重新检查”；其他模块不受影响。
+- 地址、epoch 或内嵌 Token 缺失/校验失败时，新闻显示“新闻数据源未内置，请使用正确的安装包”，不启动 poller，也不显示“重新检查”；其他模块不受影响。
 
-### 5.2 Keyring Token
+### 5.2 内嵌 Token 与 Keyring 覆盖
 
 - 新闻使用独立 Keyring service `easiflux_desktop_tauri_news`，entry/user name 固定为 `news_api_token`。不得沿用交易凭据的 `easiflux_desktop_tauri` service，因为交易账户 ID 没有保留字限制，同名账户会产生键碰撞。
-- 部署或安装流程把原始 Bearer Token 写入该项；应用只读取，不提供写入、删除或回显 Token 的前端命令。
-- 首次安装和后续 Token 轮换必须绑定同一个 TG-forwarder 公开 API endpoint 及同一组来源；换到另一 endpoint 或重建上游 delivery 数据库会改变 `delivery_id` 游标空间，属于需要显式数据迁移的新数据源变更，不得伪装成普通 Token 轮换。TG-forwarder 的公开响应不返回 endpoint 身份，因此部署方必须在管理端核验绑定；客户端无法仅凭 Token 自证这一点。
+- 正常首次启动直接使用构建期内嵌 Token，不读取到 Keyring 项也不进入“未配置”；应用不提供写入、删除或回显 Token 的前端命令。
+- 若 Keyring 存在语法合法的覆盖 Token，则覆盖值优先；Keyring 缺项、后端不可用或存储值语法非法时回退内嵌值。上游拒绝一个语法合法的覆盖值时不得静默换身份，必须通过工具更新/删除覆盖值后“重新检查”或重启。
+- Token 轮换必须绑定同一个 TG-forwarder 公开 API endpoint 及同一组来源；换到另一 endpoint 或重建上游 delivery 数据库会改变 `delivery_id` 游标空间，属于需要显式数据迁移的新数据源变更，不得伪装成普通 Token 轮换。TG-forwarder 的公开响应不返回 endpoint 身份，因此部署方必须在管理端核验绑定；客户端无法仅凭 Token 自证这一点。
 - Token 不写入日志、错误详情、SQLite、配置文件、Tauri 事件、Pinia 或 DOM。
-- “重新检查”只重新读取固定 Keyring 项并恢复 poller，不打开编辑器，也不接受前端传入 Token。
-- Keyring 后端错误与 Token 缺失都只停用新闻，但状态文案区分“未配置”和“凭据存储暂不可用”；底层错误详情保持在脱敏诊断中。
+- “重新检查”重新解析 Keyring 覆盖与内嵌默认值并恢复 poller，不打开编辑器，也不接受前端传入 Token。
+- GitHub Secret 只能保护仓库配置和构建日志，无法让编译进客户端的 Token 对最终用户保密。该 Token 必须是明确允许分发、最小权限、可限流和可撤销的新闻专用凭据，不能复用交易或管理凭据。
 
 ### 5.3 安装与轮换
 
-PRD-09 的交付范围包含一个最小 Rust provisioning utility，与桌面应用使用相同版本的 `keyring` crate 和上述固定 service/entry：
+PRD-09 保留一个最小 Rust provisioning utility，与桌面应用使用相同版本的 `keyring` crate 和上述固定 service/entry：
 
-- utility 由安装器或受控部署流程在目标桌面用户的登录会话中运行，只负责写入新闻 Token；它不是应用运行时 sidecar，也不由 Vue 调用。
+- utility 不由安装器、应用或 Vue 自动调用，也不是首次启动依赖；它只作为以后显式写入、轮换或删除 Keyring 覆盖值的工具。
 - Token 只通过标准输入或平台等价的匿名安全管道传入，禁止放入命令行参数、环境变量、响应文件、临时文件或安装日志。utility 不回显输入，内存缓冲在完成后清零。
-- 首次安装和轮换使用同一写入动作；再次执行覆盖固定 entry。utility 不会在写入前主动删除旧值；写入失败返回非零状态且不启动或破坏桌面应用，但若平台 Keyring 后端不保证原子覆盖，部署流程必须准备原 Token 重新写入，不能声称失败后旧值必然仍可用。
-- Windows、macOS 和 Linux 构建均调用 `keyring::Entry::new("easiflux_desktop_tauri_news", "news_api_token")`，由 `keyring` 后端写入当前用户的系统凭据存储；平台凭据存储不可用时部署明确失败，应用保持“凭据存储暂不可用”。
-- 部署完成只通过 utility 退出状态和应用的脱敏 `get_news_status` 验证，不读取、打印或比较明文 Token。
+- 覆盖值的首次写入和后续轮换使用同一写入动作；再次执行覆盖固定 entry。utility 不会在写入前主动删除旧值；写入失败返回非零状态且不启动或破坏桌面应用，但若平台 Keyring 后端不保证原子覆盖，维护流程必须准备原 Token 重新写入，不能声称失败后旧值必然仍可用。
+- Windows、macOS 和 Linux 构建均调用 `keyring::Entry::new("easiflux_desktop_tauri_news", "news_api_token")`，由 `keyring` 后端写入当前用户的系统凭据存储；工具遇到平台凭据存储不可用时返回失败，应用仍回退内嵌 Token。
+- 覆盖操作只通过 utility 退出状态和应用的脱敏 `get_news_status` 验证，不读取、打印或比较明文 Token。
 - 轮换前由部署方保证新 Token 仍绑定同一公开 endpoint；写入后用户或部署自动化触发“重新检查”。卸载默认不删除系统凭据，避免无意销毁外部管理的秘密；明确的安全回收流程可调用 utility 的删除模式，并需单独确认目标 service/entry。
 
-安装器/部署维护者负责从其秘密管理系统把每客户端 Token 送入该 utility；应用仓库负责 utility、跨平台构建接入、无泄漏测试和部署文档。没有完成这一步的产物可以运行其他模块，但新闻按设计保持未配置。
+应用仓库负责 utility、跨平台构建接入、无泄漏测试和部署文档。维护者只有在需要临时覆盖已发布默认值时才运行 utility；安装和首次启动不调用它。
 
 ## 6. SQLite 数据模型与一致性
 
@@ -219,9 +220,9 @@ INSERT INTO news_sync_state(singleton_id) VALUES (1);
 ### 7.1 状态
 
 ```text
-deploymentMisconfigured 固定地址缺失或非法；release 打包应在更早阶段阻止该状态
-notConfigured     Token 缺失，poller 暂停
-credentialStoreUnavailable
+deploymentMisconfigured 固定地址、epoch 或内嵌 Token 缺失/非法；release 打包应在更早阶段阻止该状态
+notConfigured     兼容状态；正常 release 启动路径不产生
+credentialStoreUnavailable 兼容状态；正常 release 启动路径遇到 Keyring 故障会回退内嵌值
 initialSync       首次全量同步中，带数据库内累计已同步总数
 live              已追平，等待下一次约 3 秒轮询
 retrying          瞬时失败退避中，带下一次重试时间和脱敏原因
@@ -250,17 +251,16 @@ stopped           应用正在退出
 
 | 条件 | 行为 | 自动恢复 |
 |---|---|---|
-| 固定地址缺失或非法 | 保留缓存，部署配置错误，停止请求 | 否；重新打包/部署，无运行时按钮 |
-| 无 Token | 保留缓存，状态为未配置，停止请求 | 否；部署后“重新检查” |
-| Keyring 读取失败 | 保留缓存，凭据存储不可用 | 否；“重新检查” |
-| 401 | 凭据无效，停止请求 | 否；重新部署 Token 后“重新检查” |
+| 固定地址、epoch 或内嵌 Token 缺失/非法 | 保留缓存，部署配置错误，停止请求 | 否；重新打包/部署，无运行时按钮 |
+| Keyring 无覆盖值或读取失败 | 使用内嵌 Token | 是；无需人工操作 |
+| 401 | 凭据无效，停止请求 | 否；更新/删除 Keyring 覆盖，或更新 Secret 后重新发布 |
 | 网络错误、超时、408、429、5xx | 保留缓存，按 3/6/12/24/48/60 秒重试 | 是 |
 | 422、其他永久 4xx | 视为部署或协议错误，停止高频请求 | 否；“重试同步” |
 | JSON/字段/时间/游标不合法 | 回滚本页，状态为协议错误 | 否；“重试同步” |
 | SQLite 打开/迁移/事务失败 | 不推进游标，不自动删除或重建数据库 | 否；“重试同步”会重新打开并迁移数据库后再恢复 poller |
 | Tauri 事件发送失败 | 已提交数据不回滚 | 是；页面下次从 SQLite 重载 |
 
-“重新检查”只重新读取固定 Keyring Token，并在条件满足时以已提交游标恢复；编译进产物的地址和 epoch 不可能由该按钮改变。“重试同步”用于存储或协议环境已被外部修复后的单次恢复；它仍保持 single-flight。两者都不清库、不重置游标。
+“重新检查”重新读取可选 Keyring 覆盖并在没有可用覆盖时回退内嵌 Token，以已提交游标恢复；编译进产物的地址、epoch 和默认 Token 不可能由该按钮改变。“重试同步”用于存储或协议环境已被外部修复后的单次恢复；它仍保持 single-flight。两者都不清库、不重置游标。
 
 故障状态下只有 `initial_sync_complete=true` 的完整缓存可以作为新闻列表展示。首次同步中途失败时保留已提交批次和累计数量用于续传，但继续显示同步中断状态，不把从历史最旧端开始的部分数据库伪装成完整最新列表。
 
@@ -372,7 +372,7 @@ news://status-changed
 - `initial_sync_complete=false` 时，主区域显示“正在同步历史新闻”及数据库内累计已同步总数；中断并重启后该数字从持久化行数恢复，不显示可能从最旧端开始的半成品列表。
 - 首次追平后加载最新 50 条并进入实时状态。
 - 已有完整缓存的后续启动先立即展示最新 50 条，再让后台 poller 校准；网络、Token 或上游状态不会阻塞缓存阅读。
-- 若从未成功同步且 Token 缺失，显示“新闻服务未配置”和“重新检查”；只有 `initial_sync_complete=true` 的完整缓存才继续显示在故障状态条下方。
+- 若构建期地址、epoch 或内嵌 Token 缺失，显示部署配置错误；正常 release 首次启动无需凭据交互即可开始同步。只有 `initial_sync_complete=true` 的完整缓存才继续显示在故障状态条下方。
 
 ### 9.5 实时新消息与滚动位置
 
@@ -402,6 +402,7 @@ news://status-changed
 ## 10. 安全、隐私与隔离
 
 - 任何包含 Token 的类型不得派生会输出原值的 `Debug`；日志只能记录请求分类、状态码、退避阶段和脱敏错误类别。
+- 构建脚本不得把 Token 或作为 Secret 管理的 host 写入 Cargo 指令值、命令参数或日志；workflow 只通过编译步骤的环境传递。内嵌 Token 可被客户端持有者提取，必须按可分发凭据设计上游权限与限流。
 - `reqwest` 错误、响应体、Keyring 错误和 URL 不直接透传到 Vue；统一映射为新闻状态类别。
 - 禁止在前端发起 TG-forwarder 请求，避免 CORS 差异和凭据暴露。
 - SQLite 查询全部使用参数绑定；前端 ID 在 Rust 严格解析，不参与 SQL 字符串拼接。
@@ -445,7 +446,7 @@ news://status-changed
 - 瞬时错误按 3、6、12、24、48、60 秒退避，成功后重置。
 - 429/503 的合法、无效和超大 `Retry-After` 按规则合并并封顶 60 秒。
 - 401 暂停直至重新检查；422/契约错误暂停直至手动重试。
-- 缺少 Token 时不发网络请求；重新检查后只启动一个 poller。
+- 缺少/非法内嵌 Token 时视为部署配置错误且不发网络请求；Keyring 缺失或失败回退内嵌值；重新检查后只启动一个 poller。
 - SQLite 提交失败不发 committed 事件、不推进游标。
 - Tauri 事件发送失败不回滚已提交数据。
 - `RunEvent::Exit` 调用 `stop_and_join`；收到退出信号后不再开启新请求，当前事务完整结束，超时路径仍保持最后已提交游标一致。
@@ -455,7 +456,7 @@ news://status-changed
 
 - 只写入 `easiflux_desktop_tauri_news/news_api_token`，与名为 `news_api_token` 的交易账户凭据互不覆盖。
 - 只从 stdin/安全管道读取，空 Token 失败；stdout、stderr、日志、进程参数和测试快照中都没有明文 Token。
-- 首次写入、轮换、平台失败和明确删除模式返回正确状态；使用可替换 Keyring adapter，不触碰开发者真实凭据。
+- 覆盖值写入、轮换、平台失败和明确删除模式返回正确状态；删除后运行时回退内嵌 Token；使用可替换 Keyring adapter，不触碰开发者真实凭据。
 
 ### 11.2 前端测试
 
@@ -470,7 +471,7 @@ news://status-changed
 - 每次“加载更多”只追加更早 50 条，防止重复请求；末页显示完成文案；失败可重试。
 - 主导航角标覆盖 0、1、99、100（`99+`）以及重启恢复；只打开页面但未到顶部不清除。
 - 新闻页从未打开时，AppShell 仍初始化监听、恢复未读并把角标传给 NavigationRail；初始化竞态通过状态快照对账。
-- 缺 Token、Keyring 不可用、离线/退避、401、协议错误和存储错误都保留可用缓存并显示正确恢复按钮。
+- 内嵌配置缺失时保留可用缓存并显示无恢复按钮的部署错误；Keyring 覆盖不可用、离线/退避、401、协议错误和存储错误按各自契约保留缓存并提供适用的恢复动作。
 
 ### 11.3 回归与验证命令
 
@@ -487,9 +488,9 @@ news://status-changed
 ## 12. 验收标准
 
 - `news/createnewscenter` 开始实施时基于已重新抓取确认的最新 `origin/main`。
-- release 打包必须固化唯一 TG-forwarder 地址和非空 source epoch；页面没有数据源或 Token 编辑入口。
-- installer/deployment 通过无回显 provisioning utility 把 Token 写入独立的 `easiflux_desktop_tauri_news/news_api_token`，不会碰撞或覆盖任何交易账户凭据。
-- 正确部署 Token 后，全新客户端从 `cursor=0` 拉取全部 API 可见历史，追平后显示最新 50 条。
+- release 打包必须从 GitHub Secrets 固化唯一 TG-forwarder 地址和默认 Token，并固化非空 source epoch；页面没有数据源或 Token 编辑入口。
+- 全新客户端无需首次凭据配置即可从 `cursor=0` 拉取全部 API 可见历史，追平后显示最新 50 条。
+- provisioning utility 保留但不自动调用；其 Keyring 覆盖与交易账户凭据隔离，合法覆盖优先，缺失/不可用覆盖回退内嵌 Token。
 - 首次导入历史不形成巨大未读角标；完成后到达的新消息产生持久化未读数。
 - 重启后从最后已提交游标继续；重复响应、重试和中途退出不会造成丢失或重复展示。
 - 追平时约每 3 秒轮询；有更多页时连续拉取；瞬时失败退避且已完成首次同步的缓存始终可读。
@@ -499,9 +500,9 @@ news://status-changed
 - 用户在顶部时新消息实时出现；阅读较早内容时视口不跳动，并可通过“有 N 条新消息”返回顶部。
 - 首屏和每次手动加载均为 50 条；没有无限滚动，全部加载后有明确结束状态。
 - 主导航未读角标持久、封顶显示 `99+`，仅在用户实际看到最新位置后推进已读水位。
-- 缺 Token、401、网络故障、协议异常或 SQLite 故障只影响新闻；行情、交易、账户和其他页面继续工作。
+- 内嵌配置缺失、401、网络故障、协议异常或 SQLite 故障只影响新闻；行情、交易、账户和其他页面继续工作。
 - 正常退出会有界停止并等待新闻任务；未提交批次不会留下已推进游标。
-- Token 不出现在 Vue、DOM、日志、错误、数据库、配置文件或 Tauri 事件中。
+- Token 不出现在 Vue、DOM、日志、错误、数据库、配置文件或 Tauri 事件中；文档明确说明内嵌 Token 可从分发产物提取。
 - 仅 `http`/`https` 链接可点击，并由系统默认浏览器打开。
 - 前端 lint/test/build、Rust fmt/test/clippy 和 `git diff --check` 全部通过。
 

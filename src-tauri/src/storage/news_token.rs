@@ -1,5 +1,6 @@
 use reqwest::header::HeaderValue;
 use std::fmt;
+use std::sync::Arc;
 use zeroize::Zeroizing;
 
 pub const NEWS_KEYRING_SERVICE: &str = "easiflux_desktop_tauri_news";
@@ -95,6 +96,48 @@ pub trait NewsTokenStore: Send + Sync {
     fn load(&self) -> Result<Option<NewsApiToken>, NewsTokenStoreError>;
     fn set(&self, token: &NewsApiToken) -> Result<(), NewsTokenStoreError>;
     fn delete(&self) -> Result<(), NewsTokenStoreError>;
+}
+
+pub(crate) struct FallbackNewsTokenStore {
+    keyring: Option<Arc<dyn NewsTokenStore>>,
+    fallback: NewsApiToken,
+}
+
+impl FallbackNewsTokenStore {
+    pub(crate) fn new(keyring: Option<Arc<dyn NewsTokenStore>>, fallback: NewsApiToken) -> Self {
+        Self { keyring, fallback }
+    }
+
+    fn fallback(&self) -> Result<Option<NewsApiToken>, NewsTokenStoreError> {
+        NewsApiToken::parse(self.fallback.as_str().as_bytes())
+            .map(Some)
+            .map_err(|_| NewsTokenStoreError::Keyring)
+    }
+}
+
+impl NewsTokenStore for FallbackNewsTokenStore {
+    fn load(&self) -> Result<Option<NewsApiToken>, NewsTokenStoreError> {
+        if let Some(keyring) = &self.keyring {
+            if let Ok(Some(token)) = keyring.load() {
+                return Ok(Some(token));
+            }
+        }
+        self.fallback()
+    }
+
+    fn set(&self, token: &NewsApiToken) -> Result<(), NewsTokenStoreError> {
+        self.keyring
+            .as_ref()
+            .ok_or(NewsTokenStoreError::Keyring)?
+            .set(token)
+    }
+
+    fn delete(&self) -> Result<(), NewsTokenStoreError> {
+        self.keyring
+            .as_ref()
+            .ok_or(NewsTokenStoreError::Keyring)?
+            .delete()
+    }
 }
 
 pub struct KeyringNewsTokenStore {

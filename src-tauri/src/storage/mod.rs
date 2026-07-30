@@ -17,6 +17,7 @@ pub use kline_store::KlineStore;
 pub(crate) use news_database::{
     NewsCommitOutcome, NewsDatabase, NewsDatabaseState, NewsStorageError, NewsStorageErrorKind,
 };
+pub(crate) use news_token::FallbackNewsTokenStore;
 pub use news_token::{
     KeyringNewsTokenStore, NewsApiToken, NewsTokenError, NewsTokenStore, NewsTokenStoreError,
 };

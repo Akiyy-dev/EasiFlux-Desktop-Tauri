@@ -2,6 +2,7 @@ use super::*;
 use keyring::credential::CredentialPersistence;
 use keyring::mock::MockCredential;
 use keyring::{Entry, Error as KeyringError};
+use std::sync::Arc;
 
 fn token(value: &[u8]) -> NewsApiToken {
     NewsApiToken::parse(value).expect("valid news token")
@@ -10,6 +11,22 @@ fn token(value: &[u8]) -> NewsApiToken {
 fn mock_store() -> KeyringNewsTokenStore {
     let entry = Entry::new_with_credential(Box::<MockCredential>::default());
     KeyringNewsTokenStore::from_entry(entry)
+}
+
+struct FailingTokenStore;
+
+impl NewsTokenStore for FailingTokenStore {
+    fn load(&self) -> Result<Option<NewsApiToken>, NewsTokenStoreError> {
+        Err(NewsTokenStoreError::Keyring)
+    }
+
+    fn set(&self, _token: &NewsApiToken) -> Result<(), NewsTokenStoreError> {
+        Err(NewsTokenStoreError::Keyring)
+    }
+
+    fn delete(&self) -> Result<(), NewsTokenStoreError> {
+        Err(NewsTokenStoreError::Keyring)
+    }
 }
 
 #[test]
@@ -110,6 +127,50 @@ fn injected_entry_supports_set_load_overwrite_delete_and_missing_entry() {
     store.delete().expect("delete token");
     assert!(store.load().expect("load deleted entry").is_none());
     store.delete().expect("delete missing entry is idempotent");
+}
+
+#[test]
+fn fallback_store_prefers_a_valid_keyring_token() {
+    let keyring = mock_store();
+    keyring.set(&token(b"keyring-token")).unwrap();
+    let store = FallbackNewsTokenStore::new(
+        Some(Arc::new(keyring) as Arc<dyn NewsTokenStore>),
+        token(b"embedded-token"),
+    );
+
+    assert_eq!(store.load().unwrap().unwrap().as_str(), "keyring-token");
+}
+
+#[test]
+fn fallback_store_uses_embedded_token_when_keyring_entry_is_missing() {
+    let store = FallbackNewsTokenStore::new(
+        Some(Arc::new(mock_store()) as Arc<dyn NewsTokenStore>),
+        token(b"embedded-token"),
+    );
+
+    assert_eq!(store.load().unwrap().unwrap().as_str(), "embedded-token");
+}
+
+#[test]
+fn fallback_store_uses_embedded_token_when_keyring_backend_fails() {
+    let store = FallbackNewsTokenStore::new(
+        Some(Arc::new(FailingTokenStore) as Arc<dyn NewsTokenStore>),
+        token(b"embedded-token"),
+    );
+
+    assert_eq!(store.load().unwrap().unwrap().as_str(), "embedded-token");
+}
+
+#[test]
+fn fallback_store_uses_embedded_token_when_keyring_value_is_invalid() {
+    let keyring = mock_store();
+    keyring.entry.set_password("invalid token").unwrap();
+    let store = FallbackNewsTokenStore::new(
+        Some(Arc::new(keyring) as Arc<dyn NewsTokenStore>),
+        token(b"embedded-token"),
+    );
+
+    assert_eq!(store.load().unwrap().unwrap().as_str(), "embedded-token");
 }
 
 #[test]

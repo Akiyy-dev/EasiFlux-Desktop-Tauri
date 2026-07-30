@@ -6,12 +6,14 @@ on:
       tag_name:
         required: true
         type: string
-      news_api_base_url:
-        required: true
-        type: string
       news_source_epoch:
         required: true
         type: string
+    secrets:
+      news_api_base_url:
+        required: true
+      news_api_token:
+        required: true
 
 permissions:
   contents: write
@@ -55,7 +57,8 @@ jobs:
       - run: pnpm install
       - name: Build news provisioning utility
         env:
-          EASIFLUX_NEWS_API_BASE_URL: ${{ inputs.news_api_base_url }}
+          EASIFLUX_NEWS_API_BASE_URL: ${{ secrets.news_api_base_url }}
+          EASIFLUX_NEWS_API_TOKEN: ${{ secrets.news_api_token }}
           EASIFLUX_NEWS_SOURCE_EPOCH: ${{ inputs.news_source_epoch }}
         run: cargo build --release --manifest-path src-tauri/Cargo.toml --bin easiflux-news-provision
       - name: Prepare news provisioning release assets
@@ -88,10 +91,11 @@ jobs:
           "asset=$asset" >> $env:GITHUB_OUTPUT
           "checksum=$checksum" >> $env:GITHUB_OUTPUT
       - name: Build and publish desktop release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EASIFLUX_NEWS_API_BASE_URL: ${{ inputs.news_api_base_url }}
+          EASIFLUX_NEWS_API_BASE_URL: ${{ secrets.news_api_base_url }}
+          EASIFLUX_NEWS_API_TOKEN: ${{ secrets.news_api_token }}
           EASIFLUX_NEWS_SOURCE_EPOCH: ${{ inputs.news_source_epoch }}
         with:
           tagName: ${{ inputs.tag_name }}

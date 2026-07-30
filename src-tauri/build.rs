@@ -8,23 +8,20 @@ use news_build_config::validate_news_build_config;
 fn main() {
     println!("cargo:rerun-if-env-changed=EASIFLUX_NEWS_API_BASE_URL");
     println!("cargo:rerun-if-env-changed=EASIFLUX_NEWS_SOURCE_EPOCH");
+    println!("cargo:rerun-if-env-changed=EASIFLUX_NEWS_API_TOKEN");
 
     let profile = env::var("PROFILE").unwrap_or_default();
     let base_url = env::var("EASIFLUX_NEWS_API_BASE_URL").ok();
     let source_epoch = env::var("EASIFLUX_NEWS_SOURCE_EPOCH").ok();
+    let api_token = env::var("EASIFLUX_NEWS_API_TOKEN").ok();
 
-    match validate_news_build_config(&profile, base_url.as_deref(), source_epoch.as_deref()) {
-        Ok(Some(config)) => {
-            println!(
-                "cargo:rustc-env=EASIFLUX_NEWS_API_BASE_URL={}",
-                config.api_base_url
-            );
-            println!(
-                "cargo:rustc-env=EASIFLUX_NEWS_SOURCE_EPOCH={}",
-                config.source_epoch
-            );
-        }
-        Ok(None) => {}
+    match validate_news_build_config(
+        &profile,
+        base_url.as_deref(),
+        source_epoch.as_deref(),
+        api_token.as_deref(),
+    ) {
+        Ok(_) => {}
         Err(error) if profile == "release" => {
             panic!("invalid release news build configuration: {error}");
         }

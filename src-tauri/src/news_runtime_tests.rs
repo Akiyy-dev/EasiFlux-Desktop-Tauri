@@ -10,7 +10,10 @@ use async_trait::async_trait;
 
 use tokio::sync::Notify;
 
-use super::{assemble_recoverable_news_with, news_database_path, parse_news_source, NewsSource};
+use super::{
+    assemble_recoverable_news_with, assemble_recoverable_news_with_fallback, news_database_path,
+    parse_news_source, NewsSource,
+};
 use crate::api::news_client::{NewsFetchError, NewsFetchErrorKind, NewsPageFetcher};
 use crate::models::news::{
     NewsMessageDto, NewsMessagesCommittedEvent, NewsPage, NewsStatusKind, NewsStatusSnapshot,
@@ -138,6 +141,60 @@ impl NewsPageFetcher for NeverFetcher {
         _limit: usize,
     ) -> Result<ValidatedNewsPage, NewsFetchError> {
         panic!("credential-store construction failure must prevent network access")
+    }
+}
+
+struct ExpectedTokenFetcher {
+    expected: &'static str,
+    matched: AtomicBool,
+    called: Notify,
+}
+
+impl ExpectedTokenFetcher {
+    fn new(expected: &'static str) -> Self {
+        Self {
+            expected,
+            matched: AtomicBool::new(false),
+            called: Notify::new(),
+        }
+    }
+
+    async fn wait_for_call(&self) {
+        tokio::time::timeout(Duration::from_secs(2), self.called.notified())
+            .await
+            .unwrap();
+    }
+}
+
+#[async_trait]
+impl NewsPageFetcher for ExpectedTokenFetcher {
+    async fn fetch_after(
+        &self,
+        token: &NewsApiToken,
+        _cursor: i64,
+        _limit: usize,
+    ) -> Result<ValidatedNewsPage, NewsFetchError> {
+        self.matched
+            .store(token.as_str() == self.expected, Ordering::SeqCst);
+        self.called.notify_waiters();
+        pending().await
+    }
+}
+
+struct CountingFetcher {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl NewsPageFetcher for CountingFetcher {
+    async fn fetch_after(
+        &self,
+        _token: &NewsApiToken,
+        _cursor: i64,
+        _limit: usize,
+    ) -> Result<ValidatedNewsPage, NewsFetchError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        pending().await
     }
 }
 
@@ -513,6 +570,80 @@ async fn token_factory_failure_keeps_cache_and_publishes_credential_store_unavai
         service.stop_and_join(Duration::from_secs(1)).await,
         NewsShutdownOutcome::Stopped
     );
+}
+
+#[tokio::test]
+async fn embedded_token_keeps_runtime_active_when_keyring_factory_fails() {
+    let fetcher = Arc::new(ExpectedTokenFetcher::new("embedded-runtime-token"));
+    let service = assemble_recoverable_news_with_fallback(
+        parse_news_source(Some("https://news.example.test"), Some("epoch-v1")),
+        Some("embedded-runtime-token"),
+        Arc::new(NullEvents),
+        || Ok(Arc::new(RecoveryRepository { fail_commit: false }) as Arc<dyn NewsRepository>),
+        || Err(NewsTokenStoreError::Keyring),
+        {
+            let fetcher = fetcher.clone();
+            move |_| Ok(fetcher as Arc<dyn NewsPageFetcher>)
+        },
+    );
+
+    service.start();
+    fetcher.wait_for_call().await;
+    assert!(fetcher.matched.load(Ordering::SeqCst));
+    assert_ne!(service.status().kind, NewsStatusKind::NotConfigured);
+    assert_ne!(
+        service.status().kind,
+        NewsStatusKind::CredentialStoreUnavailable
+    );
+    assert_eq!(
+        service.stop_and_join(Duration::from_secs(1)).await,
+        NewsShutdownOutcome::Stopped
+    );
+}
+
+async fn assert_embedded_token_misconfiguration(embedded_token: Option<&'static str>) {
+    let fetcher = Arc::new(CountingFetcher {
+        calls: AtomicUsize::new(0),
+    });
+    let client_builds = Arc::new(AtomicUsize::new(0));
+    let service = assemble_recoverable_news_with_fallback(
+        parse_news_source(Some("https://news.example.test"), Some("epoch-v1")),
+        embedded_token,
+        Arc::new(NullEvents),
+        || Ok(Arc::new(RecoveryRepository { fail_commit: false }) as Arc<dyn NewsRepository>),
+        || Ok(Arc::new(StaticTokenStore) as Arc<dyn NewsTokenStore>),
+        {
+            let client_builds = client_builds.clone();
+            let fetcher = fetcher.clone();
+            move |_| {
+                client_builds.fetch_add(1, Ordering::SeqCst);
+                Ok(fetcher as Arc<dyn NewsPageFetcher>)
+            }
+        },
+    );
+
+    assert_eq!(
+        service.status().kind,
+        NewsStatusKind::DeploymentMisconfigured
+    );
+    assert_eq!(client_builds.load(Ordering::SeqCst), 0);
+    service.start();
+    tokio::task::yield_now().await;
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        service.stop_and_join(Duration::from_secs(1)).await,
+        NewsShutdownOutcome::Stopped
+    );
+}
+
+#[tokio::test]
+async fn missing_embedded_token_is_misconfigured_even_with_valid_keyring() {
+    assert_embedded_token_misconfiguration(None).await;
+}
+
+#[tokio::test]
+async fn invalid_embedded_token_is_misconfigured_even_with_valid_keyring() {
+    assert_embedded_token_misconfiguration(Some("invalid embedded token")).await;
 }
 
 #[tokio::test]
