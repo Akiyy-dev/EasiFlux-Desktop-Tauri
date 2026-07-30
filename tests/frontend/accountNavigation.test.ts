@@ -23,6 +23,7 @@ vi.mock('../../src/components/market/KlineChart.vue', () => ({
 vi.mock('../../src/composables/useChartWorkspaceAutosaveHost', () => ({
   useChartWorkspaceAutosaveHost: vi.fn(),
 }))
+vi.mock('../../src/composables/useNewsRuntimeHost', () => ({ useNewsRuntimeHost: vi.fn() }))
 
 describe('account navigation', () => {
   let pinia: Pinia
@@ -116,12 +117,18 @@ describe('account navigation', () => {
     expect(wrapper.emitted('openSettings')).toHaveLength(1)
   })
 
-  it('keeps primary navigation mounted and hides Sidebar only for charts', async () => {
+  it('keeps primary navigation mounted and hides Sidebar only for charts and news', async () => {
     const wrapper = mountShell()
     const topBar = wrapper.getComponent(TopBar).element
     const navigationRail = wrapper.getComponent(NavigationRail).element
 
     await wrapper.getComponent(NavigationRail).findAll('.rail-top button')[2]!.trigger('click')
+    await flushPromises()
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(false)
+    expect(wrapper.getComponent(TopBar).element).toBe(topBar)
+    expect(wrapper.getComponent(NavigationRail).element).toBe(navigationRail)
+
+    await wrapper.getComponent(NavigationRail).get('button[aria-label^="新闻"]').trigger('click')
     await flushPromises()
     expect(wrapper.findComponent(Sidebar).exists()).toBe(false)
     expect(wrapper.getComponent(TopBar).element).toBe(topBar)

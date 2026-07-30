@@ -2,6 +2,7 @@ pub mod client;
 pub mod diagnostic;
 pub mod endpoints;
 pub mod mapper;
+pub mod news_client;
 pub mod private;
 pub mod public;
 pub mod response;

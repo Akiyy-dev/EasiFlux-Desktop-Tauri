@@ -1,0 +1,50 @@
+.app-shell {
+  display: flex;
+  height: 100vh;
+  flex-direction: column;
+  gap: var(--ef-space-2);
+  padding: 0 var(--ef-space-2) var(--ef-space-2);
+  overflow: hidden;
+}
+
+.workbench {
+  display: flex;
+  flex: 1;
+  gap: var(--ef-space-2);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.main {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  gap: var(--ef-space-2);
+  overflow: hidden;
+}
+
+.placeholder {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.placeholder-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ef-space-2);
+  font-size: var(--ef-text-base);
+}
+
+.muted {
+  color: var(--muted-foreground);
+}
+
+@media (max-width: 900px) {
+  .workbench {
+    gap: 6px;
+  }
+}
