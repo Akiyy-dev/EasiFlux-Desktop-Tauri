@@ -9,8 +9,8 @@ use crate::models::config::{AppConfig, EnvironmentStatus};
 use crate::plugin::PluginRegistry;
 use crate::services::{
     AccountLifecycleCoordinator, AccountService, AnalyticsService, ChartWorkspaceService,
-    ConnectionService, DailyPnlService, MarketService, RiskService, SchedulerService,
-    TimeService, TradingService,
+    ConnectionService, DailyPnlService, MarketService, RiskService, SchedulerService, TimeService,
+    TradingService,
 };
 use crate::storage::{CacheStore, ChartStateStore, ConfigStore, KlineStore, TradeLogStore};
 use crate::ws::WsManager;
