@@ -28,8 +28,6 @@ vi.mock('../../src/services/chartWorkspaceFlushRegistry', () => ({
 }))
 
 vi.mock('../../src/services/errorService', () => ({ reportError: vi.fn() }))
-vi.mock('../../src/composables/useNewsRuntimeHost', () => ({ useNewsRuntimeHost: vi.fn() }))
-
 vi.mock('../../src/components/layout/TradingLayout.vue', () => ({
   default: {
     name: 'TradingLayout',

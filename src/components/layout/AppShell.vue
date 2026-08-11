@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { storeToRefs } from 'pinia'
 import { computed, ref } from 'vue'
 import AppCard from '../ui/AppCard.vue'
 import TopBar from './TopBar.vue'
@@ -9,12 +8,9 @@ import TradingLayout from './TradingLayout.vue'
 import AccountCenterPage from '../account/AccountCenterPage.vue'
 import DashboardPage from '../dashboard/DashboardPage.vue'
 import ChartWorkspacePage from '../chart/ChartWorkspacePage.vue'
-import NewsCenterPage from '../news/NewsCenterPage.vue'
 import { useChartWorkspaceAutosaveHost } from '../../composables/useChartWorkspaceAutosaveHost'
-import { useNewsRuntimeHost } from '../../composables/useNewsRuntimeHost'
 import { flushActiveChartWorkspace } from '../../services/chartWorkspaceFlushRegistry'
 import { reportError } from '../../services/errorService'
-import { useNewsStore } from '../../stores/news'
 import type {
   AccountSection,
   NavigationTarget,
@@ -31,14 +27,11 @@ const emit = defineEmits<{
 const activePage = ref<NavKey>('home')
 const chartsVisited = ref(false)
 const tradingVisited = ref(false)
-const newsVisited = ref(false)
 const activeAccountSection = ref<AccountSection>('api')
 const activeSecondary = ref<NonAccountSection>('welcome')
 const sidebarCollapsed = ref(false)
 
 useChartWorkspaceAutosaveHost()
-useNewsRuntimeHost()
-const { unreadCount: newsUnreadCount } = storeToRefs(useNewsStore())
 const sidebarTarget = computed<SidebarTarget>(() => activePage.value === 'account'
   ? { page: 'account', section: activeAccountSection.value }
   : { page: activePage.value, section: activeSecondary.value })
@@ -48,7 +41,6 @@ const pageTitle = computed(() => {
     home: '首页',
     trading: '交易',
     charts: '图表',
-    news: '新闻',
     account: '账户',
     plugins: '插件',
     settings: '设置',
@@ -69,7 +61,6 @@ function applyNavigation(target: NavigationTarget): void {
   activePage.value = target.page
   if (target.page === 'charts') chartsVisited.value = true
   if (target.page === 'trading') tradingVisited.value = true
-  if (target.page === 'news') newsVisited.value = true
   if (target.page === 'account' && target.section) {
     activeAccountSection.value = target.section
   } else if (target.page === 'home') {
@@ -103,12 +94,11 @@ function selectSection(section: SidebarSectionKey): void {
     <div class="workbench">
       <NavigationRail
         :active="activePage"
-        :news-unread-count="newsUnreadCount"
         @select="navigateTo"
         @open-settings="emit('openSettings')"
       />
       <Sidebar
-        v-if="activePage !== 'charts' && activePage !== 'news'"
+        v-if="activePage !== 'charts'"
         :target="sidebarTarget"
         :collapsed="sidebarCollapsed"
         @select-section="selectSection"
@@ -129,11 +119,6 @@ function selectSection(section: SidebarSectionKey): void {
           v-if="chartsVisited"
           v-show="activePage === 'charts'"
           :active="activePage === 'charts'"
-        />
-        <NewsCenterPage
-          v-if="newsVisited"
-          v-show="activePage === 'news'"
-          :active="activePage === 'news'"
         />
         <AccountCenterPage
           v-if="activePage === 'account'"
