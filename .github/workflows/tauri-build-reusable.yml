@@ -6,14 +6,6 @@ on:
       tag_name:
         required: true
         type: string
-      news_source_epoch:
-        required: true
-        type: string
-    secrets:
-      news_api_base_url:
-        required: true
-      news_api_token:
-        required: true
 
 permissions:
   contents: write
@@ -55,48 +47,10 @@ jobs:
         with:
           workspaces: src-tauri
       - run: pnpm install
-      - name: Build news provisioning utility
-        env:
-          EASIFLUX_NEWS_API_BASE_URL: ${{ secrets.news_api_base_url }}
-          EASIFLUX_NEWS_API_TOKEN: ${{ secrets.news_api_token }}
-          EASIFLUX_NEWS_SOURCE_EPOCH: ${{ inputs.news_source_epoch }}
-        run: cargo build --release --manifest-path src-tauri/Cargo.toml --bin easiflux-news-provision
-      - name: Prepare news provisioning release assets
-        id: news-provision
-        shell: pwsh
-        run: |
-          $hostLine = rustc -vV | Select-String '^host: '
-          if (-not $hostLine) {
-            throw 'Unable to determine the Rust host triple'
-          }
-          $hostTriple = $hostLine.Line.Substring(6).Trim()
-          $extension = if ($IsWindows) { '.exe' } else { '' }
-          $metadata = cargo metadata --manifest-path src-tauri/Cargo.toml --format-version 1 --no-deps | ConvertFrom-Json
-          $source = Join-Path (Join-Path $metadata.target_directory 'release') "easiflux-news-provision$extension"
-          $asset = "easiflux-news-provision-$hostTriple$extension"
-          $checksum = "$asset.sha256"
-          Copy-Item -LiteralPath $source -Destination $asset -ErrorAction Stop
-
-          if ($IsWindows) {
-            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
-            "$hash  $asset" | Set-Content -LiteralPath $checksum -NoNewline -Encoding ascii
-          } elseif ($IsMacOS) {
-            shasum -a 256 -- $asset | Set-Content -LiteralPath $checksum -NoNewline -Encoding ascii
-            if ($LASTEXITCODE -ne 0) { throw 'SHA-256 generation failed' }
-          } else {
-            sha256sum -- $asset | Set-Content -LiteralPath $checksum -NoNewline -Encoding ascii
-            if ($LASTEXITCODE -ne 0) { throw 'SHA-256 generation failed' }
-          }
-
-          "asset=$asset" >> $env:GITHUB_OUTPUT
-          "checksum=$checksum" >> $env:GITHUB_OUTPUT
       - name: Build and publish desktop release
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EASIFLUX_NEWS_API_BASE_URL: ${{ secrets.news_api_base_url }}
-          EASIFLUX_NEWS_API_TOKEN: ${{ secrets.news_api_token }}
-          EASIFLUX_NEWS_SOURCE_EPOCH: ${{ inputs.news_source_epoch }}
         with:
           tagName: ${{ inputs.tag_name }}
           releaseName: 'EasiFlux Desktop ${{ inputs.tag_name }}'
@@ -104,13 +58,3 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
-      - name: Upload news provisioning release assets
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NEWS_RELEASE_TAG: ${{ inputs.tag_name }}
-          NEWS_PROVISION_ASSET: ${{ steps.news-provision.outputs.asset }}
-          NEWS_PROVISION_CHECKSUM: ${{ steps.news-provision.outputs.checksum }}
-        run: |
-          gh release upload -- $env:NEWS_RELEASE_TAG $env:NEWS_PROVISION_ASSET $env:NEWS_PROVISION_CHECKSUM
-          if ($LASTEXITCODE -ne 0) { throw 'Provisioning asset upload failed' }
