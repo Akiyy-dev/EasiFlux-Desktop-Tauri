@@ -4,7 +4,6 @@ pub mod chart_workspace;
 pub mod config;
 pub mod diagnostic;
 pub mod market;
-pub mod news;
 pub mod risk;
 pub mod time;
 pub mod trading;
