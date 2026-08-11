@@ -4,7 +4,7 @@
 
 **Goal:** 从桌面应用中完整移除新闻中心及其后台、存储、凭据、构建与发布接线，同时保持非新闻模块行为不变。
 
-**Architecture:** 以共享导航类型、Tauri `AppState`/handler 注册和发布 workflow 输入为三个删除边界。每个边界先建立一个会失败的移除契约测试，再删除专属实现并清理共享接线；Cargo 锁文件由当前 manifest 重算，不回退历史版本。
+**Architecture:** 以共享导航类型、Tauri `AppState`/handler 注册和发布 workflow 输入为三个删除边界。前端入口使用 RED/GREEN 行为测试；Rust 纯删除与 workflow 配置变更使用变更前基线、编译/既有测试和残留扫描验证。Cargo 锁文件由当前 manifest 重算，不回退历史版本。
 
 **Tech Stack:** Vue 3、TypeScript、Vitest、Pinia、Tauri 2、Rust、Cargo、GitHub Actions
 
@@ -116,7 +116,6 @@ git commit -m "refactor: remove news frontend"
 ### Task 2: 移除 Rust/Tauri 新闻运行时和依赖
 
 **Files:**
-- Create: `tests/frontend/newsBackendRemoval.test.ts`
 - Modify: `src-tauri/src/lib.rs`
 - Modify: `src-tauri/src/state.rs`
 - Modify: `src-tauri/src/api/mod.rs`
@@ -184,58 +183,15 @@ git commit -m "refactor: remove news frontend"
 - Consumes: Tauri application setup, invoke handler list, `AppState`, event emitter, Cargo manifest.
 - Produces: 单一桌面 binary；无新闻服务字段、命令、事件、后台任务或专用构建配置。
 
-- [ ] **Step 1: 创建会失败的后端移除契约测试**
+- [ ] **Step 1: 运行变更前 Rust 基线**
 
-创建 `tests/frontend/newsBackendRemoval.test.ts`：
+Run: `cargo check --manifest-path src-tauri/Cargo.toml --all-targets`
 
-```ts
-import { access, readFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --all-targets`
 
-const repoPath = (path: string) => resolve(process.cwd(), path)
-const readRepoFile = (path: string) => readFile(repoPath(path), 'utf8')
+Expected: 两条命令均 PASS；若基线失败，先记录并停止归因，不把既有失败误判为删除引入。
 
-describe('news backend removal', () => {
-  it('does not register or configure a news runtime', async () => {
-    const contents = await Promise.all([
-      'src-tauri/Cargo.toml',
-      'src-tauri/build.rs',
-      'src-tauri/src/lib.rs',
-      'src-tauri/src/state.rs',
-      'src-tauri/src/api/mod.rs',
-      'src-tauri/src/commands/mod.rs',
-      'src-tauri/src/events/mod.rs',
-      'src-tauri/src/models/mod.rs',
-      'src-tauri/src/services/mod.rs',
-      'src-tauri/src/storage/mod.rs',
-    ].map(readRepoFile))
-
-    expect(contents.join('\n')).not.toMatch(
-      /EASIFLUX_NEWS|easiflux-news|NewsService|get_news_|list_news_|mark_news_|news_runtime|news_provision|pub mod news|services::news|models::news/,
-    )
-  })
-
-  it.each([
-    'src-tauri/build_support/news_build_config.rs',
-    'src-tauri/src/api/news_client.rs',
-    'src-tauri/src/services/news.rs',
-    'src-tauri/src/storage/news_database.rs',
-    'src-tauri/src/storage/news_token.rs',
-    'src-tauri/src/bin/easiflux-news-provision.rs',
-  ])('removes %s', async (path) => {
-    await expect(access(repoPath(path))).rejects.toMatchObject({ code: 'ENOENT' })
-  })
-})
-```
-
-- [ ] **Step 2: 运行契约测试并确认按预期失败**
-
-Run: `pnpm exec vitest run tests/frontend/newsBackendRemoval.test.ts`
-
-Expected: FAIL，因为新闻模块注册和专属文件仍存在。
-
-- [ ] **Step 3: 删除 Rust 新闻模块并清理共享注册点**
+- [ ] **Step 2: 删除 Rust 新闻模块并清理共享注册点**
 
 - `lib.rs` 删除新闻模块、公开 token 类型、启动/退出处理、5 个 handler 和 lifecycle 测试注册；保留 scheduler 及其他退出逻辑。
 - `state.rs` 删除 `NewsService` import、字段、构造和初始化。
@@ -251,11 +207,7 @@ fn main() {
 - `Cargo.toml` 删除 `default-run` 和显式 bin 块、build-dependency `url`、`reqwest` 的 `stream` feature、`zeroize`、`rpassword`、`async-trait`、`httpdate`、`rusqlite`、dev `tempfile` 与 tokio `test-util`。保留现有 `keyring` 平台 features。
 - 运行 Cargo 命令让 `Cargo.lock` 基于当前 manifest 更新，禁止用 pre-news 锁文件覆盖。
 
-- [ ] **Step 4: 运行后端契约与基础 Rust 检查**
-
-Run: `pnpm exec vitest run tests/frontend/newsBackendRemoval.test.ts`
-
-Expected: PASS。
+- [ ] **Step 3: 运行基础 Rust 检查**
 
 Run: `cargo check --manifest-path src-tauri/Cargo.toml --all-targets`
 
@@ -265,17 +217,16 @@ Run: `cargo test --manifest-path src-tauri/Cargo.toml --all-targets`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交 Rust/Tauri 删除**
+- [ ] **Step 4: 提交 Rust/Tauri 删除**
 
 ```powershell
-git add -A -- src-tauri tests/frontend/newsBackendRemoval.test.ts
+git add -A -- src-tauri
 git commit -m "refactor: remove news backend"
 ```
 
 ### Task 3: 移除新闻发布流程和过期文档
 
 **Files:**
-- Create: `tests/frontend/releaseWorkflow.test.ts`
 - Delete: `tests/frontend/newsReleaseWorkflow.test.ts`
 - Modify: `.github/workflows/release.yml`
 - Modify: `.github/workflows/release-please.yml`
@@ -289,48 +240,13 @@ git commit -m "refactor: remove news backend"
 - Consumes: release/release-please callers and reusable Tauri build workflow.
 - Produces: 只接收 `tag_name` 的 reusable workflow；调用方恢复 `secrets: inherit`；不再构建或上传 provision 资产。
 
-- [ ] **Step 1: 写入会失败的发布流程移除测试**
+- [ ] **Step 1: 记录发布 workflow 基线**
 
-创建 `tests/frontend/releaseWorkflow.test.ts`：
+Run: `pnpm exec vitest run tests/frontend/newsReleaseWorkflow.test.ts`
 
-```ts
-import { readFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
+Expected: PASS，证明删除前的新闻发布契约测试处于绿色；该测试会随新闻发布流程一起删除。
 
-const readWorkflow = (name: string) =>
-  readFile(resolve(process.cwd(), '.github', 'workflows', name), 'utf8')
-
-describe('release workflow', () => {
-  it.each(['release.yml', 'release-please.yml'])(
-    '%s no longer maps news build configuration',
-    async (name) => {
-      const workflow = await readWorkflow(name)
-      expect(workflow).toContain('secrets: inherit')
-      expect(workflow).not.toMatch(/EASIFLUX_NEWS|news_api_|news_source_epoch/)
-    },
-  )
-
-  it('builds only the desktop release', async () => {
-    const workflow = await readWorkflow('tauri-build-reusable.yml')
-    expect(workflow).not.toMatch(
-      /EASIFLUX_NEWS|news_api_|news_source_epoch|easiflux-news-provision|news-provision/,
-    )
-    expect(workflow).toContain(
-      'uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2',
-    )
-    expect(workflow).toContain('libdbus-1-dev')
-  })
-})
-```
-
-- [ ] **Step 2: 运行测试并确认按预期失败**
-
-Run: `pnpm exec vitest run tests/frontend/releaseWorkflow.test.ts`
-
-Expected: FAIL，因为 workflow 仍要求新闻配置并构建 provision 资产。
-
-- [ ] **Step 3: 清理发布 workflow 与文档**
+- [ ] **Step 2: 清理发布 workflow 与文档**
 
 - 两个 caller 删除新闻 input/secret 映射并恢复 `secrets: inherit`。
 - reusable workflow 删除新闻 input/secrets、provision 构建/校验和/上传、桌面构建中的新闻环境变量。
@@ -339,13 +255,17 @@ Expected: FAIL，因为 workflow 仍要求新闻配置并构建 provision 资产
 - `docs/UI_REFACTOR.md` 的快捷入口改为“交易 / 账户 / 插件”，动态项删除 RSS 新闻占位描述。
 - 不改写 `CHANGELOG.md` 的 0.4.0 历史。
 
-- [ ] **Step 4: 运行发布流程测试并确认通过**
+- [ ] **Step 3: 检查 workflow 残留和 diff**
 
-Run: `pnpm exec vitest run tests/frontend/releaseWorkflow.test.ts`
+Run: `rg -n -i "EASIFLUX_NEWS|easiflux-news|news_api_|news_source_epoch|news-provision" .github/workflows`
+
+Expected: 无匹配。
+
+Run: `git diff --check -- .github docs tests/frontend`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交发布和文档清理**
+- [ ] **Step 4: 提交发布和文档清理**
 
 ```powershell
 git add -A -- .github docs tests/frontend
