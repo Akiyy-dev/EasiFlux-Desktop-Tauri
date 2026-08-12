@@ -4,15 +4,6 @@ version = "0.3.0"
 description = "EasiFlux Desktop - cryptocurrency contract trading client"
 authors = ["EasiFlux"]
 edition = "2021"
-default-run = "easiflux-desktop"
-
-[[bin]]
-name = "easiflux-desktop"
-path = "src/main.rs"
-
-[[bin]]
-name = "easiflux-news-provision"
-path = "src/bin/easiflux-news-provision.rs"
 
 [lib]
 name = "easiflux_desktop_lib"
@@ -20,7 +11,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-url = "2"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -28,7 +18,7 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt-multi-thread"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 hmac = "0.12"
@@ -45,12 +35,6 @@ url = "2"
 rust_decimal = { version = "1", features = ["serde"] }
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
-zeroize = "1"
-rpassword = "7"
-async-trait = "0.1"
-httpdate = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "test-util"] }
-tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }

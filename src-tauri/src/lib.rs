@@ -4,39 +4,16 @@ mod commands;
 mod error;
 mod events;
 mod models;
-pub mod news_provision;
-mod news_runtime;
 mod plugin;
 mod services;
 mod state;
 mod storage;
 mod ws;
 
-use std::future::Future;
-use std::time::Duration;
-
 use tauri::{Manager, RunEvent};
 
 use commands::*;
-use services::news::NewsShutdownOutcome;
 use state::AppState;
-pub use storage::{
-    KeyringNewsTokenStore, NewsApiToken, NewsTokenError, NewsTokenStore, NewsTokenStoreError,
-};
-
-const NEWS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
-
-async fn stop_news_with<Stop, StopFuture, OnTimeout>(stop: Stop, on_timeout: OnTimeout)
-where
-    Stop: FnOnce(Duration) -> StopFuture,
-    StopFuture: Future<Output = NewsShutdownOutcome>,
-    OnTimeout: FnOnce(),
-{
-    match stop(NEWS_SHUTDOWN_TIMEOUT).await {
-        NewsShutdownOutcome::Stopped => {}
-        NewsShutdownOutcome::TimedOut => on_timeout(),
-    }
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -50,7 +27,6 @@ pub fn run() {
             let handle = app.handle().clone();
             let state = AppState::new(handle.clone())?;
             let scheduler = state.scheduler.clone();
-            let news = state.news.clone();
             app.manage(state);
 
             let emitter = {
@@ -62,10 +38,6 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 scheduler.start().await;
             });
-            tauri::async_runtime::spawn(async move {
-                news.start();
-            });
-
             if let Some(window) = app.get_webview_window("main") {
                 let state: tauri::State<AppState> = app.state();
                 let config =
@@ -85,11 +57,6 @@ pub fn run() {
             get_time_snapshot,
             sync_time_now,
             get_environment_status,
-            get_news_status,
-            list_news_messages,
-            mark_news_seen,
-            recheck_news_credentials,
-            retry_news_sync,
             scheduler_run_task,
             get_config,
             save_config,
@@ -157,18 +124,7 @@ pub fn run() {
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 let state: tauri::State<AppState> = app.state();
-                let news = state.news.clone();
                 tauri::async_runtime::block_on(async {
-                    stop_news_with(
-                        move |timeout| async move { news.stop_and_join(timeout).await },
-                        || {
-                            tracing::warn!(
-                                category = "news_shutdown_timeout",
-                                "news shutdown timed out"
-                            );
-                        },
-                    )
-                    .await;
                     state.scheduler.stop().await;
                 });
                 for (key, result) in state.chart_workspace.flush_dirty_klines() {
@@ -184,7 +140,6 @@ pub fn run() {
             }
         });
 }
-
 #[cfg(test)]
 mod capability_tests {
     use tauri::ipc::Origin;
@@ -206,7 +161,3 @@ mod capability_tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "news_lifecycle_tests.rs"]
-mod news_lifecycle_tests;

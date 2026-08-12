@@ -6,10 +6,8 @@ use tauri::{AppHandle, Emitter};
 use crate::models::account::AccountSummary;
 use crate::models::config::{ConnectionStatus, EnvironmentStatus};
 use crate::models::market::{Depth, Kline, Ticker};
-use crate::models::news::{NewsMessagesCommittedEvent, NewsStatusSnapshot};
 use crate::models::time::{DailyPnlSnapshot, TimeSnapshot};
 use crate::models::trading::{Order, Position, PrivatePanelsSnapshot};
-use crate::services::news::ports::{NewsEventError, NewsEventSink};
 use crate::services::AccountLifecycleCoordinator;
 
 #[derive(serde::Serialize)]
@@ -155,27 +153,6 @@ impl EventEmitter {
                 "timestamp": chrono::Utc::now().timestamp_millis(),
             }),
         );
-    }
-}
-
-impl NewsEventSink for EventEmitter {
-    fn emit_messages_committed(
-        &self,
-        event: &NewsMessagesCommittedEvent,
-    ) -> Result<(), NewsEventError> {
-        super::news::emit_news_payload(
-            |name, payload| self.app.emit(name, payload),
-            super::news::NEWS_MESSAGES_COMMITTED_EVENT,
-            event,
-        )
-    }
-
-    fn emit_status_changed(&self, status: &NewsStatusSnapshot) -> Result<(), NewsEventError> {
-        super::news::emit_news_payload(
-            |name, payload| self.app.emit(name, payload),
-            super::news::NEWS_STATUS_CHANGED_EVENT,
-            status,
-        )
     }
 }
 

@@ -109,8 +109,8 @@ Vue 层通过 `useUiMotion.ts` 导出 class 预设（`ef-motion-hover`、`ef-mot
 | 布局 | `DashboardPage` 卡片化分区 |
 | 资产 | 读取 account / position store |
 | 行情 | `fetch_ticker` 拉取 BTC/ETH/SOL |
-| 快捷入口 | 跳转交易 / 账户 / 新闻 / 插件 |
-| 动态 | 静态占位，预留 RSS |
+| 快捷入口 | 跳转交易 / 账户 / 插件 |
+| 动态 | 静态占位 |
 | 状态栏 | API / WS / 版本实时展示 |
 
 ## PRD-07 落地范围

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Megaphone, Newspaper, Sparkles } from 'lucide-vue-next'
+import { Megaphone, Sparkles } from 'lucide-vue-next'
 import type { FunctionalComponent } from 'vue'
 import AppCard from '../ui/AppCard.vue'
 import AppIcon from '../ui/AppIcon.vue'
@@ -20,19 +20,11 @@ const activities: DashboardActivityItem[] = [
     summary: '连接 API 后即可在交易页进行合约下单、查看持仓与资产。',
     timeLabel: '公告',
   },
-  {
-    id: 'news-placeholder',
-    type: 'news',
-    title: '新闻中心即将上线',
-    summary: '后续将支持 RSS 与官方公告接口，集中展示市场资讯。',
-    timeLabel: '预告',
-  },
 ]
 
 const iconByType: Record<DashboardActivityType, FunctionalComponent> = {
   update: Sparkles,
   announcement: Megaphone,
-  news: Newspaper,
 }
 </script>
 

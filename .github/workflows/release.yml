@@ -19,7 +19,4 @@ jobs:
     uses: ./.github/workflows/tauri-build-reusable.yml
     with:
       tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
-      news_source_epoch: ${{ vars.EASIFLUX_NEWS_SOURCE_EPOCH }}
-    secrets:
-      news_api_base_url: ${{ secrets.EASIFLUX_NEWS_API_BASE_URL }}
-      news_api_token: ${{ secrets.EASIFLUX_NEWS_API_TOKEN }}
+    secrets: inherit

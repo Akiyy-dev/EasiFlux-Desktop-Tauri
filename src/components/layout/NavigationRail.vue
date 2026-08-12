@@ -3,20 +3,17 @@ import {
   ArrowLeftRight,
   BarChart3,
   Home,
-  Newspaper,
   Puzzle,
   Settings,
   User,
 } from 'lucide-vue-next'
 import type { FunctionalComponent } from 'vue'
-import { computed } from 'vue'
 import type { NavKey } from '../../types/navigation'
 import { AppButton, AppCard, AppIcon } from '../ui'
 
-const props = withDefaults(defineProps<{
+const props = defineProps<{
   active: NavKey
-  newsUnreadCount?: number
-}>(), { newsUnreadCount: 0 })
+}>()
 
 const emit = defineEmits<{
   select: [key: NavKey]
@@ -31,18 +28,9 @@ const items: Array<{
   { key: 'home', label: '首页', icon: Home },
   { key: 'trading', label: '交易', icon: ArrowLeftRight },
   { key: 'charts', label: '图表', icon: BarChart3 },
-  { key: 'news', label: '新闻', icon: Newspaper },
   { key: 'account', label: '账户', icon: User },
   { key: 'plugins', label: '插件', icon: Puzzle },
 ]
-
-const normalizedUnread = computed(() => Math.max(0, Math.floor(props.newsUnreadCount)))
-const newsBadge = computed(() => normalizedUnread.value > 99 ? '99+' : String(normalizedUnread.value))
-
-function accessibleLabel(key: Exclude<NavKey, 'settings'>, label: string): string {
-  if (key !== 'news' || normalizedUnread.value === 0) return label
-  return `${label}，${normalizedUnread.value} 条未读`
-}
 </script>
 
 <template>
@@ -57,15 +45,10 @@ function accessibleLabel(key: Exclude<NavKey, 'settings'>, label: string): strin
         class="rail-btn"
         :class="{ active: props.active === item.key }"
         :title="item.label"
-        :aria-label="accessibleLabel(item.key, item.label)"
+        :aria-label="item.label"
         @click="emit('select', item.key)"
       >
         <AppIcon :icon="item.icon" :size="18" />
-        <span
-          v-if="item.key === 'news' && normalizedUnread > 0"
-          class="news-unread-badge"
-          aria-hidden="true"
-        >{{ newsBadge }}</span>
       </AppButton>
     </div>
     <div class="rail-bottom">
@@ -121,26 +104,6 @@ function accessibleLabel(key: Exclude<NavKey, 'settings'>, label: string): strin
   width: clamp(44px, 2.35rem + 0.9vw, 54px);
   height: clamp(44px, 2.35rem + 0.9vw, 54px);
   color: var(--text-secondary);
-}
-
-.news-unread-badge {
-  position: absolute;
-  top: 3px;
-  right: 2px;
-  display: inline-flex;
-  min-width: 18px;
-  height: 18px;
-  align-items: center;
-  justify-content: center;
-  padding: 0 4px;
-  border: 1px solid var(--card);
-  border-radius: 999px;
-  color: var(--primary-foreground, #fff);
-  background: var(--danger);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  font-weight: 700;
-  line-height: 1;
 }
 
 .rail-btn :deep(.ef-icon) {

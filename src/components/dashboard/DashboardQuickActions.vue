@@ -2,7 +2,6 @@
 import {
   ArrowLeftRight,
   Briefcase,
-  Newspaper,
   Puzzle,
   Wallet,
 } from 'lucide-vue-next'
@@ -25,7 +24,6 @@ const actions: QuickActionItem[] = [
   { key: 'trading', label: '开始交易', description: '进入交易终端', icon: ArrowLeftRight },
   { key: 'positions', label: '查看持仓', description: '仓位与委托', icon: Briefcase },
   { key: 'assets', label: '查看资产', description: '账户与保证金', icon: Wallet },
-  { key: 'news', label: '新闻中心', description: '市场资讯', icon: Newspaper },
   { key: 'plugins', label: '插件市场', description: '扩展能力', icon: Puzzle },
 ]
 </script>

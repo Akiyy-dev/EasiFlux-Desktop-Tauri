@@ -4,7 +4,6 @@ export type NavKey =
   | 'home'
   | 'trading'
   | 'charts'
-  | 'news'
   | 'account'
   | 'plugins'
   | 'settings'
