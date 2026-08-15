@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.4.0...easiflux-desktop-tauri-v0.4.1) (2026-08-15)
+
+
+### Bug Fixes
+
+* **dev:** prevent Vite from watching Cargo target artifacts ([ab7a6e3](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/ab7a6e3b14968dd8a513cd1ab8f6a57823f14b83))
+* ignore Cargo target artifacts in Vite watcher ([7fc158d](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/7fc158d3f1a0b7bed71d3557ca6e7ee3c6a92313))
+
 ## [0.4.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.3.0...easiflux-desktop-tauri-v0.4.0) (2026-07-30)
 
 
