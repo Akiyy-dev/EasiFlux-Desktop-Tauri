@@ -30,6 +30,9 @@ export const useConnectionStore = defineStore('connection', () => {
   const status = ref<ConnectionStatus>('disconnected')
   const wsStatus = ref<ConnectionStatus>('disconnected')
   const lastError = ref<string | null>(null)
+  const reconnecting = ref(false)
+  const reconnectError = ref<string | null>(null)
+  let reconnectPromise: Promise<void> | null = null
   let latestStatusRequest = 0
   let latestWsStatusRequest = 0
   const connecting = computed(() => status.value === 'connecting')
@@ -83,6 +86,25 @@ export const useConnectionStore = defineStore('connection', () => {
     setWsStatus('disconnected')
   }
 
+  function reconnect(startRealtime: boolean): Promise<void> {
+    if (reconnectPromise) return reconnectPromise
+    reconnecting.value = true
+    reconnectError.value = null
+    reconnectPromise = (async () => {
+      try {
+        await disconnect()
+        await connect(startRealtime)
+      } catch (error) {
+        reconnectError.value = formatInvokeError(error)
+        throw error
+      } finally {
+        reconnecting.value = false
+        reconnectPromise = null
+      }
+    })()
+    return reconnectPromise
+  }
+
   async function refreshStatus(): Promise<ConnectionStatus> {
     const requestId = ++latestStatusRequest
     const next = await tauriInvoke<ConnectionStatus>('get_connection_status')
@@ -101,6 +123,8 @@ export const useConnectionStore = defineStore('connection', () => {
     status,
     wsStatus,
     lastError,
+    reconnecting,
+    reconnectError,
     connecting,
     connected,
     wsConnected,
@@ -108,6 +132,7 @@ export const useConnectionStore = defineStore('connection', () => {
     setWsStatus,
     connect,
     disconnect,
+    reconnect,
     refreshStatus,
     refreshWsStatus,
     refreshTask: refreshSyncTask,

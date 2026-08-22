@@ -130,4 +130,40 @@ describe('connection store', () => {
 
     expect(store.wsStatus).toBe('connected')
   })
+
+  it('reconnects once by disconnecting before connecting', async () => {
+    const store = useConnectionStore()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      if (command === 'scheduler_run_task') return Promise.resolve(undefined)
+      return Promise.resolve(undefined)
+    })
+
+    await Promise.all([store.reconnect(false), store.reconnect(false)])
+
+    const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command === 'disconnect')).toHaveLength(1)
+    expect(commands.filter((command) => command === 'connect')).toHaveLength(1)
+    expect(commands.indexOf('disconnect')).toBeLessThan(commands.indexOf('connect'))
+    expect(store.reconnecting).toBe(false)
+    expect(store.reconnectError).toBeNull()
+  })
+
+  it('rejects a failed reconnect and leaves it retryable', async () => {
+    const store = useConnectionStore()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'disconnect') return Promise.resolve(undefined)
+      if (command === 'connect') return Promise.reject(new Error('reconnect socket failed'))
+      return Promise.resolve(undefined)
+    })
+
+    await expect(store.reconnect(true)).rejects.toThrow('reconnect socket failed')
+
+    const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command === 'disconnect')).toHaveLength(1)
+    expect(commands.filter((command) => command === 'connect')).toHaveLength(1)
+    expect(commands.indexOf('disconnect')).toBeLessThan(commands.indexOf('connect'))
+    expect(store.reconnecting).toBe(false)
+    expect(store.reconnectError).toBe('reconnect socket failed')
+  })
 })
