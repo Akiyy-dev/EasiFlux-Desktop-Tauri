@@ -86,13 +86,17 @@ export const useConnectionStore = defineStore('connection', () => {
     setWsStatus('disconnected')
   }
 
-  function reconnect(startRealtime: boolean): Promise<void> {
+  function reconnect(
+    startRealtime: boolean,
+    shouldConnect: () => boolean = () => true,
+  ): Promise<void> {
     if (reconnectPromise) return reconnectPromise
     reconnecting.value = true
     reconnectError.value = null
     reconnectPromise = (async () => {
       try {
         await disconnect()
+        if (!shouldConnect()) return
         await connect(startRealtime)
       } catch (error) {
         reconnectError.value = formatInvokeError(error)

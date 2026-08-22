@@ -149,6 +149,30 @@ describe('connection store', () => {
     expect(store.reconnectError).toBeNull()
   })
 
+  it('skips connect when the caller guard invalidates during disconnect', async () => {
+    let allowConnect = true
+    let releaseDisconnect!: () => void
+    const disconnectPending = new Promise<void>((resolve) => {
+      releaseDisconnect = resolve
+    })
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'disconnect') return disconnectPending
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+
+    const reconnecting = store.reconnect(false, () => allowConnect)
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('disconnect'))
+    allowConnect = false
+    releaseDisconnect()
+    await reconnecting
+
+    expect(tauriInvoke).not.toHaveBeenCalledWith('connect', expect.anything())
+    expect(store.status).toBe('disconnected')
+    expect(store.reconnecting).toBe(false)
+    expect(store.reconnectError).toBeNull()
+  })
+
   it('rejects a failed reconnect and leaves it retryable', async () => {
     const store = useConnectionStore()
     vi.mocked(tauriInvoke).mockImplementation((command) => {

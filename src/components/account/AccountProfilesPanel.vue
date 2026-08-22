@@ -18,11 +18,12 @@ const editorMode = ref<'create' | 'edit'>('create')
 const editing = ref<AccountProfile | null>(null)
 const deleteTarget = ref<AccountProfile | null>(null)
 const lastOperation = ref<'switch' | 'delete' | null>(null)
-const pendingReconnectAccountId = ref<string | null>(null)
+const pendingReconnect = ref<{ accountId: string; generation: number } | null>(null)
 const reconnectError = ref<string | null>(null)
 const reconnectPending = computed(() =>
-  pendingReconnectAccountId.value === store.activeAccountId,
+  pendingReconnect.value?.accountId === store.activeAccountId,
 )
+let reconnectGeneration = 0
 const panelError = computed(() => {
   if (deleteTarget.value) return null
   if (store.switching || store.reconciliationError || store.recoveryError) return null
@@ -41,20 +42,13 @@ watch(
     if (unhealthy) editorOpen.value = false
   },
 )
-watch(() => store.activeAccountId, (accountId) => {
-  if (
-    pendingReconnectAccountId.value
-    && pendingReconnectAccountId.value !== accountId
-  ) {
-    pendingReconnectAccountId.value = null
-    reconnectError.value = null
-  }
-})
+watch(() => store.activeAccountId, () => {
+  invalidateReconnect()
+}, { flush: 'sync' })
 watch(() => connectionStore.connected, (connected, wasConnected) => {
-  if (!pendingReconnectAccountId.value) return
+  if (!pendingReconnect.value) return
   if (connected || (wasConnected && !connectionStore.reconnecting)) {
-    pendingReconnectAccountId.value = null
-    reconnectError.value = null
+    invalidateReconnect()
   }
 })
 
@@ -93,34 +87,41 @@ function credentialStateLabel(state: CredentialState): string {
 }
 
 function handleCredentialSaved(accountId: string): void {
+  const generation = ++reconnectGeneration
   reconnectError.value = null
-  pendingReconnectAccountId.value = accountId === store.activeAccountId
+  pendingReconnect.value = accountId === store.activeAccountId
     && connectionStore.connected
-    ? accountId
+    ? { accountId, generation }
     : null
 }
 
+function invalidateReconnect(): void {
+  reconnectGeneration += 1
+  pendingReconnect.value = null
+  reconnectError.value = null
+}
+
+function ownsReconnect(attempt: { accountId: string; generation: number }): boolean {
+  return reconnectGeneration === attempt.generation
+    && pendingReconnect.value?.generation === attempt.generation
+    && pendingReconnect.value.accountId === attempt.accountId
+    && store.activeAccountId === attempt.accountId
+}
+
 async function reconnectActiveAccount(): Promise<void> {
-  const accountId = pendingReconnectAccountId.value
-  if (!accountId || accountId !== store.activeAccountId) {
-    pendingReconnectAccountId.value = null
+  const attempt = pendingReconnect.value
+  if (!attempt || !ownsReconnect(attempt)) {
+    invalidateReconnect()
     return
   }
   reconnectError.value = null
   try {
     const config = configStore.config ?? await configStore.fetchConfig()
-    if (
-      accountId !== store.activeAccountId
-      || pendingReconnectAccountId.value !== accountId
-    ) {
-      pendingReconnectAccountId.value = null
-      return
-    }
-    await connectionStore.reconnect(config.useWebsocket)
-    if (pendingReconnectAccountId.value === accountId) {
-      pendingReconnectAccountId.value = null
-    }
+    if (!ownsReconnect(attempt)) return
+    await connectionStore.reconnect(config.useWebsocket, () => ownsReconnect(attempt))
+    if (ownsReconnect(attempt)) invalidateReconnect()
   } catch (error) {
+    if (!ownsReconnect(attempt)) return
     reconnectError.value = reportError(error, '账户重新连接失败')
   }
 }

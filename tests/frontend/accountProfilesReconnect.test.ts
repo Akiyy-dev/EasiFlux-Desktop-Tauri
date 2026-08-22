@@ -3,6 +3,7 @@ import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import AccountProfilesPanel from '../../src/components/account/AccountProfilesPanel.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
+import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConfigStore } from '../../src/stores/config'
 import { useConnectionStore } from '../../src/stores/connection'
 import type { AccountProfile, AppConfig } from '../../src/types/models'
@@ -11,8 +12,12 @@ vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }
 
 function deferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((done) => { resolve = done })
-  return { promise, resolve }
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done
+    reject = fail
+  })
+  return { promise, resolve, reject }
 }
 
 const profiles: AccountProfile[] = [
@@ -83,6 +88,27 @@ describe('AccountProfilesPanel credential reconnect', () => {
   async function emitSaved(wrapper: VueWrapper, accountId: string): Promise<void> {
     wrapper.findComponent({ name: 'CredentialEditor' }).vm.$emit('saved', accountId)
     await wrapper.vm.$nextTick()
+  }
+
+  async function establishAuthoritativeAccount(accountId: string): Promise<void> {
+    vi.mocked(tauriInvoke).mockImplementation((command, args) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({
+          activeAccountId: String(args?.accountId),
+          connected: true,
+          sessionEpoch: 1,
+        })
+      }
+      if (command === 'get_config') {
+        return Promise.resolve({ ...appConfig, activeAccountId: accountId })
+      }
+      if (command === 'list_account_profiles') return Promise.resolve(profiles)
+      if (command === 'get_connection_status' || command === 'get_websocket_status') {
+        return Promise.resolve('connected')
+      }
+      return Promise.resolve(undefined)
+    })
+    await useAccountProfilesStore().switchAccount(accountId)
   }
 
   it('waits for an explicit action before reconnecting with authoritative websocket mode', async () => {
@@ -215,6 +241,161 @@ describe('AccountProfilesPanel credential reconnect', () => {
     expect(wrapper.find('[data-testid="account-reconnect"]').exists()).toBe(false)
     expect(tauriInvoke).not.toHaveBeenCalledWith('disconnect')
     expect(tauriInvoke).not.toHaveBeenCalledWith('connect', expect.anything())
+  })
+
+  it('does not connect the new active account after the old account disconnect finishes', async () => {
+    const disconnectGate = deferred<void>()
+    let disconnectCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return Promise.resolve(profiles)
+      if (command === 'disconnect') {
+        disconnectCalls += 1
+        return disconnectCalls === 1 ? disconnectGate.promise : Promise.resolve(undefined)
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountPanel()
+    await flushPromises()
+    vi.mocked(tauriInvoke).mockClear()
+    await emitSaved(wrapper, 'primary')
+
+    await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('disconnect'))
+    useConfigStore().adoptActiveAccountId('backup')
+    await flushPromises()
+    disconnectGate.resolve()
+    await flushPromises()
+
+    expect(tauriInvoke).not.toHaveBeenCalledWith('connect', expect.anything())
+
+    useConnectionStore().setStatus('connected')
+    await flushPromises()
+    await emitSaved(wrapper, 'backup')
+    await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
+    await flushPromises()
+
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: true,
+      credential: undefined,
+    })
+  })
+
+  it('does not revive an old reconnect attempt after switching away and back', async () => {
+    const disconnectGate = deferred<void>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return Promise.resolve(profiles)
+      if (command === 'disconnect') return disconnectGate.promise
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountPanel()
+    await flushPromises()
+    vi.mocked(tauriInvoke).mockClear()
+    await emitSaved(wrapper, 'primary')
+
+    await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('disconnect'))
+    useConfigStore().adoptActiveAccountId('backup')
+    useConfigStore().adoptActiveAccountId('primary')
+    await flushPromises()
+    disconnectGate.resolve()
+    await flushPromises()
+
+    expect(tauriInvoke).not.toHaveBeenCalledWith('connect', expect.anything())
+    expect(wrapper.find('[data-testid="account-reconnect"]').exists()).toBe(false)
+  })
+
+  it('does not let an old config result clear the new account reconnect action', async () => {
+    const configGate = deferred<AppConfig>()
+    const wrapper = mountPanel()
+    await flushPromises()
+    await establishAuthoritativeAccount('primary')
+    useConfigStore().config = null
+    vi.mocked(tauriInvoke).mockClear()
+    vi.mocked(tauriInvoke).mockImplementation((command, args) => {
+      if (command === 'get_config') return configGate.promise
+      if (command === 'switch_account') {
+        return Promise.resolve({
+          activeAccountId: String(args?.accountId),
+          connected: true,
+          sessionEpoch: 2,
+        })
+      }
+      if (command === 'list_account_profiles') return Promise.resolve(profiles)
+      if (command === 'get_connection_status' || command === 'get_websocket_status') {
+        return Promise.resolve('connected')
+      }
+      return Promise.resolve(undefined)
+    })
+    await emitSaved(wrapper, 'primary')
+
+    await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('get_config'))
+    const switching = useAccountProfilesStore().switchAccount('backup')
+    await vi.waitFor(() => expect(useAccountProfilesStore().activeAccountId).toBe('backup'))
+    await emitSaved(wrapper, 'backup')
+    configGate.resolve({ ...appConfig, activeAccountId: 'primary' })
+    await switching
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="account-reconnect"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('账户重新连接失败')
+
+    await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
+    await flushPromises()
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: true,
+      credential: undefined,
+    })
+  })
+
+  it('does not let an old config error replace the new account reconnect state', async () => {
+    const configGate = deferred<AppConfig>()
+    const wrapper = mountPanel()
+    await flushPromises()
+    await establishAuthoritativeAccount('primary')
+    useConfigStore().config = null
+    vi.mocked(tauriInvoke).mockClear()
+    let getConfigCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command, args) => {
+      if (command === 'get_config') {
+        getConfigCalls += 1
+        return getConfigCalls === 1
+          ? configGate.promise
+          : Promise.resolve({ ...appConfig, activeAccountId: 'backup' })
+      }
+      if (command === 'switch_account') {
+        return Promise.resolve({
+          activeAccountId: String(args?.accountId),
+          connected: true,
+          sessionEpoch: 2,
+        })
+      }
+      if (command === 'list_account_profiles') return Promise.resolve(profiles)
+      if (command === 'get_connection_status' || command === 'get_websocket_status') {
+        return Promise.resolve('connected')
+      }
+      return Promise.resolve(undefined)
+    })
+    await emitSaved(wrapper, 'primary')
+
+    await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('get_config'))
+    await useAccountProfilesStore().switchAccount('backup')
+    await emitSaved(wrapper, 'backup')
+    configGate.reject(new Error('old primary config failed'))
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="account-reconnect"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('old primary config failed')
+
+    await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
+    await flushPromises()
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: true,
+      credential: undefined,
+    })
   })
 
   it('clears pending reconnect after an external disconnect', async () => {
