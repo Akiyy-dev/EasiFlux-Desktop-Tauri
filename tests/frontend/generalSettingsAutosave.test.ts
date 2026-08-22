@@ -249,6 +249,31 @@ describe('general settings autosave', () => {
     await expect(autosave.flush()).resolves.toBeUndefined()
   })
 
+  it('preserves the save error when reconciliation throws synchronously', async () => {
+    vi.useFakeTimers()
+    const save = vi.fn<
+      (value: GeneralSettings) => Promise<GeneralSettings>
+    >().mockRejectedValueOnce(new Error('save-original'))
+    const reconcile = vi.fn((): Promise<void> => {
+      throw new Error('reconcile-sync')
+    })
+    const autosave = useGeneralSettingsAutosave(save, reconcile, 300)
+
+    autosave.initialize({ useWebsocket: true, tickerPollInterval: 1 })
+    autosave.update({ tickerPollInterval: 2 })
+
+    await expect(autosave.flush()).resolves.toBeUndefined()
+    expect(reconcile).toHaveBeenCalledTimes(1)
+    expect(autosave.status.value).toBe('error')
+    expect(autosave.error.value).toBe('save-original')
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(save).toHaveBeenCalledTimes(1)
+    await expect(autosave.dispose()).rejects.toThrow('save-original')
+    expect(vi.getTimerCount()).toBe(0)
+    await expect(autosave.flush()).resolves.toBeUndefined()
+  })
+
   it('rejects disposal after reconciling a final failed save', async () => {
     vi.useFakeTimers()
     const save = vi.fn<

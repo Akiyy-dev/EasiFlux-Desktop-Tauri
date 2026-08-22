@@ -58,7 +58,11 @@ export function useGeneralSettingsAutosave(
         dirty = true
         status.value = 'error'
         error.value = cause instanceof Error ? cause.message : String(cause)
-        await reconcile().catch(() => undefined)
+        try {
+          await reconcile()
+        } catch {
+          // Reconciliation must not replace the retained save error.
+        }
         return
       }
     }
