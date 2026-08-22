@@ -9,6 +9,13 @@ vi.mock('../../src/composables/useTauriCommand', () => ({
 
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
+  return { promise, resolve, reject }
+}
+
 function reconnectAction(store: ReturnType<typeof useConnectionStore>) {
   // Pinia wraps public action promises for subscriptions. Exercise the setup
   // action itself when asserting the identity of the store's shared flight.
@@ -88,6 +95,124 @@ describe('connection store', () => {
     await expect(store.connect()).rejects.toThrow('认证失败: 无效密钥')
     expect(store.status).toBe('error')
     expect(store.lastError).toBe('认证失败: 无效密钥')
+  })
+
+  it('does not run status refresh or sync for an older connect success', async () => {
+    const firstInvoke = deferred<void>()
+    const secondInvoke = deferred<void>()
+    let connectCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') {
+        connectCalls += 1
+        return connectCalls === 1 ? firstInvoke.promise : secondInvoke.promise
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+
+    const first = store.connect(true)
+    const second = store.connect(true)
+    firstInvoke.resolve()
+    await first
+
+    expect(store.status).toBe('connecting')
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_connection_status')).toHaveLength(0)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+
+    secondInvoke.resolve()
+    await second
+
+    expect(store.status).toBe('connected')
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_connection_status')).toHaveLength(1)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(1)
+  })
+
+  it('rejects an older failed caller without overwriting a newer success', async () => {
+    const firstInvoke = deferred<void>()
+    let connectCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') {
+        connectCalls += 1
+        return connectCalls === 1 ? firstInvoke.promise : Promise.resolve(undefined)
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+
+    const first = store.connect(true)
+    await store.connect(true)
+    firstInvoke.reject(new Error('apiKey=raw-key apiSecret=raw-secret'))
+
+    await expect(first).rejects.toThrow('apiKey=raw-key apiSecret=raw-secret')
+    expect(store.status).toBe('connected')
+    expect(store.lastError).toBeNull()
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(1)
+  })
+
+  it('keeps a completed disconnect authoritative over an older pending connect', async () => {
+    const pendingConnect = deferred<void>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') return pendingConnect.promise
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+
+    const connecting = store.connect(true)
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('connect', expect.anything()))
+    await store.disconnect()
+    pendingConnect.resolve()
+    await connecting
+
+    expect(store.status).toBe('disconnected')
+    expect(store.wsStatus).toBe('disconnected')
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_connection_status')).toHaveLength(0)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+  })
+
+  it('does not sync from an older status refresh after a newer connect starts', async () => {
+    const firstStatus = deferred<'connected'>()
+    const secondInvoke = deferred<void>()
+    let connectCalls = 0
+    let statusCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') {
+        connectCalls += 1
+        return connectCalls === 1 ? Promise.resolve(undefined) : secondInvoke.promise
+      }
+      if (command === 'get_connection_status') {
+        statusCalls += 1
+        return statusCalls === 1 ? firstStatus.promise : Promise.resolve('connected')
+      }
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+
+    const first = store.connect(true)
+    await vi.waitFor(() => expect(statusCalls).toBe(1))
+    const second = store.connect(true)
+    firstStatus.resolve('connected')
+    await first
+
+    expect(store.status).toBe('connecting')
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+
+    secondInvoke.resolve()
+    await second
+
+    expect(store.status).toBe('connected')
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(1)
   })
 
   it('delegates post-connect refresh to scheduler bridge', async () => {

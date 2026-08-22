@@ -43,6 +43,7 @@ export const useConnectionStore = defineStore('connection', () => {
   const reconnecting = ref(false)
   const reconnectError = ref<string | null>(null)
   let reconnectFlight: ReconnectFlight | null = null
+  let latestConnectionRequest = 0
   let latestStatusRequest = 0
   let latestWsStatusRequest = 0
   const connecting = computed(() => status.value === 'connecting')
@@ -69,21 +70,29 @@ export const useConnectionStore = defineStore('connection', () => {
     startRealtime = true,
     credential?: ApiCredential,
   ): Promise<void> {
+    const connectionRequest = ++latestConnectionRequest
     lastError.value = null
     setStatus('connecting')
     try {
       await tauriInvoke('connect', { startRealtime, credential })
+      if (connectionRequest !== latestConnectionRequest) return
       if (!startRealtime) {
         setWsStatus('disconnected')
       }
-      const currentStatus = await refreshStatus()
-      if (currentStatus === 'connected') {
+      const currentStatus = await refreshStatusForConnection(connectionRequest)
+      if (
+        currentStatus.applied
+        && currentStatus.status === 'connected'
+        && connectionRequest === latestConnectionRequest
+      ) {
         await refreshSyncTask('market', true)
       }
     } catch (error) {
-      setStatus('error')
       const message = formatInvokeError(error)
-      lastError.value = message
+      if (connectionRequest === latestConnectionRequest) {
+        setStatus('error')
+        lastError.value = message
+      }
       const wrapped = new Error(message) as Error & { cause?: unknown }
       wrapped.cause = error
       throw wrapped
@@ -91,7 +100,9 @@ export const useConnectionStore = defineStore('connection', () => {
   }
 
   async function disconnect(): Promise<void> {
+    const connectionRequest = ++latestConnectionRequest
     await tauriInvoke('disconnect')
+    if (connectionRequest !== latestConnectionRequest) return
     setStatus('disconnected')
     setWsStatus('disconnected')
   }
@@ -137,11 +148,19 @@ export const useConnectionStore = defineStore('connection', () => {
     return flight.promise
   }
 
-  async function refreshStatus(): Promise<ConnectionStatus> {
+  async function refreshStatusForConnection(
+    connectionRequest?: number,
+  ): Promise<{ status: ConnectionStatus; applied: boolean }> {
     const requestId = ++latestStatusRequest
     const next = await tauriInvoke<ConnectionStatus>('get_connection_status')
-    if (requestId === latestStatusRequest) status.value = next
-    return next
+    const applied = requestId === latestStatusRequest
+      && (connectionRequest === undefined || connectionRequest === latestConnectionRequest)
+    if (applied) status.value = next
+    return { status: next, applied }
+  }
+
+  async function refreshStatus(): Promise<ConnectionStatus> {
+    return (await refreshStatusForConnection()).status
   }
 
   async function refreshWsStatus(): Promise<ConnectionStatus> {

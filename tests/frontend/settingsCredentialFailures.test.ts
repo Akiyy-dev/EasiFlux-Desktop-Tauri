@@ -1,13 +1,16 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
+import { defineComponent, nextTick, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MessageApi } from 'naive-ui'
 import CredentialEditor from '../../src/components/account/CredentialEditor.vue'
+import ConnectionStatus from '../../src/components/common/ConnectionStatus.vue'
 import QuickSetupDialog from '../../src/components/settings/QuickSetupDialog.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { installMessageApi } from '../../src/services/errorService'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConfigStore } from '../../src/stores/config'
+import { useConnectionStore } from '../../src/stores/connection'
 import { useLogStore } from '../../src/stores/log'
 import type { AccountProfile, AppConfig } from '../../src/types/models'
 
@@ -264,6 +267,102 @@ describe('QuickSetup connection failures', () => {
     expect(wrapper.getComponent(CredentialEditor).props('initialLabel')).toBe('Fresh profile')
     expect(wrapper.text()).not.toContain('raw-key')
     expect(wrapper.text()).not.toContain('raw-secret')
+  })
+
+  it('keeps fresh global connection state when an older session connect rejects late', async () => {
+    const firstConnect = deferred<void>()
+    let connectCalls = 0
+    useConfigStore().config = config
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return Promise.resolve([profile])
+      if (command === 'save_credentials') return Promise.resolve(undefined)
+      if (command === 'connect') {
+        connectCalls += 1
+        return connectCalls === 1 ? firstConnect.promise : Promise.resolve(undefined)
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      if (command === 'scheduler_run_task') return Promise.resolve(undefined)
+      return Promise.resolve(undefined)
+    })
+    const host = mount(defineComponent({
+      components: { ConnectionStatus, QuickSetupDialog },
+      setup: () => ({ show: ref(true) }),
+      template: '<QuickSetupDialog v-model:show="show"/><ConnectionStatus/>',
+    }), {
+      global: { plugins: [pinia], stubs: { AppDialog: dialogStub } },
+    })
+    const quickSetup = host.getComponent(QuickSetupDialog)
+    await flushPromises()
+    await quickSetup.findAll('button')
+      .find((button) => button.text() === '编辑凭据')!.trigger('click')
+    await quickSetup.findAll('button')
+      .find((button) => button.text() === '保存')!.trigger('click')
+    await flushPromises()
+
+    await quickSetup.get('[data-testid="dialog-close"]').trigger('click')
+    const hostState = host.vm as unknown as { show: boolean }
+    hostState.show = true
+    await nextTick()
+    await flushPromises()
+    await quickSetup.findAll('button')
+      .find((button) => button.text() === '编辑凭据')!.trigger('click')
+    await quickSetup.findAll('button')
+      .find((button) => button.text() === '保存')!.trigger('click')
+    await flushPromises()
+
+    const store = useConnectionStore()
+    const closesAfterFreshConnect = (quickSetup.emitted('update:show') ?? [])
+      .filter(([show]) => show === false).length
+    expect(connectCalls).toBe(2)
+    expect(closesAfterFreshConnect).toBe(2)
+    expect(store.status).toBe('connected')
+    expect(store.lastError).toBeNull()
+    expect(host.getComponent(ConnectionStatus).text()).toContain('API 已连接')
+
+    firstConnect.reject(new Error('apiKey=raw-key apiSecret=raw-secret'))
+    await flushPromises()
+
+    expect(store.status).toBe('connected')
+    expect(store.lastError).toBeNull()
+    expect(host.getComponent(ConnectionStatus).text()).toContain('API 已连接')
+    expect(host.text()).not.toContain('raw-key')
+    expect(host.text()).not.toContain('raw-secret')
+    expect((quickSetup.emitted('update:show') ?? [])
+      .filter(([show]) => show === false)).toHaveLength(closesAfterFreshConnect)
+  })
+
+  it('handles duplicate saved events as one connection flow', async () => {
+    const pendingConnect = deferred<void>()
+    useConfigStore().config = null
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return Promise.resolve([profile])
+      if (command === 'get_config') return Promise.resolve(config)
+      if (command === 'connect') return pendingConnect.promise
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      if (command === 'scheduler_run_task') return Promise.resolve(undefined)
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountQuickSetup()
+    await flushPromises()
+    await wrapper.findAll('button').find((button) => button.text() === '编辑凭据')!.trigger('click')
+    const editor = wrapper.getComponent(CredentialEditor)
+
+    editor.vm.$emit('saved', 'default')
+    editor.vm.$emit('saved', 'default')
+    await flushPromises()
+
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_config')).toHaveLength(1)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'connect')).toHaveLength(1)
+
+    pendingConnect.resolve()
+    await flushPromises()
+
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(1)
+    expect((wrapper.emitted('update:show') ?? [])
+      .filter(([show]) => show === false)).toHaveLength(1)
   })
 
   it('ignores a connection success that resolves after a newer dialog session opens', async () => {

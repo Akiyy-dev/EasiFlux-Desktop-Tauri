@@ -107,6 +107,7 @@ async function connectStoredCredentials(session = flowSession): Promise<void> {
 }
 
 function handleCredentialSaved(): void {
+  if (credentialsSaved.value || connecting.value) return
   credentialsSaved.value = true
   editorOpen.value = false
   void connectStoredCredentials()
