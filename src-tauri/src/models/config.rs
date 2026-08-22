@@ -15,6 +15,8 @@ pub const CONFIG_FILENAME: &str = "config.toml";
 pub const DEFAULT_WATCHLIST: &[&str] = &["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
 pub const KLINE_INTERVALS: &[&str] = &["1", "5", "15", "60", "240", "D"];
 pub const RECV_WINDOW_MS: u64 = 5000;
+pub const MIN_TICKER_POLL_INTERVAL_SECS: f64 = 1.0;
+pub const MAX_TICKER_POLL_INTERVAL_SECS: f64 = 3600.0;
 
 /// Normalize account id: trim whitespace, fall back to `"default"` when empty.
 pub fn normalize_account_id(account_id: &str) -> String {
