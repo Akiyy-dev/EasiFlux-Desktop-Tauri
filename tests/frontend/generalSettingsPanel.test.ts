@@ -320,6 +320,129 @@ describe('GeneralSettingsPanel', () => {
     ))).toHaveLength(2)
   })
 
+  it('retains committed mode B when a queued mode A save fails', async () => {
+    const modeBSave = deferred<GeneralSettings>()
+    let saveAttempts = 0
+    vi.mocked(tauriInvoke).mockImplementation((command, args) => {
+      if (command === 'update_general_settings') {
+        saveAttempts += 1
+        if (saveAttempts === 1) return modeBSave.promise
+        return Promise.reject(new Error('queued mode A failed'))
+      }
+      if (command === 'get_config') {
+        return Promise.resolve(makeConfig({ useWebsocket: false }))
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    useConnectionStore().setStatus('connected')
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    await setWebsocket(wrapper, false)
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+    await setWebsocket(wrapper, true)
+    await vi.advanceTimersByTimeAsync(300)
+    modeBSave.resolve({ useWebsocket: false, tickerPollInterval: 10 })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('queued mode A failed')
+    expect(wrapper.getComponent(NSwitch).props('value')).toBe(true)
+    expect(wrapper.get('[data-testid="general-settings-save-retry"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="general-reconnect"]').exists()).toBe(true)
+
+    await wrapper.get('[data-testid="general-reconnect"]').trigger('click')
+    await flushPromises()
+
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: false,
+      credential: undefined,
+    })
+    expect(vi.mocked(tauriInvoke).mock.calls.filter(([command]) => (
+      command === 'update_general_settings'
+    ))).toHaveLength(2)
+    expect(wrapper.get('[data-testid="general-settings-save-retry"]').exists()).toBe(true)
+  })
+
+  it('keeps a second committed mode pending after an older reconnect completes', async () => {
+    const firstDisconnect = deferred<void>()
+    let disconnectAttempts = 0
+    vi.mocked(tauriInvoke).mockImplementation((command, args) => {
+      if (command === 'update_general_settings') {
+        return Promise.resolve({ ...(args?.request as GeneralSettings) })
+      }
+      if (command === 'disconnect') {
+        disconnectAttempts += 1
+        return disconnectAttempts === 1
+          ? firstDisconnect.promise
+          : Promise.resolve(undefined)
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    useConnectionStore().setStatus('connected')
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    await setWebsocket(wrapper, false)
+    await finishDebounce()
+    await wrapper.get('[data-testid="general-reconnect"]').trigger('click')
+    await flushPromises()
+    expect(tauriInvoke).toHaveBeenCalledWith('disconnect')
+
+    await setWebsocket(wrapper, true)
+    await finishDebounce()
+    firstDisconnect.resolve()
+    await flushPromises()
+
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: false,
+      credential: undefined,
+    })
+    expect(wrapper.get('[data-testid="general-reconnect"]').exists()).toBe(true)
+
+    await wrapper.get('[data-testid="general-reconnect"]').trigger('click')
+    await flushPromises()
+
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: true,
+      credential: undefined,
+    })
+    expect(vi.mocked(tauriInvoke).mock.calls.filter(([command]) => (
+      command === 'update_general_settings'
+    ))).toHaveLength(2)
+  })
+
+  it('does not show an old reconnect error for a newly committed mode', async () => {
+    vi.mocked(tauriInvoke).mockImplementation((command, args) => {
+      if (command === 'update_general_settings') {
+        return Promise.resolve({ ...(args?.request as GeneralSettings) })
+      }
+      if (command === 'connect') return Promise.reject(new Error('old mode B failed'))
+      return Promise.resolve(undefined)
+    })
+    const connectionStore = useConnectionStore()
+    connectionStore.setStatus('connected')
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    await setWebsocket(wrapper, false)
+    await finishDebounce()
+    await wrapper.get('[data-testid="general-reconnect"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="general-reconnect-error"]').text())
+      .toContain('old mode B failed')
+
+    connectionStore.setStatus('connected')
+    await flushPromises()
+    await setWebsocket(wrapper, true)
+    await finishDebounce()
+
+    expect(wrapper.get('[data-testid="general-reconnect"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="general-reconnect-error"]').exists()).toBe(false)
+  })
+
   it('does not retain reconnect work across disconnected or natural connection states', async () => {
     installSuccessfulBackend()
     const connectionStore = useConnectionStore()

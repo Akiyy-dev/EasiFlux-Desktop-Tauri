@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NForm, NFormItem, NInputNumber, NSwitch } from 'naive-ui'
 import { useGeneralSettingsAutosave } from '../../composables/useGeneralSettingsAutosave'
 import { reportError } from '../../services/errorService'
@@ -30,12 +30,16 @@ const autosave = useGeneralSettingsAutosave(
 )
 
 const appliedWebsocketMode = ref<boolean | null>(null)
-const reconnectCandidate = ref<boolean | null>(null)
-const websocketEditPending = ref(false)
 const pendingWebsocketMode = ref<boolean | null>(null)
+const reconnectAttemptMode = ref<boolean | null>(null)
+const reconnectErrorMode = ref<boolean | null>(null)
+const websocketDraftUnsaved = computed(() => (
+  autosave.lastSaved.value !== null
+  && useWebsocket.value !== autosave.lastSaved.value.useWebsocket
+))
 const reconnectRequired = computed(() => (
   pendingWebsocketMode.value !== null
-  && (!websocketEditPending.value || autosave.status.value === 'error')
+  && (!websocketDraftUnsaved.value || autosave.status.value === 'error')
 ))
 const controlsDisabled = computed(() => initializing.value || !initialized.value)
 const autosaveStatusText = computed(() => {
@@ -50,6 +54,28 @@ function errorText(error: unknown): string {
   return '通用设置加载失败'
 }
 
+function setPendingWebsocketMode(mode: boolean | null): void {
+  pendingWebsocketMode.value = mode
+  if (mode === null || reconnectErrorMode.value !== mode) {
+    reconnectErrorMode.value = null
+  }
+}
+
+function applyCommittedModeToPending(committedMode: boolean): void {
+  reconnectErrorMode.value = null
+  if (reconnectAttemptMode.value !== null) {
+    setPendingWebsocketMode(
+      committedMode === reconnectAttemptMode.value ? null : committedMode,
+    )
+    return
+  }
+  setPendingWebsocketMode(
+    connectionStore.connected && committedMode !== appliedWebsocketMode.value
+      ? committedMode
+      : null,
+  )
+}
+
 async function initialize(): Promise<void> {
   if (initializing.value && initialized.value) return
   initializing.value = true
@@ -60,15 +86,15 @@ async function initialize(): Promise<void> {
       useWebsocket: config.useWebsocket,
       tickerPollInterval: config.tickerPollInterval,
     }
+    appliedWebsocketMode.value = settings.useWebsocket
     autosave.initialize(settings)
     useWebsocket.value = settings.useWebsocket
     tickerPollInterval.value = settings.tickerPollInterval
     intervalError.value = null
     visibleSaveError.value = null
-    appliedWebsocketMode.value = settings.useWebsocket
-    reconnectCandidate.value = null
-    websocketEditPending.value = false
-    pendingWebsocketMode.value = null
+    setPendingWebsocketMode(null)
+    reconnectAttemptMode.value = null
+    reconnectErrorMode.value = null
     initialized.value = true
   } catch (error) {
     initialized.value = false
@@ -81,8 +107,6 @@ async function initialize(): Promise<void> {
 function updateWebsocket(value: boolean): void {
   if (!initialized.value) return
   useWebsocket.value = value
-  websocketEditPending.value = true
-  reconnectCandidate.value = connectionStore.connected ? value : null
   autosave.update({ useWebsocket: value })
 }
 
@@ -109,12 +133,24 @@ async function retrySave(): Promise<void> {
 async function reconnectNow(): Promise<void> {
   const mode = pendingWebsocketMode.value
   if (mode === null) return
+  reconnectAttemptMode.value = mode
+  reconnectErrorMode.value = null
   try {
     await connectionStore.reconnect(mode)
     appliedWebsocketMode.value = mode
-    pendingWebsocketMode.value = null
+    const committedMode = autosave.lastSaved.value?.useWebsocket
+    setPendingWebsocketMode(
+      committedMode !== undefined && committedMode !== mode
+        ? committedMode
+        : null,
+    )
   } catch {
-    // The store owns reconnectError. Keep the committed pending mode retryable.
+    const committedMode = autosave.lastSaved.value?.useWebsocket ?? mode
+    setPendingWebsocketMode(committedMode)
+    reconnectErrorMode.value = committedMode === mode ? mode : null
+  } finally {
+    await nextTick()
+    reconnectAttemptMode.value = null
   }
 }
 
@@ -128,21 +164,10 @@ watch(
 )
 
 watch(
-  () => [
-    autosave.status.value,
-    autosave.lastSaved.value?.useWebsocket,
-  ] as const,
-  ([status, savedMode]) => {
-    if (status !== 'saved' || !websocketEditPending.value) return
-    const candidate = reconnectCandidate.value
-    pendingWebsocketMode.value = connectionStore.connected
-      && candidate !== null
-      && savedMode === candidate
-      && candidate !== appliedWebsocketMode.value
-      ? candidate
-      : null
-    websocketEditPending.value = false
-    reconnectCandidate.value = null
+  () => autosave.lastSaved.value?.useWebsocket,
+  (committedMode) => {
+    if (!initialized.value || committedMode === undefined) return
+    applyCommittedModeToPending(committedMode)
   },
   { flush: 'sync' },
 )
@@ -151,16 +176,20 @@ watch(
   () => connectionStore.connected,
   (connected, wasConnected) => {
     if (connected && !wasConnected) {
+      if (reconnectAttemptMode.value !== null) return
       appliedWebsocketMode.value = autosave.lastSaved.value?.useWebsocket ?? null
-      pendingWebsocketMode.value = null
-      reconnectCandidate.value = websocketEditPending.value
-        ? autosave.draft.value?.useWebsocket ?? null
-        : null
+      setPendingWebsocketMode(null)
+      reconnectErrorMode.value = null
       return
     }
-    if (!connected && wasConnected && !connectionStore.reconnecting) {
-      pendingWebsocketMode.value = null
-      reconnectCandidate.value = null
+    if (
+      !connected
+      && wasConnected
+      && reconnectAttemptMode.value === null
+      && !connectionStore.reconnecting
+    ) {
+      setPendingWebsocketMode(null)
+      reconnectErrorMode.value = null
     }
   },
 )
@@ -266,7 +295,9 @@ onBeforeUnmount(() => {
     </div>
 
     <p
-      v-if="connectionStore.reconnectError && pendingWebsocketMode !== null"
+      v-if="connectionStore.reconnectError
+        && reconnectErrorMode !== null
+        && reconnectErrorMode === pendingWebsocketMode"
       class="general-settings-error"
       data-testid="general-reconnect-error"
       role="alert"
