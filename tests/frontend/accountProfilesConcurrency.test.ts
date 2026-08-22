@@ -3,7 +3,7 @@ import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import AccountProfilesPanel from '../../src/components/account/AccountProfilesPanel.vue'
 import CredentialEditor from '../../src/components/account/CredentialEditor.vue'
-import SettingsDialog from '../../src/components/settings/SettingsDialog.vue'
+import QuickSetupDialog from '../../src/components/settings/QuickSetupDialog.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConfigStore } from '../../src/stores/config'
@@ -61,7 +61,7 @@ describe('account profile refresh concurrency', () => {
     mount(AccountProfilesPanel, {
       global: { plugins: [pinia], stubs: { CredentialEditor: true, AppDialog: true } },
     })
-    const settings = mount(SettingsDialog, {
+    const settings = mount(QuickSetupDialog, {
       props: { show: true },
       global: { plugins: [pinia], stubs: { AppDialog: dialogStub } },
     })

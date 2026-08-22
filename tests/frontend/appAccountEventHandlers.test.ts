@@ -28,7 +28,7 @@ vi.mock('../../src/components/layout/AppShell.vue', () => ({
 vi.mock('../../src/components/common/ErrorToastBridge.vue', () => ({
   default: { template: '<div />' },
 }))
-vi.mock('../../src/components/settings/SettingsDialog.vue', () => ({
+vi.mock('../../src/components/settings/QuickSetupDialog.vue', () => ({
   default: { template: '<div />' },
 }))
 
@@ -50,7 +50,12 @@ describe('App account-bound event handlers', () => {
     mocks.invoke.mockReset()
     mocks.invoke.mockImplementation((command: string) => {
       if (command === 'get_config') return Promise.resolve(config)
-      if (command === 'has_credentials') return Promise.resolve(false)
+      if (command === 'list_account_profiles') {
+        return Promise.resolve([{
+          accountId: 'primary', label: 'Primary', baseUrl: 'https://trade.example',
+          credentialState: 'missing', active: true,
+        }])
+      }
       if (command === 'get_version') return Promise.resolve('test')
       return Promise.resolve(undefined)
     })
@@ -59,6 +64,27 @@ describe('App account-bound event handlers', () => {
 
   it('installs the application close guard exactly once', () => {
     expect(mocks.closeGuard).toHaveBeenCalledOnce()
+  })
+
+  it('retains every application event subscription', () => {
+    expect([...mocks.listeners.keys()]).toEqual([
+      'app:ready',
+      'connection:status',
+      'websocket:status',
+      'market:ticker',
+      'market:depth',
+      'market:kline',
+      'order:updated',
+      'position:updated',
+      'balance:updated',
+      'account:snapshot',
+      'private-panels:snapshot',
+      'daily-pnl:updated',
+      'environment:updated',
+      'time:updated',
+      'error:occurred',
+      'log:entry',
+    ])
   })
 
   it('does not write a stale balance event into the account store', () => {

@@ -2,7 +2,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import CredentialEditor from '../../src/components/account/CredentialEditor.vue'
-import SettingsDialog from '../../src/components/settings/SettingsDialog.vue'
+import QuickSetupDialog from '../../src/components/settings/QuickSetupDialog.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConfigStore } from '../../src/stores/config'
@@ -25,7 +25,19 @@ const profile: AccountProfile = {
 }
 
 const dialogStub = {
-  props: ['show'], template: '<section v-if="show"><slot/><slot name="footer"/></section>',
+  props: ['show'],
+  emits: ['update:show'],
+  template: `<section v-if="show">
+    <button data-testid="dialog-close" @click="$emit('update:show', false)">close</button>
+    <slot/><slot name="footer"/>
+  </section>`,
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
+  return { promise, resolve, reject }
 }
 
 describe('CredentialEditor failures', () => {
@@ -97,7 +109,7 @@ describe('CredentialEditor failures', () => {
   })
 })
 
-describe('settings config failures', () => {
+describe('QuickSetup connection failures', () => {
   let pinia: Pinia
 
   beforeEach(async () => {
@@ -108,14 +120,14 @@ describe('settings config failures', () => {
     await useAccountProfilesStore().refreshProfiles()
   })
 
-  function mountSettings() {
-    return mount(SettingsDialog, {
+  function mountQuickSetup() {
+    return mount(QuickSetupDialog, {
       props: { show: true },
       global: { plugins: [pinia], stubs: { AppDialog: dialogStub } },
     })
   }
 
-  async function saveThroughEditor(wrapper: ReturnType<typeof mountSettings>) {
+  async function saveThroughEditor(wrapper: ReturnType<typeof mountQuickSetup>) {
     await flushPromises()
     const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
     await edit!.trigger('click')
@@ -124,7 +136,7 @@ describe('settings config failures', () => {
     await flushPromises()
   }
 
-  it('does not connect when missing config cannot be fetched', async () => {
+  it('keeps saved credentials committed when authoritative config cannot be fetched', async () => {
     useConfigStore().config = null
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'save_credentials') return Promise.resolve(undefined)
@@ -132,53 +144,94 @@ describe('settings config failures', () => {
       if (command === 'get_config') return Promise.reject(new Error('config fetch failed'))
       return Promise.resolve(undefined)
     })
-    const wrapper = mountSettings()
+    const wrapper = mountQuickSetup()
     await saveThroughEditor(wrapper)
 
+    expect(tauriInvoke).toHaveBeenCalledWith('save_credentials', expect.anything())
     expect(wrapper.get('[role="alert"]').text()).toContain('config fetch failed')
     expect(tauriInvoke).not.toHaveBeenCalledWith('connect', expect.anything())
+    expect(wrapper.findComponent(CredentialEditor).exists()).toBe(false)
+    expect(wrapper.get('[data-testid="quick-setup-retry"]').exists()).toBe(true)
   })
 
-  it('does not connect when general settings persistence fails', async () => {
+  it('resets a saved/error/retry session after close and reopen', async () => {
     useConfigStore().config = config
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'save_credentials') return Promise.resolve(undefined)
       if (command === 'list_account_profiles') return Promise.resolve([profile])
-      if (command === 'save_config') return Promise.reject(new Error('config save failed'))
+      if (command === 'connect') return Promise.reject(new Error('connect failed'))
       return Promise.resolve(undefined)
     })
-    const wrapper = mountSettings()
+    const wrapper = mountQuickSetup()
     await saveThroughEditor(wrapper)
 
-    expect(wrapper.get('[role="alert"]').text()).toContain('config save failed')
-    expect(tauriInvoke).not.toHaveBeenCalledWith('connect', expect.anything())
+    expect(wrapper.text()).toContain('凭据已保存，连接失败')
+    expect(wrapper.get('[data-testid="quick-setup-retry"]').exists()).toBe(true)
+
+    await wrapper.get('[data-testid="dialog-close"]').trigger('click')
+    await wrapper.setProps({ show: false })
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('connect failed')
+    expect(wrapper.find('[data-testid="quick-setup-retry"]').exists()).toBe(false)
+    expect(wrapper.getComponent(CredentialEditor).props('show')).toBe(false)
+    expect(wrapper.findAll('button').some((button) => button.text() === '编辑凭据')).toBe(true)
   })
 
-  it('preserves the user general-settings draft when missing config is fetched', async () => {
-    useConfigStore().config = null
-    vi.mocked(tauriInvoke).mockImplementation((command, args) => {
+  it('ignores a connection success that resolves after a newer dialog session opens', async () => {
+    const pending = deferred<void>()
+    useConfigStore().config = config
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'list_account_profiles') return Promise.resolve([profile])
       if (command === 'save_credentials') return Promise.resolve(undefined)
-      if (command === 'get_config') {
-        return Promise.resolve({ ...config, useWebsocket: true, tickerPollInterval: 1000 })
-      }
-      if (command === 'save_config') {
-        return Promise.resolve((args as { config: AppConfig }).config)
-      }
-      if (command === 'get_connection_status') return Promise.resolve('disconnected')
+      if (command === 'connect') return pending.promise
       return Promise.resolve(undefined)
     })
-    const wrapper = mountSettings()
-    await flushPromises()
-    await wrapper.get('[role="switch"]').trigger('click')
-    await wrapper.get('.n-input-number input').setValue('2500')
+    const wrapper = mountQuickSetup()
     await saveThroughEditor(wrapper)
 
-    expect(tauriInvoke).toHaveBeenCalledWith('save_config', {
-      config: expect.objectContaining({ useWebsocket: false, tickerPollInterval: 2500 }),
+    await wrapper.get('[data-testid="dialog-close"]').trigger('click')
+    await wrapper.setProps({ show: false })
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+    const closesBeforeOldCompletion = (wrapper.emitted('update:show') ?? [])
+      .filter(([show]) => show === false).length
+
+    pending.resolve()
+    await flushPromises()
+
+    const closesAfterOldCompletion = (wrapper.emitted('update:show') ?? [])
+      .filter(([show]) => show === false).length
+    expect(closesAfterOldCompletion).toBe(closesBeforeOldCompletion)
+    expect(wrapper.find('[data-testid="quick-setup-retry"]').exists()).toBe(false)
+    expect(wrapper.getComponent(CredentialEditor).props('show')).toBe(false)
+  })
+
+  it('ignores a connection rejection that settles after a newer dialog session opens', async () => {
+    const pending = deferred<void>()
+    useConfigStore().config = config
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return Promise.resolve([profile])
+      if (command === 'save_credentials') return Promise.resolve(undefined)
+      if (command === 'connect') return pending.promise
+      return Promise.resolve(undefined)
     })
-    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
-      startRealtime: false, credential: undefined,
-    })
+    const wrapper = mountQuickSetup()
+    await saveThroughEditor(wrapper)
+
+    await wrapper.get('[data-testid="dialog-close"]').trigger('click')
+    await wrapper.setProps({ show: false })
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+
+    pending.reject(new Error('late apiKey=raw-key apiSecret=raw-secret'))
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('late')
+    expect(wrapper.text()).not.toContain('raw-key')
+    expect(wrapper.text()).not.toContain('raw-secret')
+    expect(wrapper.find('[data-testid="quick-setup-retry"]').exists()).toBe(false)
+    expect(wrapper.getComponent(CredentialEditor).props('show')).toBe(false)
   })
 })

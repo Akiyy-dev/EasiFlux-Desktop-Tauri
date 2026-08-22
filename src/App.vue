@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { NConfigProvider, NMessageProvider, darkTheme } from 'naive-ui'
-import AppShell from './components/layout/AppShell.vue'
-import ErrorToastBridge from './components/common/ErrorToastBridge.vue'
-import SettingsDialog from './components/settings/SettingsDialog.vue'
+import { NConfigProvider, NMessageProvider, darkTheme } from 'naive-ui'
+import AppShell from './components/layout/AppShell.vue'
+import ErrorToastBridge from './components/common/ErrorToastBridge.vue'
+import QuickSetupDialog from './components/settings/QuickSetupDialog.vue'
 import { naiveThemeOverrides } from './constants/naiveTheme'
 import { useTauriEvent, whenTauriListenersReady } from './composables/useTauriEvent'
 import { useAccountSessionEvent } from './composables/useAccountSessionEvent'
 import { useChartWorkspaceCloseGuard } from './composables/useChartWorkspaceCloseGuard'
-import { useAppStore } from './stores/app'
-import { useConfigStore } from './stores/config'
+import { useAppStore } from './stores/app'
+import { useAccountProfilesStore } from './stores/accountProfiles'
+import { useConfigStore } from './stores/config'
 import { useConnectionStore } from './stores/connection'
 import { useMarketStore } from './stores/market'
 import { useOrderStore } from './stores/order'
@@ -21,8 +22,7 @@ import { reportError as reportGlobalError } from './services/errorService'
 import { onConnectionStatusChanged, onWebsocketStatusChanged } from './services/realtimeService'
 import { onTimeUpdated } from './services/timeService'
 import { applyPrivatePanelsSnapshot } from './stores/privatePanels'
-import { normalizeAccountId } from './utils/account'
-import { normalizeOrders } from './utils/order'
+import { normalizeOrders } from './utils/order'
 import { normalizePositions } from './utils/position'
 import type {
   AccountSummary,
@@ -39,8 +39,9 @@ import type {
   TimeSnapshot,
 } from './types/models'
 
-const appStore = useAppStore()
-const configStore = useConfigStore()
+const appStore = useAppStore()
+const accountProfilesStore = useAccountProfilesStore()
+const configStore = useConfigStore()
 const connectionStore = useConnectionStore()
 const marketStore = useMarketStore()
 const orderStore = useOrderStore()
@@ -49,7 +50,7 @@ const accountStore = useAccountStore()
 const logStore = useLogStore()
 const timeStore = useTimeStore()
 
-const showSettings = ref(false)
+const showQuickSetup = ref(false)
 
 useChartWorkspaceCloseGuard()
 
@@ -136,45 +137,60 @@ onMounted(async () => {
     reportError('启动检查失败', error)
   }
 
-  try {
-    await configStore.fetchConfig()
-  } catch (error) {
-    reportError('加载配置失败', error)
-    showSettings.value = true
-    return
-  }
-
-  if (configStore.config) {
-    marketStore.activeSymbol = configStore.config.activeSymbol
-    marketStore.klineInterval = configStore.config.klineInterval
-    void marketStore.loadInstruments(configStore.config.watchlistSymbols)
-    void appStore.refreshEnvironment(true).catch((error) => {
-      reportError('环境检测失败', error)
-    })
-  }
-
-  const hasCreds = await configStore.hasCredentials(
-    normalizeAccountId(configStore.config?.activeAccountId),
-  )
-  if (hasCreds) {
-    try {
-      await connectionStore.connect(configStore.config?.useWebsocket ?? true)
-    } catch (error) {
-      reportError('自动连接失败', error)
-      showSettings.value = true
-    }
-  } else {
-    showSettings.value = true
-  }
-})
+  let config
+  try {
+    config = await configStore.fetchConfig()
+  } catch (error) {
+    reportError('加载配置失败', error)
+    return
+  }
+
+  const profilesPromise = accountProfilesStore.refreshProfiles()
+  marketStore.activeSymbol = config.activeSymbol
+  marketStore.klineInterval = config.klineInterval
+  void marketStore.loadInstruments(config.watchlistSymbols)
+  void appStore.refreshEnvironment(true).catch((error) => {
+    reportError('环境检测失败', error)
+  })
+
+  let profiles
+  try {
+    profiles = await profilesPromise
+  } catch (error) {
+    reportError('加载账户配置失败', error)
+    return
+  }
+
+  const activeProfile = profiles.find(
+    (profile) => profile.accountId === accountProfilesStore.activeAccountId,
+  )
+  if (!activeProfile) {
+    reportError('加载活动账户失败', new Error('活动账户不在账户列表中'))
+    return
+  }
+  if (activeProfile.credentialState === 'missing') {
+    showQuickSetup.value = true
+    return
+  }
+  if (activeProfile.credentialState === 'unavailable') {
+    reportError('读取账户凭据失败', new Error('凭据存储不可用'))
+    return
+  }
+
+  try {
+    await connectionStore.connect(config.useWebsocket)
+  } catch (error) {
+    reportError('自动连接失败', error)
+  }
+})
 </script>
 
 <template>
   <NConfigProvider :theme="darkTheme" :theme-overrides="naiveThemeOverrides">
     <NMessageProvider>
-      <ErrorToastBridge />
+      <ErrorToastBridge />
       <AppShell />
-      <SettingsDialog v-model:show="showSettings" />
+      <QuickSetupDialog v-model:show="showQuickSetup" />
     </NMessageProvider>
   </NConfigProvider>
 </template>

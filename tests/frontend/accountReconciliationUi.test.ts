@@ -3,7 +3,7 @@ import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import AccountProfilesPanel from '../../src/components/account/AccountProfilesPanel.vue'
 import CredentialEditor from '../../src/components/account/CredentialEditor.vue'
-import SettingsDialog from '../../src/components/settings/SettingsDialog.vue'
+import QuickSetupDialog from '../../src/components/settings/QuickSetupDialog.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConfigStore } from '../../src/stores/config'
@@ -56,8 +56,8 @@ describe('post-switch reconciliation UI', () => {
     })
   }
 
-  function mountSettings() {
-    return mount(SettingsDialog, {
+  function mountQuickSetup() {
+    return mount(QuickSetupDialog, {
       props: { show: true },
       global: { plugins: [pinia], stubs: { AppDialog: dialogStub } },
     })
@@ -93,7 +93,7 @@ describe('post-switch reconciliation UI', () => {
     await switchButton!.trigger('click')
     await vi.waitFor(() => expect(useAccountProfilesStore().reconciliationLoading).toBe(true))
 
-    const settings = mountSettings()
+    const settings = mountQuickSetup()
     await flushPromises()
     expect(panel.text()).toContain('正在同步已切换的账户')
     expect(settings.text()).toContain('正在同步已切换的账户')
@@ -157,7 +157,7 @@ describe('post-switch reconciliation UI', () => {
       if (command === 'get_connection_status') return Promise.resolve('disconnected')
       return Promise.resolve(undefined)
     })
-    const settings = mountSettings()
+    const settings = mountQuickSetup()
     const panel = mountPanel()
     await flushPromises()
     const store = useAccountProfilesStore()

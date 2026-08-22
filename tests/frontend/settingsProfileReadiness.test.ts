@@ -2,7 +2,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import CredentialEditor from '../../src/components/account/CredentialEditor.vue'
-import SettingsDialog from '../../src/components/settings/SettingsDialog.vue'
+import QuickSetupDialog from '../../src/components/settings/QuickSetupDialog.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConfigStore } from '../../src/stores/config'
@@ -41,8 +41,8 @@ describe('settings profile readiness', () => {
     vi.mocked(tauriInvoke).mockReset()
   })
 
-  function mountSettings() {
-    return mount(SettingsDialog, {
+  function mountQuickSetup() {
+    return mount(QuickSetupDialog, {
       props: { show: true },
       global: {
         plugins: [pinia],
@@ -53,7 +53,7 @@ describe('settings profile readiness', () => {
     })
   }
 
-  function editorEntryButtons(wrapper: ReturnType<typeof mountSettings>) {
+  function editorEntryButtons(wrapper: ReturnType<typeof mountQuickSetup>) {
     return wrapper.findAll('button').filter((button) =>
       button.text() === '编辑凭据'
         || button.text() === '保存凭据并连接')
@@ -62,7 +62,7 @@ describe('settings profile readiness', () => {
   it('blocks both entry points until the sanitized active profile is loaded', async () => {
     const pending = deferred<AccountProfile[]>()
     vi.mocked(tauriInvoke).mockReturnValueOnce(pending.promise)
-    const wrapper = mountSettings()
+    const wrapper = mountQuickSetup()
 
     expect(wrapper.text()).toContain('正在加载账户配置')
     expect(editorEntryButtons(wrapper)).toHaveLength(2)
@@ -84,7 +84,7 @@ describe('settings profile readiness', () => {
 
   it('blocks both entry points for unavailable credentials', async () => {
     vi.mocked(tauriInvoke).mockResolvedValueOnce([{ ...profile, credentialState: 'unavailable' }])
-    const wrapper = mountSettings()
+    const wrapper = mountQuickSetup()
     await flushPromises()
 
     expect(wrapper.text()).toContain('凭据存储不可用')
@@ -95,7 +95,7 @@ describe('settings profile readiness', () => {
 
   it('shows profile load errors and keeps both entry points blocked', async () => {
     vi.mocked(tauriInvoke).mockRejectedValueOnce(new Error('profile list failed'))
-    const wrapper = mountSettings()
+    const wrapper = mountQuickSetup()
     await flushPromises()
 
     expect(wrapper.get('[role="alert"]').text()).toContain('profile list failed')
@@ -112,7 +112,7 @@ describe('settings profile readiness', () => {
     vi.mocked(tauriInvoke)
       .mockRejectedValueOnce(new Error('temporary profile failure'))
       .mockResolvedValueOnce([profile])
-    const wrapper = mount(SettingsDialog, {
+    const wrapper = mount(QuickSetupDialog, {
       props: { show: false },
       global: {
         plugins: [pinia],
