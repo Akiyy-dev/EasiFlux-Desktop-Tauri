@@ -1,12 +1,35 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { compileStyle, parse } from 'vue/compiler-sfc'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import AppShell from '../../src/components/layout/AppShell.vue'
+import NavigationRail from '../../src/components/layout/NavigationRail.vue'
+import Sidebar from '../../src/components/layout/Sidebar.vue'
+import DashboardPage from '../../src/components/dashboard/DashboardPage.vue'
+import DashboardQuickActions from '../../src/components/dashboard/DashboardQuickActions.vue'
 import SettingsCenterPage from '../../src/components/settings/SettingsCenterPage.vue'
 import { SETTINGS_SECTION_BY_KEY, SETTINGS_SECTION_GROUPS } from '../../src/components/settings/settingsSections'
 import { useAppStore } from '../../src/stores/app'
+
+vi.mock('../../src/composables/useChartWorkspaceAutosaveHost', () => ({
+  useChartWorkspaceAutosaveHost: vi.fn(),
+}))
+vi.mock('../../src/components/layout/TradingLayout.vue', () => ({
+  default: {
+    name: 'TradingLayout',
+    props: { active: Boolean },
+    template: '<div data-testid="trading-layout" />',
+  },
+}))
+vi.mock('../../src/components/market/KlineChart.vue', () => ({
+  default: {
+    name: 'KlineChart',
+    props: { mode: String, active: Boolean },
+    template: '<div data-testid="kline-chart" />',
+  },
+}))
 
 const placeholderDescriptions = {
   plugins: '管理插件的启用状态、权限与插件级配置。',
@@ -36,6 +59,33 @@ function mountCenter(props: Record<string, unknown> = {}) {
       },
     },
   })
+}
+
+function mountShell() {
+  return mount(AppShell, {
+    global: {
+      plugins: [pinia],
+      stubs: {
+        ChartWorkspacePage: {
+          name: 'ChartWorkspacePage',
+          props: { active: Boolean },
+          template: '<div data-testid="chart-workspace-page" />',
+        },
+        GeneralSettingsPanel: {
+          template: '<div data-testid="general-settings-stub" />',
+        },
+        AccountSettingsPage: {
+          props: ['initialSection'],
+          template: '<div data-testid="account-settings-stub" :data-initial-section="initialSection" />',
+        },
+      },
+    },
+  })
+}
+
+async function clickRail(wrapper: ReturnType<typeof mountShell>, label: string): Promise<void> {
+  await wrapper.getComponent(NavigationRail).get(`button[aria-label="${label}"]`).trigger('click')
+  await flushPromises()
 }
 
 describe('SettingsCenterPage presentation', () => {
@@ -133,5 +183,119 @@ describe('SettingsCenterPage presentation', () => {
     await wrapper.get('[data-testid="settings-back"]').trigger('click')
 
     expect(wrapper.emitted('back')).toHaveLength(1)
+  })
+})
+
+describe('AppShell settings navigation', () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  it('does not expose news navigation or a Dashboard news action', () => {
+    const wrapper = mountShell()
+
+    expect(wrapper.find('button[aria-label^="新闻"]').exists()).toBe(false)
+    expect(wrapper.getComponent(DashboardQuickActions).text()).not.toContain('新闻中心')
+  })
+
+  it('uses the settings gear as primary navigation and removes the account rail item', async () => {
+    const wrapper = mountShell()
+
+    expect(wrapper.find('button[aria-label="账户"]').exists()).toBe(false)
+    await clickRail(wrapper, '设置')
+
+    expect(wrapper.getComponent(NavigationRail).props('active')).toBe('settings')
+    expect(wrapper.findComponent(SettingsCenterPage).exists()).toBe(true)
+    expect(wrapper.get('[data-testid="settings-nav-general"]').attributes('aria-current'))
+      .toBe('page')
+    expect(wrapper.get('[data-testid="general-settings-stub"]').exists()).toBe(true)
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(false)
+  })
+
+  it('returns from settings to the previous non-settings page', async () => {
+    const wrapper = mountShell()
+
+    await clickRail(wrapper, '交易')
+    await clickRail(wrapper, '设置')
+    await wrapper.get('[data-testid="settings-back"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.getComponent(NavigationRail).props('active')).toBe('trading')
+    expect(wrapper.findComponent(SettingsCenterPage).exists()).toBe(false)
+    expect(wrapper.get('[data-testid="trading-layout"]').isVisible()).toBe(true)
+  })
+
+  it('leaves settings immediately when a primary page is selected', async () => {
+    const wrapper = mountShell()
+
+    await clickRail(wrapper, '设置')
+    expect(wrapper.findComponent(SettingsCenterPage).exists()).toBe(true)
+    await clickRail(wrapper, '插件')
+
+    expect(wrapper.getComponent(NavigationRail).props('active')).toBe('plugins')
+    expect(wrapper.findComponent(SettingsCenterPage).exists()).toBe(false)
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(true)
+  })
+
+  it('mounts the generic Sidebar only for Home and Plugins', async () => {
+    const wrapper = mountShell()
+
+    expect(wrapper.getComponent(NavigationRail).props('active')).toBe('home')
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(true)
+
+    await clickRail(wrapper, '交易')
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(false)
+
+    await clickRail(wrapper, '图表')
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(false)
+
+    await clickRail(wrapper, '插件')
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(true)
+
+    await clickRail(wrapper, '设置')
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(false)
+  })
+
+  it('keeps an active settings session but remounts General for a later gear entry', async () => {
+    const wrapper = mountShell()
+
+    await clickRail(wrapper, '设置')
+    await wrapper.get('[data-testid="settings-nav-notifications"]').trigger('click')
+    expect(wrapper.get('[data-testid="settings-nav-notifications"]').attributes('aria-current'))
+      .toBe('page')
+
+    await clickRail(wrapper, '设置')
+    expect(wrapper.get('[data-testid="settings-nav-notifications"]').attributes('aria-current'))
+      .toBe('page')
+
+    await clickRail(wrapper, '首页')
+    await clickRail(wrapper, '设置')
+    expect(wrapper.get('[data-testid="settings-nav-general"]').attributes('aria-current'))
+      .toBe('page')
+    expect(wrapper.get('[data-testid="general-settings-stub"]').exists()).toBe(true)
+  })
+
+  it('opens Dashboard assets as an account/assets deep link without persisting it', async () => {
+    const wrapper = mountShell()
+    const quickActions = wrapper.getComponent(DashboardPage).getComponent(DashboardQuickActions)
+    const assetsAction = quickActions.findAll('button')
+      .find((button) => button.text().includes('查看资产'))
+
+    expect(assetsAction).toBeDefined()
+    await assetsAction!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.getComponent(NavigationRail).props('active')).toBe('settings')
+    expect(wrapper.get('[data-testid="settings-nav-account"]').attributes('aria-current'))
+      .toBe('page')
+    expect(wrapper.get('[data-testid="account-settings-stub"]').attributes('data-initial-section'))
+      .toBe('assets')
+
+    await clickRail(wrapper, '首页')
+    await clickRail(wrapper, '设置')
+    expect(wrapper.get('[data-testid="settings-nav-general"]').attributes('aria-current'))
+      .toBe('page')
+    expect(wrapper.find('[data-testid="account-settings-stub"]').exists()).toBe(false)
   })
 })

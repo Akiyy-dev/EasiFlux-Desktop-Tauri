@@ -5,7 +5,6 @@ import {
   Home,
   Puzzle,
   Settings,
-  User,
 } from 'lucide-vue-next'
 import type { FunctionalComponent } from 'vue'
 import type { NavKey } from '../../types/navigation'
@@ -17,7 +16,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   select: [key: NavKey]
-  openSettings: []
 }>()
 
 const items: Array<{
@@ -28,7 +26,6 @@ const items: Array<{
   { key: 'home', label: '首页', icon: Home },
   { key: 'trading', label: '交易', icon: ArrowLeftRight },
   { key: 'charts', label: '图表', icon: BarChart3 },
-  { key: 'account', label: '账户', icon: User },
   { key: 'plugins', label: '插件', icon: Puzzle },
 ]
 </script>
@@ -60,7 +57,7 @@ const items: Array<{
         :class="{ active: props.active === 'settings' }"
         title="设置"
         aria-label="设置"
-        @click="emit('openSettings')"
+        @click="emit('select', 'settings')"
       >
         <AppIcon :icon="Settings" :size="18" />
       </AppButton>

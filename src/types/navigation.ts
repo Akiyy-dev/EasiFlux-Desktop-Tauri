@@ -1,5 +1,4 @@
 export type AccountSettingsSection = 'api' | 'assets' | 'risk'
-export type AccountSection = AccountSettingsSection
 
 export type SettingsSection =
   | 'general'
@@ -13,22 +12,22 @@ export type SettingsSection =
   | 'languageRegion'
   | 'about'
 
-export type NavKey =
-  | 'home'
-  | 'trading'
-  | 'charts'
-  | 'account'
-  | 'plugins'
-  | 'settings'
+export type PrimaryPage = 'home' | 'trading' | 'charts' | 'plugins' | 'settings'
+export type NavKey = PrimaryPage
 
-export interface NavigationTarget {
-  page: NavKey
-  section?: AccountSection
-}
+export type SettingsNavigationTarget =
+  | { page: 'settings'; settingsSection?: Exclude<SettingsSection, 'account'> }
+  | { page: 'settings'; settingsSection: 'account'; accountSection?: AccountSettingsSection }
 
-export type NonAccountSection = 'welcome' | 'updates' | 'installed' | 'market' | 'manage'
-export type SidebarSectionKey = AccountSection | NonAccountSection
+export type NavigationTarget =
+  | { page: Exclude<PrimaryPage, 'settings'> }
+  | SettingsNavigationTarget
 
+export type NavigationRequest = PrimaryPage | NavigationTarget
+
+export type HomeSection = 'welcome' | 'updates'
+export type PluginSection = 'installed' | 'market' | 'manage'
+export type SidebarSectionKey = HomeSection | PluginSection
 export type SidebarTarget =
-  | { page: 'account'; section: AccountSection }
-  | { page: Exclude<NavKey, 'account'>; section: NonAccountSection }
+  | { page: 'home'; section: HomeSection }
+  | { page: 'plugins'; section: PluginSection }

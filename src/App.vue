@@ -173,7 +173,7 @@ onMounted(async () => {
   <NConfigProvider :theme="darkTheme" :theme-overrides="naiveThemeOverrides">
     <NMessageProvider>
       <ErrorToastBridge />
-      <AppShell @open-settings="showSettings = true" />
+      <AppShell />
       <SettingsDialog v-model:show="showSettings" />
     </NMessageProvider>
   </NConfigProvider>
