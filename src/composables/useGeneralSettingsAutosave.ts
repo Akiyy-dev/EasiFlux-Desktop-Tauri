@@ -86,7 +86,7 @@ export function useGeneralSettingsAutosave(
 
   async function dispose(): Promise<void> {
     clearTimer()
-    if (status.value !== 'error') await flush()
+    await flush()
     if (status.value === 'error') {
       throw new Error(error.value ?? '通用设置保存失败')
     }

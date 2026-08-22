@@ -216,6 +216,39 @@ describe('general settings autosave', () => {
     expect(autosave.status.value).toBe('saved')
   })
 
+  it('waits for pending reconciliation before rejecting disposal', async () => {
+    vi.useFakeTimers()
+    const saveError = new Error('save failed before dispose')
+    const pendingReconcile = deferred<void>()
+    const save = vi.fn<
+      (value: GeneralSettings) => Promise<GeneralSettings>
+    >().mockRejectedValueOnce(saveError)
+    const reconcile = vi.fn(() => pendingReconcile.promise)
+    const autosave = useGeneralSettingsAutosave(save, reconcile, 300)
+
+    autosave.initialize({ useWebsocket: true, tickerPollInterval: 1 })
+    autosave.update({ tickerPollInterval: 2 })
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+    expect(autosave.status.value).toBe('error')
+    expect(reconcile).toHaveBeenCalledTimes(1)
+
+    const disposing = autosave.dispose()
+    let disposalSettled = false
+    void disposing.then(
+      () => { disposalSettled = true },
+      () => { disposalSettled = true },
+    )
+    await flushPromises()
+    const settledBeforeReconcile = disposalSettled
+
+    pendingReconcile.resolve()
+    await expect(disposing).rejects.toThrow('save failed before dispose')
+    expect(settledBeforeReconcile).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+    await expect(autosave.flush()).resolves.toBeUndefined()
+  })
+
   it('rejects disposal after reconciling a final failed save', async () => {
     vi.useFakeTimers()
     const save = vi.fn<
