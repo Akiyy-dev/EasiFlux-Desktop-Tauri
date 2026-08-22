@@ -1,4 +1,5 @@
 import { createPinia, setActivePinia } from 'pinia'
+import { watch } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useConnectionStore } from '../../src/stores/connection'
 
@@ -7,6 +8,14 @@ vi.mock('../../src/composables/useTauriCommand', () => ({
 }))
 
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
+
+function reconnectAction(store: ReturnType<typeof useConnectionStore>) {
+  // Pinia wraps public action promises for subscriptions. Exercise the setup
+  // action itself when asserting the identity of the store's shared flight.
+  return (store as unknown as {
+    _hmrPayload: { actions: { reconnect: typeof store.reconnect } }
+  })._hmrPayload.actions.reconnect
+}
 
 describe('connection store', () => {
   beforeEach(() => {
@@ -147,6 +156,147 @@ describe('connection store', () => {
     expect(commands.indexOf('disconnect')).toBeLessThan(commands.indexOf('connect'))
     expect(store.reconnecting).toBe(false)
     expect(store.reconnectError).toBeNull()
+  })
+
+  it('publishes the active reconnect promise before synchronous true watchers reenter', async () => {
+    let releaseDisconnect!: () => void
+    const disconnectPending = new Promise<void>((resolve) => {
+      releaseDisconnect = resolve
+    })
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'disconnect') return disconnectPending
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    const reconnect = reconnectAction(store)
+    let joined!: Promise<void>
+    const stop = watch(
+      () => store.reconnecting,
+      (reconnecting) => {
+        if (reconnecting) joined = reconnect(true)
+      },
+      { flush: 'sync' },
+    )
+
+    try {
+      const first = reconnect(false)
+      let firstSettled = false
+      let joinedSettled = false
+      void first.then(() => { firstSettled = true })
+      void joined.then(() => { joinedSettled = true })
+
+      expect(joined).toBe(first)
+      await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('disconnect'))
+      await Promise.resolve()
+      expect(firstSettled).toBe(false)
+      expect(joinedSettled).toBe(false)
+
+      releaseDisconnect()
+      await expect(Promise.all([first, joined])).resolves.toEqual([undefined, undefined])
+
+      const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
+      expect(commands.filter((command) => command === 'disconnect')).toHaveLength(1)
+      expect(commands.filter((command) => command === 'connect')).toHaveLength(1)
+      expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+        startRealtime: false,
+        credential: undefined,
+      })
+    } finally {
+      stop()
+    }
+  })
+
+  it('starts a new reconnect flight from a synchronous false watcher', async () => {
+    let releaseSecondDisconnect!: () => void
+    const secondDisconnectPending = new Promise<void>((resolve) => {
+      releaseSecondDisconnect = resolve
+    })
+    let disconnectCount = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'disconnect') {
+        disconnectCount += 1
+        return disconnectCount === 1 ? Promise.resolve(undefined) : secondDisconnectPending
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    const reconnect = reconnectAction(store)
+    let second: Promise<void> | undefined
+    let startedSecond = false
+    const stop = watch(
+      () => store.reconnecting,
+      (reconnecting) => {
+        if (!reconnecting && !startedSecond) {
+          startedSecond = true
+          second = reconnect(true)
+        }
+      },
+      { flush: 'sync' },
+    )
+
+    try {
+      const first = reconnect(false)
+      await first
+
+      expect(second).toBeDefined()
+      expect(second).not.toBe(first)
+      await vi.waitFor(() => expect(disconnectCount).toBe(2))
+
+      let secondSettled = false
+      void second!.then(() => { secondSettled = true })
+      await Promise.resolve()
+      expect(secondSettled).toBe(false)
+
+      releaseSecondDisconnect()
+      await expect(second).resolves.toBeUndefined()
+
+      const reconnectCommands = vi.mocked(tauriInvoke).mock.calls
+        .filter(([command]) => command === 'disconnect' || command === 'connect')
+      expect(reconnectCommands).toEqual([
+        ['disconnect'],
+        ['connect', { startRealtime: false, credential: undefined }],
+        ['disconnect'],
+        ['connect', { startRealtime: true, credential: undefined }],
+      ])
+    } finally {
+      stop()
+    }
+  })
+
+  it('observes intents appended synchronously while evaluating a reconnect guard', async () => {
+    let releaseDisconnect!: () => void
+    const disconnectPending = new Promise<void>((resolve) => {
+      releaseDisconnect = resolve
+    })
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'disconnect') return disconnectPending
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    const reconnect = reconnectAction(store)
+    let joined!: Promise<void>
+
+    const first = reconnect(false, () => {
+      joined = reconnect(true)
+      return false
+    })
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('disconnect'))
+    releaseDisconnect()
+
+    await vi.waitFor(() => expect(joined).toBeDefined())
+    expect(joined).toBe(first)
+    await expect(Promise.all([first, joined])).resolves.toEqual([undefined, undefined])
+
+    const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command === 'disconnect')).toHaveLength(1)
+    expect(commands.filter((command) => command === 'connect')).toHaveLength(1)
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: true,
+      credential: undefined,
+    })
   })
 
   it('skips connect when the caller guard invalidates during disconnect', async () => {

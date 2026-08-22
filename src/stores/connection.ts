@@ -96,6 +96,30 @@ export const useConnectionStore = defineStore('connection', () => {
     setWsStatus('disconnected')
   }
 
+  async function runReconnectFlight(flight: ReconnectFlight): Promise<void> {
+    try {
+      await disconnect()
+      let selected: ReconnectIntent | undefined
+      for (let index = 0; index < flight.intents.length; index += 1) {
+        const candidate = flight.intents[index]
+        if (candidate.shouldConnect?.() !== false) {
+          selected = candidate
+          break
+        }
+      }
+      if (!selected) return
+      await connect(selected.startRealtime)
+    } catch (error) {
+      reconnectError.value = formatInvokeError(error)
+      throw error
+    } finally {
+      if (reconnectFlight === flight) {
+        reconnectFlight = null
+        reconnecting.value = false
+      }
+    }
+  }
+
   function reconnect(
     startRealtime: boolean,
     shouldConnect?: () => boolean,
@@ -105,29 +129,11 @@ export const useConnectionStore = defineStore('connection', () => {
       reconnectFlight.intents.push(intent)
       return reconnectFlight.promise
     }
-    const flight: ReconnectFlight = {
-      intents: [intent],
-      promise: Promise.resolve(),
-    }
+    const flight = { intents: [intent] } as ReconnectFlight
+    flight.promise = Promise.resolve().then(() => runReconnectFlight(flight))
     reconnectFlight = flight
-    reconnecting.value = true
     reconnectError.value = null
-    flight.promise = (async () => {
-      try {
-        await disconnect()
-        const selected = flight.intents.find((candidate) =>
-          candidate.shouldConnect?.() !== false,
-        )
-        if (!selected) return
-        await connect(selected.startRealtime)
-      } catch (error) {
-        reconnectError.value = formatInvokeError(error)
-        throw error
-      } finally {
-        reconnecting.value = false
-        if (reconnectFlight === flight) reconnectFlight = null
-      }
-    })()
+    reconnecting.value = true
     return flight.promise
   }
 
