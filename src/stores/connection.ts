@@ -124,7 +124,9 @@ export const useConnectionStore = defineStore('connection', () => {
       const message = formatInvokeError(error)
       if (canApplyCompletion()) {
         setStatus('error')
-        lastError.value = message
+        if (canApplyCompletion()) {
+          lastError.value = message
+        }
       }
       const wrapped = new Error(message) as Error & { cause?: unknown }
       wrapped.cause = error
@@ -138,6 +140,7 @@ export const useConnectionStore = defineStore('connection', () => {
     isCompletionValid?: ConnectionCompletionValidity,
   ): Promise<void> {
     const connectionRequest = ++latestConnectionRequest
+    unpublishSupersededReconnectFlight()
     return connectWithRequest(
       connectionRequest,
       startRealtime,
@@ -158,14 +161,37 @@ export const useConnectionStore = defineStore('connection', () => {
 
   async function disconnect(): Promise<void> {
     const connectionRequest = ++latestConnectionRequest
+    unpublishSupersededReconnectFlight()
     await disconnectWithRequest(connectionRequest)
+  }
+
+  function unpublishSupersededReconnectFlight(): void {
+    if (!reconnectFlight) return
+    reconnectFlight = null
+    reconnecting.value = false
+  }
+
+  function reconnectFlightHasCurrentIntent(flight: ReconnectFlight): boolean {
+    if (flight.connectionRequest !== latestConnectionRequest) return false
+    for (let index = 0; index < flight.intents.length; index += 1) {
+      if (connectionCompletionRemainsCurrent(
+        flight.connectionRequest,
+        flight.intents[index].shouldConnect,
+      )) {
+        return true
+      }
+      if (flight.connectionRequest !== latestConnectionRequest) return false
+    }
+    return false
   }
 
   async function runReconnectFlight(flight: ReconnectFlight): Promise<void> {
     let selected: ReconnectIntent | undefined
+    let selectionStarted = false
     try {
       const disconnected = await disconnectWithRequest(flight.connectionRequest)
       if (!disconnected) return
+      selectionStarted = true
       for (let index = 0; index < flight.intents.length; index += 1) {
         const candidate = flight.intents[index]
         if (candidate.shouldConnect?.() !== false) {
@@ -181,10 +207,15 @@ export const useConnectionStore = defineStore('connection', () => {
         selected.shouldConnect,
       )
     } catch (error) {
-      if (connectionCompletionRemainsCurrent(
-        flight.connectionRequest,
-        selected?.shouldConnect,
-      )) {
+      const canPublishFailure = selected
+        ? connectionCompletionRemainsCurrent(
+            flight.connectionRequest,
+            selected.shouldConnect,
+          )
+        : selectionStarted
+          ? connectionCompletionRemainsCurrent(flight.connectionRequest)
+          : reconnectFlightHasCurrentIntent(flight)
+      if (canPublishFailure) {
         reconnectError.value = formatInvokeError(error)
       }
       throw error
@@ -201,7 +232,10 @@ export const useConnectionStore = defineStore('connection', () => {
     shouldConnect?: () => boolean,
   ): Promise<void> {
     const intent = { startRealtime, shouldConnect }
-    if (reconnectFlight) {
+    if (
+      reconnectFlight
+      && reconnectFlight.connectionRequest === latestConnectionRequest
+    ) {
       reconnectFlight.intents.push(intent)
       return reconnectFlight.promise
     }
