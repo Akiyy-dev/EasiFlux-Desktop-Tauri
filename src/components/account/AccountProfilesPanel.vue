@@ -50,7 +50,7 @@ watch(() => connectionStore.connected, (connected, wasConnected) => {
   if (connected || (wasConnected && !connectionStore.reconnecting)) {
     invalidateReconnect()
   }
-})
+}, { flush: 'sync' })
 
 function retryProfileList(): void {
   void store.refreshProfiles().catch(() => undefined)

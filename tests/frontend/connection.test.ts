@@ -173,6 +173,116 @@ describe('connection store', () => {
     expect(store.reconnectError).toBeNull()
   })
 
+  it('uses a later default intent when the first guarded intent becomes stale', async () => {
+    let firstIntentValid = true
+    let releaseDisconnect!: () => void
+    const disconnectPending = new Promise<void>((resolve) => {
+      releaseDisconnect = resolve
+    })
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'disconnect') return disconnectPending
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+
+    const first = store.reconnect(false, () => firstIntentValid)
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('disconnect'))
+    const second = store.reconnect(true)
+    firstIntentValid = false
+    releaseDisconnect()
+
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined])
+    const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command === 'disconnect')).toHaveLength(1)
+    expect(commands.filter((command) => command === 'connect')).toHaveLength(1)
+    expect(commands.indexOf('disconnect')).toBeLessThan(commands.indexOf('connect'))
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: true,
+      credential: undefined,
+    })
+  })
+
+  it('keeps the first default intent ahead of a later guarded intent', async () => {
+    let releaseDisconnect!: () => void
+    const disconnectPending = new Promise<void>((resolve) => {
+      releaseDisconnect = resolve
+    })
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'disconnect') return disconnectPending
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+
+    const first = store.reconnect(false)
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('disconnect'))
+    const second = store.reconnect(true, () => true)
+    releaseDisconnect()
+
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined])
+    const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command === 'disconnect')).toHaveLength(1)
+    expect(commands.filter((command) => command === 'connect')).toHaveLength(1)
+    expect(commands.indexOf('disconnect')).toBeLessThan(commands.indexOf('connect'))
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: false,
+      credential: undefined,
+    })
+  })
+
+  it('keeps the first valid guarded intent ahead of a later default intent', async () => {
+    let releaseDisconnect!: () => void
+    const disconnectPending = new Promise<void>((resolve) => {
+      releaseDisconnect = resolve
+    })
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'disconnect') return disconnectPending
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+
+    const first = store.reconnect(false, () => true)
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('disconnect'))
+    const second = store.reconnect(true)
+    releaseDisconnect()
+
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined])
+    const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command === 'disconnect')).toHaveLength(1)
+    expect(commands.filter((command) => command === 'connect')).toHaveLength(1)
+    expect(commands.indexOf('disconnect')).toBeLessThan(commands.indexOf('connect'))
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: false,
+      credential: undefined,
+    })
+  })
+
+  it('rejects the flight when an intent guard throws', async () => {
+    let releaseDisconnect!: () => void
+    const disconnectPending = new Promise<void>((resolve) => {
+      releaseDisconnect = resolve
+    })
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'disconnect') return disconnectPending
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    const guardError = new Error('reconnect guard failed')
+
+    const first = store.reconnect(false, () => { throw guardError })
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('disconnect'))
+    const second = store.reconnect(true)
+    releaseDisconnect()
+
+    await expect(first).rejects.toThrow('reconnect guard failed')
+    await expect(second).rejects.toThrow('reconnect guard failed')
+    expect(tauriInvoke).not.toHaveBeenCalledWith('connect', expect.anything())
+    expect(store.reconnecting).toBe(false)
+    expect(store.reconnectError).toBe('reconnect guard failed')
+  })
+
   it('rejects a failed reconnect and leaves it retryable', async () => {
     const store = useConnectionStore()
     vi.mocked(tauriInvoke).mockImplementation((command) => {

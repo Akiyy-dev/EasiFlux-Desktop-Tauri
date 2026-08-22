@@ -4,6 +4,16 @@ import { tauriInvoke } from '../composables/useTauriCommand'
 import type { ApiCredential, ConnectionStatus } from '../types/models'
 import { refreshSyncTask } from '../services/dataSyncService'
 
+type ReconnectIntent = {
+  startRealtime: boolean
+  shouldConnect?: () => boolean
+}
+
+type ReconnectFlight = {
+  intents: ReconnectIntent[]
+  promise: Promise<void>
+}
+
 function parseStatus(next: string): ConnectionStatus | null {
   if (
     next === 'disconnected'
@@ -32,7 +42,7 @@ export const useConnectionStore = defineStore('connection', () => {
   const lastError = ref<string | null>(null)
   const reconnecting = ref(false)
   const reconnectError = ref<string | null>(null)
-  let reconnectPromise: Promise<void> | null = null
+  let reconnectFlight: ReconnectFlight | null = null
   let latestStatusRequest = 0
   let latestWsStatusRequest = 0
   const connecting = computed(() => status.value === 'connecting')
@@ -88,25 +98,37 @@ export const useConnectionStore = defineStore('connection', () => {
 
   function reconnect(
     startRealtime: boolean,
-    shouldConnect: () => boolean = () => true,
+    shouldConnect?: () => boolean,
   ): Promise<void> {
-    if (reconnectPromise) return reconnectPromise
+    const intent = { startRealtime, shouldConnect }
+    if (reconnectFlight) {
+      reconnectFlight.intents.push(intent)
+      return reconnectFlight.promise
+    }
+    const flight: ReconnectFlight = {
+      intents: [intent],
+      promise: Promise.resolve(),
+    }
+    reconnectFlight = flight
     reconnecting.value = true
     reconnectError.value = null
-    reconnectPromise = (async () => {
+    flight.promise = (async () => {
       try {
         await disconnect()
-        if (!shouldConnect()) return
-        await connect(startRealtime)
+        const selected = flight.intents.find((candidate) =>
+          candidate.shouldConnect?.() !== false,
+        )
+        if (!selected) return
+        await connect(selected.startRealtime)
       } catch (error) {
         reconnectError.value = formatInvokeError(error)
         throw error
       } finally {
         reconnecting.value = false
-        reconnectPromise = null
+        if (reconnectFlight === flight) reconnectFlight = null
       }
     })()
-    return reconnectPromise
+    return flight.promise
   }
 
   async function refreshStatus(): Promise<ConnectionStatus> {

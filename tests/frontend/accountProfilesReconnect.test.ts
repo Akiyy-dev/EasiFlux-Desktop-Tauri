@@ -408,4 +408,22 @@ describe('AccountProfilesPanel credential reconnect', () => {
 
     expect(wrapper.find('[data-testid="account-reconnect"]').exists()).toBe(false)
   })
+
+  it('keeps a same-tick credential save after a natural connection succeeds', async () => {
+    useConnectionStore().setStatus('disconnected')
+    const wrapper = mountPanel()
+    await flushPromises()
+    vi.mocked(tauriInvoke).mockClear()
+
+    useConnectionStore().setStatus('connected')
+    await emitSaved(wrapper, 'primary')
+
+    expect(wrapper.text()).toContain('凭据已保存，重新连接后生效')
+    await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
+    await flushPromises()
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: true,
+      credential: undefined,
+    })
+  })
 })
