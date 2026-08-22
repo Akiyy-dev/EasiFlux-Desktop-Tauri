@@ -187,7 +187,7 @@ async fn unchanged_interval_does_not_rearm_market_fallback() {
     let runtime = Arc::new(RwLock::new(initial));
     let notifications = Arc::new(AtomicUsize::new(0));
 
-    apply_general_settings_update(
+    let result = apply_general_settings_update(
         &AccountLifecycleCoordinator::new(),
         &store,
         &runtime,
@@ -205,6 +205,14 @@ async fn unchanged_interval_does_not_rearm_market_fallback() {
     .await
     .unwrap();
 
+    let memory = runtime.read().await.clone();
+    let disk = store.load().unwrap();
+    assert!(!result.use_websocket);
+    assert_eq!(result.ticker_poll_interval, 1.0);
+    for config in [&memory, &disk] {
+        assert!(!config.use_websocket);
+        assert_eq!(config.ticker_poll_interval, 1.0);
+    }
     assert_eq!(notifications.load(Ordering::SeqCst), 0);
     cleanup_config(&path);
 }
@@ -244,11 +252,14 @@ async fn concurrent_general_and_market_updates_preserve_both_modules() {
     drop(held);
 
     let (general_result, market_result) = tokio::join!(general, market);
-    general_result.unwrap();
+    let general_settings = general_result.unwrap();
     market_result.unwrap();
+    assert!(!general_settings.use_websocket);
+    assert_eq!(general_settings.ticker_poll_interval, 20.0);
     let memory = runtime.read().await.clone();
     let disk = store.load().unwrap();
     for config in [&memory, &disk] {
+        assert!(!config.use_websocket);
         assert_eq!(config.ticker_poll_interval, 20.0);
         assert_eq!(config.active_symbol, "ETHUSDT");
         assert_eq!(config.kline_interval, "15");
@@ -301,10 +312,13 @@ async fn queued_lifecycle_fields_then_general_preserve_account_window_and_risk()
 
     let (lifecycle_result, general_result) = tokio::join!(lifecycle, general);
     lifecycle_result.unwrap();
-    general_result.unwrap();
+    let general_settings = general_result.unwrap();
+    assert!(!general_settings.use_websocket);
+    assert_eq!(general_settings.ticker_poll_interval, 30.0);
     let memory = runtime.read().await.clone();
     let disk = store.load().unwrap();
     for config in [&memory, &disk] {
+        assert!(!config.use_websocket);
         assert_eq!(config.ticker_poll_interval, 30.0);
         assert_eq!(config.active_account_id, "backup");
         assert_eq!(
@@ -331,14 +345,32 @@ async fn queued_general_updates_notify_in_commit_order() {
     let held = coordinator.mutation_guard().await;
     let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    let first = apply_general_settings_update(&coordinator, &store, &runtime, request(10.0), {
-        let notifications = Arc::clone(&notifications);
-        move |interval| notifications.lock().unwrap().push(interval)
-    });
-    let second = apply_general_settings_update(&coordinator, &store, &runtime, request(20.0), {
-        let notifications = Arc::clone(&notifications);
-        move |interval| notifications.lock().unwrap().push(interval)
-    });
+    let first = apply_general_settings_update(
+        &coordinator,
+        &store,
+        &runtime,
+        UpdateGeneralSettingsRequest {
+            use_websocket: true,
+            ticker_poll_interval: 10.0,
+        },
+        {
+            let notifications = Arc::clone(&notifications);
+            move |interval| notifications.lock().unwrap().push(interval)
+        },
+    );
+    let second = apply_general_settings_update(
+        &coordinator,
+        &store,
+        &runtime,
+        UpdateGeneralSettingsRequest {
+            use_websocket: false,
+            ticker_poll_interval: 20.0,
+        },
+        {
+            let notifications = Arc::clone(&notifications);
+            move |interval| notifications.lock().unwrap().push(interval)
+        },
+    );
     tokio::pin!(first);
     tokio::pin!(second);
     assert!(matches!(
@@ -352,15 +384,21 @@ async fn queued_general_updates_notify_in_commit_order() {
     drop(held);
 
     let (first_result, second_result) = tokio::join!(first, second);
-    first_result.unwrap();
-    second_result.unwrap();
+    let first_settings = first_result.unwrap();
+    let second_settings = second_result.unwrap();
+    assert!(first_settings.use_websocket);
+    assert_eq!(first_settings.ticker_poll_interval, 10.0);
+    assert!(!second_settings.use_websocket);
+    assert_eq!(second_settings.ticker_poll_interval, 20.0);
     assert_eq!(
         *notifications.lock().unwrap(),
         [Duration::from_secs(10), Duration::from_secs(20)],
     );
     let memory = runtime.read().await.clone();
     let disk = store.load().unwrap();
+    assert!(!memory.use_websocket);
     assert_eq!(memory.ticker_poll_interval, 20.0);
+    assert!(!disk.use_websocket);
     assert_eq!(disk.ticker_poll_interval, 20.0);
     cleanup_config(&path);
 }
