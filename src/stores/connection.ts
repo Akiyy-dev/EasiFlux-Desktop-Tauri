@@ -11,6 +11,7 @@ type ReconnectIntent = {
 
 type ReconnectFlight = {
   intents: ReconnectIntent[]
+  connectionRequest: number
   promise: Promise<void>
 }
 
@@ -77,16 +78,30 @@ export const useConnectionStore = defineStore('connection', () => {
     }
   }
 
-  async function connect(
+  function connectionCompletionRemainsCurrent(
+    connectionRequest: number,
+    isCompletionValid?: ConnectionCompletionValidity,
+  ): boolean {
+    if (connectionRequest !== latestConnectionRequest) return false
+    if (!completionRemainsValid(isCompletionValid)) return false
+    return connectionRequest === latestConnectionRequest
+  }
+
+  async function connectWithRequest(
+    connectionRequest: number,
     startRealtime = true,
     credential?: ApiCredential,
     isCompletionValid?: ConnectionCompletionValidity,
   ): Promise<void> {
-    const connectionRequest = ++latestConnectionRequest
-    const canApplyCompletion = () => connectionRequest === latestConnectionRequest
-      && completionRemainsValid(isCompletionValid)
+    const canApplyCompletion = () => connectionCompletionRemainsCurrent(
+      connectionRequest,
+      isCompletionValid,
+    )
+    if (!canApplyCompletion()) return
     lastError.value = null
+    if (!canApplyCompletion()) return
     setStatus('connecting')
+    if (!canApplyCompletion()) return
     try {
       await tauriInvoke('connect', { startRealtime, credential })
       if (!canApplyCompletion()) return
@@ -117,18 +132,40 @@ export const useConnectionStore = defineStore('connection', () => {
     }
   }
 
+  function connect(
+    startRealtime = true,
+    credential?: ApiCredential,
+    isCompletionValid?: ConnectionCompletionValidity,
+  ): Promise<void> {
+    const connectionRequest = ++latestConnectionRequest
+    return connectWithRequest(
+      connectionRequest,
+      startRealtime,
+      credential,
+      isCompletionValid,
+    )
+  }
+
+  async function disconnectWithRequest(connectionRequest: number): Promise<boolean> {
+    if (connectionRequest !== latestConnectionRequest) return false
+    await tauriInvoke('disconnect')
+    if (connectionRequest !== latestConnectionRequest) return false
+    setStatus('disconnected')
+    if (connectionRequest !== latestConnectionRequest) return false
+    setWsStatus('disconnected')
+    return connectionRequest === latestConnectionRequest
+  }
+
   async function disconnect(): Promise<void> {
     const connectionRequest = ++latestConnectionRequest
-    await tauriInvoke('disconnect')
-    if (connectionRequest !== latestConnectionRequest) return
-    setStatus('disconnected')
-    setWsStatus('disconnected')
+    await disconnectWithRequest(connectionRequest)
   }
 
   async function runReconnectFlight(flight: ReconnectFlight): Promise<void> {
     let selected: ReconnectIntent | undefined
     try {
-      await disconnect()
+      const disconnected = await disconnectWithRequest(flight.connectionRequest)
+      if (!disconnected) return
       for (let index = 0; index < flight.intents.length; index += 1) {
         const candidate = flight.intents[index]
         if (candidate.shouldConnect?.() !== false) {
@@ -137,9 +174,17 @@ export const useConnectionStore = defineStore('connection', () => {
         }
       }
       if (!selected) return
-      await connect(selected.startRealtime, undefined, selected.shouldConnect)
+      await connectWithRequest(
+        flight.connectionRequest,
+        selected.startRealtime,
+        undefined,
+        selected.shouldConnect,
+      )
     } catch (error) {
-      if (!selected || completionRemainsValid(selected.shouldConnect)) {
+      if (connectionCompletionRemainsCurrent(
+        flight.connectionRequest,
+        selected?.shouldConnect,
+      )) {
         reconnectError.value = formatInvokeError(error)
       }
       throw error
@@ -160,7 +205,10 @@ export const useConnectionStore = defineStore('connection', () => {
       reconnectFlight.intents.push(intent)
       return reconnectFlight.promise
     }
-    const flight = { intents: [intent] } as ReconnectFlight
+    const flight = {
+      intents: [intent],
+      connectionRequest: ++latestConnectionRequest,
+    } as ReconnectFlight
     flight.promise = Promise.resolve().then(() => runReconnectFlight(flight))
     reconnectFlight = flight
     reconnectError.value = null
@@ -176,8 +224,7 @@ export const useConnectionStore = defineStore('connection', () => {
     const next = await tauriInvoke<ConnectionStatus>('get_connection_status')
     const applied = requestId === latestStatusRequest
       && (connectionRequest === undefined || (
-        connectionRequest === latestConnectionRequest
-        && completionRemainsValid(isCompletionValid)
+        connectionCompletionRemainsCurrent(connectionRequest, isCompletionValid)
       ))
     if (applied) status.value = next
     return { status: next, applied }
