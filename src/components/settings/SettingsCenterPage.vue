@@ -46,4 +46,4 @@ function selectSection(section: SettingsSection): void {
   </section>
 </template>
 
-<style scoped src="./SettingsCenterPage.css"></style>
+<style src="./SettingsCenterPage.css"></style>

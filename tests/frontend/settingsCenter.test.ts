@@ -1,5 +1,8 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
+import { compileStyle, parse } from 'vue/compiler-sfc'
 import { beforeEach, describe, expect, it } from 'vitest'
 import SettingsCenterPage from '../../src/components/settings/SettingsCenterPage.vue'
 import { SETTINGS_SECTION_BY_KEY, SETTINGS_SECTION_GROUPS } from '../../src/components/settings/settingsSections'
@@ -74,12 +77,40 @@ describe('SettingsCenterPage presentation', () => {
       await wrapper.get(`[data-testid="settings-nav-${key}"]`).trigger('click')
 
       const placeholder = wrapper.get('[data-testid="settings-placeholder"]')
-      expect(placeholder.text()).toContain(description)
-      expect(placeholder.text()).toContain('规划中')
+      const paragraphs = placeholder.findAll('p')
+      expect(paragraphs).toHaveLength(2)
+      expect(paragraphs[0].text()).toBe(description)
+      expect(paragraphs[1].text()).toBe('规划中')
       expect(placeholder.findAll('button, a[href], input, select, textarea, [role="switch"], [tabindex]'))
         .toHaveLength(0)
     },
   )
+
+  it('compiles child navigation styles without a parent scope attribute', () => {
+    const pageSource = readFileSync(
+      resolve(process.cwd(), 'src/components/settings/SettingsCenterPage.vue'),
+      'utf8',
+    )
+    const cssSource = readFileSync(
+      resolve(process.cwd(), 'src/components/settings/SettingsCenterPage.css'),
+      'utf8',
+    )
+    const { descriptor } = parse(pageSource)
+    const style = descriptor.styles[0]
+    const compiled = compileStyle({
+      source: cssSource,
+      filename: 'SettingsCenterPage.css',
+      id: 'data-v-settings-center',
+      scoped: style.scoped,
+    })
+
+    expect(style.src).toBe('./SettingsCenterPage.css')
+    expect(style.scoped).not.toBe(true)
+    expect(compiled.errors).toEqual([])
+    expect(compiled.code).toMatch(/\.settings-sidebar-item\s*\{[^}]*width:\s*100%/)
+    expect(compiled.code).toMatch(/\.settings-sidebar-item\.active\s*\{[^}]*background:\s*var\(--accent\)/)
+    expect(compiled.code).not.toContain('[data-v-settings-center]')
+  })
 
   it('shows the ready app version in About', async () => {
     useAppStore().markReady('0.4.1-test')
