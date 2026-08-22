@@ -163,6 +163,29 @@ impl Default for AppConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGeneralSettingsRequest {
+    pub use_websocket: bool,
+    pub ticker_poll_interval: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneralSettings {
+    pub use_websocket: bool,
+    pub ticker_poll_interval: f64,
+}
+
+impl From<&AppConfig> for GeneralSettings {
+    fn from(config: &AppConfig) -> Self {
+        Self {
+            use_websocket: config.use_websocket,
+            ticker_poll_interval: config.ticker_poll_interval,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RiskConfig {
