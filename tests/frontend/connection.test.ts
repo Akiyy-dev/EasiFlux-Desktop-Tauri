@@ -215,6 +215,123 @@ describe('connection store', () => {
       .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(1)
   })
 
+  it('does not apply a connect success after its caller validity expires', async () => {
+    const pendingConnect = deferred<void>()
+    let callerValid = true
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') return pendingConnect.promise
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    store.setWsStatus('connected')
+
+    const connecting = store.connect(false, undefined, () => callerValid)
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('connect', expect.anything()))
+    callerValid = false
+    pendingConnect.resolve()
+
+    await expect(connecting).resolves.toBeUndefined()
+    expect(store.status).toBe('connecting')
+    expect(store.wsStatus).toBe('connected')
+    expect(store.lastError).toBeNull()
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_connection_status')).toHaveLength(0)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+  })
+
+  it('does not apply a connect failure after its caller validity expires', async () => {
+    const pendingConnect = deferred<void>()
+    let callerValid = true
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') return pendingConnect.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    store.setWsStatus('connected')
+
+    const connecting = store.connect(false, undefined, () => callerValid)
+    const rejection = expect(connecting).rejects.toThrow('apiKey=raw-key apiSecret=raw-secret')
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('connect', expect.anything()))
+    callerValid = false
+    pendingConnect.reject(new Error('apiKey=raw-key apiSecret=raw-secret'))
+
+    await rejection
+    expect(store.status).toBe('connecting')
+    expect(store.wsStatus).toBe('connected')
+    expect(store.lastError).toBeNull()
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_connection_status')).toHaveLength(0)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+  })
+
+  it('does not apply a status refresh after its connect caller validity expires', async () => {
+    const pendingStatus = deferred<'connected'>()
+    let callerValid = true
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') return Promise.resolve(undefined)
+      if (command === 'get_connection_status') return pendingStatus.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    store.setWsStatus('connected')
+
+    const connecting = store.connect(false, undefined, () => callerValid)
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('get_connection_status'))
+    callerValid = false
+    pendingStatus.resolve('connected')
+
+    await expect(connecting).resolves.toBeUndefined()
+    expect(store.status).toBe('connecting')
+    expect(store.wsStatus).toBe('disconnected')
+    expect(store.lastError).toBeNull()
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+  })
+
+  it('does not apply a status refresh failure after its connect caller validity expires', async () => {
+    const pendingStatus = deferred<'connected'>()
+    let callerValid = true
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') return Promise.resolve(undefined)
+      if (command === 'get_connection_status') return pendingStatus.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    store.setWsStatus('connected')
+
+    const connecting = store.connect(false, undefined, () => callerValid)
+    const rejection = expect(connecting).rejects.toThrow('stale status failed')
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('get_connection_status'))
+    callerValid = false
+    pendingStatus.reject(new Error('stale status failed'))
+
+    await rejection
+    expect(store.status).toBe('connecting')
+    expect(store.wsStatus).toBe('disconnected')
+    expect(store.lastError).toBeNull()
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+  })
+
+  it('preserves the invoke error when a completion validity predicate throws', async () => {
+    const invokeError = new Error('original connect failed')
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') return Promise.reject(invokeError)
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+
+    await expect(store.connect(true, undefined, () => {
+      throw new Error('validity predicate failed')
+    })).rejects.toThrow('original connect failed')
+
+    expect(store.status).toBe('connecting')
+    expect(store.lastError).toBeNull()
+  })
+
   it('delegates post-connect refresh to scheduler bridge', async () => {
     vi.mocked(tauriInvoke).mockImplementation((cmd) => {
       if (cmd === 'get_connection_status') {
@@ -446,6 +563,66 @@ describe('connection store', () => {
     expect(store.status).toBe('disconnected')
     expect(store.reconnecting).toBe(false)
     expect(store.reconnectError).toBeNull()
+  })
+
+  it('does not apply a guarded reconnect success after its selected intent expires', async () => {
+    const pendingConnect = deferred<void>()
+    let selectedIntentValid = true
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') return pendingConnect.promise
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    store.setStatus('connected')
+
+    const reconnecting = store.reconnect(false, () => selectedIntentValid)
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('connect', expect.anything()))
+    selectedIntentValid = false
+    pendingConnect.resolve()
+
+    await expect(reconnecting).resolves.toBeUndefined()
+    expect(store.status).toBe('connecting')
+    expect(store.wsStatus).toBe('disconnected')
+    expect(store.lastError).toBeNull()
+    expect(store.reconnectError).toBeNull()
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_connection_status')).toHaveLength(0)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+  })
+
+  it('rejects a stale guarded reconnect flight without applying its failure', async () => {
+    const pendingConnect = deferred<void>()
+    let selectedIntentValid = true
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'connect') return pendingConnect.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useConnectionStore()
+    store.setStatus('connected')
+
+    const first = store.reconnect(true, () => selectedIntentValid)
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('connect', expect.anything()))
+    const joined = store.reconnect(true, () => selectedIntentValid)
+    const firstRejection = expect(first).rejects.toThrow('stale reconnect failed')
+    const joinedRejection = expect(joined).rejects.toThrow('stale reconnect failed')
+    selectedIntentValid = false
+    pendingConnect.reject(new Error('stale reconnect failed'))
+
+    await firstRejection
+    await joinedRejection
+    expect(store.status).toBe('connecting')
+    expect(store.wsStatus).toBe('disconnected')
+    expect(store.lastError).toBeNull()
+    expect(store.reconnectError).toBeNull()
+    expect(store.reconnecting).toBe(false)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'connect')).toHaveLength(1)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_connection_status')).toHaveLength(0)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
   })
 
   it('uses a later default intent when the first guarded intent becomes stale', async () => {

@@ -133,6 +133,16 @@ describe('QuickSetup connection failures', () => {
     })
   }
 
+  function mountQuickSetupWithConnectionStatus() {
+    return mount(defineComponent({
+      components: { ConnectionStatus, QuickSetupDialog },
+      setup: () => ({ show: ref(true) }),
+      template: '<QuickSetupDialog v-model:show="show"/><ConnectionStatus/>',
+    }), {
+      global: { plugins: [pinia], stubs: { AppDialog: dialogStub } },
+    })
+  }
+
   async function saveThroughEditor(wrapper: ReturnType<typeof mountQuickSetup>) {
     await flushPromises()
     const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
@@ -269,6 +279,131 @@ describe('QuickSetup connection failures', () => {
     expect(wrapper.text()).not.toContain('raw-secret')
   })
 
+  it('does not apply an old connect success after close and reopen without a fresh connect', async () => {
+    const pendingConnect = deferred<void>()
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useConfigStore().config = config
+    useLogStore().clear()
+    useLogStore().clearError()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return Promise.resolve([profile])
+      if (command === 'save_credentials') return Promise.resolve(undefined)
+      if (command === 'connect') return pendingConnect.promise
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      if (command === 'scheduler_run_task') return Promise.resolve(undefined)
+      return Promise.resolve(undefined)
+    })
+    const connectionStore = useConnectionStore()
+    connectionStore.setWsStatus('error')
+    const host = mountQuickSetupWithConnectionStatus()
+    const quickSetup = host.getComponent(QuickSetupDialog)
+    await flushPromises()
+    await quickSetup.findAll('button')
+      .find((button) => button.text() === '编辑凭据')!.trigger('click')
+    await quickSetup.findAll('button')
+      .find((button) => button.text() === '保存')!.trigger('click')
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('connect', expect.anything()))
+
+    await quickSetup.get('[data-testid="dialog-close"]').trigger('click')
+    const hostState = host.vm as unknown as { show: boolean }
+    expect(hostState.show).toBe(false)
+    hostState.show = true
+    await nextTick()
+    await flushPromises()
+    const closesAtReopen = (quickSetup.emitted('update:show') ?? [])
+      .filter(([show]) => show === false).length
+    const statusAtReopen = host.getComponent(ConnectionStatus).text()
+    const baseline = {
+      status: connectionStore.status,
+      wsStatus: connectionStore.wsStatus,
+      lastError: connectionStore.lastError,
+      logLastError: useLogStore().lastError,
+      logEntries: [...useLogStore().entries],
+    }
+
+    pendingConnect.resolve()
+    await flushPromises()
+
+    expect(connectionStore.status).toBe(baseline.status)
+    expect(connectionStore.wsStatus).toBe(baseline.wsStatus)
+    expect(connectionStore.lastError).toBe(baseline.lastError)
+    expect(useLogStore().lastError).toBe(baseline.logLastError)
+    expect(useLogStore().entries).toEqual(baseline.logEntries)
+    expect(toastError).not.toHaveBeenCalled()
+    expect(host.getComponent(ConnectionStatus).text()).toBe(statusAtReopen)
+    expect(host.text()).not.toContain('API 已连接')
+    expect(host.text()).not.toContain('raw-key')
+    expect(host.text()).not.toContain('raw-secret')
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_connection_status')).toHaveLength(0)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+    expect((quickSetup.emitted('update:show') ?? [])
+      .filter(([show]) => show === false)).toHaveLength(closesAtReopen)
+  })
+
+  it('does not apply or expose an old connect failure after close and reopen', async () => {
+    const pendingConnect = deferred<void>()
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useConfigStore().config = config
+    useLogStore().clear()
+    useLogStore().clearError()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return Promise.resolve([profile])
+      if (command === 'save_credentials') return Promise.resolve(undefined)
+      if (command === 'connect') return pendingConnect.promise
+      return Promise.resolve(undefined)
+    })
+    const connectionStore = useConnectionStore()
+    connectionStore.setWsStatus('error')
+    const host = mountQuickSetupWithConnectionStatus()
+    const quickSetup = host.getComponent(QuickSetupDialog)
+    await flushPromises()
+    await quickSetup.findAll('button')
+      .find((button) => button.text() === '编辑凭据')!.trigger('click')
+    await quickSetup.findAll('button')
+      .find((button) => button.text() === '保存')!.trigger('click')
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('connect', expect.anything()))
+
+    await quickSetup.get('[data-testid="dialog-close"]').trigger('click')
+    const hostState = host.vm as unknown as { show: boolean }
+    expect(hostState.show).toBe(false)
+    hostState.show = true
+    await nextTick()
+    await flushPromises()
+    const closesAtReopen = (quickSetup.emitted('update:show') ?? [])
+      .filter(([show]) => show === false).length
+    const statusAtReopen = host.getComponent(ConnectionStatus).text()
+    const baseline = {
+      status: connectionStore.status,
+      wsStatus: connectionStore.wsStatus,
+      lastError: connectionStore.lastError,
+      logLastError: useLogStore().lastError,
+      logEntries: [...useLogStore().entries],
+    }
+
+    pendingConnect.reject(new Error('apiKey=raw-key apiSecret=raw-secret'))
+    await flushPromises()
+
+    expect(connectionStore.status).toBe(baseline.status)
+    expect(connectionStore.wsStatus).toBe(baseline.wsStatus)
+    expect(connectionStore.lastError).toBe(baseline.lastError)
+    expect(useLogStore().lastError).toBe(baseline.logLastError)
+    expect(useLogStore().entries).toEqual(baseline.logEntries)
+    expect(toastError).not.toHaveBeenCalled()
+    expect(host.getComponent(ConnectionStatus).text()).toBe(statusAtReopen)
+    expect(host.text()).not.toContain('raw-key')
+    expect(host.text()).not.toContain('raw-secret')
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'get_connection_status')).toHaveLength(0)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'scheduler_run_task')).toHaveLength(0)
+    expect((quickSetup.emitted('update:show') ?? [])
+      .filter(([show]) => show === false)).toHaveLength(closesAtReopen)
+  })
+
   it('keeps fresh global connection state when an older session connect rejects late', async () => {
     const firstConnect = deferred<void>()
     let connectCalls = 0
@@ -284,13 +419,7 @@ describe('QuickSetup connection failures', () => {
       if (command === 'scheduler_run_task') return Promise.resolve(undefined)
       return Promise.resolve(undefined)
     })
-    const host = mount(defineComponent({
-      components: { ConnectionStatus, QuickSetupDialog },
-      setup: () => ({ show: ref(true) }),
-      template: '<QuickSetupDialog v-model:show="show"/><ConnectionStatus/>',
-    }), {
-      global: { plugins: [pinia], stubs: { AppDialog: dialogStub } },
-    })
+    const host = mountQuickSetupWithConnectionStatus()
     const quickSetup = host.getComponent(QuickSetupDialog)
     await flushPromises()
     await quickSetup.findAll('button')

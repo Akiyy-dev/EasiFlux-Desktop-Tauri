@@ -95,7 +95,11 @@ async function connectStoredCredentials(session = flowSession): Promise<void> {
   try {
     const config = configStore.config ?? await configStore.fetchConfig()
     if (session !== flowSession || !props.show) return
-    await connectionStore.connect(config.useWebsocket)
+    await connectionStore.connect(
+      config.useWebsocket,
+      undefined,
+      () => session === flowSession && props.show,
+    )
     if (session === flowSession && props.show) emit('update:show', false)
   } catch (error) {
     if (session === flowSession && props.show) {

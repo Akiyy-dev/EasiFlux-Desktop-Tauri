@@ -14,6 +14,8 @@ type ReconnectFlight = {
   promise: Promise<void>
 }
 
+type ConnectionCompletionValidity = () => boolean
+
 function parseStatus(next: string): ConnectionStatus | null {
   if (
     next === 'disconnected'
@@ -34,6 +36,15 @@ function formatInvokeError(error: unknown): string {
     return error.message
   }
   return '连接失败'
+}
+
+function completionRemainsValid(isCompletionValid?: ConnectionCompletionValidity): boolean {
+  if (!isCompletionValid) return true
+  try {
+    return isCompletionValid() !== false
+  } catch {
+    return false
+  }
 }
 
 export const useConnectionStore = defineStore('connection', () => {
@@ -69,27 +80,34 @@ export const useConnectionStore = defineStore('connection', () => {
   async function connect(
     startRealtime = true,
     credential?: ApiCredential,
+    isCompletionValid?: ConnectionCompletionValidity,
   ): Promise<void> {
     const connectionRequest = ++latestConnectionRequest
+    const canApplyCompletion = () => connectionRequest === latestConnectionRequest
+      && completionRemainsValid(isCompletionValid)
     lastError.value = null
     setStatus('connecting')
     try {
       await tauriInvoke('connect', { startRealtime, credential })
-      if (connectionRequest !== latestConnectionRequest) return
+      if (!canApplyCompletion()) return
       if (!startRealtime) {
         setWsStatus('disconnected')
       }
-      const currentStatus = await refreshStatusForConnection(connectionRequest)
+      if (!canApplyCompletion()) return
+      const currentStatus = await refreshStatusForConnection(
+        connectionRequest,
+        isCompletionValid,
+      )
       if (
         currentStatus.applied
         && currentStatus.status === 'connected'
-        && connectionRequest === latestConnectionRequest
+        && canApplyCompletion()
       ) {
         await refreshSyncTask('market', true)
       }
     } catch (error) {
       const message = formatInvokeError(error)
-      if (connectionRequest === latestConnectionRequest) {
+      if (canApplyCompletion()) {
         setStatus('error')
         lastError.value = message
       }
@@ -108,9 +126,9 @@ export const useConnectionStore = defineStore('connection', () => {
   }
 
   async function runReconnectFlight(flight: ReconnectFlight): Promise<void> {
+    let selected: ReconnectIntent | undefined
     try {
       await disconnect()
-      let selected: ReconnectIntent | undefined
       for (let index = 0; index < flight.intents.length; index += 1) {
         const candidate = flight.intents[index]
         if (candidate.shouldConnect?.() !== false) {
@@ -119,9 +137,11 @@ export const useConnectionStore = defineStore('connection', () => {
         }
       }
       if (!selected) return
-      await connect(selected.startRealtime)
+      await connect(selected.startRealtime, undefined, selected.shouldConnect)
     } catch (error) {
-      reconnectError.value = formatInvokeError(error)
+      if (!selected || completionRemainsValid(selected.shouldConnect)) {
+        reconnectError.value = formatInvokeError(error)
+      }
       throw error
     } finally {
       if (reconnectFlight === flight) {
@@ -150,11 +170,15 @@ export const useConnectionStore = defineStore('connection', () => {
 
   async function refreshStatusForConnection(
     connectionRequest?: number,
+    isCompletionValid?: ConnectionCompletionValidity,
   ): Promise<{ status: ConnectionStatus; applied: boolean }> {
     const requestId = ++latestStatusRequest
     const next = await tauriInvoke<ConnectionStatus>('get_connection_status')
     const applied = requestId === latestStatusRequest
-      && (connectionRequest === undefined || connectionRequest === latestConnectionRequest)
+      && (connectionRequest === undefined || (
+        connectionRequest === latestConnectionRequest
+        && completionRemainsValid(isCompletionValid)
+      ))
     if (applied) status.value = next
     return { status: next, applied }
   }

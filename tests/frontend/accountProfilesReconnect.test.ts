@@ -132,6 +132,10 @@ describe('AccountProfilesPanel credential reconnect', () => {
       startRealtime: appConfig.useWebsocket,
       credential: undefined,
     })
+    expect(tauriInvoke).toHaveBeenCalledWith('scheduler_run_task', {
+      task: 'market',
+      force: true,
+    })
     expect(tauriInvoke).not.toHaveBeenCalledWith('save_credentials', expect.anything())
     expect(wrapper.find('[data-testid="account-reconnect"]').exists()).toBe(false)
   })

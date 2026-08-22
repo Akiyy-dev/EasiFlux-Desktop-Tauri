@@ -47,7 +47,7 @@ watch(() => store.activeAccountId, () => {
 }, { flush: 'sync' })
 watch(() => connectionStore.connected, (connected, wasConnected) => {
   if (!pendingReconnect.value) return
-  if (connected || (wasConnected && !connectionStore.reconnecting)) {
+  if (!connectionStore.reconnecting && (connected || wasConnected)) {
     invalidateReconnect()
   }
 }, { flush: 'sync' })
