@@ -61,10 +61,13 @@ watch(
   () => props.show,
   (visible) => {
     flowSession += 1
+    const session = flowSession
     resetFlow()
     if (visible) {
       void accountProfilesStore.refreshProfiles().catch((error) => {
-        reportError(error, '加载账户配置失败')
+        if (session === flowSession && props.show) {
+          reportError(error, '加载账户配置失败')
+        }
       })
     }
   },
@@ -91,6 +94,7 @@ async function connectStoredCredentials(session = flowSession): Promise<void> {
   connectionError.value = null
   try {
     const config = configStore.config ?? await configStore.fetchConfig()
+    if (session !== flowSession || !props.show) return
     await connectionStore.connect(config.useWebsocket)
     if (session === flowSession && props.show) emit('update:show', false)
   } catch (error) {

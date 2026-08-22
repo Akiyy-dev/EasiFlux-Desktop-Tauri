@@ -1,11 +1,14 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { MessageApi } from 'naive-ui'
 import CredentialEditor from '../../src/components/account/CredentialEditor.vue'
 import QuickSetupDialog from '../../src/components/settings/QuickSetupDialog.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
+import { installMessageApi } from '../../src/services/errorService'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConfigStore } from '../../src/stores/config'
+import { useLogStore } from '../../src/stores/log'
 import type { AccountProfile, AppConfig } from '../../src/types/models'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
@@ -177,6 +180,90 @@ describe('QuickSetup connection failures', () => {
     expect(wrapper.find('[data-testid="quick-setup-retry"]').exists()).toBe(false)
     expect(wrapper.getComponent(CredentialEditor).props('show')).toBe(false)
     expect(wrapper.findAll('button').some((button) => button.text() === '编辑凭据')).toBe(true)
+  })
+
+  it('does not connect when a stale session config fetch resolves after reopen', async () => {
+    const pendingConfig = deferred<AppConfig>()
+    useConfigStore().config = null
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return Promise.resolve([profile])
+      if (command === 'save_credentials') return Promise.resolve(undefined)
+      if (command === 'get_config') return pendingConfig.promise
+      if (command === 'connect') return Promise.resolve(undefined)
+      if (command === 'get_connection_status') return Promise.resolve('disconnected')
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountQuickSetup()
+    await saveThroughEditor(wrapper)
+
+    await wrapper.get('[data-testid="dialog-close"]').trigger('click')
+    await wrapper.setProps({ show: false })
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+    const closesBeforeOldConfig = (wrapper.emitted('update:show') ?? [])
+      .filter(([show]) => show === false).length
+
+    pendingConfig.resolve(config)
+    await flushPromises()
+
+    expect(tauriInvoke).not.toHaveBeenCalledWith('connect', expect.anything())
+    expect((wrapper.emitted('update:show') ?? [])
+      .filter(([show]) => show === false)).toHaveLength(closesBeforeOldConfig)
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="quick-setup-retry"]').exists()).toBe(false)
+    expect(wrapper.getComponent(CredentialEditor).props('show')).toBe(false)
+
+    await wrapper.findAll('button').find((button) => button.text() === '编辑凭据')!.trigger('click')
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click')
+    await flushPromises()
+
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'connect')).toHaveLength(1)
+    expect((wrapper.emitted('update:show') ?? [])
+      .filter(([show]) => show === false)).toHaveLength(closesBeforeOldConfig + 1)
+  })
+
+  it('does not report a stale profile refresh rejection after reopen succeeds', async () => {
+    const firstRefresh = deferred<AccountProfile[]>()
+    const freshProfile = { ...profile, label: 'Fresh profile' }
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
+    let listCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') {
+        listCalls += 1
+        return listCalls === 1 ? firstRefresh.promise : Promise.resolve([freshProfile])
+      }
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountQuickSetup()
+
+    await wrapper.get('[data-testid="dialog-close"]').trigger('click')
+    await wrapper.setProps({ show: false })
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+
+    const store = useAccountProfilesStore()
+    expect(store.profiles).toEqual([freshProfile])
+    expect(store.listError).toBeNull()
+    expect(store.loading).toBe(false)
+    expect(wrapper.getComponent(CredentialEditor).props('initialLabel')).toBe('Fresh profile')
+    const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
+    expect(edit?.attributes('disabled')).toBeUndefined()
+
+    firstRefresh.reject(new Error('stale apiKey=raw-key apiSecret=raw-secret'))
+    await flushPromises()
+
+    expect(toastError).not.toHaveBeenCalled()
+    expect(useLogStore().lastError).toBeNull()
+    expect(useLogStore().entries).toEqual([])
+    expect(store.profiles).toEqual([freshProfile])
+    expect(store.listError).toBeNull()
+    expect(wrapper.getComponent(CredentialEditor).props('initialLabel')).toBe('Fresh profile')
+    expect(wrapper.text()).not.toContain('raw-key')
+    expect(wrapper.text()).not.toContain('raw-secret')
   })
 
   it('ignores a connection success that resolves after a newer dialog session opens', async () => {
