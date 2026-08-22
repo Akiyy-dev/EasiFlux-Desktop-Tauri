@@ -1,4 +1,17 @@
-export type AccountSection = 'api' | 'assets' | 'risk'
+export type AccountSettingsSection = 'api' | 'assets' | 'risk'
+export type AccountSection = AccountSettingsSection
+
+export type SettingsSection =
+  | 'general'
+  | 'account'
+  | 'plugins'
+  | 'notifications'
+  | 'searchCommands'
+  | 'hotkeys'
+  | 'workspace'
+  | 'appearance'
+  | 'languageRegion'
+  | 'about'
 
 export type NavKey =
   | 'home'
