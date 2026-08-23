@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::{oneshot, Mutex, RwLock};
@@ -261,8 +261,27 @@ where
     }
 }
 
-async fn execute_kline_flush(service: Arc<ChartWorkspaceService>) -> AppResult<()> {
-    let outcomes = tokio::task::spawn_blocking(move || service.flush_dirty_klines())
+async fn run_serialized_blocking<F, R>(
+    gate: Arc<StdMutex<()>>,
+    operation: F,
+) -> Result<R, tokio::task::JoinError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        // The blocking closure owns the guard so cancelling its async waiter cannot release it early.
+        let _guard = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation()
+    })
+    .await
+}
+
+async fn execute_kline_flush(
+    service: Arc<ChartWorkspaceService>,
+    gate: Arc<StdMutex<()>>,
+) -> AppResult<()> {
+    let outcomes = run_serialized_blocking(gate, move || service.flush_dirty_klines())
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
     let failures = outcomes
@@ -289,6 +308,65 @@ struct TaskRunState {
     active_force_waiters: Vec<oneshot::Sender<AppResult<()>>>,
 }
 
+type TaskRunStateRef = Arc<StdMutex<TaskRunState>>;
+
+fn new_task_run_states() -> Arc<HashMap<TaskId, TaskRunStateRef>> {
+    Arc::new(
+        TaskId::all()
+            .iter()
+            .copied()
+            .map(|task| (task, Arc::new(StdMutex::new(TaskRunState::default()))))
+            .collect(),
+    )
+}
+
+fn cancelled_task_result() -> AppResult<()> {
+    Err(AppError::Internal("调度任务在强制重跑完成前被取消".into()))
+}
+
+fn cancel_task_run_state(run_state: &TaskRunStateRef) {
+    let waiters = {
+        let mut state = run_state.lock().unwrap();
+        state.in_flight = false;
+        state.pending_force = false;
+        state.forced_rerun = false;
+        let mut waiters = std::mem::take(&mut state.active_force_waiters);
+        waiters.extend(std::mem::take(&mut state.pending_force_waiters));
+        waiters
+    };
+    for waiter in waiters {
+        let _ = waiter.send(cancelled_task_result());
+    }
+}
+
+struct TaskRunOwnerGuard {
+    run_state: TaskRunStateRef,
+    completed: bool,
+}
+
+impl TaskRunOwnerGuard {
+    fn new(run_state: TaskRunStateRef) -> Self {
+        Self {
+            run_state,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for TaskRunOwnerGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            // TaskRunState uses a synchronous mutex specifically so cancellation can finish
+            // every force waiter from Drop without spawning cleanup work.
+            cancel_task_run_state(&self.run_state);
+        }
+    }
+}
+
 enum TaskRunClaim {
     Owner,
     Skip,
@@ -296,7 +374,7 @@ enum TaskRunClaim {
 }
 
 async fn run_scheduled_task<F, Fut>(
-    run_state: &Mutex<TaskRunState>,
+    run_state: TaskRunStateRef,
     force_if_busy: bool,
     execute: F,
 ) -> AppResult<()>
@@ -305,7 +383,7 @@ where
     Fut: std::future::Future<Output = AppResult<()>>,
 {
     let claim = {
-        let mut state = run_state.lock().await;
+        let mut state = run_state.lock().unwrap();
         if state.in_flight {
             if force_if_busy {
                 let (sender, receiver) = oneshot::channel();
@@ -326,17 +404,20 @@ where
         }
     };
     match claim {
-        TaskRunClaim::Owner => drain_scheduled_runs(run_state, execute).await,
+        TaskRunClaim::Owner => {
+            let mut owner = TaskRunOwnerGuard::new(Arc::clone(&run_state));
+            let result = drain_scheduled_runs(&run_state, execute).await;
+            owner.complete();
+            result
+        }
         TaskRunClaim::Skip => Ok(()),
-        TaskRunClaim::Wait(receiver) => receiver
-            .await
-            .unwrap_or_else(|_| Err(AppError::Internal("调度任务在强制重跑完成前被取消".into()))),
+        TaskRunClaim::Wait(receiver) => receiver.await.unwrap_or_else(|_| cancelled_task_result()),
     }
 }
 
 async fn run_reschedulable_periodic<F, Fut>(
     running: Arc<AtomicBool>,
-    run_state: Arc<Mutex<TaskRunState>>,
+    run_state: TaskRunStateRef,
     mut intervals: tokio::sync::watch::Receiver<Duration>,
     first_delay: Duration,
     mut execute: F,
@@ -363,7 +444,7 @@ async fn run_reschedulable_periodic<F, Fut>(
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
-                let _ = run_scheduled_task(run_state.as_ref(), false, &mut execute).await;
+                let _ = run_scheduled_task(Arc::clone(&run_state), false, &mut execute).await;
             }
         }
     }
@@ -371,7 +452,7 @@ async fn run_reschedulable_periodic<F, Fut>(
 
 async fn run_fixed_periodic<F, Fut>(
     running: Arc<AtomicBool>,
-    run_state: Arc<Mutex<TaskRunState>>,
+    run_state: TaskRunStateRef,
     first_delay: Duration,
     interval: Duration,
     mut execute: F,
@@ -386,7 +467,7 @@ async fn run_fixed_periodic<F, Fut>(
         if !running.load(Ordering::Relaxed) {
             break;
         }
-        let _ = run_scheduled_task(run_state.as_ref(), false, &mut execute).await;
+        let _ = run_scheduled_task(Arc::clone(&run_state), false, &mut execute).await;
     }
 }
 
@@ -412,10 +493,7 @@ async fn run_notification_maintenance_once(
     }
 }
 
-async fn drain_scheduled_runs<F, Fut>(
-    run_state: &Mutex<TaskRunState>,
-    mut execute: F,
-) -> AppResult<()>
+async fn drain_scheduled_runs<F, Fut>(run_state: &TaskRunStateRef, mut execute: F) -> AppResult<()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = AppResult<()>>,
@@ -423,7 +501,7 @@ where
     loop {
         let result = execute().await;
         let completed_waiters = {
-            let mut state = run_state.lock().await;
+            let mut state = run_state.lock().unwrap();
             if !state.forced_rerun && state.pending_force {
                 state.pending_force = false;
                 state.forced_rerun = true;
@@ -459,6 +537,8 @@ struct SchedulerLifecycle {
     state: SchedulerLifecycleState,
     next_generation: u64,
     handles: HashMap<TaskId, SchedulerHandle>,
+    run_states: Option<Arc<HashMap<TaskId, TaskRunStateRef>>>,
+    generation_running: Option<Arc<AtomicBool>>,
 }
 
 impl SchedulerLifecycle {
@@ -467,37 +547,104 @@ impl SchedulerLifecycle {
             state: SchedulerLifecycleState::Stopped,
             next_generation: 0,
             handles: HashMap::new(),
+            run_states: None,
+            generation_running: None,
         }
     }
 
-    fn begin_start(&mut self) -> Option<u64> {
+    fn begin_start(
+        &mut self,
+    ) -> Option<(u64, Arc<HashMap<TaskId, TaskRunStateRef>>, Arc<AtomicBool>)> {
         if self.state != SchedulerLifecycleState::Stopped {
             return None;
         }
         self.next_generation = self.next_generation.saturating_add(1);
         let generation = self.next_generation;
+        // Run coordination is generation-owned; stale cleanup can never mutate a restart.
+        let run_states = new_task_run_states();
+        let generation_running = Arc::new(AtomicBool::new(true));
         self.state = SchedulerLifecycleState::Starting { generation };
-        Some(generation)
+        self.run_states = Some(Arc::clone(&run_states));
+        self.generation_running = Some(Arc::clone(&generation_running));
+        Some((generation, run_states, generation_running))
     }
 
-    fn install_handles(&mut self, handles: Vec<(TaskId, SchedulerHandle)>) {
+    fn install_handles(
+        &mut self,
+        generation: u64,
+        handles: Vec<(TaskId, SchedulerHandle)>,
+    ) -> Result<(), Vec<(TaskId, SchedulerHandle)>> {
+        if self.state != (SchedulerLifecycleState::Starting { generation }) {
+            return Err(handles);
+        }
         for (task, handle) in handles {
             if let Some(previous) = self.handles.insert(task, handle) {
                 previous.abort();
             }
         }
+        Ok(())
     }
 
-    fn finish_start(&mut self, generation: u64) {
-        debug_assert_eq!(self.state, SchedulerLifecycleState::Starting { generation });
+    fn finish_start(&mut self, generation: u64) -> bool {
+        if self.state != (SchedulerLifecycleState::Starting { generation }) {
+            return false;
+        }
         self.state = SchedulerLifecycleState::Running { generation };
+        true
     }
 
-    fn stop(&mut self) -> (bool, Vec<SchedulerHandle>) {
+    fn rollback_start(
+        &mut self,
+        generation: u64,
+    ) -> Option<(
+        Vec<SchedulerHandle>,
+        Arc<HashMap<TaskId, TaskRunStateRef>>,
+        Arc<AtomicBool>,
+    )> {
+        if self.state != (SchedulerLifecycleState::Starting { generation }) {
+            return None;
+        }
+        self.state = SchedulerLifecycleState::Stopped;
+        let handles = std::mem::take(&mut self.handles).into_values().collect();
+        let run_states = self
+            .run_states
+            .take()
+            .expect("starting generation has run states");
+        let generation_running = self
+            .generation_running
+            .take()
+            .expect("starting generation has running state");
+        Some((handles, run_states, generation_running))
+    }
+
+    fn stop(
+        &mut self,
+    ) -> (
+        bool,
+        Vec<SchedulerHandle>,
+        Option<Arc<HashMap<TaskId, TaskRunStateRef>>>,
+        Option<Arc<AtomicBool>>,
+    ) {
         let was_active = self.state != SchedulerLifecycleState::Stopped || !self.handles.is_empty();
         self.state = SchedulerLifecycleState::Stopped;
         let handles = std::mem::take(&mut self.handles).into_values().collect();
-        (was_active, handles)
+        (
+            was_active,
+            handles,
+            self.run_states.take(),
+            self.generation_running.take(),
+        )
+    }
+
+    fn run_state(&self, task: TaskId) -> Option<TaskRunStateRef> {
+        self.run_states
+            .as_ref()
+            .and_then(|states| states.get(&task))
+            .cloned()
+    }
+
+    fn is_starting(&self, generation: u64) -> bool {
+        self.state == (SchedulerLifecycleState::Starting { generation })
     }
 
     #[cfg(test)]
@@ -519,51 +666,121 @@ impl SchedulerLifecycle {
     }
 }
 
-async fn start_scheduler_lifecycle<F, PrepareFut, FinishFut>(
-    lifecycle: &Mutex<SchedulerLifecycle>,
-    running: &Arc<AtomicBool>,
-    install: F,
-) -> bool
-where
-    F: FnOnce(u64) -> PrepareFut,
-    PrepareFut: std::future::Future<Output = (Vec<(TaskId, SchedulerHandle)>, FinishFut)>,
-    FinishFut: std::future::Future<Output = ()>,
-{
-    let mut lifecycle = lifecycle.lock().await;
-    let Some(generation) = lifecycle.begin_start() else {
-        return false;
-    };
-    running.store(true, Ordering::SeqCst);
-    let (handles, finish_start) = install(generation).await;
-    lifecycle.install_handles(handles);
-    finish_start.await;
-    lifecycle.finish_start(generation);
-    true
-}
-
-async fn stop_scheduler_lifecycle(
-    lifecycle: &Mutex<SchedulerLifecycle>,
-    running: &Arc<AtomicBool>,
-) -> bool {
-    let mut lifecycle = lifecycle.lock().await;
-    running.store(false, Ordering::SeqCst);
-    let (was_active, handles) = lifecycle.stop();
+fn release_scheduler_generation(
+    handles: Vec<SchedulerHandle>,
+    run_states: Option<Arc<HashMap<TaskId, TaskRunStateRef>>>,
+    generation_running: Option<Arc<AtomicBool>>,
+) {
+    if let Some(generation_running) = generation_running {
+        generation_running.store(false, Ordering::SeqCst);
+    }
+    if let Some(run_states) = run_states {
+        for run_state in run_states.values() {
+            cancel_task_run_state(run_state);
+        }
+    }
     for handle in handles {
         handle.abort();
     }
-    was_active
 }
 
-struct TaskRuntime {
-    run_state: Arc<Mutex<TaskRunState>>,
+struct SchedulerStartGuard {
+    lifecycle: Arc<StdMutex<SchedulerLifecycle>>,
+    running: Arc<AtomicBool>,
+    generation: u64,
+    committed: bool,
 }
 
-impl TaskRuntime {
-    fn new() -> Self {
-        Self {
-            run_state: Arc::new(Mutex::new(TaskRunState::default())),
+impl SchedulerStartGuard {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SchedulerStartGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let released = self
+            .lifecycle
+            .lock()
+            .unwrap()
+            .rollback_start(self.generation);
+        if let Some((handles, run_states, generation_running)) = released {
+            self.running.store(false, Ordering::SeqCst);
+            release_scheduler_generation(handles, Some(run_states), Some(generation_running));
         }
     }
+}
+
+async fn start_scheduler_lifecycle<Prepare, PrepareFut, Prepared, Install, FinishFut>(
+    lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
+    running: &Arc<AtomicBool>,
+    prepare: Prepare,
+    install: Install,
+) -> bool
+where
+    Prepare: FnOnce(u64) -> PrepareFut,
+    PrepareFut: std::future::Future<Output = Prepared>,
+    Install: FnOnce(
+        u64,
+        Arc<HashMap<TaskId, TaskRunStateRef>>,
+        Arc<AtomicBool>,
+        Prepared,
+    ) -> (Vec<(TaskId, SchedulerHandle)>, FinishFut),
+    FinishFut: std::future::Future<Output = ()>,
+{
+    let Some((generation, run_states, generation_running)) =
+        lifecycle.lock().unwrap().begin_start()
+    else {
+        return false;
+    };
+    running.store(true, Ordering::SeqCst);
+    let mut guard = SchedulerStartGuard {
+        lifecycle: Arc::clone(lifecycle),
+        running: Arc::clone(running),
+        generation,
+        committed: false,
+    };
+    let prepared = prepare(generation).await;
+    if !lifecycle.lock().unwrap().is_starting(generation) {
+        return false;
+    }
+    let (handles, finish_start) = install(
+        generation,
+        Arc::clone(&run_states),
+        Arc::clone(&generation_running),
+        prepared,
+    );
+    if let Err(rejected) = lifecycle
+        .lock()
+        .unwrap()
+        .install_handles(generation, handles)
+    {
+        release_scheduler_generation(
+            rejected.into_iter().map(|(_, handle)| handle).collect(),
+            None,
+            Some(generation_running),
+        );
+        return false;
+    }
+    finish_start.await;
+    let committed = lifecycle.lock().unwrap().finish_start(generation);
+    if committed {
+        guard.commit();
+    }
+    committed
+}
+
+async fn stop_scheduler_lifecycle(
+    lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
+    running: &Arc<AtomicBool>,
+) -> bool {
+    running.store(false, Ordering::SeqCst);
+    let (was_active, handles, run_states, generation_running) = lifecycle.lock().unwrap().stop();
+    release_scheduler_generation(handles, run_states, generation_running);
+    was_active
 }
 
 pub struct SchedulerService {
@@ -581,8 +798,8 @@ pub struct SchedulerService {
     environment_status: Arc<RwLock<EnvironmentStatus>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
     running: Arc<AtomicBool>,
-    lifecycle: Mutex<SchedulerLifecycle>,
-    tasks: HashMap<TaskId, TaskRuntime>,
+    lifecycle: Arc<StdMutex<SchedulerLifecycle>>,
+    kline_flush_gate: Arc<StdMutex<()>>,
     market_fallback_interval_tx: tokio::sync::watch::Sender<Duration>,
     prev_public_connected: Arc<Mutex<bool>>,
     prev_private_connected: Arc<Mutex<bool>>,
@@ -604,10 +821,6 @@ impl SchedulerService {
         environment_status: Arc<RwLock<EnvironmentStatus>>,
         account_lifecycle: Arc<AccountLifecycleCoordinator>,
     ) -> Self {
-        let mut tasks = HashMap::new();
-        for &id in TaskId::all() {
-            tasks.insert(id, TaskRuntime::new());
-        }
         let (market_fallback_interval_tx, _) =
             tokio::sync::watch::channel(INTERVAL_MARKET_FALLBACK);
         Self {
@@ -625,8 +838,8 @@ impl SchedulerService {
             environment_status,
             account_lifecycle,
             running: Arc::new(AtomicBool::new(false)),
-            lifecycle: Mutex::new(SchedulerLifecycle::new()),
-            tasks,
+            lifecycle: Arc::new(StdMutex::new(SchedulerLifecycle::new())),
+            kline_flush_gate: Arc::new(StdMutex::new(())),
             market_fallback_interval_tx,
             prev_public_connected: Arc::new(Mutex::new(false)),
             prev_private_connected: Arc::new(Mutex::new(false)),
@@ -634,32 +847,57 @@ impl SchedulerService {
     }
 
     pub async fn start(&self) {
-        start_scheduler_lifecycle(&self.lifecycle, &self.running, |_| async {
-            let market_fallback_interval = {
+        start_scheduler_lifecycle(
+            &self.lifecycle,
+            &self.running,
+            |_| async {
                 let config = self.config.read().await;
                 configured_task_interval(TaskId::MarketFallback, &config)
                     .expect("market fallback has an interval")
-            };
-            self.market_fallback_interval_tx
-                .send_replace(market_fallback_interval);
-            let handles = periodic_task_ids()
-                .iter()
-                .copied()
-                .map(|task| {
-                    let handle = if task == TaskId::MarketFallback {
-                        self.spawn_market_fallback()
-                    } else {
-                        self.spawn_periodic(task, task.interval().expect("periodic task"))
-                    };
-                    (task, handle)
-                })
-                .collect();
-            let finish_start = async {
-                let _ = self.run_now(TaskId::TimeSync, true).await;
-                let _ = self.run_now(TaskId::Environment, true).await;
-            };
-            (handles, finish_start)
-        })
+            },
+            |generation, run_states, generation_running, market_fallback_interval| {
+                self.market_fallback_interval_tx
+                    .send_replace(market_fallback_interval);
+                let handles = periodic_task_ids()
+                    .iter()
+                    .copied()
+                    .map(|task| {
+                        let run_state = run_states.get(&task).expect("task registered").clone();
+                        let handle = if task == TaskId::MarketFallback {
+                            self.spawn_market_fallback(run_state, Arc::clone(&generation_running))
+                        } else {
+                            self.spawn_periodic(
+                                task,
+                                task.interval().expect("periodic task"),
+                                run_state,
+                                Arc::clone(&generation_running),
+                            )
+                        };
+                        (task, handle)
+                    })
+                    .collect();
+                let lifecycle = Arc::clone(&self.lifecycle);
+                let finish_start = async move {
+                    let time_state = run_states
+                        .get(&TaskId::TimeSync)
+                        .expect("time task registered")
+                        .clone();
+                    let _ = run_scheduled_task(time_state, true, || self.execute(TaskId::TimeSync))
+                        .await;
+                    if lifecycle.lock().unwrap().is_starting(generation) {
+                        let environment_state = run_states
+                            .get(&TaskId::Environment)
+                            .expect("environment task registered")
+                            .clone();
+                        let _ = run_scheduled_task(environment_state, true, || {
+                            self.execute(TaskId::Environment)
+                        })
+                        .await;
+                    }
+                };
+                (handles, finish_start)
+            },
+        )
         .await;
     }
 
@@ -693,20 +931,26 @@ impl SchedulerService {
     }
 
     pub async fn run_now(&self, task: TaskId, force: bool) -> AppResult<()> {
-        let runtime = self
-            .tasks
-            .get(&task)
-            .ok_or_else(|| crate::error::AppError::Internal("未知调度任务".into()))?;
-        run_scheduled_task(runtime.run_state.as_ref(), force, || self.execute(task)).await
+        let run_state = self
+            .lifecycle
+            .lock()
+            .unwrap()
+            .run_state(task)
+            .ok_or_else(|| crate::error::AppError::Internal("调度器未运行".into()))?;
+        run_scheduled_task(run_state, force, || self.execute(task)).await
     }
 
-    fn spawn_periodic(&self, task: TaskId, interval: Duration) -> SchedulerHandle {
-        let runtime = self.tasks.get(&task).expect("task registered");
+    fn spawn_periodic(
+        &self,
+        task: TaskId,
+        interval: Duration,
+        run_state: TaskRunStateRef,
+        generation_running: Arc<AtomicBool>,
+    ) -> SchedulerHandle {
         let scheduler = self.clone_refs();
-        let run_state = runtime.run_state.clone();
         tauri::async_runtime::spawn(async move {
             run_fixed_periodic(
-                scheduler.running.clone(),
+                generation_running,
                 run_state,
                 first_tick_delay(task),
                 interval,
@@ -716,16 +960,15 @@ impl SchedulerService {
         })
     }
 
-    fn spawn_market_fallback(&self) -> SchedulerHandle {
-        let runtime = self
-            .tasks
-            .get(&TaskId::MarketFallback)
-            .expect("task registered");
+    fn spawn_market_fallback(
+        &self,
+        run_state: TaskRunStateRef,
+        generation_running: Arc<AtomicBool>,
+    ) -> SchedulerHandle {
         let scheduler = self.clone_refs();
-        let run_state = Arc::clone(&runtime.run_state);
         let receiver = self.market_fallback_interval_tx.subscribe();
         tauri::async_runtime::spawn(run_reschedulable_periodic(
-            Arc::clone(&self.running),
+            generation_running,
             run_state,
             receiver,
             Duration::ZERO,
@@ -751,7 +994,7 @@ impl SchedulerService {
             api: self.api.clone(),
             environment_status: self.environment_status.clone(),
             account_lifecycle: self.account_lifecycle.clone(),
-            running: self.running.clone(),
+            kline_flush_gate: self.kline_flush_gate.clone(),
             prev_public_connected: self.prev_public_connected.clone(),
             prev_private_connected: self.prev_private_connected.clone(),
         }
@@ -772,7 +1015,10 @@ impl SchedulerService {
             TaskId::PrivatePanels => self.run_private_panels(mode).await,
             TaskId::DailyPnl => self.daily_pnl.refresh().await.map(|_| ()),
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
-            TaskId::KlineFlush => execute_kline_flush(self.chart_workspace.clone()).await,
+            TaskId::KlineFlush => {
+                execute_kline_flush(self.chart_workspace.clone(), self.kline_flush_gate.clone())
+                    .await
+            }
             TaskId::Environment => self.run_environment().await,
             TaskId::NotificationMaintenance => {
                 run_notification_maintenance_once(
@@ -917,7 +1163,7 @@ struct SchedulerRefs {
     api: Arc<crate::api::ApiClient>,
     environment_status: Arc<RwLock<EnvironmentStatus>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
-    running: Arc<AtomicBool>,
+    kline_flush_gate: Arc<StdMutex<()>>,
     prev_public_connected: Arc<Mutex<bool>>,
     prev_private_connected: Arc<Mutex<bool>>,
 }
@@ -941,7 +1187,10 @@ impl SchedulerRefs {
             TaskId::PrivatePanels => self.run_private_panels(mode).await,
             TaskId::DailyPnl => self.daily_pnl.refresh().await.map(|_| ()),
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
-            TaskId::KlineFlush => execute_kline_flush(self.chart_workspace.clone()).await,
+            TaskId::KlineFlush => {
+                execute_kline_flush(self.chart_workspace.clone(), self.kline_flush_gate.clone())
+                    .await
+            }
             TaskId::Environment => self.run_environment().await,
             TaskId::NotificationMaintenance => {
                 run_notification_maintenance_once(

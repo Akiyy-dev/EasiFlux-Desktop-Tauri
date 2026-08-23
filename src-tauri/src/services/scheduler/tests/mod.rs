@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 
 use crate::models::time::{TimeSnapshot, TimeSource, TimeSyncStatus};
 
@@ -49,6 +49,50 @@ async fn kline_flush_executes_while_account_mutation_guard_is_held() {
     assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_outer_future_keeps_blocking_kline_work_serialized_across_restart() {
+    let gate = Arc::new(StdMutex::new(()));
+    let entered_first = Arc::new(tokio::sync::Notify::new());
+    let entered_second = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new((StdMutex::new(false), Condvar::new()));
+
+    let first = tokio::spawn(run_serialized_blocking(Arc::clone(&gate), {
+        let entered = Arc::clone(&entered_first);
+        let release = Arc::clone(&release);
+        move || {
+            entered.notify_one();
+            let (released, wake) = release.as_ref();
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
+    }));
+    entered_first.notified().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let second = tokio::spawn(run_serialized_blocking(Arc::clone(&gate), {
+        let entered = Arc::clone(&entered_second);
+        move || entered.notify_one()
+    }));
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), entered_second.notified())
+            .await
+            .is_err()
+    );
+
+    let (released, wake) = release.as_ref();
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+    tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .expect("the restarted flush should run after old blocking work exits")
+        .unwrap()
+        .unwrap();
+}
+
 #[test]
 fn kline_flush_delays_its_first_tick_while_existing_tasks_remain_immediate() {
     assert_eq!(first_tick_delay(TaskId::KlineFlush), Duration::from_secs(5));
@@ -89,7 +133,7 @@ async fn kline_flush_attempts_every_dirty_key_before_returning_a_joined_storage_
         Arc::new(|_| {}),
     ));
 
-    let result = execute_kline_flush(service).await;
+    let result = execute_kline_flush(service, Arc::new(StdMutex::new(()))).await;
 
     assert!(matches!(result, Err(AppError::Storage(_))));
     assert!(kline_dir.join("BBB_1.jsonl").is_file());

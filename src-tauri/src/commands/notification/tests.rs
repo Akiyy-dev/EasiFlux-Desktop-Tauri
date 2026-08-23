@@ -103,6 +103,14 @@ fn list_notifications_rejects_flat_and_unknown_request_shapes() {
     assert!(unknown_filter.is_err());
 }
 
+#[test]
+fn list_notifications_rejects_unknown_nested_fields() {
+    let unknown_nested = serde_json::from_value::<ListNotificationsCommandArgs>(json!({
+        "request": { "accountId": "primary", "futureOption": true }
+    }));
+    assert!(unknown_nested.is_err());
+}
+
 fn record(id: &str, scope: NotificationScope, created_at_ms: u64) -> NotificationRecord {
     NotificationRecord {
         id: id.into(),

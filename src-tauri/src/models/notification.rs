@@ -623,7 +623,7 @@ pub enum NotificationFilter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListNotificationsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,

@@ -1,6 +1,6 @@
 use super::super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -24,7 +24,7 @@ fn market_fallback_interval_comes_from_config_without_changing_other_tasks() {
 async fn interval_change_rearms_from_change_time_without_duplicate_tick() {
     let (tx, rx) = tokio::sync::watch::channel(Duration::from_secs(1));
     let running = Arc::new(AtomicBool::new(true));
-    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
+    let run_state = Arc::new(StdMutex::new(TaskRunState::default()));
     let runs = Arc::new(AtomicUsize::new(0));
     let runs_for_loop = Arc::clone(&runs);
 
@@ -64,7 +64,7 @@ async fn interval_change_rearms_from_change_time_without_duplicate_tick() {
 async fn reschedule_during_in_flight_run_keeps_one_owner_and_uses_latest_period() {
     let (tx, rx) = tokio::sync::watch::channel(Duration::from_secs(1));
     let running = Arc::new(AtomicBool::new(true));
-    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
+    let run_state = Arc::new(StdMutex::new(TaskRunState::default()));
     let started = Arc::new(AtomicUsize::new(0));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
