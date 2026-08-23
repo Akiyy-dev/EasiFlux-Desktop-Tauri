@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::models::notification::{
-    ListNotificationsRequest, NotificationChange, NotificationChannel, NotificationEnvironment,
-    NotificationFilter, NotificationKind, NotificationScope,
+    ListNotificationsRequest, NotificationChange, NotificationChannel, NotificationEntity,
+    NotificationEntityType, NotificationEnvironment, NotificationFilter, NotificationKind,
+    NotificationScope,
 };
 use crate::services::notification::{
     enforce_serialized_file_cap_for_test, AvailabilityState, ConnectionObservation,
@@ -31,6 +32,143 @@ fn request() -> ListNotificationsRequest {
         cursor: None,
         limit: 100,
     }
+}
+
+fn near_file_cap_before_created_publish(scope: NotificationScope) -> (NotificationFileV1, String) {
+    near_file_cap_before_created_publish_at(scope, 70, 1)
+}
+
+fn near_file_cap_before_created_publish_at(
+    scope: NotificationScope,
+    revision: u64,
+    prospective_overage: usize,
+) -> (NotificationFileV1, String) {
+    let mut carrier = record(1, scope.clone(), "carrier-source", "carrier-dedupe", NOW);
+    carrier.entity = Some(NotificationEntity {
+        entity_type: NotificationEntityType::Order,
+        id: "x".into(),
+    });
+    let carrier_id = carrier.id.clone();
+    let mut file = NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision,
+        source_event_index: vec![NotificationSourceEventIndexEntry {
+            scope: scope.clone(),
+            source_event_id: "carrier-source".into(),
+            notification_id: carrier_id.clone(),
+        }],
+        partitions: vec![NotificationPartition {
+            scope: scope.clone(),
+            items: vec![carrier],
+        }],
+    };
+    let pending = record(
+        2,
+        scope.clone(),
+        "pending-source",
+        "pending-dedupe",
+        NOW + 1,
+    );
+    let mut prospective = file.clone();
+    prospective.partitions[0].items.push(pending.clone());
+    prospective
+        .source_event_index
+        .push(NotificationSourceEventIndexEntry {
+            scope,
+            source_event_id: "pending-source".into(),
+            notification_id: pending.id,
+        });
+    let current_bytes = serde_json::to_vec_pretty(&file).unwrap().len();
+    let publish_bytes = serde_json::to_vec_pretty(&prospective).unwrap().len() - current_bytes;
+    let target_bytes = MAX_NOTIFICATION_FILE_BYTES - publish_bytes + prospective_overage;
+    let padding = target_bytes - current_bytes;
+    file.partitions[0].items[0]
+        .entity
+        .as_mut()
+        .unwrap()
+        .id
+        .push_str(&"x".repeat(padding));
+    prospective.partitions[0].items[0].entity = file.partitions[0].items[0].entity.clone();
+    assert_eq!(
+        serde_json::to_vec_pretty(&file).unwrap().len(),
+        target_bytes
+    );
+    assert_eq!(
+        serde_json::to_vec_pretty(&prospective).unwrap().len(),
+        MAX_NOTIFICATION_FILE_BYTES + prospective_overage
+    );
+    (file, carrier_id)
+}
+
+fn near_file_cap_before_semantic_publish(
+    scope: NotificationScope,
+) -> (NotificationFileV1, String, String) {
+    let mut carrier = record(
+        1,
+        scope.clone(),
+        "carrier-source",
+        "carrier-dedupe",
+        NOW + 1,
+    );
+    carrier.entity = Some(NotificationEntity {
+        entity_type: NotificationEntityType::Order,
+        id: "x".into(),
+    });
+    let carrier_id = carrier.id.clone();
+    let mut target = record(2, scope.clone(), "target-source", "semantic-target", NOW);
+    target.read_at_ms = Some(NOW + 1);
+    let target_id = target.id.clone();
+    let mut file = NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision: 80,
+        source_event_index: vec![
+            NotificationSourceEventIndexEntry {
+                scope: scope.clone(),
+                source_event_id: "carrier-source".into(),
+                notification_id: carrier_id.clone(),
+            },
+            NotificationSourceEventIndexEntry {
+                scope: scope.clone(),
+                source_event_id: "target-source".into(),
+                notification_id: target_id.clone(),
+            },
+        ],
+        partitions: vec![NotificationPartition {
+            scope: scope.clone(),
+            items: vec![carrier, target],
+        }],
+    };
+    let mut prospective = file.clone();
+    let prospective_target = &mut prospective.partitions[0].items[1];
+    prospective_target.occurrence_count += 1;
+    prospective_target.updated_at_ms = NOW + 2;
+    prospective
+        .source_event_index
+        .push(NotificationSourceEventIndexEntry {
+            scope,
+            source_event_id: "semantic-new-source".into(),
+            notification_id: target_id.clone(),
+        });
+    let current_bytes = serde_json::to_vec_pretty(&file).unwrap().len();
+    let publish_bytes = serde_json::to_vec_pretty(&prospective).unwrap().len() - current_bytes;
+    let target_bytes = MAX_NOTIFICATION_FILE_BYTES - publish_bytes + 1;
+    let padding = target_bytes - current_bytes;
+    file.partitions[0].items[0]
+        .entity
+        .as_mut()
+        .unwrap()
+        .id
+        .push_str(&"x".repeat(padding));
+    prospective.partitions[0].items[0].entity = file.partitions[0].items[0].entity.clone();
+    assert_eq!(
+        serde_json::to_vec_pretty(&file).unwrap().len(),
+        target_bytes
+    );
+    assert_eq!(
+        serde_json::to_vec_pretty(&prospective).unwrap().len(),
+        MAX_NOTIFICATION_FILE_BYTES + 1
+    );
+    (file, carrier_id, target_id)
 }
 
 #[tokio::test]
@@ -165,6 +303,228 @@ async fn startup_prunes_orphan_accounts_and_persists_one_reset() {
     assert!(persisted.partitions.is_empty());
     assert!(persisted.source_event_index.is_empty());
     assert_eq!(persisted.revision, 7);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn startup_legal_backfill_commits_reset_immediately_and_is_restart_stable() {
+    let root = std::env::temp_dir().join(format!(
+        "easiflux-notification-service-backfill-{}-{}",
+        std::process::id(),
+        TEST_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = root.join("notifications.v1.json");
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let legacy = NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision: 12,
+        source_event_index: Vec::new(),
+        partitions: vec![NotificationPartition {
+            scope: scope.clone(),
+            items: vec![record(
+                1,
+                scope.clone(),
+                "legacy-source",
+                "legacy-dedupe",
+                NOW,
+            )],
+        }],
+    };
+    NotificationStore::with_path(path.clone())
+        .save(&legacy)
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let emitter: NotificationEmitter = Arc::new(move |event| {
+        sink.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+
+    let service = NotificationService::load(
+        NotificationStore::with_path(path.clone()),
+        &["alpha".into()],
+        NOW,
+        emitter,
+    )
+    .unwrap();
+
+    assert_eq!(service.revision().await, "13");
+    let emitted = events.lock().unwrap();
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].change, NotificationChange::Reset);
+    assert_eq!(emitted[0].previous_revision, "12");
+    assert_eq!(emitted[0].revision, "13");
+    assert_eq!(emitted[0].affected_scopes, vec![scope.clone()]);
+    drop(emitted);
+    drop(service);
+
+    let persisted = NotificationStore::with_path(path.clone())
+        .load()
+        .unwrap()
+        .file;
+    assert_eq!(persisted.revision, 13);
+    assert_eq!(persisted.source_event_index.len(), 1);
+    assert_eq!(
+        persisted.source_event_index[0].source_event_id,
+        "legacy-source"
+    );
+
+    let restart_events = Arc::new(Mutex::new(Vec::new()));
+    let restart_sink = Arc::clone(&restart_events);
+    let restart_emitter: NotificationEmitter = Arc::new(move |event| {
+        restart_sink.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+    let restarted = NotificationService::load(
+        NotificationStore::with_path(path.clone()),
+        &["alpha".into()],
+        NOW + 1,
+        restart_emitter,
+    )
+    .unwrap();
+    assert_eq!(restarted.revision().await, "13");
+    assert!(restart_events.lock().unwrap().is_empty());
+    let duplicate = restarted
+        .publish(input(scope, "legacy-source", "different-dedupe"), NOW + 1)
+        .await
+        .unwrap();
+    assert!(duplicate.notification.is_none());
+    assert_eq!(duplicate.revision, "13");
+    assert!(restart_events.lock().unwrap().is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn startup_backfill_save_failure_does_not_construct_service_or_change_disk() {
+    let root = std::env::temp_dir().join(format!(
+        "easiflux-notification-service-backfill-failure-{}-{}",
+        std::process::id(),
+        TEST_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = root.join("notifications.v1.json");
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let legacy = NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision: 20,
+        source_event_index: Vec::new(),
+        partitions: vec![NotificationPartition {
+            scope: scope.clone(),
+            items: vec![record(1, scope, "legacy-source", "legacy-dedupe", NOW)],
+        }],
+    };
+    NotificationStore::with_path(path.clone())
+        .save(&legacy)
+        .unwrap();
+    let baseline = fs::read(&path).unwrap();
+    let temp_path = NotificationStore::temp_path_for_test(&path);
+    fs::create_dir(&temp_path).unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let emitter: NotificationEmitter = Arc::new(move |event| {
+        sink.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+
+    let error = NotificationService::load(
+        NotificationStore::with_path(path.clone()),
+        &["alpha".into()],
+        NOW,
+        emitter,
+    )
+    .err()
+    .expect("startup normalization save must fail");
+
+    assert_eq!(error.code(), "NOTIFICATION_STORAGE_UNAVAILABLE");
+    assert_eq!(fs::read(&path).unwrap(), baseline);
+    assert!(events.lock().unwrap().is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn startup_backfill_reserves_reset_revision_digit_growth() {
+    let root = std::env::temp_dir().join(format!(
+        "easiflux-notification-service-backfill-revision-growth-{}-{}",
+        std::process::id(),
+        TEST_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = root.join("notifications.v1.json");
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let mut item = record(1, scope.clone(), "legacy-source", "legacy-dedupe", NOW);
+    item.entity = Some(NotificationEntity {
+        entity_type: NotificationEntityType::Order,
+        id: "x".into(),
+    });
+    let notification_id = item.id.clone();
+    let mut legacy = NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision: 9,
+        source_event_index: Vec::new(),
+        partitions: vec![NotificationPartition {
+            scope: scope.clone(),
+            items: vec![item],
+        }],
+    };
+    let mut normalized = legacy.clone();
+    normalized
+        .source_event_index
+        .push(NotificationSourceEventIndexEntry {
+            scope: scope.clone(),
+            source_event_id: "legacy-source".into(),
+            notification_id,
+        });
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap().len();
+    let normalization_bytes = serde_json::to_vec_pretty(&normalized).unwrap().len() - legacy_bytes;
+    let padding = MAX_NOTIFICATION_FILE_BYTES - normalization_bytes - legacy_bytes;
+    legacy.partitions[0].items[0]
+        .entity
+        .as_mut()
+        .unwrap()
+        .id
+        .push_str(&"x".repeat(padding));
+    normalized.partitions[0].items[0].entity = legacy.partitions[0].items[0].entity.clone();
+    assert_eq!(
+        serde_json::to_vec_pretty(&normalized).unwrap().len(),
+        MAX_NOTIFICATION_FILE_BYTES
+    );
+    NotificationStore::with_path(path.clone())
+        .save(&legacy)
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let emitter: NotificationEmitter = Arc::new(move |event| {
+        sink.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+
+    let service = NotificationService::load(
+        NotificationStore::with_path(path.clone()),
+        &["alpha".into()],
+        NOW,
+        emitter,
+    )
+    .unwrap();
+
+    assert_eq!(service.revision().await, "10");
+    let emitted = events.lock().unwrap();
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].change, NotificationChange::Reset);
+    assert_eq!(emitted[0].previous_revision, "9");
+    assert_eq!(emitted[0].revision, "10");
+    drop(emitted);
+    drop(service);
+    let persisted = NotificationStore::with_path(path.clone())
+        .load()
+        .unwrap()
+        .file;
+    assert!(notification_file_fits_serialized_limit(&persisted));
+    assert!(persisted.partitions.is_empty());
+    assert!(persisted.source_event_index.is_empty());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -439,6 +799,61 @@ fn serialized_cap_repair_uses_logarithmic_probes_when_many_records_must_be_evict
 }
 
 #[tokio::test]
+async fn prune_defensively_converges_an_oversized_runtime_snapshot() {
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let mut oversized = record(
+        1,
+        scope.clone(),
+        "oversized-source",
+        "oversized-dedupe",
+        NOW,
+    );
+    oversized.entity = Some(NotificationEntity {
+        entity_type: NotificationEntityType::Order,
+        id: "x".repeat(MAX_NOTIFICATION_FILE_BYTES),
+    });
+    let oversized_id = oversized.id.clone();
+    let file = NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision: 9,
+        source_event_index: vec![NotificationSourceEventIndexEntry {
+            scope: scope.clone(),
+            source_event_id: "oversized-source".into(),
+            notification_id: oversized_id,
+        }],
+        partitions: vec![NotificationPartition {
+            scope: scope.clone(),
+            items: vec![oversized],
+        }],
+    };
+    assert!(!notification_file_fits_serialized_limit(&file));
+    let harness = harness(NotificationFileV1::empty());
+    harness.service.state.lock().await.file = file;
+
+    let outcome = harness
+        .service
+        .prune(&HashSet::from(["alpha".into()]), NOW + 1)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.affected_count, 1);
+    assert_eq!(outcome.affected_scopes, vec![scope]);
+    assert_eq!(outcome.revision, "10");
+    let saves = harness.persistence.saves();
+    assert_eq!(saves.len(), 1);
+    assert!(notification_file_fits_serialized_limit(&saves[0]));
+    assert!(saves[0].partitions.is_empty());
+    assert!(saves[0].source_event_index.is_empty());
+    let events = harness.events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].change, NotificationChange::Reset);
+    assert_eq!(events[0].previous_revision, "9");
+    assert_eq!(events[0].revision, "10");
+}
+
+#[tokio::test]
 async fn publishing_enforces_oldest_first_one_thousand_limit_for_account_and_global() {
     for scope in [
         NotificationScope::Global,
@@ -650,6 +1065,329 @@ async fn housekeeping_and_publish_failures_have_separate_copy_on_write_boundarie
             .revision,
         "5"
     );
+}
+
+#[tokio::test]
+async fn serialized_reservation_evicts_before_created_and_is_restart_idempotent() {
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let (file, carrier_id) = near_file_cap_before_created_publish(scope.clone());
+    let first = harness(file);
+
+    let outcome = first
+        .service
+        .publish(
+            input(scope.clone(), "pending-source", "pending-dedupe"),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.revision, "72");
+    let created_id = outcome.notification.unwrap().id;
+    let saves = first.persistence.saves();
+    assert_eq!(saves.len(), 2);
+    assert!(notification_file_fits_serialized_limit(&saves[0]));
+    assert!(notification_file_fits_serialized_limit(&saves[1]));
+    assert!(!saves[0]
+        .partitions
+        .iter()
+        .any(|partition| { partition.items.iter().any(|record| record.id == carrier_id) }));
+    assert!(!saves[0]
+        .partitions
+        .iter()
+        .any(|partition| { partition.items.iter().any(|record| record.id == created_id) }));
+    assert!(saves[1]
+        .partitions
+        .iter()
+        .any(|partition| { partition.items.iter().any(|record| record.id == created_id) }));
+    let events = first.events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].change, NotificationChange::Reset);
+    assert_eq!(events[0].previous_revision, "70");
+    assert_eq!(events[0].revision, "71");
+    assert_eq!(events[1].change, NotificationChange::Created);
+    assert_eq!(events[1].previous_revision, "71");
+    assert_eq!(events[1].revision, "72");
+    drop(events);
+
+    let root = std::env::temp_dir().join(format!(
+        "easiflux-notification-service-byte-restart-{}-{}",
+        std::process::id(),
+        TEST_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = root.join("notifications.v1.json");
+    NotificationStore::with_path(path.clone())
+        .save(&saves[1])
+        .unwrap();
+    let baseline = fs::read(&path).unwrap();
+    let restart_events = Arc::new(Mutex::new(Vec::new()));
+    let restart_sink = Arc::clone(&restart_events);
+    let restart_emitter: NotificationEmitter = Arc::new(move |event| {
+        restart_sink.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+    let restarted = NotificationService::load(
+        NotificationStore::with_path(path.clone()),
+        &["alpha".into()],
+        NOW + 2,
+        restart_emitter,
+    )
+    .unwrap();
+    let duplicate = restarted
+        .publish(input(scope, "pending-source", "pending-dedupe"), NOW + 2)
+        .await
+        .unwrap();
+    assert!(duplicate.notification.is_none());
+    assert_eq!(duplicate.revision, "72");
+    assert!(restart_events.lock().unwrap().is_empty());
+    drop(restarted);
+    assert_eq!(fs::read(&path).unwrap(), baseline);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn serialized_reservation_accounts_for_revision_digit_growth() {
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let (file, carrier_id) = near_file_cap_before_created_publish_at(scope.clone(), 9, 0);
+    let harness = harness(file);
+
+    let outcome = harness
+        .service
+        .publish(input(scope, "pending-source", "pending-dedupe"), NOW + 1)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.revision, "11");
+    let created_id = outcome.notification.unwrap().id;
+    let saves = harness.persistence.saves();
+    assert_eq!(saves.len(), 2);
+    assert_eq!(saves[0].revision, 10);
+    assert_eq!(saves[1].revision, 11);
+    assert!(notification_file_fits_serialized_limit(&saves[0]));
+    assert!(notification_file_fits_serialized_limit(&saves[1]));
+    assert!(!saves[0]
+        .partitions
+        .iter()
+        .any(|partition| { partition.items.iter().any(|record| record.id == carrier_id) }));
+    assert!(saves[1]
+        .partitions
+        .iter()
+        .any(|partition| { partition.items.iter().any(|record| record.id == created_id) }));
+    let events = harness.events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].change, NotificationChange::Reset);
+    assert_eq!(events[0].previous_revision, "9");
+    assert_eq!(events[0].revision, "10");
+    assert_eq!(events[1].change, NotificationChange::Created);
+    assert_eq!(events[1].previous_revision, "10");
+    assert_eq!(events[1].revision, "11");
+}
+
+#[tokio::test]
+async fn serialized_reservation_protects_semantic_target_and_resets_before_updated() {
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let (file, carrier_id, target_id) = near_file_cap_before_semantic_publish(scope.clone());
+    let harness = harness(file);
+
+    let outcome = harness
+        .service
+        .publish(
+            input(scope.clone(), "semantic-new-source", "semantic-target"),
+            NOW + 2,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.revision, "82");
+    let merged = outcome.notification.unwrap();
+    assert_eq!(merged.id, target_id);
+    assert_eq!(merged.occurrence_count, 2);
+    assert_eq!(merged.read_at_ms, Some(NOW + 1));
+    let saves = harness.persistence.saves();
+    assert_eq!(saves.len(), 2);
+    assert!(notification_file_fits_serialized_limit(&saves[1]));
+    assert!(!saves[1]
+        .partitions
+        .iter()
+        .any(|partition| { partition.items.iter().any(|record| record.id == carrier_id) }));
+    assert!(saves[1]
+        .partitions
+        .iter()
+        .any(|partition| { partition.items.iter().any(|record| record.id == target_id) }));
+    let events = harness.events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].change, NotificationChange::Reset);
+    assert_eq!(events[0].previous_revision, "80");
+    assert_eq!(events[0].revision, "81");
+    assert_eq!(events[1].change, NotificationChange::Updated);
+    assert_eq!(events[1].previous_revision, "81");
+    assert_eq!(events[1].revision, "82");
+    assert!(events[1].toast_candidate.is_none());
+    drop(events);
+
+    let root = std::env::temp_dir().join(format!(
+        "easiflux-notification-service-byte-merge-restart-{}-{}",
+        std::process::id(),
+        TEST_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = root.join("notifications.v1.json");
+    NotificationStore::with_path(path.clone())
+        .save(&saves[1])
+        .unwrap();
+    let baseline = fs::read(&path).unwrap();
+    let restart_events = Arc::new(Mutex::new(Vec::new()));
+    let restart_sink = Arc::clone(&restart_events);
+    let restart_emitter: NotificationEmitter = Arc::new(move |event| {
+        restart_sink.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+    let restarted = NotificationService::load(
+        NotificationStore::with_path(path.clone()),
+        &["alpha".into()],
+        NOW + 3,
+        restart_emitter,
+    )
+    .unwrap();
+
+    let duplicate = restarted
+        .publish(
+            input(scope, "semantic-new-source", "semantic-target"),
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+
+    assert!(duplicate.notification.is_none());
+    assert_eq!(duplicate.revision, "82");
+    assert!(restart_events.lock().unwrap().is_empty());
+    drop(restarted);
+    assert_eq!(fs::read(&path).unwrap(), baseline);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn serialized_reservation_phase_failures_keep_copy_on_write_boundaries() {
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let pending = || input(scope.clone(), "pending-source", "pending-dedupe");
+
+    let (file, carrier_id) = near_file_cap_before_created_publish(scope.clone());
+    let phase_one = harness(file);
+    phase_one.persistence.fail_next();
+    let error = phase_one
+        .service
+        .publish(pending(), NOW + 1)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "NOTIFICATION_STORAGE_UNAVAILABLE");
+    assert_eq!(phase_one.service.revision().await, "70");
+    assert!(phase_one.persistence.saves().is_empty());
+    assert!(phase_one.events.lock().unwrap().is_empty());
+    let mut account_request = request();
+    account_request.account_id = Some("alpha".into());
+    let page = phase_one
+        .service
+        .list(
+            ViewContext::account("alpha").unwrap(),
+            account_request,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id, carrier_id);
+
+    let (file, _) = near_file_cap_before_created_publish(scope.clone());
+    let phase_two = harness(file);
+    phase_two.persistence.fail_after_successes(1);
+    let error = phase_two
+        .service
+        .publish(pending(), NOW + 1)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "NOTIFICATION_STORAGE_UNAVAILABLE");
+    assert_eq!(phase_two.service.revision().await, "71");
+    assert_eq!(phase_two.persistence.saves().len(), 1);
+    let events = phase_two.events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].change, NotificationChange::Reset);
+    assert_eq!(events[0].revision, "71");
+    drop(events);
+    let mut account_request = request();
+    account_request.account_id = Some("alpha".into());
+    assert!(phase_two
+        .service
+        .list(
+            ViewContext::account("alpha").unwrap(),
+            account_request,
+            NOW + 1,
+        )
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    let retry = phase_two.service.publish(pending(), NOW + 2).await.unwrap();
+    assert_eq!(retry.revision, "72");
+    assert_eq!(phase_two.events.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn serialized_reservation_returns_domain_capacity_error_without_a_safe_candidate() {
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let target = record(1, scope.clone(), "target-source", "semantic-target", NOW);
+    let target_id = target.id.clone();
+    let harness = harness(NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision: 90,
+        source_event_index: vec![NotificationSourceEventIndexEntry {
+            scope: scope.clone(),
+            source_event_id: "target-source".into(),
+            notification_id: target_id.clone(),
+        }],
+        partitions: vec![NotificationPartition {
+            scope: scope.clone(),
+            items: vec![target],
+        }],
+    });
+    let mut oversized = input(scope, "oversized-source", "semantic-target");
+    oversized.entity = Some(NotificationEntity {
+        entity_type: NotificationEntityType::Order,
+        id: "x".repeat(MAX_NOTIFICATION_FILE_BYTES),
+    });
+
+    let error = harness
+        .service
+        .publish(oversized, NOW + 1)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "NOTIFICATION_FILE_CAPACITY_EXCEEDED");
+    assert_eq!(harness.service.revision().await, "90");
+    assert!(harness.persistence.saves().is_empty());
+    assert!(harness.events.lock().unwrap().is_empty());
+    let mut account_request = request();
+    account_request.account_id = Some("alpha".into());
+    let page = harness
+        .service
+        .list(
+            ViewContext::account("alpha").unwrap(),
+            account_request,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id, target_id);
+    assert_eq!(page.items[0].occurrence_count, 1);
 }
 
 #[tokio::test]
@@ -1398,26 +2136,64 @@ async fn partial_legacy_incident_order_stays_stable_after_backfill_is_saved_and_
         .unwrap()
         .to_string();
     partial.source_event_index.remove(0);
-
-    let normalized = harness(partial);
-    normalized
-        .service
-        .publish(
-            input(NotificationScope::Global, "unrelated", "unrelated"),
-            NOW + 1,
-        )
-        .await
+    let original_revision = partial.revision;
+    let root = std::env::temp_dir().join(format!(
+        "easiflux-notification-service-partial-incident-{}-{}",
+        std::process::id(),
+        TEST_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = root.join("notifications.v1.json");
+    NotificationStore::with_path(path.clone())
+        .save(&partial)
         .unwrap();
-    let persisted = normalized.persistence.saves().last().unwrap().clone();
-    let restarted = harness(persisted);
+    let normalization_events = Arc::new(Mutex::new(Vec::new()));
+    let normalization_sink = Arc::clone(&normalization_events);
+    let normalization_emitter: NotificationEmitter = Arc::new(move |event| {
+        normalization_sink.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+    let normalized = NotificationService::load(
+        NotificationStore::with_path(path.clone()),
+        &["alpha".into()],
+        NOW + 1,
+        normalization_emitter,
+    )
+    .unwrap();
+    assert_eq!(
+        normalized.revision().await,
+        (original_revision + 1).to_string()
+    );
+    let emitted = normalization_events.lock().unwrap();
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].change, NotificationChange::Reset);
+    drop(emitted);
+    drop(normalized);
+
+    let restart_events = Arc::new(Mutex::new(Vec::new()));
+    let restart_sink = Arc::clone(&restart_events);
+    let restart_emitter: NotificationEmitter = Arc::new(move |event| {
+        restart_sink.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+    let restarted = NotificationService::load(
+        NotificationStore::with_path(path.clone()),
+        &["alpha".into()],
+        NOW + 2,
+        restart_emitter,
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.revision().await,
+        (original_revision + 1).to_string()
+    );
+    assert!(restart_events.lock().unwrap().is_empty());
     let recovered = restarted
-        .service
         .observe_connection(
             ConnectionObservation {
                 state: AvailabilityState::Available,
                 ..unavailable
             },
-            NOW + 2,
+            NOW + 3,
         )
         .await
         .unwrap()
@@ -1426,6 +2202,7 @@ async fn partial_legacy_incident_order_stays_stable_after_backfill_is_saved_and_
 
     assert_eq!(recovered.kind, NotificationKind::ConnectionRecovered);
     assert!(recovered.dedupe_key.contains(&expected_incident));
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -1530,7 +2307,7 @@ async fn command_terminal_still_publishes_after_same_order_snapshot_seeded_termi
 }
 
 #[tokio::test]
-async fn different_terminal_after_snapshot_is_diagnostic_only_and_preserves_snapshot_state() {
+async fn terminal_order_state_absorbs_late_nonterminal_and_conflicting_terminal_observations() {
     let harness = harness(NotificationFileV1::empty());
     let snapshot = OrderObservation {
         account_id: "alpha".into(),
@@ -1546,45 +2323,53 @@ async fn different_terminal_after_snapshot_is_diagnostic_only_and_preserves_snap
         .await
         .unwrap();
 
-    let conflicting = harness
-        .service
-        .observe_order(
-            OrderObservation {
-                status: ObservedOrderStatus::Canceled,
-                origin: OrderObservationOrigin::Command,
-                ..snapshot.clone()
-            },
+    for (status, origin, observed_at_ms) in [
+        (
+            ObservedOrderStatus::New,
+            OrderObservationOrigin::Realtime,
             NOW + 1,
-        )
-        .await
-        .unwrap();
-    assert!(conflicting.notification.is_none());
+        ),
+        (
+            ObservedOrderStatus::PartiallyFilled,
+            OrderObservationOrigin::Snapshot,
+            NOW + 2,
+        ),
+        (
+            ObservedOrderStatus::Canceled,
+            OrderObservationOrigin::Command,
+            NOW + 3,
+        ),
+        (
+            ObservedOrderStatus::Canceled,
+            OrderObservationOrigin::Realtime,
+            NOW + 4,
+        ),
+    ] {
+        let ignored = harness
+            .service
+            .observe_order(
+                OrderObservation {
+                    status,
+                    origin,
+                    ..snapshot.clone()
+                },
+                observed_at_ms,
+            )
+            .await
+            .unwrap();
+        assert!(ignored.notification.is_none());
+    }
     assert!(harness.persistence.saves().is_empty());
     assert!(harness.events.lock().unwrap().is_empty());
-
-    let realtime_conflict = harness
-        .service
-        .observe_order(
-            OrderObservation {
-                status: ObservedOrderStatus::Rejected,
-                origin: OrderObservationOrigin::Realtime,
-                ..snapshot.clone()
-            },
-            NOW + 2,
-        )
-        .await
-        .unwrap();
-    assert!(realtime_conflict.notification.is_none());
-    assert!(harness.persistence.saves().is_empty());
 
     let matching = harness
         .service
         .observe_order(
             OrderObservation {
                 origin: OrderObservationOrigin::Command,
-                ..snapshot
+                ..snapshot.clone()
             },
-            NOW + 3,
+            NOW + 5,
         )
         .await
         .unwrap();
@@ -1592,6 +2377,21 @@ async fn different_terminal_after_snapshot_is_diagnostic_only_and_preserves_snap
         matching.notification.unwrap().kind,
         NotificationKind::OrderFilled
     );
+
+    let duplicate = harness
+        .service
+        .observe_order(
+            OrderObservation {
+                origin: OrderObservationOrigin::Command,
+                ..snapshot
+            },
+            NOW + 6,
+        )
+        .await
+        .unwrap();
+    assert!(duplicate.notification.is_none());
+    assert_eq!(harness.persistence.saves().len(), 1);
+    assert_eq!(harness.events.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1720,6 +2520,70 @@ async fn observer_state_does_not_leak_into_a_committed_housekeeping_phase() {
         .unwrap()
         .notification
         .is_some());
+}
+
+#[tokio::test]
+async fn incident_state_does_not_leak_when_byte_reservation_phase_two_fails() {
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let (mut file, carrier_id) = near_file_cap_before_created_publish(scope);
+    let current_bytes = serde_json::to_vec_pretty(&file).unwrap().len();
+    file.partitions[0].items[0]
+        .entity
+        .as_mut()
+        .unwrap()
+        .id
+        .push_str(&"x".repeat(MAX_NOTIFICATION_FILE_BYTES - current_bytes));
+    assert_eq!(
+        serde_json::to_vec_pretty(&file).unwrap().len(),
+        MAX_NOTIFICATION_FILE_BYTES
+    );
+    let harness = harness(file);
+    let unavailable = ConnectionObservation {
+        account_id: "alpha".into(),
+        session_epoch: 1,
+        channel: NotificationChannel::Api,
+        state: AvailabilityState::Unavailable,
+    };
+    harness.persistence.fail_after_successes(1);
+
+    let error = harness
+        .service
+        .observe_connection(unavailable.clone(), NOW + 1)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "NOTIFICATION_STORAGE_UNAVAILABLE");
+    assert_eq!(harness.service.revision().await, "71");
+    let saves = harness.persistence.saves();
+    assert_eq!(saves.len(), 1);
+    assert!(notification_file_fits_serialized_limit(&saves[0]));
+    assert!(!saves[0]
+        .partitions
+        .iter()
+        .any(|partition| { partition.items.iter().any(|record| record.id == carrier_id) }));
+    let events = harness.events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].change, NotificationChange::Reset);
+    assert_eq!(events[0].previous_revision, "70");
+    assert_eq!(events[0].revision, "71");
+    drop(events);
+
+    let retry = harness
+        .service
+        .observe_connection(unavailable, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(retry.revision, "72");
+    assert_eq!(
+        retry.notification.unwrap().kind,
+        NotificationKind::ConnectionUnavailable
+    );
+    let events = harness.events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].change, NotificationChange::Created);
+    assert!(events[1].toast_candidate.is_some());
 }
 
 #[tokio::test]

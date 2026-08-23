@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    FailurePoint, NotificationFileV1, NotificationLoadStatus, NotificationPartition,
-    NotificationPersistence, NotificationSourceEventIndexEntry, NotificationStore, RecoverySource,
+    read_candidate_from_open_file, Candidate, FailurePoint, NotificationFileV1,
+    NotificationLoadStatus, NotificationPartition, NotificationPersistence,
+    NotificationSourceEventIndexEntry, NotificationStore, RecoverySource,
     MAX_NOTIFICATION_FILE_BYTES, NOTIFICATION_SCHEMA_VERSION,
 };
 use crate::error::AppError;
@@ -330,6 +331,33 @@ fn valid_main_remains_authoritative_over_a_lower_future_temp_on_save() {
     );
     assert!(!NotificationStore::temp_path_for_test(&path).exists());
     cleanup(&root);
+}
+
+#[test]
+fn valid_main_remains_authoritative_over_lower_oversized_unknown_artifacts() {
+    for label in ["temp", "backup"] {
+        let root = test_root(&format!("current-main-oversized-unknown-{label}"));
+        let path = store_path(&root);
+        let store = NotificationStore::with_path(path.clone());
+        store.save(&sample_file(1)).unwrap();
+        let artifact_path = if label == "temp" {
+            NotificationStore::temp_path_for_test(&path)
+        } else {
+            NotificationStore::backup_path_for_test(&path)
+        };
+        let oversized_unknown = vec![b' '; MAX_NOTIFICATION_FILE_BYTES + 1];
+        fs::write(&artifact_path, &oversized_unknown).unwrap();
+
+        store.save(&sample_file(2)).unwrap();
+
+        assert_eq!(read_file(&path).revision, 2);
+        assert_eq!(
+            read_file(&NotificationStore::backup_path_for_test(&path)).revision,
+            1
+        );
+        assert!(!NotificationStore::temp_path_for_test(&path).exists());
+        cleanup(&root);
+    }
 }
 
 #[test]
@@ -928,5 +956,69 @@ fn oversized_candidate_with_unrecognized_schema_prefix_is_preserved_and_blocks_s
             .count(),
         0
     );
+    cleanup(&root);
+}
+
+#[test]
+fn candidate_growth_after_metadata_check_uses_safe_prefix_classification() {
+    for (label, bytes, expected_future) in [
+        (
+            "future",
+            {
+                let mut bytes = br#"{"schemaVersion":2,"futureData":""#.to_vec();
+                bytes.resize(MAX_NOTIFICATION_FILE_BYTES + 1, b'x');
+                bytes
+            },
+            Some(2),
+        ),
+        ("unknown", vec![b' '; MAX_NOTIFICATION_FILE_BYTES + 1], None),
+    ] {
+        let root = test_root(&format!("candidate-growth-{label}"));
+        let path = store_path(&root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let candidate = read_candidate_from_open_file(
+            fs::File::open(&path).unwrap(),
+            MAX_NOTIFICATION_FILE_BYTES as u64,
+        )
+        .unwrap();
+        match (candidate, expected_future) {
+            (Candidate::Future(found), Some(expected)) => assert_eq!(found, expected),
+            (Candidate::OversizedUnknown, None) => {}
+            _ => panic!("grown candidate was not classified safely"),
+        }
+
+        let store = NotificationStore::with_path(path.clone());
+        if let Some(found) = expected_future {
+            assert_eq!(
+                store.load().unwrap().status,
+                NotificationLoadStatus::UnsupportedSchema { found }
+            );
+        } else {
+            assert_storage_unavailable(store.load().unwrap_err());
+        }
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(store.save(&sample_file(1)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        cleanup(&root);
+    }
+}
+
+#[test]
+fn oversized_prefix_uses_the_first_root_schema_version_even_if_a_later_key_is_future() {
+    let root = test_root("oversized-duplicate-schema");
+    let path = store_path(&root);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut bytes = br#"{"schemaVersion":1,"schemaVersion":2,"padding":""#.to_vec();
+    bytes.resize(MAX_NOTIFICATION_FILE_BYTES + 1, b'x');
+    fs::write(&path, &bytes).unwrap();
+
+    let candidate = read_candidate_from_open_file(
+        fs::File::open(&path).unwrap(),
+        MAX_NOTIFICATION_FILE_BYTES as u64,
+    )
+    .unwrap();
+
+    assert!(matches!(candidate, Candidate::Corrupt));
     cleanup(&root);
 }

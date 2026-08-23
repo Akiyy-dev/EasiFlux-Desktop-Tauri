@@ -403,29 +403,28 @@ fn existing_candidate(path: &Path, path_kind: &'static str) -> AppResult<Option<
 }
 
 fn read_candidate(path: &Path) -> std::io::Result<Candidate> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > MAX_NOTIFICATION_FILE_BYTES as u64 {
+    let file = File::open(path)?;
+    let observed_len = file.metadata()?.len();
+    read_candidate_from_open_file(file, observed_len)
+}
+
+fn read_candidate_from_open_file(mut file: File, observed_len: u64) -> std::io::Result<Candidate> {
+    if observed_len > MAX_NOTIFICATION_FILE_BYTES as u64 {
         let mut prefix = Vec::with_capacity(MAX_NOTIFICATION_SCHEMA_SNIFF_BYTES as usize);
-        File::open(path)?
+        std::io::Read::by_ref(&mut file)
             .take(MAX_NOTIFICATION_SCHEMA_SNIFF_BYTES)
             .read_to_end(&mut prefix)?;
-        return Ok(match sniff_leading_schema_version(&prefix) {
-            Some(schema_version) if schema_version > NOTIFICATION_SCHEMA_VERSION => {
-                Candidate::Future(schema_version)
-            }
-            Some(_) => Candidate::Corrupt,
-            None => Candidate::OversizedUnknown,
-        });
+        return Ok(classify_oversized_prefix(&prefix));
     }
-    let capacity = usize::try_from(metadata.len())
+    let capacity = usize::try_from(observed_len)
         .unwrap_or(MAX_NOTIFICATION_FILE_BYTES)
         .min(MAX_NOTIFICATION_FILE_BYTES);
     let mut bytes = Vec::with_capacity(capacity);
-    File::open(path)?
+    std::io::Read::by_ref(&mut file)
         .take(MAX_NOTIFICATION_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_NOTIFICATION_FILE_BYTES {
-        return Ok(Candidate::Corrupt);
+        return Ok(classify_oversized_prefix(&bytes));
     }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Ok(Candidate::Corrupt);
@@ -449,6 +448,19 @@ fn read_candidate(path: &Path) -> std::io::Result<Candidate> {
         Ok(Candidate::Corrupt)
     } else {
         Ok(Candidate::Valid(file))
+    }
+}
+
+fn classify_oversized_prefix(bytes: &[u8]) -> Candidate {
+    let prefix_len = bytes
+        .len()
+        .min(MAX_NOTIFICATION_SCHEMA_SNIFF_BYTES as usize);
+    match sniff_leading_schema_version(&bytes[..prefix_len]) {
+        Some(schema_version) if schema_version > NOTIFICATION_SCHEMA_VERSION => {
+            Candidate::Future(schema_version)
+        }
+        Some(_) => Candidate::Corrupt,
+        None => Candidate::OversizedUnknown,
     }
 }
 

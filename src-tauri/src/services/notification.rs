@@ -27,6 +27,7 @@ const NOTIFICATION_SCOPE_MISMATCH: &str = "NOTIFICATION_SCOPE_MISMATCH";
 const NOTIFICATION_NOT_FOUND: &str = "NOTIFICATION_NOT_FOUND";
 const NOTIFICATION_SOURCE_INDEX_CAPACITY_EXCEEDED: &str =
     "NOTIFICATION_SOURCE_INDEX_CAPACITY_EXCEEDED";
+const NOTIFICATION_FILE_CAPACITY_EXCEEDED: &str = "NOTIFICATION_FILE_CAPACITY_EXCEEDED";
 const INVALID_NOTIFICATION_CURSOR: &str = "INVALID_NOTIFICATION_CURSOR";
 const MAINTENANCE_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
 
@@ -219,10 +220,10 @@ impl NotificationService {
     where
         P: NotificationPersistence + 'static,
     {
-        normalize_source_event_index(&mut file);
+        let _ = normalize_source_event_index(&mut file);
         let mut normalization = HousekeepingMutation::default();
         enforce_source_index_caps(&mut file, &mut normalization);
-        enforce_serialized_file_cap(&mut file, &mut normalization);
+        let _ = enforce_serialized_file_cap(&mut file, &mut normalization, false);
         let active_incidents = rebuild_active_incidents(&file);
         let seen_source_events = rebuild_seen_source_events(&file);
         Self {
@@ -254,9 +255,9 @@ impl NotificationService {
         let mut file = outcome.file;
         let configured: HashSet<_> = configured_accounts.iter().cloned().collect();
         let mut pruning = prune_file(&mut file, Some(&configured), now_ms);
-        normalize_source_event_index(&mut file);
+        pruning.merge(normalize_source_event_index(&mut file));
         enforce_source_index_caps(&mut file, &mut pruning);
-        enforce_serialized_file_cap(&mut file, &mut pruning);
+        enforce_serialized_file_cap(&mut file, &mut pruning, true)?;
         let previous_revision = file.revision;
         if pruning.changed {
             file.revision = file.revision.checked_add(1).ok_or_else(|| {
@@ -289,12 +290,11 @@ impl NotificationService {
         now_ms: u64,
     ) -> Result<PublishOutcome, NotificationError> {
         let mut guard = self.state.lock().await;
-        let preparation = self.prepare_publish_locked(&mut guard, &input, now_ms)?;
-        if !preparation.should_publish {
+        let Some(prepared) = self.prepare_publish_locked(&mut guard, &input, now_ms)? else {
             return Ok(no_publish_outcome(&guard));
-        }
+        };
         let mut next = guard.clone();
-        let mutation = apply_publish(&mut next, input, now_ms)?;
+        let mutation = apply_prepared_publish(&mut next, prepared)?;
         self.commit_publish(&mut guard, next, mutation)
     }
 
@@ -582,7 +582,8 @@ impl NotificationService {
         let mut guard = self.state.lock().await;
         let mut next = guard.clone();
         next.last_pruned_at_ms = now_ms;
-        let pruning = prune_file(&mut next.file, Some(configured_accounts), now_ms);
+        let mut pruning = prune_file(&mut next.file, Some(configured_accounts), now_ms);
+        enforce_serialized_file_cap(&mut next.file, &mut pruning, true)?;
         next.seen_source_events = rebuild_seen_source_events(&next.file);
         next.active_incidents = rebuild_active_incidents(&next.file);
         next.order_states
@@ -702,17 +703,16 @@ impl NotificationService {
                 )
             }
         };
-        let preparation = self.prepare_publish_locked(&mut guard, &input, now_ms)?;
-        if !preparation.should_publish {
+        let Some(prepared) = self.prepare_publish_locked(&mut guard, &input, now_ms)? else {
             return Ok(no_publish_outcome(&guard));
-        }
+        };
         let mut next = guard.clone();
         if let Some(incident) = next_incident {
             next.active_incidents.insert(key, incident);
         } else {
             next.active_incidents.remove(&key);
         }
-        let mutation = apply_publish(&mut next, input, now_ms)?;
+        let mutation = apply_prepared_publish(&mut next, prepared)?;
         self.commit_publish(&mut guard, next, mutation)
     }
 
@@ -765,17 +765,16 @@ impl NotificationService {
                 )
             }
         };
-        let preparation = self.prepare_publish_locked(&mut guard, &input, now_ms)?;
-        if !preparation.should_publish {
+        let Some(prepared) = self.prepare_publish_locked(&mut guard, &input, now_ms)? else {
             return Ok(no_publish_outcome(&guard));
-        }
+        };
         let mut next = guard.clone();
         if let Some(incident) = next_incident {
             next.active_incidents.insert(key, incident);
         } else {
             next.active_incidents.remove(&key);
         }
-        let mutation = apply_publish(&mut next, input, now_ms)?;
+        let mutation = apply_prepared_publish(&mut next, prepared)?;
         self.commit_publish(&mut guard, next, mutation)
     }
 
@@ -800,16 +799,15 @@ impl NotificationService {
         };
         let mut guard = self.state.lock().await;
         let previous = guard.order_states.get(&key).copied();
-        if previous.is_some_and(|state| state.status.is_terminal())
-            && observation.status.is_terminal()
-            && previous.map(|state| state.status) != Some(observation.status)
-        {
-            tracing::warn!(
-                previous_status = previous.expect("terminal status was checked").status.name(),
-                observed_status = observation.status.name(),
-                "ignored inconsistent terminal order transition"
-            );
-            return Ok(no_publish_outcome(&guard));
+        if let Some(previous) = previous.filter(|state| state.status.is_terminal()) {
+            if !observation.status.is_terminal() || previous.status != observation.status {
+                tracing::warn!(
+                    previous_status = previous.status.name(),
+                    observed_status = observation.status.name(),
+                    "ignored order transition after terminal state"
+                );
+                return Ok(no_publish_outcome(&guard));
+            }
         }
         let already_notified = previous.is_some_and(|state| state.terminal_notified);
         let should_publish = observation.status.is_terminal()
@@ -860,10 +858,9 @@ impl NotificationService {
             )?,
             ObservedOrderStatus::New | ObservedOrderStatus::PartiallyFilled => unreachable!(),
         };
-        let preparation = self.prepare_publish_locked(&mut guard, &input, now_ms)?;
-        if !preparation.should_publish {
+        let Some(prepared) = self.prepare_publish_locked(&mut guard, &input, now_ms)? else {
             return Ok(no_publish_outcome(&guard));
-        }
+        };
         let mut next = guard.clone();
         next.order_states.insert(
             key,
@@ -872,7 +869,7 @@ impl NotificationService {
                 terminal_notified: true,
             },
         );
-        let mutation = apply_publish(&mut next, input, now_ms)?;
+        let mutation = apply_prepared_publish(&mut next, prepared)?;
         self.commit_publish(&mut guard, next, mutation)
     }
 
@@ -881,23 +878,25 @@ impl NotificationService {
         guard: &mut ServiceState,
         input: &NotificationInput,
         now_ms: u64,
-    ) -> Result<PublishPreparation, NotificationError> {
+    ) -> Result<Option<PreparedPublish>, NotificationError> {
         validate_publish_input(input)?;
         if source_key(input)
             .as_ref()
             .is_some_and(|key| guard.seen_source_events.contains(key))
         {
-            return Ok(PublishPreparation {
-                should_publish: false,
-            });
+            return Ok(None);
         }
 
         let mut next = guard.clone();
-        let housekeeping = prepare_file_for_publish(&mut next.file, input, now_ms)?;
+        let mut housekeeping = prepare_file_for_publish(&mut next.file, input, now_ms)?;
+        let prepared = prepare_publish_record(&next.file, input, now_ms)?;
+        reserve_serialized_capacity_for_publish(
+            &mut next.file,
+            &prepared,
+            &mut housekeeping.mutation,
+        )?;
         if !housekeeping.mutation.changed {
-            return Ok(PublishPreparation {
-                should_publish: true,
-            });
+            return Ok(Some(prepared));
         }
         next.seen_source_events = rebuild_seen_source_events(&next.file);
         next.active_incidents = rebuild_active_incidents(&next.file);
@@ -911,9 +910,7 @@ impl NotificationService {
             toast_candidate: None,
         };
         self.emit_diagnostic_only(&event);
-        Ok(PublishPreparation {
-            should_publish: true,
-        })
+        Ok(Some(prepared))
     }
 
     fn commit_publish(
@@ -966,47 +963,43 @@ struct PublishMutation {
     affected_scopes: Vec<NotificationScope>,
 }
 
-struct PublishPreparation {
-    should_publish: bool,
-}
-
 struct PublishHousekeeping {
     mutation: HousekeepingMutation,
 }
 
-fn apply_publish(
-    next: &mut ServiceState,
-    input: NotificationInput,
-    now_ms: u64,
-) -> Result<PublishMutation, NotificationError> {
-    validate_publish_input(&input)?;
-    let source_key = source_key(&input);
-    if source_key
-        .as_ref()
-        .is_some_and(|key| next.seen_source_events.contains(key))
-    {
-        return Ok(PublishMutation {
-            record: None,
-            change: None,
-            toast_candidate: None,
-            affected_scopes: Vec::new(),
-        });
-    }
+#[derive(Clone)]
+struct PreparedPublish {
+    record: NotificationRecord,
+    change: NotificationChange,
+    toast_candidate: Option<NotificationToastCandidate>,
+    source_entry: Option<NotificationSourceEventIndexEntry>,
+}
 
+fn prepare_publish_record(
+    file: &NotificationFileV1,
+    input: &NotificationInput,
+    now_ms: u64,
+) -> Result<PreparedPublish, NotificationError> {
     let scope = input.scope.clone();
     let session_epoch = input.session_epoch;
-    let partition = partition_mut(&mut next.file, &scope);
-    let existing = partition
-        .items
-        .iter_mut()
-        .find(|record| record.dedupe_key == input.dedupe_key);
-    let (record, change, toast_candidate) = if let Some(record) = existing {
+    let existing = file
+        .partitions
+        .iter()
+        .find(|partition| partition.scope == scope)
+        .and_then(|partition| {
+            partition
+                .items
+                .iter()
+                .find(|record| record.dedupe_key == input.dedupe_key)
+        });
+    let (record, change, toast_candidate) = if let Some(existing) = existing {
+        let mut record = existing.clone();
         record.category = input.category;
         record.kind = input.kind;
         record.severity = input.severity;
-        record.content = input.content;
-        record.entity = input.entity;
-        record.action = input.action;
+        record.content = input.content.clone();
+        record.entity = input.entity.clone();
+        record.action = input.action.clone();
         record.occurrence_count = record.occurrence_count.checked_add(1).ok_or_else(|| {
             NotificationError::new("NOTIFICATION_OCCURRENCE_OVERFLOW", "通知出现次数已达上限")
         })?;
@@ -1014,7 +1007,7 @@ fn apply_publish(
         record
             .validate()
             .map_err(|error| NotificationError::new(error.code(), "通知记录无效"))?;
-        (record.clone(), NotificationChange::Updated, None)
+        (record, NotificationChange::Updated, None)
     } else {
         let record = NotificationRecord {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1022,11 +1015,11 @@ fn apply_publish(
             category: input.category,
             kind: input.kind,
             severity: input.severity,
-            content: input.content,
-            entity: input.entity,
-            action: input.action,
+            content: input.content.clone(),
+            entity: input.entity.clone(),
+            action: input.action.clone(),
             source_event_id: input.source_event_id.clone(),
-            dedupe_key: input.dedupe_key,
+            dedupe_key: input.dedupe_key.clone(),
             occurrence_count: 1,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -1044,25 +1037,78 @@ fn apply_publish(
             content: record.content.clone(),
             action: record.action.clone(),
         };
-        partition.items.push(record.clone());
         (record, NotificationChange::Created, Some(toast))
     };
-    if let Some((source_scope, source_event_id)) = source_key {
-        next.file
-            .source_event_index
-            .push(NotificationSourceEventIndexEntry {
-                scope: source_scope.clone(),
-                source_event_id: source_event_id.clone(),
-                notification_id: record.id.clone(),
-            });
-        next.seen_source_events
-            .insert((source_scope, source_event_id));
+    let source_entry = source_key(input).map(|(source_scope, source_event_id)| {
+        NotificationSourceEventIndexEntry {
+            scope: source_scope,
+            source_event_id,
+            notification_id: record.id.clone(),
+        }
+    });
+    Ok(PreparedPublish {
+        record,
+        change,
+        toast_candidate,
+        source_entry,
+    })
+}
+
+fn apply_prepared_to_file(
+    file: &mut NotificationFileV1,
+    prepared: &PreparedPublish,
+) -> Result<(), NotificationError> {
+    match prepared.change {
+        NotificationChange::Created => {
+            partition_mut(file, &prepared.record.scope)
+                .items
+                .push(prepared.record.clone());
+        }
+        NotificationChange::Updated => {
+            let record = file
+                .partitions
+                .iter_mut()
+                .find(|partition| partition.scope == prepared.record.scope)
+                .and_then(|partition| {
+                    partition
+                        .items
+                        .iter_mut()
+                        .find(|record| record.id == prepared.record.id)
+                })
+                .ok_or_else(|| {
+                    NotificationError::new("NOTIFICATION_STATE_CONFLICT", "通知状态已发生冲突")
+                })?;
+            *record = prepared.record.clone();
+        }
+        NotificationChange::Removed | NotificationChange::Reset => {
+            return Err(NotificationError::new(
+                "NOTIFICATION_STATE_CONFLICT",
+                "通知状态已发生冲突",
+            ));
+        }
+    }
+    if let Some(source_entry) = &prepared.source_entry {
+        file.source_event_index.push(source_entry.clone());
+    }
+    Ok(())
+}
+
+fn apply_prepared_publish(
+    next: &mut ServiceState,
+    prepared: PreparedPublish,
+) -> Result<PublishMutation, NotificationError> {
+    apply_prepared_to_file(&mut next.file, &prepared)?;
+    if let Some(source_entry) = &prepared.source_entry {
+        next.seen_source_events.insert((
+            source_entry.scope.clone(),
+            source_entry.source_event_id.clone(),
+        ));
     }
     Ok(PublishMutation {
-        record: Some(record),
-        change: Some(change),
-        toast_candidate,
-        affected_scopes: vec![scope],
+        record: Some(prepared.record.clone()),
+        change: Some(prepared.change),
+        toast_candidate: prepared.toast_candidate,
+        affected_scopes: vec![prepared.record.scope],
     })
 }
 
@@ -1114,6 +1160,16 @@ impl HousekeepingMutation {
     fn note_removed_record(&mut self, scope: NotificationScope) {
         self.affected_count += 1;
         self.note_scope(scope);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.affected_count = self.affected_count.saturating_add(other.affected_count);
+        self.changed |= other.changed;
+        for scope in other.affected_scopes {
+            if !self.affected_scopes.contains(&scope) {
+                self.affected_scopes.push(scope);
+            }
+        }
     }
 }
 
@@ -1180,6 +1236,78 @@ fn prepare_file_for_publish(
     }
 
     Ok(PublishHousekeeping { mutation })
+}
+
+fn reserve_serialized_capacity_for_publish(
+    file: &mut NotificationFileV1,
+    prepared: &PreparedPublish,
+    mutation: &mut HousekeepingMutation,
+) -> Result<(), NotificationError> {
+    let initial_revision_increment = if mutation.changed { 2 } else { 1 };
+    if prepared_file_fits_after_eviction(file, prepared, &[], initial_revision_increment)? {
+        return Ok(());
+    }
+
+    let protected_id =
+        (prepared.change == NotificationChange::Updated).then_some(prepared.record.id.as_str());
+    let mut candidates: Vec<_> = file
+        .partitions
+        .iter()
+        .flat_map(|partition| {
+            partition.items.iter().filter_map(|record| {
+                (protected_id != Some(record.id.as_str())).then(|| {
+                    (
+                        record.created_at_ms,
+                        record.id.clone(),
+                        partition.scope.clone(),
+                    )
+                })
+            })
+        })
+        .collect();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    if candidates.is_empty() || !prepared_file_fits_after_eviction(file, prepared, &candidates, 2)?
+    {
+        return Err(NotificationError::new(
+            NOTIFICATION_FILE_CAPACITY_EXCEEDED,
+            "通知存储容量已满",
+        ));
+    }
+
+    let mut lower = 0_usize;
+    let mut upper = candidates.len();
+    while lower + 1 < upper {
+        let middle = lower + (upper - lower) / 2;
+        if prepared_file_fits_after_eviction(file, prepared, &candidates[..middle], 2)? {
+            upper = middle;
+        } else {
+            lower = middle;
+        }
+    }
+    let selected = &candidates[..upper];
+    remove_record_candidates(file, selected);
+    for (_, _, scope) in selected {
+        mutation.note_removed_record(scope.clone());
+    }
+    Ok(())
+}
+
+fn prepared_file_fits_after_eviction(
+    original: &NotificationFileV1,
+    prepared: &PreparedPublish,
+    candidates: &[(u64, String, NotificationScope)],
+    revision_increment: u64,
+) -> Result<bool, NotificationError> {
+    let mut trial = original.clone();
+    remove_record_candidates(&mut trial, candidates);
+    apply_prepared_to_file(&mut trial, prepared)?;
+    trial.revision = trial
+        .revision
+        .checked_add(revision_increment)
+        .ok_or_else(|| {
+            NotificationError::new("NOTIFICATION_REVISION_EXHAUSTED", "通知修订号已达上限")
+        })?;
+    Ok(notification_file_fits_serialized_limit(&trial))
 }
 
 fn can_reduce_source_index_without_record(
@@ -1301,10 +1429,12 @@ fn enforce_source_index_caps(file: &mut NotificationFileV1, mutation: &mut House
 fn enforce_serialized_file_cap(
     file: &mut NotificationFileV1,
     mutation: &mut HousekeepingMutation,
-) -> usize {
+    persists_revision: bool,
+) -> Result<usize, NotificationError> {
     let mut probes = 1_usize;
-    if notification_file_fits_serialized_limit(file) {
-        return probes;
+    let existing_increment = u64::from(persists_revision && mutation.changed);
+    if serialized_file_fits_after_eviction(file, &[], existing_increment)? {
+        return Ok(probes);
     }
     let mut candidates: Vec<_> = file
         .partitions
@@ -1321,27 +1451,39 @@ fn enforce_serialized_file_cap(
         .collect();
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     if candidates.is_empty() {
-        return probes;
+        return Err(NotificationError::new(
+            NOTIFICATION_FILE_CAPACITY_EXCEEDED,
+            "通知存储容量已满",
+        ));
     }
 
     let original = file.clone();
+    let revision_increment = u64::from(persists_revision);
     let mut lower = 0_usize;
     let mut upper = 1_usize;
     loop {
         probes += 1;
-        if serialized_file_fits_after_eviction(&original, &candidates[..upper]) {
+        if serialized_file_fits_after_eviction(&original, &candidates[..upper], revision_increment)?
+        {
             break;
         }
         lower = upper;
         if upper == candidates.len() {
-            break;
+            return Err(NotificationError::new(
+                NOTIFICATION_FILE_CAPACITY_EXCEEDED,
+                "通知存储容量已满",
+            ));
         }
         upper = upper.saturating_mul(2).min(candidates.len());
     }
     while lower + 1 < upper {
         let middle = lower + (upper - lower) / 2;
         probes += 1;
-        if serialized_file_fits_after_eviction(&original, &candidates[..middle]) {
+        if serialized_file_fits_after_eviction(
+            &original,
+            &candidates[..middle],
+            revision_increment,
+        )? {
             upper = middle;
         } else {
             lower = middle;
@@ -1353,22 +1495,29 @@ fn enforce_serialized_file_cap(
     for (_, _, scope) in selected {
         mutation.note_removed_record(scope.clone());
     }
-    probes
+    Ok(probes)
 }
 
 #[cfg(test)]
 pub(super) fn enforce_serialized_file_cap_for_test(file: &mut NotificationFileV1) -> usize {
     let mut mutation = HousekeepingMutation::default();
-    enforce_serialized_file_cap(file, &mut mutation)
+    enforce_serialized_file_cap(file, &mut mutation, false).unwrap()
 }
 
 fn serialized_file_fits_after_eviction(
     original: &NotificationFileV1,
     candidates: &[(u64, String, NotificationScope)],
-) -> bool {
+    revision_increment: u64,
+) -> Result<bool, NotificationError> {
     let mut trial = original.clone();
     remove_record_candidates(&mut trial, candidates);
-    notification_file_fits_serialized_limit(&trial)
+    trial.revision = trial
+        .revision
+        .checked_add(revision_increment)
+        .ok_or_else(|| {
+            NotificationError::new("NOTIFICATION_REVISION_EXHAUSTED", "通知修订号已达上限")
+        })?;
+    Ok(notification_file_fits_serialized_limit(&trial))
 }
 
 fn remove_record_candidates(
@@ -1499,8 +1648,9 @@ fn rebuild_seen_source_events(file: &NotificationFileV1) -> HashSet<(Notificatio
         .collect()
 }
 
-fn normalize_source_event_index(file: &mut NotificationFileV1) {
-    canonicalize_partial_incident_creation_order(file);
+fn normalize_source_event_index(file: &mut NotificationFileV1) -> HousekeepingMutation {
+    let before = file.source_event_index.clone();
+    let _ = canonicalize_partial_incident_creation_order(file);
     let mut indexed: HashSet<_> = file
         .source_event_index
         .iter()
@@ -1542,9 +1692,13 @@ fn normalize_source_event_index(file: &mut NotificationFileV1) {
         }
     }
     file.source_event_index.extend(missing);
+    source_index_mutation_since(&before, &file.source_event_index)
 }
 
-fn canonicalize_partial_incident_creation_order(file: &mut NotificationFileV1) {
+fn canonicalize_partial_incident_creation_order(
+    file: &mut NotificationFileV1,
+) -> HousekeepingMutation {
+    let before = file.source_event_index.clone();
     let creation_positions = incident_creation_positions(file);
     let edges: Vec<_> = file
         .partitions
@@ -1560,7 +1714,7 @@ fn canonicalize_partial_incident_creation_order(file: &mut NotificationFileV1) {
         .map(|edge| edge.key.clone())
         .collect();
     if fallback_keys.is_empty() {
-        return;
+        return HousekeepingMutation::default();
     }
 
     let creation_entries: HashMap<_, _> = file
@@ -1674,6 +1828,37 @@ fn canonicalize_partial_incident_creation_order(file: &mut NotificationFileV1) {
             &mut file.source_event_index,
         );
     }
+    source_index_mutation_since(&before, &file.source_event_index)
+}
+
+fn source_index_mutation_since(
+    before: &[NotificationSourceEventIndexEntry],
+    after: &[NotificationSourceEventIndexEntry],
+) -> HousekeepingMutation {
+    if before == after {
+        return HousekeepingMutation::default();
+    }
+    let mut scopes: Vec<_> = before
+        .iter()
+        .chain(after)
+        .map(|entry| entry.scope.clone())
+        .collect();
+    scopes.sort_by(|left, right| scope_sort_key(left).cmp(&scope_sort_key(right)));
+    scopes.dedup();
+    let mut mutation = HousekeepingMutation::default();
+    for scope in scopes {
+        let before_scope: Vec<_> = before.iter().filter(|entry| entry.scope == scope).collect();
+        let after_scope: Vec<_> = after.iter().filter(|entry| entry.scope == scope).collect();
+        if before_scope != after_scope {
+            mutation.note_scope(scope);
+        }
+    }
+    if !mutation.changed {
+        for entry in before.iter().chain(after) {
+            mutation.note_scope(entry.scope.clone());
+        }
+    }
+    mutation
 }
 
 fn incident_creation_positions(file: &NotificationFileV1) -> HashMap<String, usize> {
