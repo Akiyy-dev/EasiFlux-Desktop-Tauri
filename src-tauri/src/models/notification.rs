@@ -121,13 +121,175 @@ pub enum NotificationScalar {
 
 impl NotificationScalar {
     fn validate(&self) -> Result<(), NotificationValidationError> {
-        if matches!(self, Self::Number(number) if !number.is_finite()) {
-            return Err(NotificationValidationError::new(
-                "INVALID_NOTIFICATION_CONTENT",
-                "通知内容包含非有限数值",
-            ));
+        match self {
+            Self::String(value) if !is_safe_scalar_string(value) => {
+                return Err(NotificationValidationError::new(
+                    "INVALID_NOTIFICATION_CONTENT",
+                    "通知内容包含不安全字符串",
+                ));
+            }
+            Self::Number(number) if !number.is_finite() => {
+                return Err(NotificationValidationError::new(
+                    "INVALID_NOTIFICATION_CONTENT",
+                    "通知内容包含非有限数值",
+                ));
+            }
+            _ => {}
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotificationMessageTemplate {
+    OrderFilled,
+    OrderCanceled,
+    OrderRejected,
+    RiskOrderBlocked,
+    AccountSessionExpired,
+    AccountRecoveryFailed,
+    AccountReconciliationFailed,
+    ConnectionUnavailable,
+    ConnectionRecovered,
+    EnvironmentUnavailable,
+    EnvironmentRecovered,
+}
+
+impl NotificationMessageTemplate {
+    fn from_message_key(value: &str) -> Option<Self> {
+        Some(match value {
+            "order.filled" => Self::OrderFilled,
+            "order.canceled" => Self::OrderCanceled,
+            "order.rejected" => Self::OrderRejected,
+            "risk.orderBlocked" => Self::RiskOrderBlocked,
+            "account.sessionExpired" => Self::AccountSessionExpired,
+            "account.recoveryFailed" => Self::AccountRecoveryFailed,
+            "account.reconciliationFailed" => Self::AccountReconciliationFailed,
+            "connection.unavailable" => Self::ConnectionUnavailable,
+            "connection.recovered" => Self::ConnectionRecovered,
+            "environment.unavailable" => Self::EnvironmentUnavailable,
+            "environment.recovered" => Self::EnvironmentRecovered,
+            _ => return None,
+        })
+    }
+
+    fn fallback(self) -> (&'static str, &'static str) {
+        match self {
+            Self::OrderFilled => ("订单已成交", "订单已完全成交，请前往交易页查看。"),
+            Self::OrderCanceled => ("订单已取消", "订单已取消，请前往交易页查看。"),
+            Self::OrderRejected => ("订单被拒绝", "订单请求被交易端拒绝，请检查订单参数。"),
+            Self::RiskOrderBlocked => ("订单被风控拦截", "请检查风控设置"),
+            Self::AccountSessionExpired => ("账户会话已失效", "请检查账户 API 设置。"),
+            Self::AccountRecoveryFailed => ("账户恢复失败", "请检查账户设置后重试。"),
+            Self::AccountReconciliationFailed => ("账户对账失败", "请检查账户数据后重试。"),
+            Self::ConnectionUnavailable => {
+                ("连接不可用", "交易连接暂时不可用，请检查网络或稍后重试。")
+            }
+            Self::ConnectionRecovered => ("连接已恢复", "交易连接已恢复。"),
+            Self::EnvironmentUnavailable => ("环境不可达", "当前交易环境暂时不可达，请稍后重试。"),
+            Self::EnvironmentRecovered => ("环境已恢复", "当前交易环境已恢复。"),
+        }
+    }
+
+    fn accepts(self, key: NotificationParameterKey, value: &NotificationScalar) -> bool {
+        match self {
+            Self::OrderFilled | Self::OrderCanceled => {
+                matches!(
+                    (key, value),
+                    (
+                        NotificationParameterKey::OrderId,
+                        NotificationScalar::String(_)
+                    )
+                )
+            }
+            Self::OrderRejected => matches!(
+                (key, value),
+                (
+                    NotificationParameterKey::OrderId,
+                    NotificationScalar::String(_)
+                ) | (
+                    NotificationParameterKey::SubmissionId,
+                    NotificationScalar::String(_)
+                )
+            ),
+            Self::RiskOrderBlocked => matches!(
+                (key, value),
+                (
+                    NotificationParameterKey::Limit,
+                    NotificationScalar::Number(_)
+                ) | (
+                    NotificationParameterKey::ViolationCode,
+                    NotificationScalar::String(_)
+                )
+            ),
+            Self::AccountSessionExpired => {
+                matches!(
+                    (key, value),
+                    (
+                        NotificationParameterKey::AccountId,
+                        NotificationScalar::String(_)
+                    )
+                )
+            }
+            Self::AccountRecoveryFailed | Self::AccountReconciliationFailed => matches!(
+                (key, value),
+                (
+                    NotificationParameterKey::AttemptId,
+                    NotificationScalar::String(_)
+                ) | (
+                    NotificationParameterKey::FailedSteps,
+                    NotificationScalar::String(_)
+                )
+            ),
+            Self::ConnectionUnavailable | Self::ConnectionRecovered => {
+                matches!(
+                    (key, value),
+                    (
+                        NotificationParameterKey::Channel,
+                        NotificationScalar::String(_)
+                    )
+                )
+            }
+            Self::EnvironmentUnavailable | Self::EnvironmentRecovered => {
+                matches!(
+                    (key, value),
+                    (
+                        NotificationParameterKey::Environment,
+                        NotificationScalar::String(_)
+                    )
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NotificationParameterKey {
+    AccountId,
+    AttemptId,
+    Channel,
+    Environment,
+    FailedSteps,
+    Limit,
+    OrderId,
+    SubmissionId,
+    ViolationCode,
+}
+
+impl NotificationParameterKey {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "accountId" => Self::AccountId,
+            "attemptId" => Self::AttemptId,
+            "channel" => Self::Channel,
+            "environment" => Self::Environment,
+            "failedSteps" => Self::FailedSteps,
+            "limit" => Self::Limit,
+            "orderId" => Self::OrderId,
+            "submissionId" => Self::SubmissionId,
+            "violationCode" => Self::ViolationCode,
+            _ => return None,
+        })
     }
 }
 
@@ -165,19 +327,36 @@ impl NotificationContent {
     }
 
     pub fn validate(&self) -> Result<(), NotificationValidationError> {
-        if self.message_key.trim().is_empty()
-            || self.fallback_title.trim().is_empty()
-            || self.fallback_body.trim().is_empty()
-            || self.params.keys().any(|key| key.trim().is_empty())
-        {
+        let Some(template) = NotificationMessageTemplate::from_message_key(&self.message_key)
+        else {
             return Err(NotificationValidationError::new(
                 "INVALID_NOTIFICATION_CONTENT",
-                "通知内容包含空白字段",
+                "通知消息模板不受支持",
+            ));
+        };
+        let (fallback_title, fallback_body) = template.fallback();
+        if self.fallback_title != fallback_title || self.fallback_body != fallback_body {
+            return Err(NotificationValidationError::new(
+                "INVALID_NOTIFICATION_CONTENT",
+                "通知兜底文本不匹配受控模板",
             ));
         }
-        self.params
-            .values()
-            .try_for_each(NotificationScalar::validate)
+        for (key, value) in &self.params {
+            let Some(parameter_key) = NotificationParameterKey::parse(key) else {
+                return Err(NotificationValidationError::new(
+                    "INVALID_NOTIFICATION_CONTENT",
+                    "通知参数名不受支持",
+                ));
+            };
+            value.validate()?;
+            if !template.accepts(parameter_key, value) {
+                return Err(NotificationValidationError::new(
+                    "INVALID_NOTIFICATION_CONTENT",
+                    "通知参数类型不受支持",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -233,6 +412,19 @@ pub enum NotificationAction {
     OpenGeneralSettings,
 }
 
+impl NotificationAction {
+    fn validate(&self) -> Result<(), NotificationValidationError> {
+        if matches!(self, Self::OpenTrading { order_id: Some(order_id) } if !is_safe_scalar_string(order_id))
+        {
+            return Err(NotificationValidationError::new(
+                "INVALID_NOTIFICATION_ACTION",
+                "通知动作订单标识无效",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationRecord {
@@ -268,6 +460,10 @@ impl NotificationRecord {
             .entity
             .as_ref()
             .is_some_and(|entity| entity.validate().is_err())
+            || self
+                .action
+                .as_ref()
+                .is_some_and(|action| action.validate().is_err())
             || self
                 .source_event_id
                 .as_ref()
@@ -317,6 +513,10 @@ impl NotificationInput {
             .entity
             .as_ref()
             .is_some_and(|entity| entity.validate().is_err())
+            || self
+                .action
+                .as_ref()
+                .is_some_and(|action| action.validate().is_err())
             || self
                 .source_event_id
                 .as_ref()
@@ -426,6 +626,25 @@ pub struct NotificationToastCandidate {
     pub action: Option<NotificationAction>,
 }
 
+impl NotificationToastCandidate {
+    fn validate(&self) -> Result<(), NotificationValidationError> {
+        validate_notification_id(&self.id).map_err(|_| invalid_event())?;
+        self.scope.validate().map_err(|_| invalid_event())?;
+        self.content.validate().map_err(|_| invalid_event())?;
+        if self
+            .session_epoch
+            .is_some_and(|epoch| !is_safe_timestamp(epoch))
+            || self
+                .action
+                .as_ref()
+                .is_some_and(|action| action.validate().is_err())
+        {
+            return Err(invalid_event());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationChangedEvent {
@@ -442,10 +661,10 @@ pub struct NotificationChangedEvent {
 impl NotificationChangedEvent {
     pub fn validate(&self) -> Result<(), NotificationValidationError> {
         if self.change != NotificationChange::Created && self.toast_candidate.is_some() {
-            return Err(NotificationValidationError::new(
-                "INVALID_NOTIFICATION_EVENT",
-                "只有新建通知可以携带 Toast 候选项",
-            ));
+            return Err(invalid_event());
+        }
+        if let Some(candidate) = &self.toast_candidate {
+            candidate.validate()?;
         }
         Ok(())
     }
@@ -496,12 +715,32 @@ fn is_safe_timestamp(value: u64) -> bool {
     value <= MAX_JAVASCRIPT_SAFE_INTEGER
 }
 
+fn is_safe_scalar_string(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'@')
+        })
+}
+
+fn validate_notification_id(id: &str) -> Result<(), NotificationValidationError> {
+    let parsed = Uuid::parse_str(id).map_err(|_| invalid_record())?;
+    if parsed.get_version() != Some(Version::Random) || parsed.hyphenated().to_string() != id {
+        return Err(invalid_record());
+    }
+    Ok(())
+}
+
 fn invalid_record() -> NotificationValidationError {
     NotificationValidationError::new("INVALID_NOTIFICATION_RECORD", "通知记录无效")
 }
 
 fn invalid_content() -> NotificationValidationError {
     NotificationValidationError::new("INVALID_NOTIFICATION_CONTENT", "通知内容无效")
+}
+
+fn invalid_event() -> NotificationValidationError {
+    NotificationValidationError::new("INVALID_NOTIFICATION_EVENT", "通知变更事件无效")
 }
 
 #[cfg(test)]
@@ -537,6 +776,59 @@ mod tests {
             "请检查风控设置",
         );
         assert_eq!(content.unwrap_err().code(), "INVALID_NOTIFICATION_CONTENT");
+    }
+
+    #[test]
+    fn content_validation_rejects_unapproved_templates_params_and_raw_fallback_text() {
+        let unknown_param = NotificationContent::new(
+            "risk.orderBlocked",
+            [(
+                "rawReason",
+                NotificationScalar::String("server error body".into()),
+            )],
+            "订单被风控拦截",
+            "请检查风控设置",
+        );
+        assert_eq!(
+            unknown_param.unwrap_err().code(),
+            "INVALID_NOTIFICATION_CONTENT"
+        );
+
+        let wrong_type = NotificationContent::new(
+            "risk.orderBlocked",
+            [("limit", NotificationScalar::String("100".into()))],
+            "订单被风控拦截",
+            "请检查风控设置",
+        );
+        assert_eq!(
+            wrong_type.unwrap_err().code(),
+            "INVALID_NOTIFICATION_CONTENT"
+        );
+
+        let raw_reason = NotificationContent::new(
+            "risk.orderBlocked",
+            [(
+                "violationCode",
+                NotificationScalar::String("raw server error body".into()),
+            )],
+            "订单被风控拦截",
+            "请检查风控设置",
+        );
+        assert_eq!(
+            raw_reason.unwrap_err().code(),
+            "INVALID_NOTIFICATION_CONTENT"
+        );
+
+        let raw_fallback = NotificationContent::new(
+            "risk.orderBlocked",
+            [("limit", NotificationScalar::Number(100.0))],
+            "订单被风控拦截",
+            "服务器返回的原始错误文本",
+        );
+        assert_eq!(
+            raw_fallback.unwrap_err().code(),
+            "INVALID_NOTIFICATION_CONTENT"
+        );
     }
 
     #[test]
@@ -754,6 +1046,80 @@ mod tests {
         assert!(value.get("toastCandidate").is_none());
     }
 
+    #[test]
+    fn created_events_reject_invalid_toast_candidates() {
+        let mut candidate = valid_toast_candidate();
+        candidate.id = "not-a-uuid".into();
+        assert_invalid_candidate(candidate);
+
+        let mut candidate = valid_toast_candidate();
+        candidate.scope = NotificationScope::Account {
+            account_id: " ".into(),
+        };
+        assert_invalid_candidate(candidate);
+
+        let mut candidate = valid_toast_candidate();
+        candidate.content = NotificationContent {
+            message_key: "risk.orderBlocked".into(),
+            params: [(
+                "rawReason".into(),
+                NotificationScalar::String("safe".into()),
+            )]
+            .into_iter()
+            .collect(),
+            fallback_title: "订单被风控拦截".into(),
+            fallback_body: "请检查风控设置".into(),
+        };
+        assert_invalid_candidate(candidate);
+
+        let mut candidate = valid_toast_candidate();
+        candidate.action = Some(NotificationAction::OpenTrading {
+            order_id: Some(" ".into()),
+        });
+        assert_invalid_candidate(candidate);
+
+        let mut candidate = valid_toast_candidate();
+        candidate.session_epoch = Some(MAX_JAVASCRIPT_SAFE_INTEGER + 1);
+        assert_invalid_candidate(candidate);
+    }
+
+    fn assert_invalid_candidate(candidate: NotificationToastCandidate) {
+        let event = NotificationChangedEvent {
+            previous_revision: "4".into(),
+            revision: "5".into(),
+            change: NotificationChange::Created,
+            affected_scopes: vec![NotificationScope::Global],
+            notification_id: Some("n-1".into()),
+            toast_candidate: Some(candidate),
+        };
+        assert_eq!(
+            event.validate().unwrap_err().code(),
+            "INVALID_NOTIFICATION_EVENT"
+        );
+    }
+
+    fn valid_toast_candidate() -> NotificationToastCandidate {
+        NotificationToastCandidate {
+            id: "0b102d04-848c-4c84-a644-033383850c71".into(),
+            scope: NotificationScope::Account {
+                account_id: "alpha".into(),
+            },
+            session_epoch: Some(4),
+            category: NotificationCategory::RiskAccount,
+            severity: NotificationSeverity::Warning,
+            content: NotificationContent::new(
+                "risk.orderBlocked",
+                [("limit", NotificationScalar::Number(100.0))],
+                "订单被风控拦截",
+                "请检查风控设置",
+            )
+            .unwrap(),
+            action: Some(NotificationAction::OpenAccountSettings {
+                account_section: AccountNotificationSection::Risk,
+            }),
+        }
+    }
+
     fn valid_record() -> NotificationRecord {
         NotificationRecord {
             id: "0b102d04-848c-4c84-a644-033383850c71".into(),
@@ -765,7 +1131,7 @@ mod tests {
             severity: NotificationSeverity::Warning,
             content: NotificationContent::new(
                 "risk.orderBlocked",
-                [("limit", NotificationScalar::String("100".into()))],
+                [("limit", NotificationScalar::Number(100.0))],
                 "订单被风控拦截",
                 "请检查风控设置",
             )

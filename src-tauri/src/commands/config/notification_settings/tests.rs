@@ -53,11 +53,18 @@ async fn update_changes_only_notification_settings_after_persistence() {
 
 #[tokio::test]
 async fn persistence_failure_retains_runtime_and_last_committed_notification_settings() {
-    let blocker = test_path("blocked-parent");
-    std::fs::write(&blocker, "not a directory").unwrap();
-    let store = ConfigStore::with_path(blocker.join("config.toml"));
-    let initial = AppConfig::default();
+    let path = test_path("blocked-temp").with_extension("toml");
+    let store = ConfigStore::with_path(path.clone());
+    let mut initial = AppConfig::default();
+    initial.notification_settings = NotificationSettings {
+        trading_toast: false,
+        risk_account_toast: true,
+        connection_system_toast: false,
+    };
+    store.save(&initial).unwrap();
     let runtime = Arc::new(RwLock::new(initial.clone()));
+    let temp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+    std::fs::create_dir(&temp).unwrap();
 
     let result = apply_notification_settings_update(
         &AccountLifecycleCoordinator::new(),
@@ -73,8 +80,9 @@ async fn persistence_failure_retains_runtime_and_last_committed_notification_set
         initial.notification_settings
     );
     assert_eq!(
-        initial.notification_settings,
-        NotificationSettings::default()
+        store.load().unwrap().notification_settings,
+        initial.notification_settings
     );
-    std::fs::remove_file(blocker).unwrap();
+    std::fs::remove_dir(temp).unwrap();
+    std::fs::remove_file(path).unwrap();
 }
