@@ -72,6 +72,25 @@ fn sample_file(revision: u64) -> NotificationFileV1 {
     }
 }
 
+fn oversized_file(revision: u64) -> NotificationFileV1 {
+    NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision,
+        partitions: vec![NotificationPartition {
+            scope: NotificationScope::Global,
+            items: (0..=1_000)
+                .map(|index| {
+                    sample_record(
+                        &format!("00000000-0000-4000-8000-{index:012}"),
+                        NotificationScope::Global,
+                        index + 1,
+                    )
+                })
+                .collect(),
+        }],
+    }
+}
+
 fn write_json(path: &Path, value: &impl serde::Serialize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
@@ -229,6 +248,51 @@ fn save_does_not_overwrite_or_rename_a_future_main_schema() {
 }
 
 #[test]
+fn save_preserves_a_future_temp_when_no_current_schema_main_is_authoritative() {
+    let root = test_root("future-temp-save");
+    let path = store_path(&root);
+    let temp_path = NotificationStore::temp_path_for_test(&path);
+    let future_bytes = br#"{"schemaVersion":3,"futureData":{"kept":true}}"#;
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&path, b"corrupt-main").unwrap();
+    fs::write(&temp_path, future_bytes).unwrap();
+
+    assert_storage_unavailable(
+        NotificationStore::with_path(path.clone())
+            .save(&sample_file(8))
+            .unwrap_err(),
+    );
+
+    assert_eq!(fs::read(&path).unwrap(), b"corrupt-main");
+    assert_eq!(fs::read(&temp_path).unwrap(), future_bytes);
+    assert!(!NotificationStore::backup_path_for_test(&path).exists());
+    cleanup(&root);
+}
+
+#[test]
+fn valid_main_remains_authoritative_over_a_lower_future_temp_on_save() {
+    let root = test_root("current-main-future-temp");
+    let path = store_path(&root);
+    let store = NotificationStore::with_path(path.clone());
+    store.save(&sample_file(1)).unwrap();
+    fs::write(
+        NotificationStore::temp_path_for_test(&path),
+        br#"{"schemaVersion":3,"futureData":{"stale":true}}"#,
+    )
+    .unwrap();
+
+    store.save(&sample_file(2)).unwrap();
+
+    assert_eq!(read_file(&path).revision, 2);
+    assert_eq!(
+        read_file(&NotificationStore::backup_path_for_test(&path)).revision,
+        1
+    );
+    assert!(!NotificationStore::temp_path_for_test(&path).exists());
+    cleanup(&root);
+}
+
+#[test]
 fn all_corrupt_v1_candidates_are_preserved_and_empty_state_is_returned() {
     let root = test_root("all-corrupt");
     let path = store_path(&root);
@@ -286,6 +350,33 @@ fn duplicate_record_id_across_partitions_is_rejected() {
 
     assert!(matches!(store.save(&file), Err(AppError::Storage(_))));
     assert!(!store.path_for_test().exists());
+    cleanup(&root);
+}
+
+#[test]
+fn save_rejects_a_partition_over_one_thousand_items() {
+    let root = test_root("oversized-save");
+    let store = NotificationStore::with_path(store_path(&root));
+
+    assert!(matches!(
+        store.save(&oversized_file(1)),
+        Err(AppError::Storage(_))
+    ));
+    assert!(!store.path_for_test().exists());
+    cleanup(&root);
+}
+
+#[test]
+fn load_treats_a_partition_over_one_thousand_items_as_corrupt() {
+    let root = test_root("oversized-load");
+    let path = store_path(&root);
+    write_json(&path, &oversized_file(1));
+
+    let outcome = NotificationStore::with_path(path.clone()).load().unwrap();
+
+    assert_eq!(outcome.status, NotificationLoadStatus::ResetFromCorruption);
+    assert_eq!(outcome.file, NotificationFileV1::empty());
+    assert!(!path.exists());
     cleanup(&root);
 }
 
@@ -415,6 +506,56 @@ fn backup_restore_failure_keeps_recovery_candidates() {
         NotificationLoadStatus::Recovered {
             source: RecoverySource::Temp
         }
+    );
+    cleanup(&root);
+}
+
+#[test]
+fn unreadable_main_returns_unavailable_without_falling_back() {
+    let root = test_root("unreadable-main");
+    let path = store_path(&root);
+    fs::create_dir_all(&path).unwrap();
+    write_json(
+        &NotificationStore::backup_path_for_test(&path),
+        &sample_file(4),
+    );
+
+    assert_storage_unavailable(
+        NotificationStore::with_path(path.clone())
+            .load()
+            .unwrap_err(),
+    );
+
+    assert!(path.is_dir());
+    assert_eq!(
+        read_file(&NotificationStore::backup_path_for_test(&path)).revision,
+        4
+    );
+    cleanup(&root);
+}
+
+#[test]
+fn evidence_preservation_failure_returns_unavailable_and_keeps_candidate() {
+    let root = test_root("evidence-failure");
+    let path = store_path(&root);
+    let corrupt_bytes = b"corrupt-main-must-remain";
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&path, corrupt_bytes).unwrap();
+    let failing = NotificationStore::with_path_and_failures(
+        path.clone(),
+        vec![FailurePoint::PreserveCorrupt],
+    );
+
+    assert_storage_unavailable(failing.load().unwrap_err());
+
+    assert_eq!(fs::read(&path).unwrap(), corrupt_bytes);
+    assert_eq!(
+        fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .count(),
+        0
     );
     cleanup(&root);
 }

@@ -13,6 +13,7 @@ use crate::models::config::APP_NAME;
 use crate::models::notification::{NotificationRecord, NotificationScope};
 
 pub const NOTIFICATION_SCHEMA_VERSION: u32 = 1;
+pub const MAX_NOTIFICATION_PARTITION_ITEMS: usize = 1_000;
 
 const TEMP_SUFFIX: &str = ".tmp";
 const BACKUP_SUFFIX: &str = ".bak";
@@ -73,6 +74,7 @@ pub(crate) trait NotificationPersistence: Send + Sync {
 pub(crate) enum FailurePoint {
     PromoteTemp,
     RestoreBackup,
+    PreserveCorrupt,
 }
 
 pub struct NotificationStore {
@@ -131,14 +133,12 @@ impl NotificationStore {
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    log_storage_failure("inspect", path_kind, &error);
-                    corrupt_candidates.push((path.to_path_buf(), path_kind));
-                    continue;
+                    return Err(storage_unavailable("inspect", path_kind, error));
                 }
             }
 
             match read_candidate(path) {
-                Candidate::Valid(file) => {
+                Ok(Candidate::Valid(file)) => {
                     let status = match source {
                         None => NotificationLoadStatus::Clean,
                         Some(source) => {
@@ -154,15 +154,16 @@ impl NotificationStore {
                     };
                     return Ok(NotificationLoadOutcome { file, status });
                 }
-                Candidate::Future(found) => {
+                Ok(Candidate::Future(found)) => {
                     return Ok(NotificationLoadOutcome {
                         file: NotificationFileV1::empty(),
                         status: NotificationLoadStatus::UnsupportedSchema { found },
                     });
                 }
-                Candidate::Corrupt => {
+                Ok(Candidate::Corrupt) => {
                     corrupt_candidates.push((path.to_path_buf(), path_kind));
                 }
+                Err(error) => return Err(storage_unavailable("read", path_kind, error)),
             }
         }
 
@@ -172,7 +173,7 @@ impl NotificationStore {
                 status: NotificationLoadStatus::Clean,
             })
         } else {
-            preserve_corrupt_candidates(&corrupt_candidates);
+            self.preserve_corrupt_candidates(&corrupt_candidates)?;
             Ok(NotificationLoadOutcome {
                 file: NotificationFileV1::empty(),
                 status: NotificationLoadStatus::ResetFromCorruption,
@@ -189,13 +190,13 @@ impl NotificationStore {
     fn save_validated(&self, file: &NotificationFileV1) -> AppResult<()> {
         validate_file(file)?;
         let paths = NotificationPaths::new(&self.path);
-        let main_candidate = existing_candidate(&paths.main);
-        if matches!(main_candidate, Some(Candidate::Future(_))) {
-            return Err(storage_unavailable_without_io("future_schema", "main"));
-        }
+        ensure_supported_save_target(&paths)?;
+        let main_candidate = existing_candidate(&paths.main, "main")?;
         let main_is_valid = matches!(main_candidate, Some(Candidate::Valid(_)));
-        let backup_is_valid =
-            matches!(existing_candidate(&paths.backup), Some(Candidate::Valid(_)));
+        let backup_is_valid = matches!(
+            existing_candidate(&paths.backup, "backup")?,
+            Some(Candidate::Valid(_))
+        );
         let bytes = serde_json::to_vec_pretty(file).map_err(|_| invalid_file())?;
 
         if let Some(parent) = paths.main.parent() {
@@ -236,6 +237,48 @@ impl NotificationStore {
         rename_and_sync(backup_path, main_path, "restore_backup")
     }
 
+    fn preserve_corrupt_candidates(&self, candidates: &[(PathBuf, &'static str)]) -> AppResult<()> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        for (index, (path, path_kind)) in candidates.iter().enumerate() {
+            self.maybe_fail(
+                FailurePointName::PreserveCorrupt,
+                "preserve_corrupt",
+                path_kind,
+            )?;
+            let evidence_path = sibling_path(path, &format!(".corrupt-{timestamp}-{index}"));
+            match fs::rename(path, &evidence_path) {
+                Ok(()) => {
+                    if let Err(error) = sync_parent_directory(&evidence_path) {
+                        tracing::warn!(
+                            path_kind,
+                            error_code = storage_error_code(&error),
+                            "notification corrupt evidence directory sync failed"
+                        );
+                    }
+                }
+                Err(rename_error) => match fs::copy(path, &evidence_path) {
+                    Ok(_) => {}
+                    Err(copy_error) => {
+                        tracing::warn!(
+                            path_kind,
+                            rename_error_kind = io_error_kind(&rename_error),
+                            copy_error_kind = io_error_kind(&copy_error),
+                            "notification corrupt evidence preservation failed"
+                        );
+                        return Err(storage_unavailable_without_io(
+                            "preserve_corrupt",
+                            path_kind,
+                        ));
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
     fn lock_writes(&self) -> AppResult<std::sync::MutexGuard<'_, ()>> {
         self.write_lock
             .lock()
@@ -253,6 +296,7 @@ impl NotificationStore {
             let configured = match point {
                 FailurePointName::PromoteTemp => FailurePoint::PromoteTemp,
                 FailurePointName::RestoreBackup => FailurePoint::RestoreBackup,
+                FailurePointName::PreserveCorrupt => FailurePoint::PreserveCorrupt,
             };
             if self.failures.contains(&configured) {
                 return Err(storage_unavailable(
@@ -299,6 +343,7 @@ impl Default for NotificationStore {
 enum FailurePointName {
     PromoteTemp,
     RestoreBackup,
+    PreserveCorrupt,
 }
 
 struct NotificationPaths {
@@ -323,41 +368,58 @@ enum Candidate {
     Corrupt,
 }
 
-fn existing_candidate(path: &Path) -> Option<Candidate> {
+fn existing_candidate(path: &Path, path_kind: &'static str) -> AppResult<Option<Candidate>> {
     match fs::symlink_metadata(path) {
-        Ok(_) => Some(read_candidate(path)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => Some(Candidate::Corrupt),
+        Ok(_) => read_candidate(path)
+            .map(Some)
+            .map_err(|error| storage_unavailable("read", path_kind, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(storage_unavailable("inspect", path_kind, error)),
     }
 }
 
-fn read_candidate(path: &Path) -> Candidate {
-    let Ok(bytes) = fs::read(path) else {
-        return Candidate::Corrupt;
-    };
+fn read_candidate(path: &Path) -> std::io::Result<Candidate> {
+    let bytes = fs::read(path)?;
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Candidate::Corrupt;
+        return Ok(Candidate::Corrupt);
     };
     let Some(schema_version) = value.get("schemaVersion").and_then(|value| value.as_u64()) else {
-        return Candidate::Corrupt;
+        return Ok(Candidate::Corrupt);
     };
     let Ok(schema_version) = u32::try_from(schema_version) else {
-        return Candidate::Corrupt;
+        return Ok(Candidate::Corrupt);
     };
     if schema_version > NOTIFICATION_SCHEMA_VERSION {
-        return Candidate::Future(schema_version);
+        return Ok(Candidate::Future(schema_version));
     }
     if schema_version != NOTIFICATION_SCHEMA_VERSION {
-        return Candidate::Corrupt;
+        return Ok(Candidate::Corrupt);
     }
     let Ok(file) = serde_json::from_value::<NotificationFileV1>(value) else {
-        return Candidate::Corrupt;
+        return Ok(Candidate::Corrupt);
     };
     if validate_file(&file).is_err() {
-        Candidate::Corrupt
+        Ok(Candidate::Corrupt)
     } else {
-        Candidate::Valid(file)
+        Ok(Candidate::Valid(file))
     }
+}
+
+fn ensure_supported_save_target(paths: &NotificationPaths) -> AppResult<()> {
+    for (path, path_kind) in [
+        (&paths.main, "main"),
+        (&paths.temp, "temp"),
+        (&paths.backup, "backup"),
+    ] {
+        match existing_candidate(path, path_kind)? {
+            None | Some(Candidate::Corrupt) => continue,
+            Some(Candidate::Valid(_)) => return Ok(()),
+            Some(Candidate::Future(_)) => {
+                return Err(storage_unavailable_without_io("future_schema", path_kind));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_file(file: &NotificationFileV1) -> AppResult<()> {
@@ -367,6 +429,9 @@ fn validate_file(file: &NotificationFileV1) -> AppResult<()> {
     let mut scopes = HashSet::new();
     let mut record_ids = HashSet::new();
     for partition in &file.partitions {
+        if partition.items.len() > MAX_NOTIFICATION_PARTITION_ITEMS {
+            return Err(invalid_file());
+        }
         partition.scope.validate().map_err(|_| invalid_file())?;
         if !scopes.insert(partition.scope.clone()) {
             return Err(invalid_file());
@@ -427,36 +492,6 @@ fn sync_parent_directory(path: &Path) -> AppResult<()> {
 #[cfg(not(unix))]
 fn sync_parent_directory(_path: &Path) -> AppResult<()> {
     Ok(())
-}
-
-fn preserve_corrupt_candidates(candidates: &[(PathBuf, &'static str)]) {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    for (index, (path, path_kind)) in candidates.iter().enumerate() {
-        let evidence_path = sibling_path(path, &format!(".corrupt-{timestamp}-{index}"));
-        match fs::rename(path, &evidence_path) {
-            Ok(()) => {
-                if let Err(error) = sync_parent_directory(&evidence_path) {
-                    tracing::warn!(
-                        path_kind,
-                        error_code = storage_error_code(&error),
-                        "notification corrupt evidence directory sync failed"
-                    );
-                }
-            }
-            Err(rename_error) => match fs::copy(path, &evidence_path) {
-                Ok(_) => {}
-                Err(copy_error) => tracing::warn!(
-                    path_kind,
-                    rename_error_kind = io_error_kind(&rename_error),
-                    copy_error_kind = io_error_kind(&copy_error),
-                    "notification corrupt evidence preservation failed"
-                ),
-            },
-        }
-    }
 }
 
 fn invalid_file() -> AppError {
