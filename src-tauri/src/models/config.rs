@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::models::notification::NotificationSettings;
+
 pub const DEFAULT_KLINE_LIMIT: u32 = 200;
 pub const DEFAULT_DEPTH_LIMIT: u32 = 20;
 
@@ -133,6 +135,8 @@ pub struct AppConfig {
     pub risk_max_daily_orders: u32,
     #[serde(default = "default_trading_day_timezone")]
     pub trading_day_timezone: String,
+    #[serde(default)]
+    pub notification_settings: NotificationSettings,
 }
 
 fn default_trading_day_timezone() -> String {
@@ -159,6 +163,7 @@ impl Default for AppConfig {
             risk_max_price_deviation_pct: "5".to_string(),
             risk_max_daily_orders: 500,
             trading_day_timezone: crate::models::time::DEFAULT_TRADING_DAY_TIMEZONE.to_string(),
+            notification_settings: NotificationSettings::default(),
         }
     }
 }
@@ -266,11 +271,50 @@ pub struct ConnectionSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::notification::NotificationSettings;
 
     #[test]
     fn normalize_account_id_empty_to_default() {
         assert_eq!(normalize_account_id(""), "default");
         assert_eq!(normalize_account_id("   "), "default");
         assert_eq!(normalize_account_id("main"), "main");
+    }
+
+    #[test]
+    fn notification_settings_default_all_toasts_to_enabled() {
+        assert_eq!(
+            NotificationSettings::default(),
+            NotificationSettings {
+                trading_toast: true,
+                risk_account_toast: true,
+                connection_system_toast: true,
+            },
+        );
+    }
+
+    #[test]
+    fn app_config_deserializes_without_notification_settings() {
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "activeSymbol": "BTCUSDT",
+            "activeAccountId": "default",
+            "watchlistSymbols": ["BTCUSDT"],
+            "theme": "dark",
+            "klineInterval": "1",
+            "useWebsocket": true,
+            "tickerPollInterval": 1.0,
+            "windowWidth": 1400,
+            "windowHeight": 900,
+            "accounts": ["default"],
+            "riskEnabled": true,
+            "riskMaxOrderQty": "100",
+            "riskMaxPriceDeviationPct": "5",
+            "riskMaxDailyOrders": 500
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.notification_settings,
+            NotificationSettings::default()
+        );
     }
 }

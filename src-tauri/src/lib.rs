@@ -61,6 +61,8 @@ pub fn run() {
             get_config,
             save_config,
             update_general_settings,
+            get_notification_settings,
+            update_notification_settings,
             get_risk_status,
             update_risk_config,
             save_credentials,

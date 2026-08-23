@@ -8,6 +8,8 @@ use crate::storage::CredentialStore;
 
 mod general_settings;
 pub use general_settings::update_general_settings;
+mod notification_settings;
+pub use notification_settings::{get_notification_settings, update_notification_settings};
 
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> AppResult<AppConfig> {
@@ -27,6 +29,7 @@ fn merge_authoritative_config(incoming: AppConfig, current: &AppConfig) -> AppCo
     merged.risk_max_price_deviation_pct = current.risk_max_price_deviation_pct.clone();
     merged.risk_max_daily_orders = current.risk_max_daily_orders;
     merged.trading_day_timezone = current.trading_day_timezone.clone();
+    merged.notification_settings = current.notification_settings;
     merged
 }
 
@@ -148,6 +151,19 @@ mod tests {
         assert_eq!(merged.trading_day_timezone, "UTC");
         assert_eq!(merged.window_width, 1440);
         assert!(!timezone_changed);
+    }
+
+    #[test]
+    fn stale_settings_save_preserves_current_notification_settings() {
+        let mut current = AppConfig::default();
+        current.notification_settings.trading_toast = false;
+        current.notification_settings.connection_system_toast = false;
+
+        let stale = AppConfig::default();
+
+        let (merged, _) = prepare_config_save(stale, &current).unwrap();
+
+        assert_eq!(merged.notification_settings, current.notification_settings);
     }
 
     #[test]

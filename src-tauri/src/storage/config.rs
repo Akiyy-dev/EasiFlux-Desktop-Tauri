@@ -7,6 +7,7 @@ use crate::error::AppResult;
 use crate::models::config::{
     AppConfig, ThemeMode, APP_NAME, CONFIG_FILENAME, DEFAULT_WS_PRIVATE_URL, DEFAULT_WS_PUBLIC_URL,
 };
+use crate::models::notification::NotificationSettings;
 
 use super::config_persistence;
 
@@ -46,6 +47,8 @@ struct TomlConfig {
     risk_max_daily_orders: u32,
     #[serde(default = "default_trading_day_timezone")]
     trading_day_timezone: String,
+    #[serde(default)]
+    notification_settings: NotificationSettings,
 }
 
 fn default_symbol() -> String {
@@ -123,6 +126,7 @@ impl From<TomlConfig> for AppConfig {
             risk_max_price_deviation_pct: t.risk_max_price_deviation_pct,
             risk_max_daily_orders: t.risk_max_daily_orders,
             trading_day_timezone: t.trading_day_timezone,
+            notification_settings: t.notification_settings,
         }
     }
 }
@@ -147,6 +151,7 @@ impl From<&AppConfig> for TomlConfig {
             risk_max_price_deviation_pct: c.risk_max_price_deviation_pct.clone(),
             risk_max_daily_orders: c.risk_max_daily_orders,
             trading_day_timezone: c.trading_day_timezone.clone(),
+            notification_settings: c.notification_settings,
         }
     }
 }
@@ -257,6 +262,52 @@ mod tests {
         let actual = store.load().unwrap();
         assert_eq!(actual.active_symbol, "ETHUSDT");
         assert_eq!(actual.window_width, 1510);
+    }
+
+    #[test]
+    fn legacy_toml_defaults_notification_settings() {
+        let legacy = r#"
+active_symbol = "ETHUSDT"
+active_account_id = "default"
+watchlist_symbols = ["ETHUSDT"]
+theme = "dark"
+kline_interval = "1"
+use_websocket = true
+ticker_poll_interval = 1.0
+window_width = 1400
+window_height = 900
+accounts = ["default"]
+risk_enabled = true
+risk_max_order_qty = "100"
+risk_max_price_deviation_pct = "5"
+risk_max_daily_orders = 500
+"#;
+
+        let config: AppConfig = toml::from_str::<TomlConfig>(legacy).unwrap().into();
+
+        assert_eq!(
+            config.notification_settings,
+            crate::models::notification::NotificationSettings::default()
+        );
+    }
+
+    #[test]
+    fn notification_settings_round_trip() {
+        let root = TestRoot::new("notification-settings");
+        let store = ConfigStore::with_path(root.path().join("config.toml"));
+        let mut expected = AppConfig::default();
+        expected.notification_settings = crate::models::notification::NotificationSettings {
+            trading_toast: false,
+            risk_account_toast: true,
+            connection_system_toast: false,
+        };
+
+        store.save(&expected).unwrap();
+
+        assert_eq!(
+            store.load().unwrap().notification_settings,
+            expected.notification_settings
+        );
     }
 
     #[test]
