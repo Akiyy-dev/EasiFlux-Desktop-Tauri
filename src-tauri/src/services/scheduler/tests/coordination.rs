@@ -486,6 +486,24 @@ async fn aborting_an_in_flight_owner_releases_waiters_and_allows_the_next_run() 
     assert_eq!(runs.load(Ordering::SeqCst), 2);
 }
 
+#[test]
+fn late_old_owner_drop_cannot_clear_a_newer_owner_token() {
+    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
+    {
+        let mut state = run_state.lock().unwrap();
+        state.in_flight = true;
+        state.owner_token = Some(2);
+        state.next_owner_token = 2;
+    }
+    let stale_owner = super::super::TaskRunOwnerGuard::new(Arc::clone(&run_state), 1);
+
+    drop(stale_owner);
+
+    let state = run_state.lock().unwrap();
+    assert!(state.in_flight);
+    assert_eq!(state.owner_token, Some(2));
+}
+
 #[tokio::test]
 async fn environment_probe_finishes_before_account_switch_returns() {
     let coordinator = AccountLifecycleCoordinator::new();

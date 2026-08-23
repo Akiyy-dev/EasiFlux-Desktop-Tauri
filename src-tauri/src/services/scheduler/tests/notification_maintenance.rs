@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::RwLock;
@@ -328,6 +328,92 @@ async fn concurrent_start_stop_restart_serializes_generations_and_owns_every_han
     assert_eq!(state.handle_count(), 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_during_synchronous_install_waits_before_restart_without_holding_lifecycle_lock() {
+    let lifecycle = Arc::new(StdMutex::new(SchedulerLifecycle::new()));
+    let running = Arc::new(AtomicBool::new(false));
+    let install_entered = Arc::new(tokio::sync::Notify::new());
+    let release_install = Arc::new((StdMutex::new(false), Condvar::new()));
+    let start = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        let running = Arc::clone(&running);
+        let install_entered = Arc::clone(&install_entered);
+        let release_install = Arc::clone(&release_install);
+        async move {
+            start_scheduler_lifecycle(
+                &lifecycle,
+                &running,
+                |_| async {},
+                move |_, _, _, ()| {
+                    install_entered.notify_one();
+                    let (released, wake) = release_install.as_ref();
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    (Vec::new(), async {})
+                },
+            )
+            .await
+        }
+    });
+    install_entered.notified().await;
+
+    let stop = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        let running = Arc::clone(&running);
+        async move { stop_scheduler_lifecycle(&lifecycle, &running).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if lifecycle.lock().unwrap().state
+                == (SchedulerLifecycleState::Stopping { generation: 1 })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stop must publish Stopping while synchronous install is blocked");
+    assert_eq!(
+        lifecycle.lock().unwrap().state,
+        SchedulerLifecycleState::Stopping { generation: 1 }
+    );
+    assert!(!stop.is_finished());
+
+    let restart = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        let running = Arc::clone(&running);
+        async move {
+            start_scheduler_lifecycle(
+                &lifecycle,
+                &running,
+                |_| async {},
+                |_, _, _, ()| (Vec::new(), async {}),
+            )
+            .await
+        }
+    });
+    let (released, wake) = release_install.as_ref();
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+
+    assert!(!start.await.unwrap());
+    assert!(stop.await.unwrap());
+    assert!(restart.await.unwrap());
+    assert_eq!(lifecycle.lock().unwrap().running_generation(), Some(2));
+    assert!(stop_scheduler_lifecycle(&lifecycle, &running).await);
+}
+
+#[test]
+fn starting_generation_is_not_exposed_to_external_run_now_claims() {
+    let mut lifecycle = SchedulerLifecycle::new();
+    assert!(lifecycle.begin_start().is_some());
+
+    assert!(lifecycle.run_state(TaskId::TimeSync).is_none());
+}
+
 #[tokio::test]
 async fn cancelling_start_before_handle_install_rolls_back_and_allows_restart() {
     let lifecycle = Arc::new(StdMutex::new(SchedulerLifecycle::new()));
@@ -356,6 +442,7 @@ async fn cancelling_start_before_handle_install_rolls_back_and_allows_restart() 
     entered.notified().await;
     start.abort();
     assert!(start.await.unwrap_err().is_cancelled());
+    let _ = stop_scheduler_lifecycle(&lifecycle, &running).await;
 
     let coherent_after_cancel = {
         let state = lifecycle.lock().unwrap();
@@ -363,7 +450,6 @@ async fn cancelling_start_before_handle_install_rolls_back_and_allows_restart() 
             && state.handle_count() == 0
             && !running.load(Ordering::SeqCst)
     };
-    stop_scheduler_lifecycle(&lifecycle, &running).await;
     let restarted = start_scheduler_lifecycle(
         &lifecycle,
         &running,
@@ -419,6 +505,7 @@ async fn cancelling_start_during_immediate_run_aborts_installed_generation() {
     immediate_entered.notified().await;
     start.abort();
     assert!(start.await.unwrap_err().is_cancelled());
+    let _ = stop_scheduler_lifecycle(&lifecycle, &running).await;
     tokio::time::advance(Duration::from_secs(2)).await;
     tokio::task::yield_now().await;
 
@@ -429,7 +516,6 @@ async fn cancelling_start_during_immediate_run_aborts_installed_generation() {
             && !running.load(Ordering::SeqCst)
     };
     let leaked_ticks = orphan_ticks.load(Ordering::SeqCst);
-    stop_scheduler_lifecycle(&lifecycle, &running).await;
     let restarted = start_scheduler_lifecycle(
         &lifecycle,
         &running,
@@ -495,7 +581,14 @@ async fn stop_resolves_time_sync_force_waiter_and_restart_runs_a_fresh_generatio
         }
     });
     loop {
-        if let Some(time_state) = lifecycle.lock().unwrap().run_state(TaskId::TimeSync) {
+        let time_state = lifecycle
+            .lock()
+            .unwrap()
+            .run_states
+            .as_ref()
+            .and_then(|states| states.get(&TaskId::TimeSync))
+            .cloned();
+        if let Some(time_state) = time_state {
             if time_state.lock().unwrap().pending_force {
                 break;
             }
@@ -558,7 +651,7 @@ async fn stop_during_in_flight_runs_allows_every_periodic_task_to_run_after_rest
             let entered = Arc::clone(&entered);
             let release = Arc::clone(&release);
             move |_, run_states, generation_running, ()| {
-                let handles = periodic_task_ids()
+                let handles: Vec<_> = periodic_task_ids()
                     .iter()
                     .copied()
                     .map(|task| {
@@ -604,7 +697,7 @@ async fn stop_during_in_flight_runs_allows_every_periodic_task_to_run_after_rest
         start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
             let fresh_runs = Arc::clone(&fresh_runs);
             move |_, run_states, generation_running, ()| {
-                let handles = periodic_task_ids()
+                let handles: Vec<_> = periodic_task_ids()
                     .iter()
                     .copied()
                     .enumerate()
@@ -644,6 +737,376 @@ async fn stop_during_in_flight_runs_allows_every_periodic_task_to_run_after_rest
     .expect("every restarted periodic task, including maintenance, should run once");
 
     assert!(stop_scheduler_lifecycle(&lifecycle, &running).await);
+}
+
+#[tokio::test]
+async fn stale_run_state_captured_before_stop_cannot_claim_after_retirement() {
+    let lifecycle = Arc::new(StdMutex::new(SchedulerLifecycle::new()));
+    let running = Arc::new(AtomicBool::new(false));
+    assert!(
+        start_scheduler_lifecycle(
+            &lifecycle,
+            &running,
+            |_| async {},
+            |_, _, _, ()| (Vec::new(), async {}),
+        )
+        .await
+    );
+    let stale = lifecycle
+        .lock()
+        .unwrap()
+        .run_state(TaskId::NotificationMaintenance)
+        .unwrap();
+
+    assert!(stop_scheduler_lifecycle(&lifecycle, &running).await);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let runs_by_task = Arc::clone(&runs);
+    let result = run_scheduled_task(stale, false, move || {
+        let runs = Arc::clone(&runs_by_task);
+        async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stop_waits_for_manual_owner_to_cancel_and_drop_before_returning() {
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let lifecycle = Arc::new(StdMutex::new(SchedulerLifecycle::new()));
+    let running = Arc::new(AtomicBool::new(false));
+    assert!(
+        start_scheduler_lifecycle(
+            &lifecycle,
+            &running,
+            |_| async {},
+            |_, _, _, ()| (Vec::new(), async {}),
+        )
+        .await
+    );
+    let run_state = lifecycle
+        .lock()
+        .unwrap()
+        .run_state(TaskId::Balances)
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let manual = tokio::spawn({
+        let entered = Arc::clone(&entered);
+        let dropped = Arc::clone(&dropped);
+        async move {
+            run_scheduled_task(run_state, false, move || {
+                let entered = Arc::clone(&entered);
+                let probe = DropProbe(Arc::clone(&dropped));
+                async move {
+                    entered.notify_one();
+                    let _probe = probe;
+                    std::future::pending::<AppResult<()>>().await
+                }
+            })
+            .await
+        }
+    });
+    entered.notified().await;
+
+    assert!(stop_scheduler_lifecycle(&lifecycle, &running).await);
+    let result = tokio::time::timeout(Duration::from_millis(100), manual)
+        .await
+        .expect("stop must wake and drain a manual owner")
+        .unwrap();
+
+    assert!(result.is_err());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        lifecycle.lock().unwrap().state,
+        SchedulerLifecycleState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn periodic_panic_during_start_prevents_commit_and_allows_healthy_restart() {
+    let lifecycle = Arc::new(StdMutex::new(SchedulerLifecycle::new()));
+    let running = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(tokio::sync::Notify::new());
+    let started = start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
+        let exited = Arc::clone(&exited);
+        move |_, _, _, ()| {
+            let handle = tauri::async_runtime::JoinHandle::Tokio(tokio::spawn({
+                let exited = Arc::clone(&exited);
+                async move {
+                    exited.notify_one();
+                    panic!("maintenance loop panic during start");
+                }
+            }));
+            let finish = async move { exited.notified().await };
+            (vec![(TaskId::NotificationMaintenance, handle)], finish)
+        }
+    })
+    .await;
+
+    assert!(!started);
+    let _ = stop_scheduler_lifecycle(&lifecycle, &running).await;
+    assert_eq!(
+        lifecycle.lock().unwrap().state,
+        SchedulerLifecycleState::Stopped
+    );
+    assert!(
+        start_scheduler_lifecycle(
+            &lifecycle,
+            &running,
+            |_| async {},
+            |_, _, _, ()| (Vec::new(), async {}),
+        )
+        .await
+    );
+    assert!(stop_scheduler_lifecycle(&lifecycle, &running).await);
+}
+
+#[tokio::test]
+async fn stop_returns_only_after_periodic_future_is_dropped() {
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let lifecycle = Arc::new(StdMutex::new(SchedulerLifecycle::new()));
+    let running = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    assert!(
+        start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
+            let entered = Arc::clone(&entered);
+            let dropped = Arc::clone(&dropped);
+            move |_, _, _, ()| {
+                let handle = tauri::async_runtime::JoinHandle::Tokio(tokio::spawn(async move {
+                    let _probe = DropProbe(dropped);
+                    entered.notify_one();
+                    std::future::pending::<()>().await;
+                }));
+                (vec![(TaskId::NotificationMaintenance, handle)], async {})
+            }
+        },)
+        .await
+    );
+    entered.notified().await;
+
+    assert!(stop_scheduler_lifecycle(&lifecycle, &running).await);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_stop_cleanup_finishes_and_a_waiting_restart_succeeds() {
+    struct BlockingDrop {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<(StdMutex<bool>, Condvar)>,
+    }
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            self.entered.notify_one();
+            let (released, wake) = self.release.as_ref();
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
+    }
+
+    let lifecycle = Arc::new(StdMutex::new(SchedulerLifecycle::new()));
+    let running = Arc::new(AtomicBool::new(false));
+    assert!(
+        start_scheduler_lifecycle(
+            &lifecycle,
+            &running,
+            |_| async {},
+            |_, _, _, ()| (Vec::new(), async {}),
+        )
+        .await
+    );
+    let run_state = lifecycle
+        .lock()
+        .unwrap()
+        .run_state(TaskId::Balances)
+        .unwrap();
+    let owner_entered = Arc::new(tokio::sync::Notify::new());
+    let drop_entered = Arc::new(tokio::sync::Notify::new());
+    let release_drop = Arc::new((StdMutex::new(false), Condvar::new()));
+    let manual = tokio::spawn({
+        let owner_entered = Arc::clone(&owner_entered);
+        let drop_entered = Arc::clone(&drop_entered);
+        let release_drop = Arc::clone(&release_drop);
+        async move {
+            run_scheduled_task(run_state, false, move || {
+                let probe = BlockingDrop {
+                    entered: Arc::clone(&drop_entered),
+                    release: Arc::clone(&release_drop),
+                };
+                let owner_entered = Arc::clone(&owner_entered);
+                async move {
+                    let _probe = probe;
+                    owner_entered.notify_one();
+                    std::future::pending::<AppResult<()>>().await
+                }
+            })
+            .await
+        }
+    });
+    owner_entered.notified().await;
+
+    let stop = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        let running = Arc::clone(&running);
+        async move { stop_scheduler_lifecycle(&lifecycle, &running).await }
+    });
+    drop_entered.notified().await;
+    stop.abort();
+    assert!(stop.await.unwrap_err().is_cancelled());
+
+    let restart = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        let running = Arc::clone(&running);
+        async move {
+            start_scheduler_lifecycle(
+                &lifecycle,
+                &running,
+                |_| async {},
+                |_, _, _, ()| (Vec::new(), async {}),
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!restart.is_finished());
+
+    let (released, wake) = release_drop.as_ref();
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+    assert!(tokio::time::timeout(Duration::from_secs(1), restart)
+        .await
+        .expect("cleanup must outlive the cancelled stop caller")
+        .unwrap());
+    assert!(manual.await.unwrap().is_err());
+    assert!(stop_scheduler_lifecycle(&lifecycle, &running).await);
+}
+
+#[tokio::test]
+async fn periodic_exit_while_running_tears_down_generation_before_restart() {
+    let lifecycle = Arc::new(StdMutex::new(SchedulerLifecycle::new()));
+    let running = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let exited = Arc::new(tokio::sync::Notify::new());
+    assert!(
+        start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
+            let release = Arc::clone(&release);
+            let exited = Arc::clone(&exited);
+            move |_, _, _, ()| {
+                let handle = tauri::async_runtime::JoinHandle::Tokio(tokio::spawn(async move {
+                    release.notified().await;
+                    exited.notify_one();
+                }));
+                (vec![(TaskId::NotificationMaintenance, handle)], async {})
+            }
+        },)
+        .await
+    );
+
+    release.notify_one();
+    exited.notified().await;
+    tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            if lifecycle.lock().unwrap().state == SchedulerLifecycleState::Stopped {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("an unexpected periodic exit must retire its generation");
+
+    assert!(
+        start_scheduler_lifecycle(
+            &lifecycle,
+            &running,
+            |_| async {},
+            |_, _, _, ()| (Vec::new(), async {}),
+        )
+        .await
+    );
+    assert!(stop_scheduler_lifecycle(&lifecycle, &running).await);
+}
+
+#[test]
+fn generation_exhaustion_fails_closed_without_reusing_the_last_generation() {
+    let mut lifecycle = SchedulerLifecycle::new();
+    lifecycle.next_generation = u64::MAX;
+
+    assert!(lifecycle.begin_start().is_none());
+    assert_eq!(lifecycle.state, SchedulerLifecycleState::Stopped);
+    assert!(lifecycle.run_states.is_none());
+}
+
+#[test]
+fn cancelled_starting_generation_cannot_commit_running() {
+    let mut lifecycle = SchedulerLifecycle::new();
+    let (_, _, _, control) = lifecycle.begin_start().unwrap();
+    control.cancel();
+
+    assert!(!lifecycle.finish_start(1));
+    assert_eq!(
+        lifecycle.state,
+        SchedulerLifecycleState::Starting { generation: 1 }
+    );
+}
+
+#[tokio::test]
+async fn partially_collected_handle_batch_aborts_owned_loops_on_panic() {
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let handle = tauri::async_runtime::JoinHandle::Tokio(tokio::spawn({
+        let entered = Arc::clone(&entered);
+        let dropped = Arc::clone(&dropped);
+        async move {
+            let _probe = DropProbe(dropped);
+            entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }));
+    entered.notified().await;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let items = [Some((TaskId::TimeSync, handle)), None];
+        let _batch: SchedulerHandleBatch = items
+            .into_iter()
+            .map(|item| item.expect("synthetic install panic"))
+            .collect();
+    }));
+    assert!(result.is_err());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while dropped.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("partial handle batch must abort the loop it already owns");
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

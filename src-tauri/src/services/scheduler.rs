@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Duration;
 
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{oneshot, watch, Mutex, Notify, RwLock};
 
 use crate::api::diagnostic::{warn_if_parse_empty, warn_if_raw_parsed_mismatch};
 use crate::api::endpoints;
@@ -299,23 +299,127 @@ async fn execute_kline_flush(
     }
 }
 
-#[derive(Debug, Default)]
+fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Debug)]
+struct GenerationControl {
+    cancelled: AtomicBool,
+    cancellation: watch::Sender<bool>,
+    active_owners: AtomicUsize,
+    drained: Notify,
+}
+
+impl GenerationControl {
+    fn new() -> Arc<Self> {
+        let (cancellation, _) = watch::channel(false);
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            cancellation,
+            active_owners: AtomicUsize::new(0),
+            drained: Notify::new(),
+        })
+    }
+
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::SeqCst) {
+            self.cancellation.send_replace(true);
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.cancellation.subscribe()
+    }
+
+    fn owner_started(&self) {
+        self.active_owners.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn owner_finished(&self) {
+        let previous = self.active_owners.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "scheduler owner count underflow");
+        if previous == 1 {
+            self.drained.notify_waiters();
+        }
+    }
+
+    async fn wait_drained(&self) {
+        loop {
+            let notified = self.drained.notified();
+            if self.active_owners.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+async fn wait_for_generation_cancel(mut cancellation: watch::Receiver<bool>) {
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+#[derive(Debug)]
 struct TaskRunState {
+    control: Arc<GenerationControl>,
+    closed: bool,
     in_flight: bool,
+    owner_token: Option<u64>,
+    next_owner_token: u64,
     pending_force: bool,
     forced_rerun: bool,
     pending_force_waiters: Vec<oneshot::Sender<AppResult<()>>>,
     active_force_waiters: Vec<oneshot::Sender<AppResult<()>>>,
 }
 
+impl TaskRunState {
+    fn new(control: Arc<GenerationControl>) -> Self {
+        Self {
+            control,
+            closed: false,
+            in_flight: false,
+            owner_token: None,
+            next_owner_token: 0,
+            pending_force: false,
+            forced_rerun: false,
+            pending_force_waiters: Vec::new(),
+            active_force_waiters: Vec::new(),
+        }
+    }
+}
+
+impl Default for TaskRunState {
+    fn default() -> Self {
+        Self::new(GenerationControl::new())
+    }
+}
+
 type TaskRunStateRef = Arc<StdMutex<TaskRunState>>;
 
-fn new_task_run_states() -> Arc<HashMap<TaskId, TaskRunStateRef>> {
+fn new_task_run_states(control: &Arc<GenerationControl>) -> Arc<HashMap<TaskId, TaskRunStateRef>> {
     Arc::new(
         TaskId::all()
             .iter()
             .copied()
-            .map(|task| (task, Arc::new(StdMutex::new(TaskRunState::default()))))
+            .map(|task| {
+                (
+                    task,
+                    Arc::new(StdMutex::new(TaskRunState::new(Arc::clone(control)))),
+                )
+            })
             .collect(),
     )
 }
@@ -326,8 +430,8 @@ fn cancelled_task_result() -> AppResult<()> {
 
 fn cancel_task_run_state(run_state: &TaskRunStateRef) {
     let waiters = {
-        let mut state = run_state.lock().unwrap();
-        state.in_flight = false;
+        let mut state = lock_unpoisoned(run_state);
+        state.closed = true;
         state.pending_force = false;
         state.forced_rerun = false;
         let mut waiters = std::mem::take(&mut state.active_force_waiters);
@@ -341,36 +445,57 @@ fn cancel_task_run_state(run_state: &TaskRunStateRef) {
 
 struct TaskRunOwnerGuard {
     run_state: TaskRunStateRef,
-    completed: bool,
+    owner_token: u64,
+    released: bool,
 }
 
 impl TaskRunOwnerGuard {
-    fn new(run_state: TaskRunStateRef) -> Self {
+    fn new(run_state: TaskRunStateRef, owner_token: u64) -> Self {
         Self {
             run_state,
-            completed: false,
+            owner_token,
+            released: false,
         }
     }
 
-    fn complete(&mut self) {
-        self.completed = true;
+    fn mark_released(&mut self) {
+        self.released = true;
     }
 }
 
 impl Drop for TaskRunOwnerGuard {
     fn drop(&mut self) {
-        if !self.completed {
-            // TaskRunState uses a synchronous mutex specifically so cancellation can finish
-            // every force waiter from Drop without spawning cleanup work.
-            cancel_task_run_state(&self.run_state);
+        if self.released {
+            return;
+        }
+        let (control, waiters, owned) = {
+            let mut state = lock_unpoisoned(&self.run_state);
+            if state.owner_token != Some(self.owner_token) {
+                (Arc::clone(&state.control), Vec::new(), false)
+            } else {
+                state.owner_token = None;
+                state.in_flight = false;
+                state.pending_force = false;
+                state.forced_rerun = false;
+                let mut waiters = std::mem::take(&mut state.active_force_waiters);
+                waiters.extend(std::mem::take(&mut state.pending_force_waiters));
+                (Arc::clone(&state.control), waiters, true)
+            }
+        };
+        if owned {
+            control.owner_finished();
+            for waiter in waiters {
+                let _ = waiter.send(cancelled_task_result());
+            }
         }
     }
 }
 
 enum TaskRunClaim {
-    Owner,
+    Owner(u64),
     Skip,
     Wait(oneshot::Receiver<AppResult<()>>),
+    Closed,
 }
 
 async fn run_scheduled_task<F, Fut>(
@@ -383,8 +508,10 @@ where
     Fut: std::future::Future<Output = AppResult<()>>,
 {
     let claim = {
-        let mut state = run_state.lock().unwrap();
-        if state.in_flight {
+        let mut state = lock_unpoisoned(&run_state);
+        if state.closed || state.control.is_cancelled() {
+            TaskRunClaim::Closed
+        } else if state.in_flight {
             if force_if_busy {
                 let (sender, receiver) = oneshot::channel();
                 if state.forced_rerun {
@@ -398,20 +525,28 @@ where
                 TaskRunClaim::Skip
             }
         } else {
+            let Some(owner_token) = state.next_owner_token.checked_add(1) else {
+                state.closed = true;
+                return cancelled_task_result();
+            };
+            state.next_owner_token = owner_token;
             state.in_flight = true;
+            state.owner_token = Some(owner_token);
             state.forced_rerun = false;
-            TaskRunClaim::Owner
+            state.control.owner_started();
+            TaskRunClaim::Owner(owner_token)
         }
     };
     match claim {
-        TaskRunClaim::Owner => {
-            let mut owner = TaskRunOwnerGuard::new(Arc::clone(&run_state));
-            let result = drain_scheduled_runs(&run_state, execute).await;
-            owner.complete();
+        TaskRunClaim::Owner(owner_token) => {
+            let mut owner = TaskRunOwnerGuard::new(Arc::clone(&run_state), owner_token);
+            let result = drain_scheduled_runs(&run_state, owner_token, execute).await;
+            owner.mark_released();
             result
         }
         TaskRunClaim::Skip => Ok(()),
         TaskRunClaim::Wait(receiver) => receiver.await.unwrap_or_else(|_| cancelled_task_result()),
+        TaskRunClaim::Closed => cancelled_task_result(),
     }
 }
 
@@ -493,31 +628,64 @@ async fn run_notification_maintenance_once(
     }
 }
 
-async fn drain_scheduled_runs<F, Fut>(run_state: &TaskRunStateRef, mut execute: F) -> AppResult<()>
+async fn drain_scheduled_runs<F, Fut>(
+    run_state: &TaskRunStateRef,
+    owner_token: u64,
+    mut execute: F,
+) -> AppResult<()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = AppResult<()>>,
 {
+    let control = {
+        let state = lock_unpoisoned(run_state);
+        Arc::clone(&state.control)
+    };
     loop {
-        let result = execute().await;
-        let completed_waiters = {
-            let mut state = run_state.lock().unwrap();
-            if !state.forced_rerun && state.pending_force {
+        let cancellation = wait_for_generation_cancel(control.subscribe());
+        tokio::pin!(cancellation);
+        let result = tokio::select! {
+            biased;
+            _ = &mut cancellation => cancelled_task_result(),
+            result = execute() => result,
+        };
+        let (completed_waiters, finished, release_owner, result) = {
+            let mut state = lock_unpoisoned(run_state);
+            if state.owner_token != Some(owner_token) {
+                (Vec::new(), true, false, cancelled_task_result())
+            } else if state.closed || control.is_cancelled() {
+                state.owner_token = None;
+                state.in_flight = false;
+                state.pending_force = false;
+                state.forced_rerun = false;
+                let mut waiters = std::mem::take(&mut state.active_force_waiters);
+                waiters.extend(std::mem::take(&mut state.pending_force_waiters));
+                (waiters, true, true, cancelled_task_result())
+            } else if !state.forced_rerun && state.pending_force {
                 state.pending_force = false;
                 state.forced_rerun = true;
                 let pending = std::mem::take(&mut state.pending_force_waiters);
                 state.active_force_waiters.extend(pending);
-                None
+                (Vec::new(), false, false, result)
             } else {
+                state.owner_token = None;
                 state.in_flight = false;
                 state.forced_rerun = false;
-                Some(std::mem::take(&mut state.active_force_waiters))
+                (
+                    std::mem::take(&mut state.active_force_waiters),
+                    true,
+                    true,
+                    result,
+                )
             }
         };
-        let Some(waiters) = completed_waiters else {
+        if !finished {
             continue;
-        };
-        for waiter in waiters {
+        }
+        if release_owner {
+            control.owner_finished();
+        }
+        for waiter in completed_waiters {
             let _ = waiter.send(result.clone());
         }
         return result;
@@ -526,11 +694,57 @@ where
 
 type SchedulerHandle = tauri::async_runtime::JoinHandle<()>;
 
+#[derive(Default)]
+struct SchedulerHandleBatch {
+    handles: Vec<(TaskId, SchedulerHandle)>,
+}
+
+impl SchedulerHandleBatch {
+    fn into_handles(mut self) -> Vec<(TaskId, SchedulerHandle)> {
+        std::mem::take(&mut self.handles)
+    }
+}
+
+impl Drop for SchedulerHandleBatch {
+    fn drop(&mut self) {
+        for (_, handle) in self.handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl FromIterator<(TaskId, SchedulerHandle)> for SchedulerHandleBatch {
+    fn from_iter<T: IntoIterator<Item = (TaskId, SchedulerHandle)>>(iter: T) -> Self {
+        let mut batch = Self::default();
+        for handle in iter {
+            batch.handles.push(handle);
+        }
+        batch
+    }
+}
+
+trait IntoSchedulerHandleBatch {
+    fn into_scheduler_handle_batch(self) -> SchedulerHandleBatch;
+}
+
+impl IntoSchedulerHandleBatch for SchedulerHandleBatch {
+    fn into_scheduler_handle_batch(self) -> SchedulerHandleBatch {
+        self
+    }
+}
+
+impl IntoSchedulerHandleBatch for Vec<(TaskId, SchedulerHandle)> {
+    fn into_scheduler_handle_batch(self) -> SchedulerHandleBatch {
+        self.into_iter().collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SchedulerLifecycleState {
     Stopped,
     Starting { generation: u64 },
     Running { generation: u64 },
+    Stopping { generation: u64 },
 }
 
 struct SchedulerLifecycle {
@@ -539,6 +753,8 @@ struct SchedulerLifecycle {
     handles: HashMap<TaskId, SchedulerHandle>,
     run_states: Option<Arc<HashMap<TaskId, TaskRunStateRef>>>,
     generation_running: Option<Arc<AtomicBool>>,
+    control: Option<Arc<GenerationControl>>,
+    cleanup_completion: Option<watch::Receiver<bool>>,
 }
 
 impl SchedulerLifecycle {
@@ -549,24 +765,32 @@ impl SchedulerLifecycle {
             handles: HashMap::new(),
             run_states: None,
             generation_running: None,
+            control: None,
+            cleanup_completion: None,
         }
     }
 
     fn begin_start(
         &mut self,
-    ) -> Option<(u64, Arc<HashMap<TaskId, TaskRunStateRef>>, Arc<AtomicBool>)> {
+    ) -> Option<(
+        u64,
+        Arc<HashMap<TaskId, TaskRunStateRef>>,
+        Arc<AtomicBool>,
+        Arc<GenerationControl>,
+    )> {
         if self.state != SchedulerLifecycleState::Stopped {
             return None;
         }
-        self.next_generation = self.next_generation.saturating_add(1);
+        self.next_generation = self.next_generation.checked_add(1)?;
         let generation = self.next_generation;
-        // Run coordination is generation-owned; stale cleanup can never mutate a restart.
-        let run_states = new_task_run_states();
+        let control = GenerationControl::new();
+        let run_states = new_task_run_states(&control);
         let generation_running = Arc::new(AtomicBool::new(true));
         self.state = SchedulerLifecycleState::Starting { generation };
         self.run_states = Some(Arc::clone(&run_states));
         self.generation_running = Some(Arc::clone(&generation_running));
-        Some((generation, run_states, generation_running))
+        self.control = Some(Arc::clone(&control));
+        Some((generation, run_states, generation_running, control))
     }
 
     fn install_handles(
@@ -586,57 +810,31 @@ impl SchedulerLifecycle {
     }
 
     fn finish_start(&mut self, generation: u64) -> bool {
-        if self.state != (SchedulerLifecycleState::Starting { generation }) {
+        if self.state != (SchedulerLifecycleState::Starting { generation })
+            || self
+                .control
+                .as_ref()
+                .is_none_or(|control| control.is_cancelled())
+        {
             return false;
         }
         self.state = SchedulerLifecycleState::Running { generation };
         true
     }
 
-    fn rollback_start(
-        &mut self,
-        generation: u64,
-    ) -> Option<(
-        Vec<SchedulerHandle>,
-        Arc<HashMap<TaskId, TaskRunStateRef>>,
-        Arc<AtomicBool>,
-    )> {
-        if self.state != (SchedulerLifecycleState::Starting { generation }) {
-            return None;
+    fn active_generation(&self) -> Option<u64> {
+        match self.state {
+            SchedulerLifecycleState::Starting { generation }
+            | SchedulerLifecycleState::Running { generation }
+            | SchedulerLifecycleState::Stopping { generation } => Some(generation),
+            SchedulerLifecycleState::Stopped => None,
         }
-        self.state = SchedulerLifecycleState::Stopped;
-        let handles = std::mem::take(&mut self.handles).into_values().collect();
-        let run_states = self
-            .run_states
-            .take()
-            .expect("starting generation has run states");
-        let generation_running = self
-            .generation_running
-            .take()
-            .expect("starting generation has running state");
-        Some((handles, run_states, generation_running))
-    }
-
-    fn stop(
-        &mut self,
-    ) -> (
-        bool,
-        Vec<SchedulerHandle>,
-        Option<Arc<HashMap<TaskId, TaskRunStateRef>>>,
-        Option<Arc<AtomicBool>>,
-    ) {
-        let was_active = self.state != SchedulerLifecycleState::Stopped || !self.handles.is_empty();
-        self.state = SchedulerLifecycleState::Stopped;
-        let handles = std::mem::take(&mut self.handles).into_values().collect();
-        (
-            was_active,
-            handles,
-            self.run_states.take(),
-            self.generation_running.take(),
-        )
     }
 
     fn run_state(&self, task: TaskId) -> Option<TaskRunStateRef> {
+        if !matches!(self.state, SchedulerLifecycleState::Running { .. }) {
+            return None;
+        }
         self.run_states
             .as_ref()
             .and_then(|states| states.get(&task))
@@ -647,11 +845,64 @@ impl SchedulerLifecycle {
         self.state == (SchedulerLifecycleState::Starting { generation })
     }
 
+    fn begin_cleanup(&mut self, generation: u64) -> CleanupRequest {
+        match self.state {
+            SchedulerLifecycleState::Stopping { generation: active } if active == generation => {
+                return self
+                    .cleanup_completion
+                    .as_ref()
+                    .cloned()
+                    .map(CleanupRequest::Wait)
+                    .unwrap_or(CleanupRequest::Inactive);
+            }
+            SchedulerLifecycleState::Starting { generation: active }
+            | SchedulerLifecycleState::Running { generation: active }
+                if active == generation => {}
+            _ => return CleanupRequest::Inactive,
+        }
+
+        let (completion, receiver) = watch::channel(false);
+        self.state = SchedulerLifecycleState::Stopping { generation };
+        self.cleanup_completion = Some(receiver.clone());
+        CleanupRequest::Start(CleanupResources {
+            generation,
+            handles: std::mem::take(&mut self.handles).into_values().collect(),
+            run_states: self.run_states.take(),
+            generation_running: self.generation_running.take(),
+            control: self.control.take(),
+            completion,
+            receiver,
+        })
+    }
+
+    fn finish_cleanup(&mut self, generation: u64) -> bool {
+        if self.state != (SchedulerLifecycleState::Stopping { generation }) {
+            return false;
+        }
+        self.state = SchedulerLifecycleState::Stopped;
+        self.handles.clear();
+        self.run_states = None;
+        self.generation_running = None;
+        self.control = None;
+        self.cleanup_completion = None;
+        true
+    }
+
+    fn cleanup_receiver(&self) -> Option<watch::Receiver<bool>> {
+        if matches!(self.state, SchedulerLifecycleState::Stopping { .. }) {
+            self.cleanup_completion.clone()
+        } else {
+            None
+        }
+    }
+
     #[cfg(test)]
     fn running_generation(&self) -> Option<u64> {
         match self.state {
             SchedulerLifecycleState::Running { generation } => Some(generation),
-            SchedulerLifecycleState::Stopped | SchedulerLifecycleState::Starting { .. } => None,
+            SchedulerLifecycleState::Stopped
+            | SchedulerLifecycleState::Starting { .. }
+            | SchedulerLifecycleState::Stopping { .. } => None,
         }
     }
 
@@ -666,34 +917,163 @@ impl SchedulerLifecycle {
     }
 }
 
-fn release_scheduler_generation(
+struct CleanupResources {
+    generation: u64,
     handles: Vec<SchedulerHandle>,
     run_states: Option<Arc<HashMap<TaskId, TaskRunStateRef>>>,
     generation_running: Option<Arc<AtomicBool>>,
-) {
-    if let Some(generation_running) = generation_running {
-        generation_running.store(false, Ordering::SeqCst);
-    }
-    if let Some(run_states) = run_states {
-        for run_state in run_states.values() {
-            cancel_task_run_state(run_state);
+    control: Option<Arc<GenerationControl>>,
+    completion: watch::Sender<bool>,
+    receiver: watch::Receiver<bool>,
+}
+
+enum CleanupRequest {
+    Start(CleanupResources),
+    Wait(watch::Receiver<bool>),
+    Inactive,
+}
+
+struct CleanupCompletionGuard {
+    lifecycle: Arc<StdMutex<SchedulerLifecycle>>,
+    running: Arc<AtomicBool>,
+    generation: u64,
+    completion: Option<watch::Sender<bool>>,
+}
+
+impl Drop for CleanupCompletionGuard {
+    fn drop(&mut self) {
+        let finished = lock_unpoisoned(&self.lifecycle).finish_cleanup(self.generation);
+        if finished {
+            self.running.store(false, Ordering::SeqCst);
+        }
+        if let Some(completion) = self.completion.take() {
+            completion.send_replace(true);
         }
     }
-    for handle in handles {
-        handle.abort();
+}
+
+async fn wait_for_cleanup(mut completion: watch::Receiver<bool>) {
+    let _ = completion.wait_for(|finished| *finished).await;
+}
+
+fn request_scheduler_cleanup(
+    lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
+    running: &Arc<AtomicBool>,
+    generation: u64,
+) -> Option<watch::Receiver<bool>> {
+    let request = lock_unpoisoned(lifecycle).begin_cleanup(generation);
+    match request {
+        CleanupRequest::Wait(receiver) => Some(receiver),
+        CleanupRequest::Inactive => None,
+        CleanupRequest::Start(mut resources) => {
+            running.store(false, Ordering::SeqCst);
+            let receiver = resources.receiver.clone();
+            if let Some(generation_running) = &resources.generation_running {
+                generation_running.store(false, Ordering::SeqCst);
+            }
+            if let Some(control) = &resources.control {
+                control.cancel();
+            }
+            if let Some(run_states) = &resources.run_states {
+                for run_state in run_states.values() {
+                    cancel_task_run_state(run_state);
+                }
+            }
+            let lifecycle = Arc::clone(lifecycle);
+            let running = Arc::clone(running);
+            tauri::async_runtime::spawn(async move {
+                let _guard = CleanupCompletionGuard {
+                    lifecycle,
+                    running,
+                    generation: resources.generation,
+                    completion: Some(resources.completion),
+                };
+                for handle in resources.handles.drain(..) {
+                    let _ = handle.await;
+                }
+                if let Some(control) = resources.control {
+                    control.wait_drained().await;
+                }
+            });
+            Some(receiver)
+        }
+    }
+}
+
+async fn supervise_scheduler_handle(
+    task: TaskId,
+    generation: u64,
+    mut handle: SchedulerHandle,
+    control: Arc<GenerationControl>,
+    lifecycle: Arc<StdMutex<SchedulerLifecycle>>,
+    running: Arc<AtomicBool>,
+    ready: oneshot::Sender<bool>,
+) {
+    let completed_before_start = std::future::poll_fn(|context| {
+        let completed = match std::future::Future::poll(std::pin::Pin::new(&mut handle), context) {
+            std::task::Poll::Ready(_) => true,
+            std::task::Poll::Pending => false,
+        };
+        std::task::Poll::Ready(completed)
+    })
+    .await;
+    let alive = !completed_before_start && !control.is_cancelled();
+    let _ = ready.send(alive);
+    if !alive {
+        if completed_before_start && !control.is_cancelled() {
+            control.cancel();
+            tracing::warn!(
+                ?task,
+                generation,
+                "scheduler periodic loop exited during start"
+            );
+            let _ = request_scheduler_cleanup(&lifecycle, &running, generation);
+        }
+        return;
+    }
+
+    let cancellation = wait_for_generation_cancel(control.subscribe());
+    tokio::pin!(cancellation);
+    let unexpected = tokio::select! {
+        biased;
+        _ = &mut cancellation => {
+            handle.abort();
+            let _ = handle.await;
+            false
+        }
+        _ = &mut handle => !control.is_cancelled(),
+    };
+    if unexpected {
+        control.cancel();
+        tracing::warn!(
+            ?task,
+            generation,
+            "scheduler periodic loop exited unexpectedly"
+        );
+        let _ = request_scheduler_cleanup(&lifecycle, &running, generation);
     }
 }
 
 struct SchedulerStartGuard {
     lifecycle: Arc<StdMutex<SchedulerLifecycle>>,
     running: Arc<AtomicBool>,
+    control: Arc<GenerationControl>,
     generation: u64,
     committed: bool,
+    activity_released: bool,
 }
 
 impl SchedulerStartGuard {
     fn commit(&mut self) {
         self.committed = true;
+        self.release_activity();
+    }
+
+    fn release_activity(&mut self) {
+        if !self.activity_released {
+            self.control.owner_finished();
+            self.activity_released = true;
+        }
     }
 }
 
@@ -702,19 +1082,12 @@ impl Drop for SchedulerStartGuard {
         if self.committed {
             return;
         }
-        let released = self
-            .lifecycle
-            .lock()
-            .unwrap()
-            .rollback_start(self.generation);
-        if let Some((handles, run_states, generation_running)) = released {
-            self.running.store(false, Ordering::SeqCst);
-            release_scheduler_generation(handles, Some(run_states), Some(generation_running));
-        }
+        let _ = request_scheduler_cleanup(&self.lifecycle, &self.running, self.generation);
+        self.release_activity();
     }
 }
 
-async fn start_scheduler_lifecycle<Prepare, PrepareFut, Prepared, Install, FinishFut>(
+async fn start_scheduler_lifecycle<Prepare, PrepareFut, Prepared, Install, Handles, FinishFut>(
     lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
     running: &Arc<AtomicBool>,
     prepare: Prepare,
@@ -728,23 +1101,42 @@ where
         Arc<HashMap<TaskId, TaskRunStateRef>>,
         Arc<AtomicBool>,
         Prepared,
-    ) -> (Vec<(TaskId, SchedulerHandle)>, FinishFut),
+    ) -> (Handles, FinishFut),
+    Handles: IntoSchedulerHandleBatch,
     FinishFut: std::future::Future<Output = ()>,
 {
-    let Some((generation, run_states, generation_running)) =
-        lifecycle.lock().unwrap().begin_start()
+    loop {
+        let waiting = lock_unpoisoned(lifecycle).cleanup_receiver();
+        let Some(waiting) = waiting else {
+            break;
+        };
+        wait_for_cleanup(waiting).await;
+    }
+    let Some((generation, run_states, generation_running, control)) =
+        lock_unpoisoned(lifecycle).begin_start()
     else {
         return false;
     };
     running.store(true, Ordering::SeqCst);
+    control.owner_started();
     let mut guard = SchedulerStartGuard {
         lifecycle: Arc::clone(lifecycle),
         running: Arc::clone(running),
+        control: Arc::clone(&control),
         generation,
         committed: false,
+        activity_released: false,
     };
-    let prepared = prepare(generation).await;
-    if !lifecycle.lock().unwrap().is_starting(generation) {
+    let cancellation = wait_for_generation_cancel(control.subscribe());
+    let prepared = prepare(generation);
+    tokio::pin!(cancellation);
+    tokio::pin!(prepared);
+    let prepared = tokio::select! {
+        biased;
+        _ = &mut cancellation => return false,
+        prepared = &mut prepared => prepared,
+    };
+    if !lock_unpoisoned(lifecycle).is_starting(generation) {
         return false;
     }
     let (handles, finish_start) = install(
@@ -753,20 +1145,57 @@ where
         Arc::clone(&generation_running),
         prepared,
     );
-    if let Err(rejected) = lifecycle
-        .lock()
-        .unwrap()
-        .install_handles(generation, handles)
-    {
-        release_scheduler_generation(
-            rejected.into_iter().map(|(_, handle)| handle).collect(),
-            None,
-            Some(generation_running),
-        );
+    let (supervised, ready_receivers): (Vec<_>, Vec<_>) = handles
+        .into_scheduler_handle_batch()
+        .into_handles()
+        .into_iter()
+        .map(|(task, handle)| {
+            let (ready, receiver) = oneshot::channel();
+            let supervisor = tauri::async_runtime::spawn(supervise_scheduler_handle(
+                task,
+                generation,
+                handle,
+                Arc::clone(&control),
+                Arc::clone(lifecycle),
+                Arc::clone(running),
+                ready,
+            ));
+            ((task, supervisor), receiver)
+        })
+        .unzip();
+    let install_result = {
+        let mut lifecycle = lock_unpoisoned(lifecycle);
+        lifecycle.install_handles(generation, supervised)
+    };
+    if let Err(rejected) = install_result {
+        control.cancel();
+        for (_, handle) in rejected {
+            let _ = handle.await;
+        }
         return false;
     }
-    finish_start.await;
-    let committed = lifecycle.lock().unwrap().finish_start(generation);
+    for ready in ready_receivers {
+        let cancellation = wait_for_generation_cancel(control.subscribe());
+        tokio::pin!(cancellation);
+        let alive = tokio::select! {
+            biased;
+            _ = &mut cancellation => false,
+            alive = ready => alive.unwrap_or(false),
+        };
+        if !alive {
+            return false;
+        }
+    }
+    let cancellation = wait_for_generation_cancel(control.subscribe());
+    tokio::pin!(cancellation);
+    tokio::pin!(finish_start);
+    tokio::select! {
+        biased;
+        _ = &mut cancellation => return false,
+        _ = &mut finish_start => {}
+    }
+    tokio::task::yield_now().await;
+    let committed = lock_unpoisoned(lifecycle).finish_start(generation);
     if committed {
         guard.commit();
     }
@@ -777,10 +1206,14 @@ async fn stop_scheduler_lifecycle(
     lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
     running: &Arc<AtomicBool>,
 ) -> bool {
-    running.store(false, Ordering::SeqCst);
-    let (was_active, handles, run_states, generation_running) = lifecycle.lock().unwrap().stop();
-    release_scheduler_generation(handles, run_states, generation_running);
-    was_active
+    let generation = lock_unpoisoned(lifecycle).active_generation();
+    let Some(generation) = generation else {
+        return false;
+    };
+    if let Some(completion) = request_scheduler_cleanup(lifecycle, running, generation) {
+        wait_for_cleanup(completion).await;
+    }
+    true
 }
 
 pub struct SchedulerService {
@@ -858,7 +1291,7 @@ impl SchedulerService {
             |generation, run_states, generation_running, market_fallback_interval| {
                 self.market_fallback_interval_tx
                     .send_replace(market_fallback_interval);
-                let handles = periodic_task_ids()
+                let handles: SchedulerHandleBatch = periodic_task_ids()
                     .iter()
                     .copied()
                     .map(|task| {
@@ -884,7 +1317,7 @@ impl SchedulerService {
                         .clone();
                     let _ = run_scheduled_task(time_state, true, || self.execute(TaskId::TimeSync))
                         .await;
-                    if lifecycle.lock().unwrap().is_starting(generation) {
+                    if lock_unpoisoned(&lifecycle).is_starting(generation) {
                         let environment_state = run_states
                             .get(&TaskId::Environment)
                             .expect("environment task registered")
@@ -931,10 +1364,7 @@ impl SchedulerService {
     }
 
     pub async fn run_now(&self, task: TaskId, force: bool) -> AppResult<()> {
-        let run_state = self
-            .lifecycle
-            .lock()
-            .unwrap()
+        let run_state = lock_unpoisoned(&self.lifecycle)
             .run_state(task)
             .ok_or_else(|| crate::error::AppError::Internal("调度器未运行".into()))?;
         run_scheduled_task(run_state, force, || self.execute(task)).await
