@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.5.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.4.1...easiflux-desktop-tauri-v0.5.0) (2026-08-23)
+
+
+### Features
+
+* **scheduler:** support dynamic market fallback interval ([6efa856](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/6efa8560d54354e1802182a4079f6746cf0a1073))
+* **settings:** add account settings page ([2ed3f45](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/2ed3f450db95535a9aee30f7b5d7a74b6d457942))
+* **settings:** add atomic general settings update ([e06a2d6](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/e06a2d6dd5f4d822e7741939fdec2ed113dded7d))
+* **settings:** add full-page settings center ([96b653d](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/96b653de43e518aa84d835b903141379e5a0eecb))
+* **settings:** add full-page settings navigation ([98dece7](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/98dece78f1e482d6eaee44b9fb4638f5e71ac218))
+* **settings:** add general settings autosave ([c658a95](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/c658a9537c98ef4264bface2940c1328884c4551))
+* **settings:** add general settings panel ([475733f](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/475733f226b227d6377bdb6cc67de393e04dd1b3))
+* **settings:** add settings center presentation ([2bef598](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/2bef598955c9f098cefb27b9c5b67591769a0bfc))
+* **settings:** separate credential quick setup ([46a4a47](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/46a4a473777f185722be7c233c32fce85b78e3bc))
+
+
+### Bug Fixes
+
+* **connection:** bind completion to caller lifetime ([d0aceda](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/d0aceda87cd85b86191f6b4c4130babffd101545))
+* **connection:** ignore stale connect completions ([9225bf6](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/9225bf6b191979247734302b4462c8ec674d7d90))
+* **connection:** make reconnect lifecycle reentrant-safe ([5e5b9cb](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/5e5b9cbb60ef2a24b1b03218419bd336b16292d6))
+* **connection:** preserve concurrent reconnect intents ([801ce1a](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/801ce1aa9edd0353acad8c3e4abe1448fc4b68b4))
+* **connection:** preserve latest reconnect intent ([2e83620](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/2e836209f1a59300f85b94e2e29a983dfbc0afd2))
+* **connection:** preserve operation ordering ([2c1f126](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/2c1f126f0319774ad57552c054d869c0bc8d59be))
+* **settings:** apply settings child presentation styles ([4d03207](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/4d03207203fbe4275251644e674c486277b66a32))
+* **settings:** await reconciliation during autosave disposal ([2a89f49](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/2a89f49a2274f22c47d85608a4226e70d271ad64))
+* **settings:** bind account reconnect attempts ([6dd5dfa](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/6dd5dfad550493b4415feb40f3cd43157dc26a9c))
+* **settings:** cancel stale quick setup side effects ([3c312ba](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/3c312ba623c1a713ea5b23a4326c4455264ae195))
+* **settings:** preserve committed reconnect intent ([6e38626](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/6e386266bf997f53c1bdb4057aaaacdf655fca59))
+* **settings:** preserve save error across reconcile throws ([a69d2d1](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/a69d2d1f746d806fc922afc83193f65d11179dc4))
+
 ## [0.4.1](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.4.0...easiflux-desktop-tauri-v0.4.1) (2026-08-15)
 
 
