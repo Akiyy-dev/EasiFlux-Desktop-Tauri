@@ -25,7 +25,17 @@ const NOTIFICATION_STORAGE_UNAVAILABLE: &str = "NOTIFICATION_STORAGE_UNAVAILABLE
 pub struct NotificationFileV1 {
     pub schema_version: u32,
     pub revision: u64,
+    #[serde(default)]
+    pub source_event_index: Vec<NotificationSourceEventIndexEntry>,
     pub partitions: Vec<NotificationPartition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationSourceEventIndexEntry {
+    pub scope: NotificationScope,
+    pub source_event_id: String,
+    pub notification_id: String,
 }
 
 impl NotificationFileV1 {
@@ -33,6 +43,7 @@ impl NotificationFileV1 {
         Self {
             schema_version: NOTIFICATION_SCHEMA_VERSION,
             revision: 0,
+            source_event_index: Vec::new(),
             partitions: Vec::new(),
         }
     }
@@ -443,7 +454,49 @@ fn validate_file(file: &NotificationFileV1) -> AppResult<()> {
             }
         }
     }
+    let records_by_id: std::collections::HashMap<_, _> = file
+        .partitions
+        .iter()
+        .flat_map(|partition| {
+            partition
+                .items
+                .iter()
+                .map(|record| (record.id.as_str(), &partition.scope))
+        })
+        .collect();
+    let mut indexed_sources = HashSet::new();
+    for entry in &file.source_event_index {
+        entry.scope.validate().map_err(|_| invalid_file())?;
+        if !is_safe_source_event_id(&entry.source_event_id)
+            || !indexed_sources.insert((entry.scope.clone(), entry.source_event_id.as_str()))
+            || !records_by_id
+                .get(entry.notification_id.as_str())
+                .is_some_and(|scope| *scope == &entry.scope)
+        {
+            return Err(invalid_file());
+        }
+    }
     Ok(())
+}
+
+fn is_safe_source_event_id(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+    {
+        return false;
+    }
+    !value
+        .split([':', '-', '_'])
+        .map(str::to_ascii_lowercase)
+        .any(|segment| {
+            matches!(
+                segment.as_str(),
+                "sk" | "secret" | "token" | "bearer" | "apikey"
+            )
+        })
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> PathBuf {

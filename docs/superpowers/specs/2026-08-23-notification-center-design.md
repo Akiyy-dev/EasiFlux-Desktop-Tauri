@@ -295,11 +295,16 @@ notifications/notifications.v1.json.bak
 NotificationFileV1 {
   schemaVersion: 1
   revision: u64
+  sourceEventIndex: [
+    { scope, sourceEventId, notificationId }
+  ]
   partitions: [
     { scope: Global | Account { accountId }, items: NotificationRecord[] }
   ]
 }
 ```
+
+`sourceEventIndex` 是仅供 Rust 权威服务使用的持久化幂等索引，不进入通知记录 DTO 或前端展示。它按 `(scope, sourceEventId)` 唯一并指向同作用域内的现存通知；语义合并产生的新来源 ID 也追加到该索引。旧 v1 文件缺少该字段时按空索引读取，服务再从每条记录的创建来源 `sourceEventId` 补齐。删除、清空、保留和账户清理必须同步移除指向已删除记录的条目。
 
 使用显式分区数组而不是把账户 ID 当作 JSON 对象键，避免保留特殊键和转义语义。加载后可以在内存中构建按作用域索引。
 
@@ -314,7 +319,7 @@ NotificationFileV1 {
 ### 9.3 启动恢复与保留
 
 - 启动时按 `main -> tmp -> bak` 顺序读取第一个严格校验通过的 v1 候选，和现有 `ChartStateStore` 恢复语义一致。若从 tmp 或 bak 恢复，使用不改变 revision 的原子规范化写入恢复主文件；规范化失败时仍可从已加载候选提供本次运行状态，并在下一次修改时重试。
-- 校验至少包含：schema、分区作用域唯一、Global 分区最多一个、账户 ID 规范化且非空、全文件通知 ID 唯一、受控枚举、有限参数、`occurrenceCount` 位于 `1..=u32::MAX`、`updatedAtMs >= createdAtMs`、`readAtMs >= createdAtMs` 和时间戳不超过 JavaScript 安全整数。
+- 校验至少包含：schema、分区作用域唯一、Global 分区最多一个、账户 ID 规范化且非空、全文件通知 ID 唯一、受控枚举、有限参数、`occurrenceCount` 位于 `1..=u32::MAX`、`updatedAtMs >= createdAtMs`、`readAtMs >= createdAtMs`、时间戳不超过 JavaScript 安全整数，以及 `sourceEventIndex` 不含重复、悬空、跨作用域或不安全来源标识。
 - 只要更高优先级候选可解析且 `schemaVersion > 1`，就停止向旧候选降级。该文件属于“不支持的新版本”，不是损坏文件；应用继续启动，但通知中心进入不可用恢复态，并且当前版本不得覆盖、降级或改名该文件。
 - 所有 v1 候选都损坏时，把不可解析文件保留为带时间戳的 `.corrupt-*` 排查副本，以空通知箱启动。通知不是应用启动的硬依赖；该恢复过程不发送 Created 或补弹 Toast。
 - 存储目录不存在时按需创建；首次无文件是正常空状态，不报告错误。

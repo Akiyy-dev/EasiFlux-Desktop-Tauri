@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     FailurePoint, NotificationFileV1, NotificationLoadStatus, NotificationPartition,
-    NotificationPersistence, NotificationStore, RecoverySource, NOTIFICATION_SCHEMA_VERSION,
+    NotificationPersistence, NotificationSourceEventIndexEntry, NotificationStore, RecoverySource,
+    NOTIFICATION_SCHEMA_VERSION,
 };
 use crate::error::AppError;
 use crate::models::notification::{
@@ -61,6 +62,7 @@ fn sample_file(revision: u64) -> NotificationFileV1 {
     NotificationFileV1 {
         schema_version: NOTIFICATION_SCHEMA_VERSION,
         revision,
+        source_event_index: Vec::new(),
         partitions: vec![NotificationPartition {
             scope: NotificationScope::Global,
             items: vec![sample_record(
@@ -76,6 +78,7 @@ fn oversized_file(revision: u64) -> NotificationFileV1 {
     NotificationFileV1 {
         schema_version: NOTIFICATION_SCHEMA_VERSION,
         revision,
+        source_event_index: Vec::new(),
         partitions: vec![NotificationPartition {
             scope: NotificationScope::Global,
             items: (0..=1_000)
@@ -116,6 +119,7 @@ fn round_trip_preserves_revision_partitions_and_records() {
     let file = NotificationFileV1 {
         schema_version: NOTIFICATION_SCHEMA_VERSION,
         revision: 7,
+        source_event_index: Vec::new(),
         partitions: vec![
             NotificationPartition {
                 scope: NotificationScope::Global,
@@ -633,5 +637,58 @@ fn content_map_round_trip_is_not_reordered_or_dropped() {
     store.save(&file).unwrap();
 
     assert_eq!(store.load().unwrap().file, file);
+    cleanup(&root);
+}
+
+#[test]
+fn legacy_file_without_source_event_index_loads_with_an_empty_index() {
+    let root = test_root("legacy-source-index");
+    let path = store_path(&root);
+    let mut value = serde_json::to_value(sample_file(3)).unwrap();
+    value.as_object_mut().unwrap().remove("sourceEventIndex");
+    write_json(&path, &value);
+
+    let outcome = NotificationStore::with_path(path).load().unwrap();
+
+    assert!(outcome.file.source_event_index.is_empty());
+    cleanup(&root);
+}
+
+#[test]
+fn source_event_index_rejects_duplicates_dangling_cross_scope_and_unsafe_ids() {
+    let root = test_root("invalid-source-index");
+    let store = NotificationStore::with_path(store_path(&root));
+    let mut base = sample_file(3);
+    let record_id = base.partitions[0].items[0].id.clone();
+    let valid = NotificationSourceEventIndexEntry {
+        scope: NotificationScope::Global,
+        source_event_id: "source-1".into(),
+        notification_id: record_id.clone(),
+    };
+
+    for index in [
+        vec![valid.clone(), valid.clone()],
+        vec![NotificationSourceEventIndexEntry {
+            notification_id: "00000000-0000-4000-8000-000000000099".into(),
+            ..valid.clone()
+        }],
+        vec![NotificationSourceEventIndexEntry {
+            scope: NotificationScope::Account {
+                account_id: "alpha".into(),
+            },
+            ..valid.clone()
+        }],
+        vec![NotificationSourceEventIndexEntry {
+            source_event_id: "raw server body".into(),
+            ..valid.clone()
+        }],
+        vec![NotificationSourceEventIndexEntry {
+            source_event_id: String::new(),
+            ..valid.clone()
+        }],
+    ] {
+        base.source_event_index = index;
+        assert!(store.save(&base).is_err());
+    }
     cleanup(&root);
 }

@@ -196,7 +196,7 @@ git commit -m "feat(notifications): define domain and toast settings"
 
 **Interfaces:**
 
-- Produces `NotificationFileV1 { schema_version, revision, partitions }` and `NotificationPartition` as the complete disk snapshot.
+- Produces `NotificationFileV1 { schema_version, revision, source_event_index, partitions }`, internal `NotificationSourceEventIndexEntry { scope, source_event_id, notification_id }`, and `NotificationPartition` as the complete disk snapshot. The index uses `serde(default)` for legacy v1 compatibility and is never exposed through `NotificationRecord` or frontend DTOs.
 - Produces `NotificationStore::new()`, test-only `with_path`, `load()`, and `save(&NotificationFileV1)`.
 - Produces a crate-private `NotificationPersistence: Send + Sync` trait implemented by `NotificationStore`, allowing service tests to inject deterministic save failures without touching real user data.
 - Loads candidates in `main -> tmp -> bak` order, distinguishes unsupported future schema from corruption, preserves corrupt evidence, and normalizes a recovered candidate without changing revision.
@@ -296,6 +296,10 @@ git commit -m "feat(notifications): persist atomic notification snapshots"
 - Create: `src-tauri/src/services/notification/tests/service.rs`
 - Create: `src-tauri/src/services/notification/tests/lifecycle.rs`
 - Modify: `src-tauri/src/services/mod.rs`
+- Modify: `src-tauri/src/storage/notification_store.rs`
+- Modify: `src-tauri/src/storage/notification_store/tests.rs`
+
+**Task 3 schema ruling:** durable absolute idempotency after semantic merges requires retaining every observed `(scope, sourceEventId)`. Task 3 therefore adds the minimal internal `sourceEventIndex` extension above, backfills legacy records on service load, and removes index entries with their target record during delete/clear/prune/account cleanup. `NotificationRecord.sourceEventId` remains the stable creating source; history is not privately encoded into that frontend-facing scalar.
 
 **Interfaces:**
 

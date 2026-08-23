@@ -1,0 +1,806 @@
+use std::sync::Arc;
+
+use crate::models::notification::{
+    ListNotificationsRequest, NotificationChange, NotificationFilter, NotificationScope,
+};
+use crate::services::notification::{NotificationEmitter, NotificationService, ViewContext};
+use crate::storage::notification_store::NotificationFileV1;
+
+use super::support::{harness, input, FakePersistence};
+
+const NOW: u64 = 1_700_000_000_000;
+
+fn request(
+    account_id: Option<&str>,
+    filter: NotificationFilter,
+    cursor: Option<String>,
+    limit: u32,
+) -> ListNotificationsRequest {
+    ListNotificationsRequest {
+        account_id: account_id.map(str::to_owned),
+        filter,
+        cursor,
+        limit,
+    }
+}
+
+#[tokio::test]
+async fn identical_scope_and_source_event_is_an_absolute_no_op() {
+    let harness = harness(NotificationFileV1::empty());
+    let item = input(
+        NotificationScope::Account {
+            account_id: "alpha".into(),
+        },
+        "source-1",
+        "alpha:order-1:filled",
+    );
+
+    let first = harness.service.publish(item.clone(), NOW).await.unwrap();
+    let second = harness.service.publish(item, NOW + 1).await.unwrap();
+
+    assert!(first.notification.is_some());
+    assert!(second.notification.is_none());
+    assert_eq!(second.revision, "1");
+    assert_eq!(harness.persistence.saves().len(), 1);
+    assert_eq!(harness.events.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn semantic_dedupe_preserves_read_state_and_never_toasts_twice() {
+    let harness = harness(NotificationFileV1::empty());
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let first = harness
+        .service
+        .publish(input(scope.clone(), "source-1", "same-semantic"), NOW)
+        .await
+        .unwrap();
+    let id = first.notification.unwrap().id;
+    harness
+        .service
+        .mark_read(ViewContext::account("alpha").unwrap(), &id, NOW + 1)
+        .await
+        .unwrap();
+    let updated = harness
+        .service
+        .publish(input(scope, "source-2", "same-semantic"), NOW + 2)
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+
+    assert_eq!(updated.occurrence_count, 2);
+    assert_eq!(updated.read_at_ms, Some(NOW + 1));
+    let events = harness.events.lock().unwrap();
+    assert_eq!(events[0].change, NotificationChange::Created);
+    assert!(events[0].toast_candidate.is_some());
+    assert_eq!(events[2].change, NotificationChange::Updated);
+    assert!(events[2].toast_candidate.is_none());
+}
+
+#[tokio::test]
+async fn source_id_remains_an_absolute_no_op_after_merge_and_unrelated_creation() {
+    let harness = harness(NotificationFileV1::empty());
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    harness
+        .service
+        .publish(input(scope.clone(), "source-1", "semantic"), NOW)
+        .await
+        .unwrap();
+    harness
+        .service
+        .publish(input(scope.clone(), "source-2", "semantic"), NOW + 1)
+        .await
+        .unwrap();
+    harness
+        .service
+        .publish(input(scope.clone(), "source-3", "unrelated"), NOW + 2)
+        .await
+        .unwrap();
+    let replay = harness
+        .service
+        .publish(input(scope, "source-1", "semantic"), NOW + 3)
+        .await
+        .unwrap();
+
+    assert!(replay.notification.is_none());
+    assert_eq!(replay.revision, "3");
+    assert_eq!(harness.persistence.saves().len(), 3);
+    assert_eq!(harness.events.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn creating_source_id_remains_idempotent_after_a_merge_and_restart() {
+    let first = harness(NotificationFileV1::empty());
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    first
+        .service
+        .publish(input(scope.clone(), "source-1", "semantic"), NOW)
+        .await
+        .unwrap();
+    first
+        .service
+        .publish(input(scope.clone(), "source-2", "semantic"), NOW + 1)
+        .await
+        .unwrap();
+    let persisted = first.persistence.saves().last().unwrap().clone();
+    let restarted = harness(persisted);
+
+    let replay = restarted
+        .service
+        .publish(input(scope, "source-1", "semantic"), NOW + 2)
+        .await
+        .unwrap();
+
+    assert!(replay.notification.is_none());
+    assert_eq!(replay.revision, "2");
+    assert!(restarted.persistence.saves().is_empty());
+    assert!(restarted.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn semantic_merge_later_source_id_is_an_absolute_no_op_after_restart() {
+    let first = harness(NotificationFileV1::empty());
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    first
+        .service
+        .publish(input(scope.clone(), "source-1", "semantic"), NOW)
+        .await
+        .unwrap();
+    first
+        .service
+        .publish(input(scope.clone(), "source-2", "semantic"), NOW + 1)
+        .await
+        .unwrap();
+    let persisted = first.persistence.saves().last().unwrap().clone();
+    let restarted = harness(persisted);
+
+    let replay = restarted
+        .service
+        .publish(input(scope, "source-2", "semantic"), NOW + 2)
+        .await
+        .unwrap();
+
+    assert!(replay.notification.is_none());
+    assert_eq!(replay.revision, "2");
+    assert!(restarted.persistence.saves().is_empty());
+    assert!(restarted.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn expired_semantic_record_does_not_swallow_a_new_created_toast() {
+    const DAY: u64 = 24 * 60 * 60 * 1_000;
+    let file = NotificationFileV1 {
+        schema_version: crate::storage::notification_store::NOTIFICATION_SCHEMA_VERSION,
+        revision: 4,
+        source_event_index: Vec::new(),
+        partitions: vec![crate::storage::notification_store::NotificationPartition {
+            scope: NotificationScope::Global,
+            items: vec![super::support::record(
+                1,
+                NotificationScope::Global,
+                "old-source",
+                "semantic",
+                NOW - 91 * DAY,
+            )],
+        }],
+    };
+    let harness = harness(file);
+
+    let outcome = harness
+        .service
+        .publish(
+            input(NotificationScope::Global, "new-source", "semantic"),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+    let created = outcome.notification.unwrap();
+    assert_eq!(created.created_at_ms, NOW);
+    assert_eq!(created.occurrence_count, 1);
+    let events = harness.events.lock().unwrap();
+    assert_eq!(events[0].change, NotificationChange::Created);
+    assert!(events[0].toast_candidate.is_some());
+}
+
+#[tokio::test]
+async fn save_failure_preserves_memory_revision_and_emits_nothing() {
+    let harness = harness(NotificationFileV1::empty());
+    harness.persistence.fail_next();
+    let error = harness
+        .service
+        .publish(
+            input(NotificationScope::Global, "source-1", "global:test"),
+            NOW,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "NOTIFICATION_STORAGE_UNAVAILABLE");
+    assert_eq!(harness.service.revision().await, "0");
+    assert!(harness.events.lock().unwrap().is_empty());
+    let page = harness
+        .service
+        .list(
+            ViewContext::global(),
+            ListNotificationsRequest {
+                account_id: None,
+                filter: NotificationFilter::All,
+                cursor: None,
+                limit: 50,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert!(page.items.is_empty());
+}
+
+#[tokio::test]
+async fn unsafe_session_epoch_is_rejected_before_save_or_event() {
+    let harness = harness(NotificationFileV1::empty());
+    let mut item = input(NotificationScope::Global, "source-1", "global:test");
+    item.session_epoch = Some(crate::models::notification::MAX_JAVASCRIPT_SAFE_INTEGER + 1);
+
+    let error = harness.service.publish(item, NOW).await.unwrap_err();
+
+    assert_eq!(error.code(), "INVALID_NOTIFICATION_CONTENT");
+    assert!(harness.persistence.saves().is_empty());
+    assert!(harness.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn emitter_failure_is_diagnostic_only_after_state_and_disk_commit() {
+    let persistence = Arc::new(FakePersistence::default());
+    let emitter: NotificationEmitter = Arc::new(|_| Err("synthetic emit failure".into()));
+    let service = NotificationService::from_snapshot(
+        NotificationFileV1::empty(),
+        Arc::clone(&persistence),
+        emitter,
+        NOW,
+    );
+
+    let outcome = service
+        .publish(
+            input(NotificationScope::Global, "source-1", "global:test"),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+    assert!(outcome.notification.is_some());
+    assert_eq!(outcome.revision, "1");
+    assert_eq!(service.revision().await, "1");
+    assert_eq!(persistence.saves().len(), 1);
+}
+
+#[tokio::test]
+async fn mutation_save_failure_preserves_record_and_revision() {
+    let harness = harness(NotificationFileV1::empty());
+    let record = harness
+        .service
+        .publish(
+            input(NotificationScope::Global, "source-1", "global:test"),
+            NOW,
+        )
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+    harness.persistence.fail_next();
+
+    let error = harness
+        .service
+        .mark_read(ViewContext::global(), &record.id, NOW + 1)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "NOTIFICATION_STORAGE_UNAVAILABLE");
+    assert_eq!(harness.service.revision().await, "1");
+    assert_eq!(harness.events.lock().unwrap().len(), 1);
+    let page = harness
+        .service
+        .list(
+            ViewContext::global(),
+            request(None, NotificationFilter::All, None, 50),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert!(page.items[0].read_at_ms.is_none());
+}
+
+#[tokio::test]
+async fn concurrent_publishers_commit_and_emit_consecutive_revisions() {
+    let harness = harness(NotificationFileV1::empty());
+    let one = Arc::clone(&harness.service);
+    let two = Arc::clone(&harness.service);
+    let a = tokio::spawn(async move {
+        one.publish(
+            input(NotificationScope::Global, "source-a", "global:a"),
+            NOW,
+        )
+        .await
+        .unwrap();
+    });
+    let b = tokio::spawn(async move {
+        two.publish(
+            input(NotificationScope::Global, "source-b", "global:b"),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    });
+    a.await.unwrap();
+    b.await.unwrap();
+
+    let pairs: Vec<_> = harness
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| (event.previous_revision.clone(), event.revision.clone()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![("0".into(), "1".into()), ("1".into(), "2".into())]
+    );
+}
+
+#[tokio::test]
+async fn current_account_view_merges_global_without_exposing_other_accounts() {
+    let harness = harness(NotificationFileV1::empty());
+    let global = harness
+        .service
+        .publish(input(NotificationScope::Global, "g", "g"), NOW + 1)
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+    let alpha = harness
+        .service
+        .publish(
+            input(
+                NotificationScope::Account {
+                    account_id: "alpha".into(),
+                },
+                "a",
+                "a",
+            ),
+            NOW + 2,
+        )
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+    let beta = harness
+        .service
+        .publish(
+            input(
+                NotificationScope::Account {
+                    account_id: "beta".into(),
+                },
+                "b",
+                "b",
+            ),
+            NOW + 3,
+        )
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+
+    let page = harness
+        .service
+        .list(
+            ViewContext::account("alpha").unwrap(),
+            request(Some("alpha"), NotificationFilter::All, None, 50),
+            NOW + 4,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<_> = page.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(ids, vec![alpha.id.as_str(), global.id.as_str()]);
+    assert!(!ids.contains(&beta.id.as_str()));
+    assert_eq!(page.unread_count, 2);
+
+    let global_only = harness
+        .service
+        .list(
+            ViewContext::global(),
+            request(None, NotificationFilter::All, None, 50),
+            NOW + 4,
+        )
+        .await
+        .unwrap();
+    assert_eq!(global_only.items[0].id, global.id);
+}
+
+#[tokio::test]
+async fn same_timestamp_sort_is_created_at_then_id_descending() {
+    let harness = harness(NotificationFileV1::empty());
+    let one = harness
+        .service
+        .publish(input(NotificationScope::Global, "one", "one"), NOW)
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+    let two = harness
+        .service
+        .publish(input(NotificationScope::Global, "two", "two"), NOW)
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+    let mut expected = vec![one.id, two.id];
+    expected.sort_by(|left, right| right.cmp(left));
+    let page = harness
+        .service
+        .list(
+            ViewContext::global(),
+            request(None, NotificationFilter::All, None, 50),
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn unread_filter_and_count_use_all_visible_records_not_only_the_page() {
+    let harness = harness(NotificationFileV1::empty());
+    let first = harness
+        .service
+        .publish(input(NotificationScope::Global, "one", "one"), NOW)
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+    harness
+        .service
+        .publish(input(NotificationScope::Global, "two", "two"), NOW + 1)
+        .await
+        .unwrap();
+    harness
+        .service
+        .publish(input(NotificationScope::Global, "three", "three"), NOW + 2)
+        .await
+        .unwrap();
+    harness
+        .service
+        .mark_read(ViewContext::global(), &first.id, NOW + 3)
+        .await
+        .unwrap();
+
+    let page = harness
+        .service
+        .list(
+            ViewContext::global(),
+            request(None, NotificationFilter::Unread, None, 1),
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.unread_count, 2);
+    assert!(page.items[0].read_at_ms.is_none());
+    assert!(page.next_cursor.as_deref().unwrap().starts_with("n1."));
+}
+
+#[tokio::test]
+async fn limit_bounds_return_the_stable_request_error() {
+    let harness = harness(NotificationFileV1::empty());
+    for limit in [0, 101] {
+        let error = harness
+            .service
+            .list(
+                ViewContext::global(),
+                request(None, NotificationFilter::All, None, limit),
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "INVALID_NOTIFICATION_REQUEST");
+    }
+}
+
+#[tokio::test]
+async fn opaque_cursor_cannot_cross_account_or_filter() {
+    let harness = harness(NotificationFileV1::empty());
+    for index in 0..3 {
+        harness
+            .service
+            .publish(
+                input(
+                    NotificationScope::Global,
+                    &format!("source-{index}"),
+                    &format!("dedupe-{index}"),
+                ),
+                NOW + index,
+            )
+            .await
+            .unwrap();
+    }
+    let first = harness
+        .service
+        .list(
+            ViewContext::account("alpha").unwrap(),
+            request(Some("alpha"), NotificationFilter::All, None, 1),
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+    let cursor = first.next_cursor.unwrap();
+    assert!(cursor.starts_with("n1."));
+
+    let wrong_filter = harness
+        .service
+        .list(
+            ViewContext::account("alpha").unwrap(),
+            request(
+                Some("alpha"),
+                NotificationFilter::Unread,
+                Some(cursor.clone()),
+                1,
+            ),
+            NOW + 3,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_filter.code(), "INVALID_NOTIFICATION_CURSOR");
+
+    let wrong_account = harness
+        .service
+        .list(
+            ViewContext::account("beta").unwrap(),
+            request(Some("beta"), NotificationFilter::All, Some(cursor), 1),
+            NOW + 3,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_account.code(), "INVALID_NOTIFICATION_CURSOR");
+}
+
+#[tokio::test]
+async fn malformed_cursor_returns_the_stable_cursor_error() {
+    let harness = harness(NotificationFileV1::empty());
+    for malformed in ["n2.00", "n1.0", "n1.zz", "n1.7b7d", "n1.aéb"] {
+        let error = harness
+            .service
+            .list(
+                ViewContext::global(),
+                request(
+                    None,
+                    NotificationFilter::All,
+                    Some(malformed.to_string()),
+                    50,
+                ),
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "INVALID_NOTIFICATION_CURSOR");
+    }
+}
+
+#[tokio::test]
+async fn keyset_cursor_is_stable_when_a_new_item_is_inserted_between_pages() {
+    let harness = harness(NotificationFileV1::empty());
+    let mut original = Vec::new();
+    for index in 0..4 {
+        original.push(
+            harness
+                .service
+                .publish(
+                    input(
+                        NotificationScope::Global,
+                        &format!("source-{index}"),
+                        &format!("dedupe-{index}"),
+                    ),
+                    NOW + index,
+                )
+                .await
+                .unwrap()
+                .notification
+                .unwrap()
+                .id,
+        );
+    }
+    let first = harness
+        .service
+        .list(
+            ViewContext::global(),
+            request(None, NotificationFilter::All, None, 2),
+            NOW + 4,
+        )
+        .await
+        .unwrap();
+    let first_ids: Vec<_> = first.items.iter().map(|item| item.id.clone()).collect();
+    harness
+        .service
+        .publish(input(NotificationScope::Global, "new", "new"), NOW + 10)
+        .await
+        .unwrap();
+    let second = harness
+        .service
+        .list(
+            ViewContext::global(),
+            request(None, NotificationFilter::All, first.next_cursor, 2),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+    let second_ids: Vec<_> = second.items.into_iter().map(|item| item.id).collect();
+    assert!(first_ids.iter().all(|id| !second_ids.contains(id)));
+    assert_eq!(second_ids, vec![original[1].clone(), original[0].clone()]);
+}
+
+#[tokio::test]
+async fn visible_mutations_enforce_scope_and_global_read_state_is_shared() {
+    let harness = harness(NotificationFileV1::empty());
+    let global = harness
+        .service
+        .publish(input(NotificationScope::Global, "global", "global"), NOW)
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+    let beta = harness
+        .service
+        .publish(
+            input(
+                NotificationScope::Account {
+                    account_id: "beta".into(),
+                },
+                "beta",
+                "beta",
+            ),
+            NOW + 1,
+        )
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+    let mismatch = harness
+        .service
+        .delete_visible(ViewContext::account("alpha").unwrap(), &beta.id, NOW + 2)
+        .await
+        .unwrap_err();
+    assert_eq!(mismatch.code(), "NOTIFICATION_SCOPE_MISMATCH");
+
+    harness
+        .service
+        .mark_read(ViewContext::account("alpha").unwrap(), &global.id, NOW + 2)
+        .await
+        .unwrap();
+    let beta_summary = harness
+        .service
+        .summary(ViewContext::account("beta").unwrap(), NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(beta_summary.unread_count, 1);
+}
+
+#[tokio::test]
+async fn mark_visible_and_clear_account_mutate_only_the_requested_view_partition() {
+    let harness = harness(NotificationFileV1::empty());
+    for (source, scope) in [
+        ("global", NotificationScope::Global),
+        (
+            "alpha",
+            NotificationScope::Account {
+                account_id: "alpha".into(),
+            },
+        ),
+        (
+            "beta",
+            NotificationScope::Account {
+                account_id: "beta".into(),
+            },
+        ),
+    ] {
+        harness
+            .service
+            .publish(input(scope, source, source), NOW)
+            .await
+            .unwrap();
+    }
+    let marked = harness
+        .service
+        .mark_visible_read(ViewContext::account("alpha").unwrap(), NOW + 1)
+        .await
+        .unwrap();
+    assert_eq!(marked.affected_count, 2);
+    assert_eq!(marked.unread_count, 0);
+
+    let mismatch = harness
+        .service
+        .clear_account("alpha", "beta", NOW + 2)
+        .await
+        .unwrap_err();
+    assert_eq!(mismatch.code(), "NOTIFICATION_SCOPE_MISMATCH");
+    let cleared = harness
+        .service
+        .clear_account("alpha", "alpha", NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(cleared.affected_count, 1);
+    let global = harness
+        .service
+        .list(
+            ViewContext::global(),
+            request(None, NotificationFilter::All, None, 50),
+            NOW + 2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(global.items.len(), 1);
+}
+
+#[tokio::test]
+async fn delete_and_clear_remove_only_their_records_source_event_index_entries() {
+    let harness = harness(NotificationFileV1::empty());
+    let global = harness
+        .service
+        .publish(
+            input(NotificationScope::Global, "global-source", "global"),
+            NOW,
+        )
+        .await
+        .unwrap()
+        .notification
+        .unwrap();
+    harness
+        .service
+        .publish(
+            input(
+                NotificationScope::Account {
+                    account_id: "alpha".into(),
+                },
+                "alpha-source",
+                "alpha",
+            ),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+    harness
+        .service
+        .delete_visible(ViewContext::global(), &global.id, NOW + 1)
+        .await
+        .unwrap();
+    let after_delete = harness.persistence.saves().last().unwrap().clone();
+    assert_eq!(after_delete.source_event_index.len(), 1);
+    assert_eq!(
+        after_delete.source_event_index[0].source_event_id,
+        "alpha-source"
+    );
+
+    harness
+        .service
+        .clear_account("alpha", "alpha", NOW + 2)
+        .await
+        .unwrap();
+    assert!(harness
+        .persistence
+        .saves()
+        .last()
+        .unwrap()
+        .source_event_index
+        .is_empty());
+}
