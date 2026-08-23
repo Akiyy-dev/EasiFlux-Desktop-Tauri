@@ -61,6 +61,20 @@ fn buffer_display_klines(
     })
 }
 
+pub(crate) async fn run_generation_owned_kline_storage<F, R>(operation: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    // Deliberately run bounded KlineStore work in the generation task. Tokio
+    // cannot cancel an already-running spawn_blocking descendant; keeping the
+    // work here means abort+join cannot finish until storage returns. Yield
+    // before cache/event publication so a pending generation cancellation is
+    // observed and cannot publish a stale event after storage unblocks.
+    let result = operation();
+    tokio::task::yield_now().await;
+    result
+}
+
 /// Upsert WS/REST bars and detect timeline gaps needing REST backfill.
 #[allow(dead_code)]
 pub fn merge_kline_updates(klines: &mut Vec<Kline>, updates: &[Kline], interval_ms: i64) -> bool {
@@ -182,6 +196,17 @@ impl MarketService {
         Ok(())
     }
 
+    async fn backfill_gaps_under_account_guard(
+        &self,
+        symbol: &str,
+        interval: &str,
+    ) -> AppResult<()> {
+        let key = chart_key(symbol, interval)?;
+        self.fetch_kline_range_under_account_guard(&key, None, None, Some(DEFAULT_KLINE_LIMIT))
+            .await?;
+        Ok(())
+    }
+
     pub fn merge_and_emit_ticker(&self, value: &Value, symbol: &str) {
         let sym = crate::api::response::get_str(value, &["symbol", "s"])
             .unwrap_or_else(|| symbol.to_string());
@@ -228,18 +253,40 @@ impl MarketService {
 
     pub fn schedule_kline_backfill(self: &Arc<Self>, symbol: &str, interval: &str) {
         let market = Arc::clone(self);
-        let account_lifecycle = Arc::clone(&self.account_lifecycle);
         let symbol = symbol.to_string();
         let interval = interval.to_string();
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = run_guarded_kline_backfill(account_lifecycle.as_ref(), || {
-                market.backfill_gaps(&symbol, &interval)
-            })
-            .await
-            {
-                market.emitter.emit_error(&format!("K线回填失败: {}", e));
-            }
+            let _ = market.run_kline_backfill(&symbol, &interval).await;
         });
+    }
+
+    /// Runs one Kline backfill in the caller's task after acquiring the account
+    /// lifecycle read guard. Detached WS/command callers use this path.
+    async fn run_kline_backfill(&self, symbol: &str, interval: &str) -> AppResult<()> {
+        let result = run_guarded_kline_backfill(self.account_lifecycle.as_ref(), || {
+            self.backfill_gaps(symbol, interval)
+        })
+        .await;
+        if let Err(error) = &result {
+            self.emitter.emit_error(&format!("K线回填失败: {error}"));
+        }
+        result
+    }
+
+    /// Runs one Kline backfill beneath a read guard already owned by the
+    /// scheduler generation. This must not reacquire the fair account RwLock.
+    pub(crate) async fn run_kline_backfill_under_account_guard(
+        &self,
+        symbol: &str,
+        interval: &str,
+    ) -> AppResult<()> {
+        let result = self
+            .backfill_gaps_under_account_guard(symbol, interval)
+            .await;
+        if let Err(error) = &result {
+            self.emitter.emit_error(&format!("K线回填失败: {error}"));
+        }
+        result
     }
 
     pub async fn fetch_ticker(&self, symbol: &str) -> AppResult<Ticker> {
@@ -324,6 +371,32 @@ impl MarketService {
         Ok(result)
     }
 
+    async fn fetch_kline_range_under_account_guard(
+        &self,
+        key: &ChartWorkspaceKey,
+        start: Option<i64>,
+        end: Option<i64>,
+        limit: Option<u32>,
+    ) -> AppResult<Vec<Kline>> {
+        let requested = requested_kline_limit(limit);
+        let rest =
+            PublicApi::klines(&self.api, &key.symbol, &key.interval, requested, start, end).await?;
+        let (update, result) = run_generation_owned_kline_storage(|| {
+            let update = buffer_display_klines(&self.kline_store, key, &rest)?;
+            let result = self
+                .kline_store
+                .load_range(key, start, end, requested as usize)?;
+            Ok::<_, AppError>((update, result))
+        })
+        .await?;
+        if update.changed {
+            self.cache
+                .set_klines(&key.symbol, &key.interval, update.display.clone());
+            self.emitter.emit_klines(&update.display);
+        }
+        Ok(result)
+    }
+
     #[allow(dead_code)]
     pub async fn fetch_klines(&self, symbol: &str, interval: &str) -> AppResult<Vec<Kline>> {
         let key = chart_key(symbol, interval)?;
@@ -356,6 +429,19 @@ impl MarketService {
         let interval = self.chart_context.read().await.interval.clone();
         if let Err(e) = self.backfill_gaps(symbol, &interval).await {
             let message = format!("K线刷新失败: {}", e);
+            self.emitter.emit_error(&message);
+            return Err(crate::error::AppError::Internal(message));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_klines_under_account_guard(&self, symbol: &str) -> AppResult<()> {
+        let interval = self.chart_context.read().await.interval.clone();
+        if let Err(error) = self
+            .backfill_gaps_under_account_guard(symbol, &interval)
+            .await
+        {
+            let message = format!("K线刷新失败: {error}");
             self.emitter.emit_error(&message);
             return Err(crate::error::AppError::Internal(message));
         }

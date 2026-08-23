@@ -27,6 +27,10 @@ pub fn run() {
             let handle = app.handle().clone();
             let state = AppState::new(handle.clone())?;
             let scheduler = state.scheduler.clone();
+            // Publish the scheduler's desired-running claim before app-ready
+            // or command handling can expose startup to the frontend. The
+            // returned driver performs network initialization asynchronously.
+            let scheduler_start = scheduler.start();
             app.manage(state);
 
             let emitter = {
@@ -35,9 +39,7 @@ pub fn run() {
             };
             emitter.emit_app_ready(&handle.package_info().version.to_string());
 
-            tauri::async_runtime::spawn(async move {
-                scheduler.start().await;
-            });
+            tauri::async_runtime::spawn(scheduler_start);
             if let Some(window) = app.get_webview_window("main") {
                 let state: tauri::State<AppState> = app.state();
                 let config =
@@ -134,7 +136,7 @@ pub fn run() {
             if let RunEvent::Exit = event {
                 let state: tauri::State<AppState> = app.state();
                 tauri::async_runtime::block_on(async {
-                    state.scheduler.stop().await;
+                    state.scheduler.shutdown().await;
                     if let Err(error) = state.scheduler.flush_klines_for_shutdown().await {
                         tracing::error!(%error, "final kline flush failed");
                     }

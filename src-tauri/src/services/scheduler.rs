@@ -20,6 +20,8 @@ use crate::models::config::{
 };
 use crate::models::time::{TimeSnapshot, TimeSyncStatus};
 use crate::models::trading::PrivatePanelsSnapshot;
+#[cfg(test)]
+use crate::services::market::run_generation_owned_kline_storage;
 use crate::services::notification::NotificationRuntime;
 use crate::services::{
     AccountLifecycleCoordinator, ChartWorkspaceService, ConnectionService, DailyPnlService,
@@ -185,6 +187,32 @@ where
     }
 }
 
+async fn run_market_reconnect_backfill<F, Fut>(
+    previous_connected: Arc<Mutex<bool>>,
+    connected: bool,
+    operation: F,
+) -> AppResult<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
+    let mut previous = previous_connected.lock().await;
+    if !connected {
+        *previous = false;
+        return Ok(());
+    }
+    if *previous {
+        return Ok(());
+    }
+
+    // Keep the transition lock for the awaited operation. Cancellation drops
+    // the lock without publishing the edge, so a replacement generation will
+    // retry; normal success or failure consumes the edge exactly once.
+    let result = operation().await;
+    *previous = true;
+    result
+}
+
 fn bootstrap_tasks(connected: bool) -> Vec<TaskId> {
     let mut tasks = vec![
         TaskId::TimeSync,
@@ -272,27 +300,74 @@ where
     }
 }
 
+async fn run_scheduler_owned_market_backfill<F, Fut>(operation: F) -> AppResult<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
+    // MarketFallback is always invoked beneath the scheduler's outer account
+    // read guard (periodic execute or connection bootstrap). Tokio's fair
+    // RwLock can deadlock if this inner path attempts to acquire a second read
+    // after an account writer has queued.
+    operation().await
+}
+
 async fn run_serialized_blocking<F, R>(
-    gate: Arc<StdMutex<()>>,
+    gate: Arc<Mutex<()>>,
     operation: F,
 ) -> Result<R, tokio::task::JoinError>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    // Reserve FIFO order before submitting to the blocking pool. Once the
+    // reservation is acquired, its owned guard moves into the closure, so
+    // cancelling the async waiter cannot let a later shutdown flush overtake
+    // an older background flush.
+    let guard = gate.lock_owned().await;
     tokio::task::spawn_blocking(move || {
-        // The blocking closure owns the guard so cancelling its async waiter cannot release it early.
-        let _guard = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = guard;
         operation()
     })
     .await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KlineFlushOrigin {
+    Background,
+    Shutdown,
+}
+
+#[derive(Debug, Default)]
+struct KlineFlushCoordinator {
+    gate: Arc<Mutex<()>>,
+}
+
+impl KlineFlushCoordinator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn run_blocking<F, R>(
+        self: Arc<Self>,
+        _origin: KlineFlushOrigin,
+        operation: F,
+    ) -> Result<R, tokio::task::JoinError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        run_serialized_blocking(Arc::clone(&self.gate), operation).await
+    }
+}
+
 async fn execute_kline_flush(
     service: Arc<ChartWorkspaceService>,
-    gate: Arc<StdMutex<()>>,
+    coordinator: Arc<KlineFlushCoordinator>,
+    origin: KlineFlushOrigin,
 ) -> AppResult<()> {
-    let outcomes = run_serialized_blocking(gate, move || service.flush_dirty_klines())
+    let outcomes = coordinator
+        .run_blocking(origin, move || service.flush_dirty_klines())
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
     let failures = outcomes
@@ -394,9 +469,14 @@ impl GenerationControl {
         self.drained.notify_waiters();
     }
 
-    async fn wait_drained(&self) {
+    async fn wait_drained(self: &Arc<Self>) {
         loop {
             let notified = self.drained.notified();
+            tokio::pin!(notified);
+            // `notify_waiters` does not retain a permit. Register before the
+            // state check so the final owner cannot disappear in the gap
+            // between checking the mutex and first polling this waiter.
+            notified.as_mut().enable();
             let deferred = {
                 let mut drain = lock_unpoisoned(&self.drain);
                 if drain.deferred_handles.is_empty() && drain.active_owners == 0 {
@@ -405,16 +485,38 @@ impl GenerationControl {
                 std::mem::take(&mut drain.deferred_handles)
             };
             if !deferred.is_empty() {
-                for mut batch in deferred {
-                    for handle in batch.handles.drain(..) {
+                let mut lease = DeferredDrainLease {
+                    control: Arc::clone(self),
+                    batches: deferred,
+                };
+                while let Some(batch) = lease.batches.last_mut() {
+                    while let Some(handle) = batch.handles.last_mut() {
                         let _ = handle.await;
+                        batch.handles.pop();
                     }
-                    drop(batch.owner);
+                    lease.batches.pop();
                 }
                 continue;
             }
-            notified.await;
+            notified.as_mut().await;
         }
+    }
+}
+
+struct DeferredDrainLease {
+    control: Arc<GenerationControl>,
+    batches: Vec<DeferredGenerationHandles>,
+}
+
+impl Drop for DeferredDrainLease {
+    fn drop(&mut self) {
+        if self.batches.is_empty() {
+            return;
+        }
+        lock_unpoisoned(&self.control.drain)
+            .deferred_handles
+            .append(&mut self.batches);
+        self.control.drained.notify_waiters();
     }
 }
 
@@ -470,6 +572,17 @@ where
     Fut: std::future::Future<Output = AppResult<()>>,
 {
     let activity = claim_generation_activity(lifecycle)?;
+    run_claimed_generation_activity(activity, operation).await
+}
+
+async fn run_claimed_generation_activity<F, Fut>(
+    activity: GenerationActivityGuard,
+    operation: F,
+) -> AppResult<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
     let cancellation = wait_for_generation_cancel(activity.control.subscribe());
     tokio::pin!(cancellation);
     let result = tokio::select! {
@@ -924,7 +1037,64 @@ struct RecoveryTicket {
     desired: Arc<DesiredRunToken>,
 }
 
-type RecoveryHandler = Arc<dyn Fn(RecoveryTicket, watch::Receiver<bool>) + Send + Sync>;
+type RecoveryFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+type RecoveryHandler =
+    Arc<dyn Fn(RecoveryTicket, watch::Receiver<bool>) -> RecoveryFuture + Send + Sync>;
+
+#[derive(Debug)]
+struct RecoveryDrain {
+    active: watch::Sender<usize>,
+}
+
+impl RecoveryDrain {
+    fn new() -> Arc<Self> {
+        let (active, _) = watch::channel(0);
+        Arc::new(Self { active })
+    }
+
+    fn owner_started(&self) {
+        self.active.send_modify(|active| {
+            *active = active
+                .checked_add(1)
+                .expect("scheduler recovery owner count exhausted");
+        });
+    }
+
+    fn owner_finished(&self) {
+        self.active
+            .send_modify(|active| match active.checked_sub(1) {
+                Some(next) => *active = next,
+                None => tracing::error!("scheduler recovery owner count underflow"),
+            });
+    }
+
+    async fn wait_drained(&self) {
+        let mut active = self.active.subscribe();
+        let _ = active.wait_for(|active| *active == 0).await;
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        *self.active.borrow()
+    }
+}
+
+struct RecoveryOwnerGuard {
+    drain: Arc<RecoveryDrain>,
+}
+
+impl RecoveryOwnerGuard {
+    fn new(drain: Arc<RecoveryDrain>) -> Self {
+        drain.owner_started();
+        Self { drain }
+    }
+}
+
+impl Drop for RecoveryOwnerGuard {
+    fn drop(&mut self) {
+        self.drain.owner_finished();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequiredLoopStatus {
@@ -954,6 +1124,7 @@ enum SchedulerStartDecision {
 enum ExplicitStartRequest {
     AlreadyRunning,
     Desired(Arc<DesiredRunToken>),
+    Rejected,
 }
 
 struct SchedulerLifecycle {
@@ -970,6 +1141,11 @@ struct SchedulerLifecycle {
     recovery_attempt: u32,
     pending_recovery: Option<RecoveryTicket>,
     recovery_handler: Option<RecoveryHandler>,
+    recovery_worker: Option<SchedulerHandle>,
+    recovery_drain: Arc<RecoveryDrain>,
+    cleanup_job: Option<Arc<CleanupJobSlot>>,
+    cleanup_changed: Arc<Notify>,
+    terminal: bool,
 }
 
 impl SchedulerLifecycle {
@@ -988,6 +1164,11 @@ impl SchedulerLifecycle {
             recovery_attempt: 0,
             pending_recovery: None,
             recovery_handler: None,
+            recovery_worker: None,
+            recovery_drain: RecoveryDrain::new(),
+            cleanup_job: None,
+            cleanup_changed: Arc::new(Notify::new()),
+            terminal: false,
         }
     }
 
@@ -999,11 +1180,14 @@ impl SchedulerLifecycle {
         Arc<AtomicBool>,
         Arc<GenerationControl>,
     )> {
-        if self.state != SchedulerLifecycleState::Stopped || self.generation_exhausted {
+        if self.state != SchedulerLifecycleState::Stopped
+            || self.generation_exhausted
+            || self.terminal
+        {
             return None;
         }
         let Some(next_generation) = self.next_generation.checked_add(1) else {
-            self.generation_exhausted = true;
+            self.fail_generation_exhaustion();
             return None;
         };
         self.next_generation = next_generation;
@@ -1025,11 +1209,15 @@ impl SchedulerLifecycle {
                 return SchedulerStartDecision::AlreadyRunning;
             }
             ExplicitStartRequest::Desired(desired) => desired,
+            ExplicitStartRequest::Rejected => return SchedulerStartDecision::Exhausted,
         };
         self.start_decision_for(&desired)
     }
 
     fn request_explicit_start(&mut self) -> ExplicitStartRequest {
+        if self.terminal || self.generation_exhausted {
+            return ExplicitStartRequest::Rejected;
+        }
         match self.state {
             SchedulerLifecycleState::Starting { .. } | SchedulerLifecycleState::Running { .. } => {
                 return ExplicitStartRequest::AlreadyRunning;
@@ -1050,10 +1238,12 @@ impl SchedulerLifecycle {
     }
 
     fn start_decision_for(&mut self, desired: &Arc<DesiredRunToken>) -> SchedulerStartDecision {
-        if self
-            .desired
-            .as_ref()
-            .is_none_or(|active| !Arc::ptr_eq(active, desired) || !active.is_active())
+        if self.terminal
+            || self.generation_exhausted
+            || self
+                .desired
+                .as_ref()
+                .is_none_or(|active| !Arc::ptr_eq(active, desired) || !active.is_active())
         {
             return SchedulerStartDecision::Exhausted;
         }
@@ -1072,6 +1262,9 @@ impl SchedulerLifecycle {
             SchedulerLifecycleState::Stopped => {}
         }
         let Some((generation, run_states, generation_running, control)) = self.begin_start() else {
+            if self.generation_exhausted {
+                self.fail_generation_exhaustion();
+            }
             return SchedulerStartDecision::Exhausted;
         };
         control.owner_started();
@@ -1084,7 +1277,9 @@ impl SchedulerLifecycle {
     }
 
     fn recovery_start_decision(&mut self, ticket: &RecoveryTicket) -> SchedulerStartDecision {
-        let valid = self.state == SchedulerLifecycleState::Stopped
+        let valid = !self.terminal
+            && !self.generation_exhausted
+            && self.state == SchedulerLifecycleState::Stopped
             && self.pending_recovery.as_ref().is_some_and(|pending| {
                 pending.failed_generation == ticket.failed_generation
                     && Arc::ptr_eq(&pending.desired, &ticket.desired)
@@ -1095,11 +1290,8 @@ impl SchedulerLifecycle {
         if !valid {
             return SchedulerStartDecision::Exhausted;
         }
-        self.pending_recovery = None;
         let Some((generation, run_states, generation_running, control)) = self.begin_start() else {
-            if let Some(desired) = self.desired.take() {
-                desired.cancel();
-            }
+            self.fail_generation_exhaustion();
             return SchedulerStartDecision::Exhausted;
         };
         control.owner_started();
@@ -1109,6 +1301,26 @@ impl SchedulerLifecycle {
             generation_running,
             control,
         }
+    }
+
+    fn fail_generation_exhaustion(&mut self) {
+        if !self.generation_exhausted {
+            tracing::error!("scheduler generation space exhausted; failing closed");
+        }
+        self.generation_exhausted = true;
+        if let Some(desired) = self.desired.take() {
+            desired.cancel();
+        }
+        self.pending_recovery = None;
+        self.recovery_attempt = 0;
+    }
+
+    fn mark_start_committed(&mut self, generation: u64) {
+        if self.state != (SchedulerLifecycleState::Running { generation }) {
+            return;
+        }
+        self.pending_recovery = None;
+        self.recovery_attempt = 0;
     }
 
     fn register_required_loops(&mut self, generation: u64, tasks: &[TaskId]) -> bool {
@@ -1247,23 +1459,10 @@ impl SchedulerLifecycle {
         }
 
         let (completion, receiver) = watch::channel(false);
-        let recovery = if cause == CleanupCause::UnexpectedRequiredLoop {
-            match (&self.desired, &self.recovery_handler) {
-                (Some(desired), Some(handler)) if desired.is_active() => {
-                    let attempt = self.recovery_attempt.saturating_add(1);
-                    self.recovery_attempt = attempt;
-                    let ticket = RecoveryTicket {
-                        failed_generation: generation,
-                        attempt,
-                        desired: Arc::clone(desired),
-                    };
-                    self.pending_recovery = Some(ticket.clone());
-                    Some((Arc::clone(handler), ticket))
-                }
-                _ => None,
-            }
-        } else {
+        let recovery = if cause == CleanupCause::ExplicitStop {
             None
+        } else {
+            self.reserve_recovery(generation)
         };
         self.state = SchedulerLifecycleState::Stopping { generation };
         self.cleanup_completion = Some(receiver.clone());
@@ -1277,6 +1476,35 @@ impl SchedulerLifecycle {
             receiver,
             recovery,
         })
+    }
+
+    fn reserve_recovery(
+        &mut self,
+        failed_generation: u64,
+    ) -> Option<(RecoveryHandler, RecoveryTicket)> {
+        if self.terminal || self.generation_exhausted {
+            return None;
+        }
+        let (Some(desired), Some(handler)) = (&self.desired, &self.recovery_handler) else {
+            return None;
+        };
+        if !desired.is_active() {
+            return None;
+        }
+        if self.pending_recovery.as_ref().is_some_and(|pending| {
+            pending.failed_generation == failed_generation && Arc::ptr_eq(&pending.desired, desired)
+        }) {
+            return None;
+        }
+        let attempt = self.recovery_attempt.saturating_add(1);
+        self.recovery_attempt = attempt;
+        let ticket = RecoveryTicket {
+            failed_generation,
+            attempt,
+            desired: Arc::clone(desired),
+        };
+        self.pending_recovery = Some(ticket.clone());
+        Some((Arc::clone(handler), ticket))
     }
 
     fn disable_desired_running(&mut self) {
@@ -1305,8 +1533,14 @@ impl SchedulerLifecycle {
         self.generation_running = None;
         self.control = None;
         self.cleanup_completion = None;
+        self.cleanup_job = None;
         self.required_loops.clear();
         true
+    }
+
+    fn begin_terminal_shutdown(&mut self) -> CleanupRequest {
+        self.terminal = true;
+        self.begin_explicit_stop()
     }
 
     fn cleanup_receiver(&self) -> Option<watch::Receiver<bool>> {
@@ -1374,96 +1608,472 @@ struct CleanupJob {
     guard: CleanupCompletionGuard,
 }
 
-async fn run_cleanup_job(job: Arc<StdMutex<Option<CleanupJob>>>) {
-    let Some(mut job) = lock_unpoisoned(&job).take() else {
-        return;
-    };
-    for handle in job.handles.drain(..) {
-        let _ = handle.await;
-    }
-    if let Some(control) = job.control.take() {
-        control.wait_drained().await;
-    }
-    drop(job.guard);
+#[derive(Default)]
+struct CleanupJobSlotState {
+    job: Option<CleanupJob>,
+    worker_active: bool,
+    worker_pending: usize,
+    workers: Vec<SchedulerHandle>,
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
-fn launch_cleanup_job(job: Arc<StdMutex<Option<CleanupJob>>>) {
-    launch_cleanup_job_inner(job, true);
+struct CleanupJobSlot {
+    state: StdMutex<CleanupJobSlotState>,
+    worker_changed: Notify,
 }
 
-fn launch_cleanup_job_inner(job: Arc<StdMutex<Option<CleanupJob>>>, try_primary: bool) {
-    let current = tokio::runtime::Handle::try_current().ok();
-    if try_primary {
-        if let Some(runtime) = &current {
-            let primary = Arc::clone(&job);
-            let launched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.spawn(run_cleanup_job(primary))
-            }));
-            if launched.is_ok() {
-                return;
+impl CleanupJobSlot {
+    fn new(job: CleanupJob) -> Arc<Self> {
+        Arc::new(Self {
+            state: StdMutex::new(CleanupJobSlotState {
+                job: Some(job),
+                ..CleanupJobSlotState::default()
+            }),
+            worker_changed: Notify::new(),
+        })
+    }
+
+    fn reserve_worker_launch(self: &Arc<Self>) -> Option<CleanupLaunchPermit> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.worker_active || state.worker_pending != 0 || state.job.is_none() {
+            return None;
+        }
+        state.worker_pending = 1;
+        Some(CleanupLaunchPermit {
+            slot: Arc::clone(self),
+            pending: true,
+        })
+    }
+
+    fn claim_job(self: &Arc<Self>) -> Option<CleanupJobLease> {
+        let job = lock_unpoisoned(&self.state).job.take()?;
+        Some(CleanupJobLease {
+            slot: Arc::clone(self),
+            job: Some(job),
+        })
+    }
+
+    fn store_worker(&self, handle: SchedulerHandle) {
+        lock_unpoisoned(&self.state).workers.push(handle);
+    }
+
+    fn store_thread(&self, handle: std::thread::JoinHandle<()>) {
+        lock_unpoisoned(&self.state).threads.push(handle);
+    }
+
+    #[cfg(test)]
+    fn abort_latest_worker(&self) -> bool {
+        let state = lock_unpoisoned(&self.state);
+        let Some(worker) = state.workers.last() else {
+            return false;
+        };
+        worker.abort();
+        true
+    }
+}
+
+struct CleanupWorkerPermit {
+    slot: Arc<CleanupJobSlot>,
+}
+
+struct CleanupLaunchPermit {
+    slot: Arc<CleanupJobSlot>,
+    pending: bool,
+}
+
+impl CleanupLaunchPermit {
+    fn begin(mut self) -> Option<CleanupWorkerPermit> {
+        let active = {
+            let mut state = lock_unpoisoned(&self.slot.state);
+            state.worker_pending = state.worker_pending.saturating_sub(1);
+            self.pending = false;
+            if state.worker_active || state.job.is_none() {
+                false
+            } else {
+                state.worker_active = true;
+                true
+            }
+        };
+        self.slot.worker_changed.notify_waiters();
+        active.then(|| CleanupWorkerPermit {
+            slot: Arc::clone(&self.slot),
+        })
+    }
+}
+
+impl Drop for CleanupLaunchPermit {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        let mut state = lock_unpoisoned(&self.slot.state);
+        state.worker_pending = state.worker_pending.saturating_sub(1);
+        drop(state);
+        self.slot.worker_changed.notify_waiters();
+    }
+}
+
+impl Drop for CleanupWorkerPermit {
+    fn drop(&mut self) {
+        lock_unpoisoned(&self.slot.state).worker_active = false;
+        self.slot.worker_changed.notify_waiters();
+    }
+}
+
+struct CleanupJobLease {
+    slot: Arc<CleanupJobSlot>,
+    job: Option<CleanupJob>,
+}
+
+impl CleanupJobLease {
+    async fn drain(&mut self) {
+        let job = self.job.as_mut().expect("cleanup lease owns a job");
+        for handle in &job.handles {
+            handle.abort();
+        }
+        while let Some(handle) = job.handles.last_mut() {
+            let _ = handle.await;
+            job.handles.pop();
+        }
+        if let Some(control) = &job.control {
+            control.wait_drained().await;
+        }
+        job.control = None;
+    }
+
+    fn complete(mut self) {
+        let mut job = self.job.take().expect("cleanup lease owns a job");
+        job.guard.complete(&self.slot);
+    }
+}
+
+impl Drop for CleanupJobLease {
+    fn drop(&mut self) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        let mut state = lock_unpoisoned(&self.slot.state);
+        if state.job.is_none() {
+            state.job = Some(job);
+        } else {
+            tracing::error!("scheduler cleanup job was returned twice");
+        }
+    }
+}
+
+impl CleanupCompletionGuard {
+    fn complete(&mut self, slot: &Arc<CleanupJobSlot>) {
+        let finished = {
+            let mut lifecycle = lock_unpoisoned(&self.lifecycle);
+            let owned = lifecycle
+                .cleanup_job
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, slot));
+            owned && lifecycle.finish_cleanup(self.generation)
+        };
+        if finished {
+            if let Some(completion) = self.completion.take() {
+                completion.send_replace(true);
             }
         }
     }
+}
 
-    // The same current executor is the first fallback for an injected or real
-    // primary-launch panic. The outer `job` Arc remains owned until a launch
-    // succeeds, so its completion guard and handles cannot be lost.
-    if let Some(runtime) = current {
-        let fallback = Arc::clone(&job);
-        let launched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.spawn(run_cleanup_job(fallback))
-        }));
-        if launched.is_ok() {
-            return;
-        }
+async fn run_cleanup_job(
+    slot: Arc<CleanupJobSlot>,
+    launch: CleanupLaunchPermit,
+    installed: oneshot::Receiver<()>,
+) {
+    if installed.await.is_err() {
+        return;
     }
+    let Some(_permit) = launch.begin() else {
+        return;
+    };
+    let Some(mut job) = slot.claim_job() else {
+        return;
+    };
+    job.drain().await;
+    job.complete();
+}
 
-    // Cleanup can be requested from a destructor after its local executor has
-    // gone away. Keep the shared job alive across the fallback launch so a
-    // spawn panic cannot detach its handles or release completion early.
-    let fallback = Arc::clone(&job);
-    let launched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        tauri::async_runtime::spawn(run_cleanup_job(fallback))
-    }));
-    if launched.is_ok() {
+fn launch_cleanup_job(slot: Arc<CleanupJobSlot>) {
+    launch_cleanup_job_inner(slot, true);
+}
+
+fn attempt_cleanup_spawn<F>(slot: &Arc<CleanupJobSlot>, spawn: F) -> bool
+where
+    F: FnOnce(
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+    ) -> SchedulerHandle,
+{
+    let Some(launch) = slot.reserve_worker_launch() else {
+        return true;
+    };
+    let (installed, installed_receiver) = oneshot::channel();
+    let worker_slot = Arc::clone(slot);
+    let future = Box::pin(run_cleanup_job(worker_slot, launch, installed_receiver));
+    let launched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| spawn(future)));
+    match launched {
+        Ok(handle) => {
+            slot.store_worker(handle);
+            let _ = installed.send(());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn spawn_cleanup_on_runtime(slot: &Arc<CleanupJobSlot>, runtime: &tokio::runtime::Handle) -> bool {
+    attempt_cleanup_spawn(slot, |future| {
+        tauri::async_runtime::JoinHandle::Tokio(runtime.spawn(future))
+    })
+}
+
+fn spawn_cleanup_on_tauri_runtime(slot: &Arc<CleanupJobSlot>) -> bool {
+    attempt_cleanup_spawn(slot, tauri::async_runtime::spawn)
+}
+
+fn launch_cleanup_job_inner(slot: Arc<CleanupJobSlot>, try_primary: bool) {
+    let current = tokio::runtime::Handle::try_current().ok();
+    if try_primary
+        && current
+            .as_ref()
+            .is_some_and(|runtime| spawn_cleanup_on_runtime(&slot, runtime))
+    {
+        return;
+    }
+    if current
+        .as_ref()
+        .is_some_and(|runtime| spawn_cleanup_on_runtime(&slot, runtime))
+    {
+        return;
+    }
+    if spawn_cleanup_on_tauri_runtime(&slot) {
         return;
     }
 
-    // This is an emergency path for shutdown-time executor loss. A dedicated
-    // current-thread runtime still joins the exact same single-take job.
-    let emergency = Arc::clone(&job);
-    let thread = std::thread::Builder::new()
+    let Some(launch) = slot.reserve_worker_launch() else {
+        return;
+    };
+    let (installed, installed_receiver) = oneshot::channel();
+    let emergency = Arc::clone(&slot);
+    match std::thread::Builder::new()
         .name("scheduler-cleanup".into())
         .spawn(move || {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             else {
-                // Preserve fail-closed Stopping state if even a runtime cannot
-                // be constructed; dropping this owner would publish a false
-                // cleanup completion.
-                std::mem::forget(emergency);
+                drop(launch);
                 return;
             };
-            runtime.block_on(run_cleanup_job(emergency));
-        });
-    if thread.is_err() {
-        tracing::error!("unable to launch scheduler cleanup fallback");
-        std::mem::forget(job);
-    }
-}
-
-impl Drop for CleanupCompletionGuard {
-    fn drop(&mut self) {
-        let _ = lock_unpoisoned(&self.lifecycle).finish_cleanup(self.generation);
-        if let Some(completion) = self.completion.take() {
-            completion.send_replace(true);
+            runtime.block_on(run_cleanup_job(emergency, launch, installed_receiver));
+        }) {
+        Ok(thread) => {
+            slot.store_thread(thread);
+            let _ = installed.send(());
+        }
+        Err(error) => {
+            tracing::error!(%error, "unable to launch scheduler cleanup fallback");
         }
     }
 }
 
+#[cfg(test)]
 async fn wait_for_cleanup(mut completion: watch::Receiver<bool>) {
     let _ = completion.wait_for(|finished| *finished).await;
+}
+
+async fn wait_for_owned_cleanup(
+    lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
+    mut completion: watch::Receiver<bool>,
+) {
+    loop {
+        if *completion.borrow() {
+            return;
+        }
+        let cleanup_changed = { Arc::clone(&lock_unpoisoned(lifecycle).cleanup_changed) };
+        let changed = cleanup_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let (slot, stopping) = {
+            let lifecycle = lock_unpoisoned(lifecycle);
+            (
+                lifecycle.cleanup_job.clone(),
+                matches!(lifecycle.state, SchedulerLifecycleState::Stopping { .. }),
+            )
+        };
+        match slot {
+            Some(slot) => {
+                let worker_changed = slot.worker_changed.notified();
+                tokio::pin!(worker_changed);
+                // A failed/cancelled worker can return its lease immediately.
+                // Register before launch so its edge cannot be lost before the
+                // select first polls this waiter.
+                worker_changed.as_mut().enable();
+                launch_cleanup_job(Arc::clone(&slot));
+                tokio::select! {
+                    changed = completion.changed() => {
+                        if changed.is_err() || *completion.borrow() {
+                            return;
+                        }
+                    }
+                    _ = worker_changed.as_mut() => {}
+                }
+            }
+            None if stopping => {
+                // begin_cleanup publishes Stopping before the durable job slot
+                // is installed. Treat that short install window as owned
+                // state, not as permission to degrade to a passive waiter.
+                tokio::select! {
+                    changed = completion.changed() => {
+                        if changed.is_err() || *completion.borrow() {
+                            return;
+                        }
+                    }
+                    _ = changed.as_mut() => {}
+                }
+            }
+            None => {
+                let _ = completion.wait_for(|finished| *finished).await;
+                return;
+            }
+        }
+    }
+}
+
+struct RecoveryTaskGuard {
+    lifecycle: Arc<StdMutex<SchedulerLifecycle>>,
+    ticket: Option<RecoveryTicket>,
+    armed: Arc<AtomicBool>,
+}
+
+impl RecoveryTaskGuard {
+    fn finish(&mut self) {
+        if self.armed.load(Ordering::SeqCst) {
+            if let Some(ticket) = self.ticket.take() {
+                reconcile_abandoned_recovery(&self.lifecycle, &ticket);
+            }
+        } else {
+            self.ticket = None;
+        }
+    }
+}
+
+impl Drop for RecoveryTaskGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn completed_cleanup_receiver() -> watch::Receiver<bool> {
+    let (_, receiver) = watch::channel(true);
+    receiver
+}
+
+fn reconcile_abandoned_recovery(
+    lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
+    abandoned: &RecoveryTicket,
+) {
+    let launch = {
+        let mut state = lock_unpoisoned(lifecycle);
+        let valid = !state.terminal
+            && !state.generation_exhausted
+            && state.pending_recovery.as_ref().is_some_and(|pending| {
+                pending.failed_generation == abandoned.failed_generation
+                    && pending.attempt == abandoned.attempt
+                    && Arc::ptr_eq(&pending.desired, &abandoned.desired)
+            })
+            && state.desired.as_ref().is_some_and(|desired| {
+                desired.is_active() && Arc::ptr_eq(desired, &abandoned.desired)
+            });
+        if !valid {
+            None
+        } else {
+            let attempt = state.recovery_attempt.saturating_add(1);
+            state.recovery_attempt = attempt;
+            let ticket = RecoveryTicket {
+                failed_generation: abandoned.failed_generation,
+                attempt,
+                desired: Arc::clone(&abandoned.desired),
+            };
+            state.pending_recovery = Some(ticket.clone());
+            state.recovery_handler.as_ref().map(|handler| {
+                let completion = state
+                    .cleanup_completion
+                    .clone()
+                    .unwrap_or_else(completed_cleanup_receiver);
+                (Arc::clone(handler), ticket, completion)
+            })
+        }
+    };
+    if let Some((handler, ticket, completion)) = launch {
+        launch_recovery_handler(lifecycle, handler, ticket, completion);
+    }
+}
+
+fn launch_recovery_handler(
+    lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
+    handler: RecoveryHandler,
+    ticket: RecoveryTicket,
+    completion: watch::Receiver<bool>,
+) {
+    let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handler(ticket.clone(), completion)
+    }));
+    let Ok(future) = future else {
+        reconcile_abandoned_recovery(lifecycle, &ticket);
+        return;
+    };
+    let armed = Arc::new(AtomicBool::new(false));
+    let guard = RecoveryTaskGuard {
+        lifecycle: Arc::clone(lifecycle),
+        ticket: Some(ticket.clone()),
+        armed: Arc::clone(&armed),
+    };
+    let (installed, installed_receiver) = oneshot::channel();
+    let mut state = lock_unpoisoned(lifecycle);
+    let valid = state.pending_recovery.as_ref().is_some_and(|pending| {
+        pending.failed_generation == ticket.failed_generation
+            && pending.attempt == ticket.attempt
+            && Arc::ptr_eq(&pending.desired, &ticket.desired)
+    }) && state
+        .desired
+        .as_ref()
+        .is_some_and(|desired| desired.is_active() && Arc::ptr_eq(desired, &ticket.desired));
+    if !valid {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::error!("scheduler recovery has no active Tokio runtime; failing closed");
+        state.terminal = true;
+        state.disable_desired_running();
+        return;
+    };
+    let owner = RecoveryOwnerGuard::new(Arc::clone(&state.recovery_drain));
+    let worker = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        SchedulerHandle::Tokio(runtime.spawn(async move {
+            let _owner = owner;
+            let mut guard = guard;
+            if installed_receiver.await.is_err() {
+                return;
+            }
+            future.await;
+            guard.finish();
+        }))
+    }));
+    let Ok(worker) = worker else {
+        drop(state);
+        reconcile_abandoned_recovery(lifecycle, &ticket);
+        return;
+    };
+    state.recovery_worker = Some(worker);
+    armed.store(true, Ordering::SeqCst);
+    if installed.send(()).is_err() {
+        drop(state);
+        reconcile_abandoned_recovery(lifecycle, &ticket);
+    }
 }
 
 #[cfg(test)]
@@ -1489,7 +2099,12 @@ fn launch_scheduler_cleanup(
     request: CleanupRequest,
 ) -> Option<watch::Receiver<bool>> {
     match request {
-        CleanupRequest::Wait(receiver) => Some(receiver),
+        CleanupRequest::Wait(receiver) => {
+            if let Some(slot) = lock_unpoisoned(lifecycle).cleanup_job.clone() {
+                launch_cleanup_job(slot);
+            }
+            Some(receiver)
+        }
         CleanupRequest::Inactive => None,
         CleanupRequest::Start(mut resources) => {
             let receiver = resources.receiver.clone();
@@ -1506,19 +2121,31 @@ fn launch_scheduler_cleanup(
             }
             let lifecycle = Arc::clone(lifecycle);
             let guard = CleanupCompletionGuard {
-                lifecycle,
+                lifecycle: Arc::clone(&lifecycle),
                 generation: resources.generation,
                 completion: Some(resources.completion),
             };
             let recovery = resources.recovery.take();
-            let job = Arc::new(StdMutex::new(Some(CleanupJob {
+            let slot = CleanupJobSlot::new(CleanupJob {
                 handles: std::mem::take(&mut resources.handles),
                 control: resources.control.take(),
                 guard,
-            })));
-            launch_cleanup_job(job);
+            });
+            {
+                let mut state = lock_unpoisoned(&lifecycle);
+                if state.state
+                    == (SchedulerLifecycleState::Stopping {
+                        generation: resources.generation,
+                    })
+                    && state.cleanup_job.is_none()
+                {
+                    state.cleanup_job = Some(Arc::clone(&slot));
+                    state.cleanup_changed.notify_waiters();
+                }
+            }
+            launch_cleanup_job(slot);
             if let Some((handler, ticket)) = recovery {
-                handler(ticket, receiver.clone());
+                launch_recovery_handler(&lifecycle, handler, ticket, receiver.clone());
             }
             Some(receiver)
         }
@@ -1825,6 +2452,7 @@ struct SchedulerStartGuard {
 
 impl SchedulerStartGuard {
     fn commit(&mut self) {
+        lock_unpoisoned(&self.lifecycle).mark_start_committed(self.generation);
         self.committed = true;
         self.release_activity();
     }
@@ -1851,9 +2479,148 @@ impl Drop for SchedulerStartGuard {
     }
 }
 
+#[derive(Clone)]
 enum SchedulerStartOrigin {
     Explicit,
     Recovery(RecoveryTicket),
+}
+
+enum SchedulerStartOwner {
+    Explicit(Arc<DesiredRunToken>),
+    Recovery(RecoveryTicket),
+}
+
+enum SchedulerStartClaimPhase {
+    Begin {
+        generation: u64,
+        run_states: Arc<HashMap<TaskId, TaskRunStateRef>>,
+        generation_running: Arc<AtomicBool>,
+        control: Arc<GenerationControl>,
+        guard: SchedulerStartGuard,
+    },
+    Wait(watch::Receiver<bool>),
+    Inactive,
+}
+
+struct SchedulerStartClaim {
+    lifecycle: Arc<StdMutex<SchedulerLifecycle>>,
+    owner: Option<SchedulerStartOwner>,
+    phase: SchedulerStartClaimPhase,
+}
+
+impl SchedulerStartClaim {
+    fn apply_decision(&mut self, decision: SchedulerStartDecision) {
+        self.phase = match decision {
+            SchedulerStartDecision::Begin {
+                generation,
+                run_states,
+                generation_running,
+                control,
+            } => {
+                let guard = SchedulerStartGuard {
+                    lifecycle: Arc::clone(&self.lifecycle),
+                    control: Arc::clone(&control),
+                    generation,
+                    committed: false,
+                    activity_released: false,
+                };
+                SchedulerStartClaimPhase::Begin {
+                    generation,
+                    run_states,
+                    generation_running,
+                    control,
+                    guard,
+                }
+            }
+            SchedulerStartDecision::Wait(waiting) => SchedulerStartClaimPhase::Wait(waiting),
+            SchedulerStartDecision::AlreadyRunning | SchedulerStartDecision::Exhausted => {
+                SchedulerStartClaimPhase::Inactive
+            }
+        };
+    }
+
+    fn refresh(&mut self) {
+        let decision = {
+            let mut lifecycle = lock_unpoisoned(&self.lifecycle);
+            match self.owner.as_ref() {
+                Some(SchedulerStartOwner::Explicit(desired)) => {
+                    lifecycle.start_decision_for(desired)
+                }
+                Some(SchedulerStartOwner::Recovery(ticket)) => {
+                    lifecycle.recovery_start_decision(ticket)
+                }
+                None => SchedulerStartDecision::Exhausted,
+            }
+        };
+        self.apply_decision(decision);
+    }
+}
+
+impl Drop for SchedulerStartClaim {
+    fn drop(&mut self) {
+        if !matches!(self.phase, SchedulerStartClaimPhase::Wait(_)) {
+            return;
+        }
+        let Some(SchedulerStartOwner::Explicit(desired)) = self.owner.as_ref() else {
+            return;
+        };
+        let launch = {
+            let mut lifecycle = lock_unpoisoned(&self.lifecycle);
+            let current = lifecycle
+                .desired
+                .as_ref()
+                .is_some_and(|active| active.is_active() && Arc::ptr_eq(active, desired));
+            if !current {
+                None
+            } else {
+                let failed_generation = lifecycle
+                    .active_generation()
+                    .unwrap_or(lifecycle.next_generation);
+                lifecycle
+                    .reserve_recovery(failed_generation)
+                    .map(|(handler, ticket)| {
+                        let completion = lifecycle
+                            .cleanup_completion
+                            .clone()
+                            .unwrap_or_else(completed_cleanup_receiver);
+                        (handler, ticket, completion)
+                    })
+            }
+        };
+        if let Some((handler, ticket, completion)) = launch {
+            launch_recovery_handler(&self.lifecycle, handler, ticket, completion);
+        }
+    }
+}
+
+fn claim_scheduler_start(
+    lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
+    origin: SchedulerStartOrigin,
+) -> SchedulerStartClaim {
+    let mut lifecycle_state = lock_unpoisoned(lifecycle);
+    let owner = match origin {
+        SchedulerStartOrigin::Explicit => match lifecycle_state.request_explicit_start() {
+            ExplicitStartRequest::Desired(desired) => Some(SchedulerStartOwner::Explicit(desired)),
+            ExplicitStartRequest::AlreadyRunning | ExplicitStartRequest::Rejected => None,
+        },
+        SchedulerStartOrigin::Recovery(ticket) => Some(SchedulerStartOwner::Recovery(ticket)),
+    };
+    let decision = match owner.as_ref() {
+        Some(SchedulerStartOwner::Explicit(desired)) => lifecycle_state.start_decision_for(desired),
+        Some(SchedulerStartOwner::Recovery(ticket)) => {
+            lifecycle_state.recovery_start_decision(ticket)
+        }
+        None => SchedulerStartDecision::Exhausted,
+    };
+    drop(lifecycle_state);
+
+    let mut claim = SchedulerStartClaim {
+        lifecycle: Arc::clone(lifecycle),
+        owner,
+        phase: SchedulerStartClaimPhase::Inactive,
+    };
+    claim.apply_decision(decision);
+    claim
 }
 
 #[cfg(test)]
@@ -1924,7 +2691,7 @@ where
     .await
 }
 
-async fn start_scheduler_lifecycle_with_origin<
+fn start_scheduler_lifecycle_with_origin<
     Prepare,
     PrepareFut,
     Prepared,
@@ -1935,6 +2702,30 @@ async fn start_scheduler_lifecycle_with_origin<
     lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
     origin: SchedulerStartOrigin,
     required_tasks: Option<&[TaskId]>,
+    prepare: Prepare,
+    install: Install,
+) -> impl std::future::Future<Output = bool>
+where
+    Prepare: FnOnce(u64) -> PrepareFut,
+    PrepareFut: std::future::Future<Output = Prepared>,
+    Install: FnOnce(
+        u64,
+        Arc<HashMap<TaskId, TaskRunStateRef>>,
+        Arc<AtomicBool>,
+        Arc<GenerationControl>,
+        Prepared,
+    ) -> (Handles, FinishFut),
+    Handles: IntoSchedulerHandleBatch,
+    FinishFut: std::future::Future<Output = ()>,
+{
+    let claim = claim_scheduler_start(lifecycle, origin);
+    let required_tasks = required_tasks.map(<[TaskId]>::to_vec);
+    async move { drive_claimed_scheduler_start(claim, required_tasks, prepare, install).await }
+}
+
+async fn drive_claimed_scheduler_start<Prepare, PrepareFut, Prepared, Install, Handles, FinishFut>(
+    mut claim: SchedulerStartClaim,
+    required_tasks: Option<Vec<TaskId>>,
     prepare: Prepare,
     install: Install,
 ) -> bool
@@ -1951,47 +2742,25 @@ where
     Handles: IntoSchedulerHandleBatch,
     FinishFut: std::future::Future<Output = ()>,
 {
-    let desired = if matches!(origin, SchedulerStartOrigin::Explicit) {
-        let mut lifecycle = lock_unpoisoned(lifecycle);
-        match lifecycle.request_explicit_start() {
-            ExplicitStartRequest::AlreadyRunning => return false,
-            ExplicitStartRequest::Desired(desired) => Some(desired),
-        }
-    } else {
-        None
-    };
-    let (generation, run_states, generation_running, control) = loop {
-        let decision = {
-            let mut lifecycle = lock_unpoisoned(lifecycle);
-            match &origin {
-                SchedulerStartOrigin::Explicit => lifecycle.start_decision_for(
-                    desired
-                        .as_ref()
-                        .expect("explicit start owns a desired-running token"),
-                ),
-                SchedulerStartOrigin::Recovery(ticket) => lifecycle.recovery_start_decision(ticket),
-            }
-        };
-        match decision {
-            SchedulerStartDecision::Begin {
+    let (generation, run_states, generation_running, control, mut guard) = loop {
+        match std::mem::replace(&mut claim.phase, SchedulerStartClaimPhase::Inactive) {
+            SchedulerStartClaimPhase::Begin {
                 generation,
                 run_states,
                 generation_running,
                 control,
-            } => break (generation, run_states, generation_running, control),
-            SchedulerStartDecision::AlreadyRunning | SchedulerStartDecision::Exhausted => {
-                return false;
+                guard,
+            } => break (generation, run_states, generation_running, control, guard),
+            SchedulerStartClaimPhase::Wait(waiting) => {
+                claim.phase = SchedulerStartClaimPhase::Wait(waiting.clone());
+                wait_for_owned_cleanup(&claim.lifecycle, waiting).await;
+                claim.phase = SchedulerStartClaimPhase::Inactive;
+                claim.refresh();
             }
-            SchedulerStartDecision::Wait(waiting) => wait_for_cleanup(waiting).await,
+            SchedulerStartClaimPhase::Inactive => return false,
         }
     };
-    let mut guard = SchedulerStartGuard {
-        lifecycle: Arc::clone(lifecycle),
-        control: Arc::clone(&control),
-        generation,
-        committed: false,
-        activity_released: false,
-    };
+    let lifecycle = Arc::clone(&claim.lifecycle);
     let cancellation = wait_for_generation_cancel(control.subscribe());
     let prepared = prepare(generation);
     tokio::pin!(cancellation);
@@ -2001,7 +2770,7 @@ where
         _ = &mut cancellation => return false,
         prepared = &mut prepared => prepared,
     };
-    if !lock_unpoisoned(lifecycle).is_starting(generation) {
+    if !lock_unpoisoned(&lifecycle).is_starting(generation) {
         return false;
     }
     let (handles, finish_start) = install(
@@ -2014,17 +2783,17 @@ where
     let mut handles = handles.into_scheduler_handle_batch();
     handles.attach(Arc::clone(&control));
     let tasks = handles.task_ids();
-    let required_tasks = required_tasks.unwrap_or(&tasks);
+    let required_tasks = required_tasks.as_deref().unwrap_or(&tasks);
     if tasks.iter().copied().collect::<HashSet<_>>()
         != required_tasks.iter().copied().collect::<HashSet<_>>()
-        || !lock_unpoisoned(lifecycle).register_required_loops(generation, required_tasks)
+        || !lock_unpoisoned(&lifecycle).register_required_loops(generation, required_tasks)
     {
         return false;
     }
     let (supervised, mut supervisors, mut commit_result) =
-        supervise_scheduler_batch(generation, &control, lifecycle, handles, |_, _| {});
+        supervise_scheduler_batch(generation, &control, &lifecycle, handles, |_, _| {});
     let install_result = {
-        let mut lifecycle = lock_unpoisoned(lifecycle);
+        let mut lifecycle = lock_unpoisoned(&lifecycle);
         lifecycle.install_handles(generation, supervised)
     };
     if let Err(rejected) = install_result {
@@ -2052,7 +2821,7 @@ where
         _ = &mut finish_start => {}
     }
     if supervisors.is_empty() {
-        let committed = lock_unpoisoned(lifecycle).finish_start(generation);
+        let committed = lock_unpoisoned(&lifecycle).finish_start(generation);
         if committed {
             guard.commit();
         }
@@ -2087,14 +2856,41 @@ async fn stop_scheduler_lifecycle(
 }
 
 async fn stop_scheduler_lifecycle_inner(lifecycle: &Arc<StdMutex<SchedulerLifecycle>>) -> bool {
-    let request = lock_unpoisoned(lifecycle).begin_explicit_stop();
-    if matches!(request, CleanupRequest::Inactive) {
-        return false;
+    stop_scheduler_lifecycle_with_mode(lifecycle, false).await
+}
+
+async fn shutdown_scheduler_lifecycle(lifecycle: &Arc<StdMutex<SchedulerLifecycle>>) -> bool {
+    stop_scheduler_lifecycle_with_mode(lifecycle, true).await
+}
+
+async fn stop_scheduler_lifecycle_with_mode(
+    lifecycle: &Arc<StdMutex<SchedulerLifecycle>>,
+    terminal: bool,
+) -> bool {
+    let (request, recovery_worker, recovery_drain) = {
+        let mut state = lock_unpoisoned(lifecycle);
+        let request = if terminal {
+            state.begin_terminal_shutdown()
+        } else {
+            state.begin_explicit_stop()
+        };
+        (
+            request,
+            state.recovery_worker.take(),
+            Arc::clone(&state.recovery_drain),
+        )
+    };
+    let active = !matches!(request, CleanupRequest::Inactive);
+    let completion = launch_scheduler_cleanup(lifecycle, request);
+    if let Some(worker) = recovery_worker {
+        worker.abort();
+        let _ = worker.await;
     }
-    if let Some(completion) = launch_scheduler_cleanup(lifecycle, request) {
-        wait_for_cleanup(completion).await;
+    recovery_drain.wait_drained().await;
+    if let Some(completion) = completion {
+        wait_for_owned_cleanup(lifecycle, completion).await;
     }
-    true
+    active
 }
 
 struct SchedulerRuntime {
@@ -2104,16 +2900,21 @@ struct SchedulerRuntime {
 }
 
 impl SchedulerRuntime {
-    async fn start_explicit(self: &Arc<Self>) -> bool {
-        self.start_with_origin(SchedulerStartOrigin::Explicit).await
+    fn start_explicit(self: &Arc<Self>) -> impl std::future::Future<Output = bool> {
+        self.start_with_origin(SchedulerStartOrigin::Explicit)
     }
 
-    async fn start_recovery(self: &Arc<Self>, ticket: RecoveryTicket) -> bool {
+    fn start_recovery(
+        self: &Arc<Self>,
+        ticket: RecoveryTicket,
+    ) -> impl std::future::Future<Output = bool> {
         self.start_with_origin(SchedulerStartOrigin::Recovery(ticket))
-            .await
     }
 
-    async fn start_with_origin(self: &Arc<Self>, origin: SchedulerStartOrigin) -> bool {
+    fn start_with_origin(
+        self: &Arc<Self>,
+        origin: SchedulerStartOrigin,
+    ) -> impl std::future::Future<Output = bool> {
         let prepare_runtime = Arc::clone(self);
         let install_runtime = Arc::clone(self);
         start_scheduler_lifecycle_with_origin(
@@ -2183,7 +2984,6 @@ impl SchedulerRuntime {
                 (handles, finish_start)
             },
         )
-        .await
     }
 
     fn spawn_periodic(
@@ -2235,14 +3035,14 @@ impl SchedulerRuntime {
         })
     }
 
-    fn schedule_recovery(
+    fn recovery_future(
         self: &Arc<Self>,
         ticket: RecoveryTicket,
         completion: watch::Receiver<bool>,
-    ) {
+    ) -> RecoveryFuture {
         let runtime = Arc::clone(self);
-        tokio::spawn(async move {
-            wait_for_cleanup(completion).await;
+        Box::pin(async move {
+            wait_for_owned_cleanup(&runtime.lifecycle, completion).await;
             let delay = recovery_backoff(ticket.attempt);
             let cancellation = wait_for_generation_cancel(ticket.desired.subscribe());
             tokio::pin!(cancellation);
@@ -2261,7 +3061,7 @@ impl SchedulerRuntime {
                 "restarting scheduler after required loop failure"
             );
             let _ = runtime.start_recovery(ticket).await;
-        });
+        })
     }
 }
 
@@ -2280,7 +3080,7 @@ pub struct SchedulerService {
     environment_status: Arc<RwLock<EnvironmentStatus>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
     lifecycle: Arc<StdMutex<SchedulerLifecycle>>,
-    kline_flush_gate: Arc<StdMutex<()>>,
+    kline_flush: Arc<KlineFlushCoordinator>,
     market_fallback_interval_tx: tokio::sync::watch::Sender<Duration>,
     prev_public_connected: Arc<Mutex<bool>>,
     prev_private_connected: Arc<Mutex<bool>>,
@@ -2306,7 +3106,7 @@ impl SchedulerService {
         let (market_fallback_interval_tx, _) =
             tokio::sync::watch::channel(INTERVAL_MARKET_FALLBACK);
         let lifecycle = Arc::new(StdMutex::new(SchedulerLifecycle::new()));
-        let kline_flush_gate = Arc::new(StdMutex::new(()));
+        let kline_flush = Arc::new(KlineFlushCoordinator::new());
         let prev_public_connected = Arc::new(Mutex::new(false));
         let prev_private_connected = Arc::new(Mutex::new(false));
         let runtime = Arc::new(SchedulerRuntime {
@@ -2324,7 +3124,7 @@ impl SchedulerService {
                 api: Arc::clone(&api),
                 environment_status: Arc::clone(&environment_status),
                 account_lifecycle: Arc::clone(&account_lifecycle),
-                kline_flush_gate: Arc::clone(&kline_flush_gate),
+                kline_flush: Arc::clone(&kline_flush),
                 prev_public_connected: Arc::clone(&prev_public_connected),
                 prev_private_connected: Arc::clone(&prev_private_connected),
             },
@@ -2332,9 +3132,17 @@ impl SchedulerService {
             market_fallback_interval_tx: market_fallback_interval_tx.clone(),
         });
         let weak_runtime = Arc::downgrade(&runtime);
+        let weak_lifecycle = Arc::downgrade(&lifecycle);
         lock_unpoisoned(&lifecycle).recovery_handler = Some(Arc::new(move |ticket, completion| {
             if let Some(runtime) = weak_runtime.upgrade() {
-                runtime.schedule_recovery(ticket, completion);
+                runtime.recovery_future(ticket, completion)
+            } else {
+                if let Some(lifecycle) = weak_lifecycle.upgrade() {
+                    let mut lifecycle = lock_unpoisoned(&lifecycle);
+                    lifecycle.terminal = true;
+                    lifecycle.disable_desired_running();
+                }
+                Box::pin(async {})
             }
         }));
         Self {
@@ -2352,7 +3160,7 @@ impl SchedulerService {
             environment_status,
             account_lifecycle,
             lifecycle,
-            kline_flush_gate,
+            kline_flush,
             market_fallback_interval_tx,
             prev_public_connected,
             prev_private_connected,
@@ -2360,18 +3168,26 @@ impl SchedulerService {
         }
     }
 
-    pub async fn start(&self) {
-        let _ = self.runtime.start_explicit().await;
+    pub fn start(&self) -> impl std::future::Future<Output = ()> {
+        let start = self.runtime.start_explicit();
+        async move {
+            let _ = start.await;
+        }
     }
 
     pub async fn stop(&self) {
         stop_scheduler_lifecycle_inner(&self.lifecycle).await;
     }
 
+    pub async fn shutdown(&self) {
+        shutdown_scheduler_lifecycle(&self.lifecycle).await;
+    }
+
     pub(crate) async fn flush_klines_for_shutdown(&self) -> AppResult<()> {
         execute_kline_flush(
             Arc::clone(&self.chart_workspace),
-            Arc::clone(&self.kline_flush_gate),
+            Arc::clone(&self.kline_flush),
+            KlineFlushOrigin::Shutdown,
         )
         .await
     }
@@ -2382,26 +3198,48 @@ impl SchedulerService {
 
     pub async fn bootstrap_connection(&self) -> AppResult<()> {
         run_generation_activity(&self.lifecycle, || async {
-            let _guard = self.account_lifecycle.read_guard().await;
-            let connected = self.connection.status().await == ConnectionStatus::Connected;
-            let tasks = bootstrap_tasks(connected);
-            // The account lifecycle guard is already held: call the non-locking inner path
-            // directly. This also keeps strict snapshots independent from regular coalescing.
-            let failed = run_bootstrap_tasks(&tasks, |task| {
-                self.execute_inner(task, ExecutionMode::Bootstrap)
-            })
-            .await;
-            for task in &failed {
-                self.emitter
-                    .emit_error(&format!("连接后{}同步失败", task.bootstrap_label()));
-            }
-            if failed.is_empty() {
-                Ok(())
-            } else {
-                Err(bootstrap_failure_error(&failed))
-            }
+            self.bootstrap_connection_inner().await
         })
         .await
+    }
+
+    pub fn spawn_connection_bootstrap(self: &Arc<Self>) -> AppResult<()> {
+        let activity = claim_generation_activity(&self.lifecycle)?;
+        let scheduler = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let result = run_claimed_generation_activity(activity, || async {
+                scheduler.bootstrap_connection_inner().await
+            })
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(
+                    message = %error.user_message(),
+                    "connection bootstrap did not complete"
+                );
+            }
+        });
+        Ok(())
+    }
+
+    async fn bootstrap_connection_inner(&self) -> AppResult<()> {
+        let _guard = self.account_lifecycle.read_guard().await;
+        let connected = self.connection.status().await == ConnectionStatus::Connected;
+        let tasks = bootstrap_tasks(connected);
+        // The account lifecycle guard is already held: call the non-locking inner path
+        // directly. This also keeps strict snapshots independent from regular coalescing.
+        let failed = run_bootstrap_tasks(&tasks, |task| {
+            self.execute_inner(task, ExecutionMode::Bootstrap)
+        })
+        .await;
+        for task in &failed {
+            self.emitter
+                .emit_error(&format!("连接后{}同步失败", task.bootstrap_label()));
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(bootstrap_failure_error(&failed))
+        }
     }
 
     pub async fn run_now(&self, task: TaskId, force: bool) -> AppResult<()> {
@@ -2427,8 +3265,12 @@ impl SchedulerService {
             TaskId::DailyPnl => self.daily_pnl.refresh().await.map(|_| ()),
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
             TaskId::KlineFlush => {
-                execute_kline_flush(self.chart_workspace.clone(), self.kline_flush_gate.clone())
-                    .await
+                execute_kline_flush(
+                    self.chart_workspace.clone(),
+                    self.kline_flush.clone(),
+                    KlineFlushOrigin::Background,
+                )
+                .await
             }
             TaskId::Environment => self.run_environment().await,
             TaskId::NotificationMaintenance => {
@@ -2518,14 +3360,19 @@ impl SchedulerService {
         let symbol = self.market.active_symbol().await;
         let public_connected = self.ws.is_public_connected();
         let private_connected = self.ws.is_private_connected();
-        {
-            let mut prev = self.prev_public_connected.lock().await;
-            if public_connected && !*prev {
+        let _ = run_market_reconnect_backfill(
+            Arc::clone(&self.prev_public_connected),
+            public_connected,
+            || async {
                 let interval = self.market.kline_interval().await;
-                self.market.schedule_kline_backfill(&symbol, &interval);
-            }
-            *prev = public_connected;
-        }
+                run_scheduler_owned_market_backfill(|| {
+                    self.market
+                        .run_kline_backfill_under_account_guard(&symbol, &interval)
+                })
+                .await
+            },
+        )
+        .await;
         {
             let mut prev = self.prev_private_connected.lock().await;
             *prev = private_connected;
@@ -2536,7 +3383,11 @@ impl SchedulerService {
             if let Err(error) = self.market.refresh_ticker_depth(&symbol).await {
                 failures.push(error.to_string());
             }
-            if let Err(error) = self.market.refresh_klines(&symbol).await {
+            if let Err(error) = self
+                .market
+                .refresh_klines_under_account_guard(&symbol)
+                .await
+            {
                 failures.push(error.to_string());
             }
             if failures.is_empty() {
@@ -2574,7 +3425,7 @@ struct SchedulerRefs {
     api: Arc<crate::api::ApiClient>,
     environment_status: Arc<RwLock<EnvironmentStatus>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
-    kline_flush_gate: Arc<StdMutex<()>>,
+    kline_flush: Arc<KlineFlushCoordinator>,
     prev_public_connected: Arc<Mutex<bool>>,
     prev_private_connected: Arc<Mutex<bool>>,
 }
@@ -2599,8 +3450,12 @@ impl SchedulerRefs {
             TaskId::DailyPnl => self.daily_pnl.refresh().await.map(|_| ()),
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
             TaskId::KlineFlush => {
-                execute_kline_flush(self.chart_workspace.clone(), self.kline_flush_gate.clone())
-                    .await
+                execute_kline_flush(
+                    self.chart_workspace.clone(),
+                    self.kline_flush.clone(),
+                    KlineFlushOrigin::Background,
+                )
+                .await
             }
             TaskId::Environment => self.run_environment().await,
             TaskId::NotificationMaintenance => {
@@ -2684,14 +3539,19 @@ impl SchedulerRefs {
     async fn run_market_fallback(&self, mode: ExecutionMode) -> AppResult<()> {
         let symbol = self.market.active_symbol().await;
         let public_connected = self.ws.is_public_connected();
-        {
-            let mut prev = self.prev_public_connected.lock().await;
-            if public_connected && !*prev {
+        let _ = run_market_reconnect_backfill(
+            Arc::clone(&self.prev_public_connected),
+            public_connected,
+            || async {
                 let interval = self.market.kline_interval().await;
-                self.market.schedule_kline_backfill(&symbol, &interval);
-            }
-            *prev = public_connected;
-        }
+                run_scheduler_owned_market_backfill(|| {
+                    self.market
+                        .run_kline_backfill_under_account_guard(&symbol, &interval)
+                })
+                .await
+            },
+        )
+        .await;
         {
             let mut prev = self.prev_private_connected.lock().await;
             *prev = self.ws.is_private_connected();
@@ -2701,7 +3561,11 @@ impl SchedulerRefs {
             if let Err(error) = self.market.refresh_ticker_depth(&symbol).await {
                 failures.push(error.to_string());
             }
-            if let Err(error) = self.market.refresh_klines(&symbol).await {
+            if let Err(error) = self
+                .market
+                .refresh_klines_under_account_guard(&symbol)
+                .await
+            {
                 failures.push(error.to_string());
             }
             if failures.is_empty() {

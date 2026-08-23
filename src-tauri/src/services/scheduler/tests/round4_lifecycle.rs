@@ -282,7 +282,7 @@ fn install_test_recovery_handler(
         let lifecycle = Arc::clone(&recovery_lifecycle);
         let running = Arc::clone(&recovery_running);
         let recovery_starts = Arc::clone(&recovery_starts);
-        tokio::spawn(async move {
+        Box::pin(async move {
             wait_for_cleanup(completion).await;
             let cancellation = wait_for_generation_cancel(ticket.desired.subscribe());
             tokio::pin!(cancellation);
@@ -308,7 +308,7 @@ fn install_test_recovery_handler(
                 },
             )
             .await;
-        });
+        })
     }));
 }
 
@@ -440,6 +440,7 @@ async fn simultaneous_required_loop_exits_reserve_only_one_recovery_ticket() {
     let requests = Arc::clone(&recovery_requests);
     lock_unpoisoned(&lifecycle).recovery_handler = Some(Arc::new(move |_, _| {
         requests.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::pending())
     }));
     let (exit, exit_receiver) = watch::channel(false);
 
@@ -787,7 +788,7 @@ async fn cleanup_primary_launch_failure_keeps_job_owned_until_fallback_finishes(
     }));
     entered.notified().await;
     handle.abort();
-    let job = Arc::new(StdMutex::new(Some(CleanupJob {
+    let job = CleanupJobSlot::new(CleanupJob {
         handles: vec![handle],
         control,
         guard: CleanupCompletionGuard {
@@ -795,7 +796,8 @@ async fn cleanup_primary_launch_failure_keeps_job_owned_until_fallback_finishes(
             generation,
             completion: Some(completion),
         },
-    })));
+    });
+    lifecycle.lock().unwrap().cleanup_job = Some(Arc::clone(&job));
 
     // `false` deterministically skips the primary branch and exercises the
     // retained-Arc fallback on this same executor.
@@ -1059,7 +1061,7 @@ async fn rejected_supervisors_remain_generation_owned_after_caller_drops_them() 
 }
 
 #[test]
-fn cleanup_and_owner_drop_recover_poisoned_mutexes_without_double_panicking() {
+fn cleanup_completion_recovers_poisoned_mutexes_without_drop_publishing() {
     let control = GenerationControl::new();
     let owner = GenerationOwnerGuard::new(Arc::clone(&control));
     let poison_control = Arc::clone(&control);
@@ -1078,11 +1080,16 @@ fn cleanup_and_owner_drop_recover_poisoned_mutexes_without_double_panicking() {
         CleanupRequest::Start(resources) => resources,
         _ => panic!("active generation must yield cleanup resources"),
     };
-    let guard = CleanupCompletionGuard {
-        lifecycle: Arc::clone(&lifecycle),
-        generation,
-        completion: Some(resources.completion),
-    };
+    let slot = CleanupJobSlot::new(CleanupJob {
+        handles: Vec::new(),
+        control: resources.control,
+        guard: CleanupCompletionGuard {
+            lifecycle: Arc::clone(&lifecycle),
+            generation,
+            completion: Some(resources.completion),
+        },
+    });
+    lifecycle.lock().unwrap().cleanup_job = Some(Arc::clone(&slot));
     let poison_lifecycle = Arc::clone(&lifecycle);
     assert!(std::thread::spawn(move || {
         let _guard = poison_lifecycle.lock().unwrap();
@@ -1090,7 +1097,8 @@ fn cleanup_and_owner_drop_recover_poisoned_mutexes_without_double_panicking() {
     })
     .join()
     .is_err());
-    drop(guard);
+    let lease = slot.claim_job().expect("cleanup job remains retained");
+    lease.complete();
     assert_eq!(
         lock_unpoisoned(&lifecycle).state,
         SchedulerLifecycleState::Stopped

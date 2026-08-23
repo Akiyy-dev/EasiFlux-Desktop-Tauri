@@ -7,6 +7,7 @@ mod coordination;
 mod notification_maintenance;
 mod rescheduling;
 mod round4_lifecycle;
+mod round5_lifecycle;
 
 #[test]
 fn task_id_parses_frontend_names() {
@@ -52,7 +53,7 @@ async fn kline_flush_executes_while_account_mutation_guard_is_held() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_outer_future_keeps_blocking_kline_work_serialized_across_restart() {
-    let gate = Arc::new(StdMutex::new(()));
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
     let entered_first = Arc::new(tokio::sync::Notify::new());
     let entered_second = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new((StdMutex::new(false), Condvar::new()));
@@ -95,15 +96,6 @@ async fn cancelled_outer_future_keeps_blocking_kline_work_serialized_across_rest
 }
 
 #[test]
-fn scheduler_exposes_the_shared_gate_for_the_final_shutdown_flush() {
-    async fn invoke(service: &SchedulerService) -> AppResult<()> {
-        service.flush_klines_for_shutdown().await
-    }
-
-    let _ = invoke;
-}
-
-#[test]
 fn kline_flush_delays_its_first_tick_while_existing_tasks_remain_immediate() {
     assert_eq!(first_tick_delay(TaskId::KlineFlush), Duration::from_secs(5));
     assert_eq!(first_tick_delay(TaskId::MarketFallback), Duration::ZERO);
@@ -143,7 +135,12 @@ async fn kline_flush_attempts_every_dirty_key_before_returning_a_joined_storage_
         Arc::new(|_| {}),
     ));
 
-    let result = execute_kline_flush(service, Arc::new(StdMutex::new(()))).await;
+    let result = execute_kline_flush(
+        service,
+        Arc::new(KlineFlushCoordinator::new()),
+        KlineFlushOrigin::Background,
+    )
+    .await;
 
     assert!(matches!(result, Err(AppError::Storage(_))));
     assert!(kline_dir.join("BBB_1.jsonl").is_file());

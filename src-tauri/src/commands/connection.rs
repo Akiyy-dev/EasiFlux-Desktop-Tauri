@@ -65,10 +65,11 @@ pub async fn connect(
     )
     .await?;
 
-    let scheduler = state.scheduler.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = scheduler.bootstrap_connection().await;
-    });
+    if let Err(error) = state.scheduler.spawn_connection_bootstrap() {
+        let message = format!("连接初始化调度失败：{}", error.user_message());
+        state.emitter.emit_error(&message);
+        tracing::warn!(message = %error.user_message(), "connection bootstrap was rejected");
+    }
     Ok(())
 }
 
