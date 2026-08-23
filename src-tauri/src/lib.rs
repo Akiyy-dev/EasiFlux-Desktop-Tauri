@@ -135,17 +135,10 @@ pub fn run() {
                 let state: tauri::State<AppState> = app.state();
                 tauri::async_runtime::block_on(async {
                     state.scheduler.stop().await;
-                });
-                for (key, result) in state.chart_workspace.flush_dirty_klines() {
-                    if let Err(error) = result {
-                        tracing::error!(
-                            symbol = %key.symbol,
-                            interval = %key.interval,
-                            %error,
-                            "final kline flush failed"
-                        );
+                    if let Err(error) = state.scheduler.flush_klines_for_shutdown().await {
+                        tracing::error!(%error, "final kline flush failed");
                     }
-                }
+                });
             }
         });
 }

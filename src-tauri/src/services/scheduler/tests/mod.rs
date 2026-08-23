@@ -6,6 +6,7 @@ use crate::models::time::{TimeSnapshot, TimeSource, TimeSyncStatus};
 mod coordination;
 mod notification_maintenance;
 mod rescheduling;
+mod round4_lifecycle;
 
 #[test]
 fn task_id_parses_frontend_names() {
@@ -91,6 +92,15 @@ async fn cancelled_outer_future_keeps_blocking_kline_work_serialized_across_rest
         .expect("the restarted flush should run after old blocking work exits")
         .unwrap()
         .unwrap();
+}
+
+#[test]
+fn scheduler_exposes_the_shared_gate_for_the_final_shutdown_flush() {
+    async fn invoke(service: &SchedulerService) -> AppResult<()> {
+        service.flush_klines_for_shutdown().await
+    }
+
+    let _ = invoke;
 }
 
 #[test]

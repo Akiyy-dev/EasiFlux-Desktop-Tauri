@@ -233,7 +233,7 @@ async fn concurrent_start_stop_restart_serializes_generations_and_owns_every_han
                     start_entered.notify_one();
                     release_start.notified().await;
                 },
-                move |generation, run_states, generation_running, ()| {
+                move |generation, run_states, generation_running, _, ()| {
                     (
                         generation_handles(
                             generation,
@@ -265,7 +265,7 @@ async fn concurrent_start_stop_restart_serializes_generations_and_owns_every_han
                 &lifecycle,
                 &running,
                 |_| async {},
-                move |generation, run_states, generation_running, ()| {
+                move |generation, run_states, generation_running, _, ()| {
                     (
                         generation_handles(
                             generation,
@@ -305,7 +305,7 @@ async fn concurrent_start_stop_restart_serializes_generations_and_owns_every_han
             move |_| async move {
                 duplicate_installs_in_start.fetch_add(1, Ordering::SeqCst);
             },
-            |_, _, _, ()| (Vec::new(), async {}),
+            |_, _, _, _, ()| (Vec::new(), async {}),
         )
         .await
     );
@@ -340,18 +340,33 @@ async fn stop_during_synchronous_install_waits_before_restart_without_holding_li
         let install_entered = Arc::clone(&install_entered);
         let release_install = Arc::clone(&release_install);
         async move {
+            let install_lifecycle = Arc::clone(&lifecycle);
             start_scheduler_lifecycle(
                 &lifecycle,
                 &running,
                 |_| async {},
-                move |_, _, _, ()| {
+                move |generation, _, _, control, ()| {
                     install_entered.notify_one();
                     let (released, wake) = release_install.as_ref();
                     let mut released = released.lock().unwrap();
                     while !*released {
                         released = wake.wait(released).unwrap();
                     }
-                    (Vec::new(), async {})
+                    // Stop has already removed control from the lifecycle by
+                    // this point. Installation must use the Begin-owned Arc,
+                    // never re-read mutable lifecycle state and panic.
+                    let mut batch = SchedulerHandleBatch::attached(Arc::clone(&control));
+                    batch.push(
+                        TaskId::NotificationMaintenance,
+                        spawn_required_loop_future(
+                            TaskId::NotificationMaintenance,
+                            generation,
+                            control,
+                            install_lifecycle,
+                            async {},
+                        ),
+                    );
+                    (batch, async {})
                 },
             )
             .await
@@ -390,7 +405,7 @@ async fn stop_during_synchronous_install_waits_before_restart_without_holding_li
                 &lifecycle,
                 &running,
                 |_| async {},
-                |_, _, _, ()| (Vec::new(), async {}),
+                |_, _, _, _, ()| (Vec::new(), async {}),
             )
             .await
         }
@@ -434,7 +449,7 @@ async fn cancelling_start_before_handle_install_rolls_back_and_allows_restart() 
                     entered.notify_one();
                     release.notified().await;
                 },
-                |_, _, _, ()| (Vec::new(), async {}),
+                |_, _, _, _, ()| (Vec::new(), async {}),
             )
             .await
         }
@@ -454,7 +469,7 @@ async fn cancelling_start_before_handle_install_rolls_back_and_allows_restart() 
         &lifecycle,
         &running,
         |_| async {},
-        |_, _, _, ()| (Vec::new(), async {}),
+        |_, _, _, _, ()| (Vec::new(), async {}),
     )
     .await;
     stop_scheduler_lifecycle(&lifecycle, &running).await;
@@ -482,7 +497,7 @@ async fn cancelling_start_during_immediate_run_aborts_installed_generation() {
                 &lifecycle,
                 &running,
                 |_| async {},
-                move |_, _, _, ()| {
+                move |_, _, _, _, ()| {
                     let handle =
                         tauri::async_runtime::JoinHandle::Tokio(tokio::spawn(async move {
                             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -520,7 +535,7 @@ async fn cancelling_start_during_immediate_run_aborts_installed_generation() {
         &lifecycle,
         &running,
         |_| async {},
-        |_, _, _, ()| (Vec::new(), async {}),
+        |_, _, _, _, ()| (Vec::new(), async {}),
     )
     .await;
     stop_scheduler_lifecycle(&lifecycle, &running).await;
@@ -547,7 +562,7 @@ async fn stop_resolves_time_sync_force_waiter_and_restart_runs_a_fresh_generatio
                 &lifecycle,
                 &running,
                 |_| async {},
-                move |_, run_states, generation_running, ()| {
+                move |_, run_states, generation_running, _, ()| {
                     let time_state = run_states.get(&TaskId::TimeSync).unwrap().clone();
                     let handle_state = time_state.clone();
                     let execute_entered = Arc::clone(&owner_entered);
@@ -611,7 +626,7 @@ async fn stop_resolves_time_sync_force_waiter_and_restart_runs_a_fresh_generatio
     let restarted =
         start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
             let fresh_runs = Arc::clone(&fresh_runs);
-            move |_, run_states, generation_running, ()| {
+            move |_, run_states, generation_running, _, ()| {
                 let state = run_states.get(&TaskId::TimeSync).unwrap().clone();
                 let handle = tauri::async_runtime::JoinHandle::Tokio(tokio::spawn(
                     run_fixed_periodic(generation_running, state, Duration::ZERO, DAY, move || {
@@ -650,7 +665,7 @@ async fn stop_during_in_flight_runs_allows_every_periodic_task_to_run_after_rest
         start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
             let entered = Arc::clone(&entered);
             let release = Arc::clone(&release);
-            move |_, run_states, generation_running, ()| {
+            move |_, run_states, generation_running, _, ()| {
                 let handles: Vec<_> = periodic_task_ids()
                     .iter()
                     .copied()
@@ -696,7 +711,7 @@ async fn stop_during_in_flight_runs_allows_every_periodic_task_to_run_after_rest
     assert!(
         start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
             let fresh_runs = Arc::clone(&fresh_runs);
-            move |_, run_states, generation_running, ()| {
+            move |_, run_states, generation_running, _, ()| {
                 let handles: Vec<_> = periodic_task_ids()
                     .iter()
                     .copied()
@@ -748,7 +763,7 @@ async fn stale_run_state_captured_before_stop_cannot_claim_after_retirement() {
             &lifecycle,
             &running,
             |_| async {},
-            |_, _, _, ()| (Vec::new(), async {}),
+            |_, _, _, _, ()| (Vec::new(), async {}),
         )
         .await
     );
@@ -790,7 +805,7 @@ async fn stop_waits_for_manual_owner_to_cancel_and_drop_before_returning() {
             &lifecycle,
             &running,
             |_| async {},
-            |_, _, _, ()| (Vec::new(), async {}),
+            |_, _, _, _, ()| (Vec::new(), async {}),
         )
         .await
     );
@@ -840,7 +855,7 @@ async fn periodic_panic_during_start_prevents_commit_and_allows_healthy_restart(
     let exited = Arc::new(tokio::sync::Notify::new());
     let started = start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
         let exited = Arc::clone(&exited);
-        move |_, _, _, ()| {
+        move |_, _, _, _, ()| {
             let handle = tauri::async_runtime::JoinHandle::Tokio(tokio::spawn({
                 let exited = Arc::clone(&exited);
                 async move {
@@ -865,7 +880,7 @@ async fn periodic_panic_during_start_prevents_commit_and_allows_healthy_restart(
             &lifecycle,
             &running,
             |_| async {},
-            |_, _, _, ()| (Vec::new(), async {}),
+            |_, _, _, _, ()| (Vec::new(), async {}),
         )
         .await
     );
@@ -889,7 +904,7 @@ async fn stop_returns_only_after_periodic_future_is_dropped() {
         start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
             let entered = Arc::clone(&entered);
             let dropped = Arc::clone(&dropped);
-            move |_, _, _, ()| {
+            move |_, _, _, _, ()| {
                 let handle = tauri::async_runtime::JoinHandle::Tokio(tokio::spawn(async move {
                     let _probe = DropProbe(dropped);
                     entered.notify_one();
@@ -930,7 +945,7 @@ async fn cancelled_stop_cleanup_finishes_and_a_waiting_restart_succeeds() {
             &lifecycle,
             &running,
             |_| async {},
-            |_, _, _, ()| (Vec::new(), async {}),
+            |_, _, _, _, ()| (Vec::new(), async {}),
         )
         .await
     );
@@ -981,7 +996,7 @@ async fn cancelled_stop_cleanup_finishes_and_a_waiting_restart_succeeds() {
                 &lifecycle,
                 &running,
                 |_| async {},
-                |_, _, _, ()| (Vec::new(), async {}),
+                |_, _, _, _, ()| (Vec::new(), async {}),
             )
             .await
         }
@@ -1010,7 +1025,7 @@ async fn periodic_exit_while_running_tears_down_generation_before_restart() {
         start_scheduler_lifecycle(&lifecycle, &running, |_| async {}, {
             let release = Arc::clone(&release);
             let exited = Arc::clone(&exited);
-            move |_, _, _, ()| {
+            move |_, _, _, _, ()| {
                 let handle = tauri::async_runtime::JoinHandle::Tokio(tokio::spawn(async move {
                     release.notified().await;
                     exited.notify_one();
@@ -1039,7 +1054,7 @@ async fn periodic_exit_while_running_tears_down_generation_before_restart() {
             &lifecycle,
             &running,
             |_| async {},
-            |_, _, _, ()| (Vec::new(), async {}),
+            |_, _, _, _, ()| (Vec::new(), async {}),
         )
         .await
     );
