@@ -65,14 +65,39 @@ pub(crate) async fn run_generation_owned_kline_storage<F, R>(operation: F) -> R
 where
     F: FnOnce() -> R,
 {
-    // Deliberately run bounded KlineStore work in the generation task. Tokio
-    // cannot cancel an already-running spawn_blocking descendant; keeping the
-    // work here means abort+join cannot finish until storage returns. Yield
-    // before cache/event publication so a pending generation cancellation is
-    // observed and cannot publish a stale event after storage unblocks.
+    // Run the entire bounded store + cache + event commit synchronously in the
+    // generation task. Tokio cannot cancel an already-running spawn_blocking
+    // descendant, while an await between these side effects can strand visible
+    // state behind a durable identical bar. Yield only after the caller's whole
+    // coherent commit has returned; stop still drains this generation owner.
     let result = operation();
     tokio::task::yield_now().await;
     result
+}
+
+async fn commit_generation_owned_kline_range<Emit>(
+    store: &KlineStore,
+    cache: &CacheStore,
+    key: &ChartWorkspaceKey,
+    bars: &[Kline],
+    start: Option<i64>,
+    end: Option<i64>,
+    requested: usize,
+    emit: Emit,
+) -> AppResult<Vec<Kline>>
+where
+    Emit: FnOnce(&[Kline]),
+{
+    run_generation_owned_kline_storage(|| {
+        let update = buffer_display_klines(store, key, bars)?;
+        let result = store.load_range(key, start, end, requested)?;
+        if update.changed {
+            cache.set_klines(&key.symbol, &key.interval, update.display.clone());
+            emit(&update.display);
+        }
+        Ok(result)
+    })
+    .await
 }
 
 /// Upsert WS/REST bars and detect timeline gaps needing REST backfill.
@@ -381,20 +406,17 @@ impl MarketService {
         let requested = requested_kline_limit(limit);
         let rest =
             PublicApi::klines(&self.api, &key.symbol, &key.interval, requested, start, end).await?;
-        let (update, result) = run_generation_owned_kline_storage(|| {
-            let update = buffer_display_klines(&self.kline_store, key, &rest)?;
-            let result = self
-                .kline_store
-                .load_range(key, start, end, requested as usize)?;
-            Ok::<_, AppError>((update, result))
-        })
-        .await?;
-        if update.changed {
-            self.cache
-                .set_klines(&key.symbol, &key.interval, update.display.clone());
-            self.emitter.emit_klines(&update.display);
-        }
-        Ok(result)
+        commit_generation_owned_kline_range(
+            &self.kline_store,
+            &self.cache,
+            key,
+            &rest,
+            start,
+            end,
+            requested as usize,
+            |display| self.emitter.emit_klines(display),
+        )
+        .await
     }
 
     #[allow(dead_code)]
@@ -545,6 +567,86 @@ mod tests {
                 .changed
         );
         assert!(!buffer_display_klines(&store, &key, &[bar]).unwrap().changed);
+    }
+
+    #[tokio::test]
+    async fn generation_owned_kline_commit_is_visible_before_post_commit_cancellation_and_identical_retry(
+    ) {
+        let store = KlineStore::with_dir(test_dir("generation-visible-commit"));
+        let cache = CacheStore::new();
+        let key = ChartWorkspaceKey::parse("BTCUSDT", "1").unwrap();
+        let bar = sample_kline(1_000, "2");
+        let mut emitted = Vec::<Vec<Kline>>::new();
+
+        let mut first = Box::pin(commit_generation_owned_kline_range(
+            &store,
+            &cache,
+            &key,
+            std::slice::from_ref(&bar),
+            None,
+            None,
+            200,
+            |payload| emitted.push(payload.to_vec()),
+        ));
+        assert!(matches!(
+            futures_util::poll!(first.as_mut()),
+            std::task::Poll::Pending
+        ));
+        drop(first); // generation cancellation at the post-commit yield boundary
+
+        assert_eq!(
+            store.load_range(&key, None, None, 200).unwrap(),
+            vec![bar.clone()]
+        );
+        assert_eq!(cache.get_klines("BTCUSDT", "1"), Some(vec![bar.clone()]));
+        assert_eq!(emitted, vec![vec![bar.clone()]]);
+
+        let retry = commit_generation_owned_kline_range(
+            &store,
+            &cache,
+            &key,
+            std::slice::from_ref(&bar),
+            None,
+            None,
+            200,
+            |payload| emitted.push(payload.to_vec()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(retry, vec![bar.clone()]);
+        assert_eq!(cache.get_klines("BTCUSDT", "1"), Some(vec![bar.clone()]));
+        assert_eq!(emitted, vec![vec![bar]]);
+    }
+
+    #[tokio::test]
+    async fn generation_owned_kline_commit_preserves_storage_errors_without_visibility() {
+        let store = KlineStore::with_dir(test_dir("generation-commit-error"));
+        let cache = CacheStore::new();
+        let key = ChartWorkspaceKey::parse("BTCUSDT", "1").unwrap();
+        let mut mismatched = sample_kline(1_000, "2");
+        mismatched.symbol = "ETHUSDT".into();
+        let mut emitted = Vec::<Vec<Kline>>::new();
+
+        let result = commit_generation_owned_kline_range(
+            &store,
+            &cache,
+            &key,
+            &[mismatched],
+            None,
+            None,
+            200,
+            |payload| emitted.push(payload.to_vec()),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Storage(message)) if message == "kline key mismatch for BTCUSDT_1"
+        ));
+        assert!(store.load_range(&key, None, None, 200).unwrap().is_empty());
+        assert_eq!(cache.get_klines("BTCUSDT", "1"), None);
+        assert!(emitted.is_empty());
     }
 
     #[test]
