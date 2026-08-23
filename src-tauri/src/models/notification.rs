@@ -66,12 +66,9 @@ impl NotificationScope {
     pub fn validate(&self) -> Result<(), NotificationValidationError> {
         match self {
             Self::Global => Ok(()),
-            Self::Account { account_id } if account_id.trim().is_empty() => {
-                Err(NotificationValidationError::new(
-                    "INVALID_NOTIFICATION_SCOPE",
-                    "通知账户范围不能为空",
-                ))
-            }
+            Self::Account { account_id } if AccountId::parse(account_id).is_none() => Err(
+                NotificationValidationError::new("INVALID_NOTIFICATION_SCOPE", "通知账户范围无效"),
+            ),
             Self::Account { .. } => Ok(()),
         }
     }
@@ -121,22 +118,80 @@ pub enum NotificationScalar {
 
 impl NotificationScalar {
     fn validate(&self) -> Result<(), NotificationValidationError> {
-        match self {
-            Self::String(value) if !is_safe_scalar_string(value) => {
-                return Err(NotificationValidationError::new(
-                    "INVALID_NOTIFICATION_CONTENT",
-                    "通知内容包含不安全字符串",
-                ));
-            }
-            Self::Number(number) if !number.is_finite() => {
-                return Err(NotificationValidationError::new(
-                    "INVALID_NOTIFICATION_CONTENT",
-                    "通知内容包含非有限数值",
-                ));
-            }
-            _ => {}
+        if matches!(self, Self::Number(number) if !number.is_finite()) {
+            return Err(NotificationValidationError::new(
+                "INVALID_NOTIFICATION_CONTENT",
+                "通知内容包含非有限数值",
+            ));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RiskViolationCode {
+    InvalidQuantity,
+    NonPositiveQuantity,
+    MaxOrderQty,
+    MissingLimitPrice,
+    InvalidLimitPrice,
+    NonPositiveLimitPrice,
+    MaxPriceDeviation,
+    DailyOrderLimit,
+    LedgerUnavailable,
+}
+
+impl RiskViolationCode {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "invalidQuantity" => Self::InvalidQuantity,
+            "nonPositiveQuantity" => Self::NonPositiveQuantity,
+            "maxOrderQty" => Self::MaxOrderQty,
+            "missingLimitPrice" => Self::MissingLimitPrice,
+            "invalidLimitPrice" => Self::InvalidLimitPrice,
+            "nonPositiveLimitPrice" => Self::NonPositiveLimitPrice,
+            "maxPriceDeviation" => Self::MaxPriceDeviation,
+            "dailyOrderLimit" => Self::DailyOrderLimit,
+            "ledgerUnavailable" => Self::LedgerUnavailable,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NotificationChannel {
+    Api,
+    Websocket,
+}
+
+impl NotificationChannel {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "api" => Self::Api,
+            "websocket" => Self::Websocket,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NotificationEnvironment {
+    Production,
+    Development,
+    Unknown,
+}
+
+impl NotificationEnvironment {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "production" => Self::Production,
+            "development" => Self::Development,
+            "unknown" => Self::Unknown,
+            _ => return None,
+        })
     }
 }
 
@@ -191,73 +246,27 @@ impl NotificationMessageTemplate {
         }
     }
 
-    fn accepts(self, key: NotificationParameterKey, value: &NotificationScalar) -> bool {
+    fn accepts(self, key: NotificationParameterKey) -> bool {
         match self {
-            Self::OrderFilled | Self::OrderCanceled => {
-                matches!(
-                    (key, value),
-                    (
-                        NotificationParameterKey::OrderId,
-                        NotificationScalar::String(_)
-                    )
-                )
-            }
+            Self::OrderFilled | Self::OrderCanceled => key == NotificationParameterKey::OrderId,
             Self::OrderRejected => matches!(
-                (key, value),
-                (
-                    NotificationParameterKey::OrderId,
-                    NotificationScalar::String(_)
-                ) | (
-                    NotificationParameterKey::SubmissionId,
-                    NotificationScalar::String(_)
-                )
+                key,
+                NotificationParameterKey::OrderId | NotificationParameterKey::SubmissionId
             ),
             Self::RiskOrderBlocked => matches!(
-                (key, value),
-                (
-                    NotificationParameterKey::Limit,
-                    NotificationScalar::Number(_)
-                ) | (
-                    NotificationParameterKey::ViolationCode,
-                    NotificationScalar::String(_)
-                )
+                key,
+                NotificationParameterKey::Limit | NotificationParameterKey::ViolationCode
             ),
-            Self::AccountSessionExpired => {
-                matches!(
-                    (key, value),
-                    (
-                        NotificationParameterKey::AccountId,
-                        NotificationScalar::String(_)
-                    )
-                )
-            }
+            Self::AccountSessionExpired => key == NotificationParameterKey::AccountId,
             Self::AccountRecoveryFailed | Self::AccountReconciliationFailed => matches!(
-                (key, value),
-                (
-                    NotificationParameterKey::AttemptId,
-                    NotificationScalar::String(_)
-                ) | (
-                    NotificationParameterKey::FailedSteps,
-                    NotificationScalar::String(_)
-                )
+                key,
+                NotificationParameterKey::AttemptId | NotificationParameterKey::FailedSteps
             ),
             Self::ConnectionUnavailable | Self::ConnectionRecovered => {
-                matches!(
-                    (key, value),
-                    (
-                        NotificationParameterKey::Channel,
-                        NotificationScalar::String(_)
-                    )
-                )
+                key == NotificationParameterKey::Channel
             }
             Self::EnvironmentUnavailable | Self::EnvironmentRecovered => {
-                matches!(
-                    (key, value),
-                    (
-                        NotificationParameterKey::Environment,
-                        NotificationScalar::String(_)
-                    )
-                )
+                key == NotificationParameterKey::Environment
             }
         }
     }
@@ -290,6 +299,80 @@ impl NotificationParameterKey {
             "violationCode" => Self::ViolationCode,
             _ => return None,
         })
+    }
+
+    fn accepts(self, value: &NotificationScalar) -> bool {
+        match (self, value) {
+            (Self::AccountId, NotificationScalar::String(value)) => {
+                AccountId::parse(value).is_some()
+            }
+            (Self::AttemptId, NotificationScalar::String(value)) => {
+                AttemptId::parse(value).is_some()
+            }
+            (Self::Channel, NotificationScalar::String(value)) => {
+                NotificationChannel::parse(value).is_some()
+            }
+            (Self::Environment, NotificationScalar::String(value)) => {
+                NotificationEnvironment::parse(value).is_some()
+            }
+            (Self::FailedSteps, NotificationScalar::String(value)) => {
+                ClientNotificationFailedStep::is_normalized_list(value)
+            }
+            (Self::Limit, NotificationScalar::Number(value)) => *value >= 0.0,
+            (Self::OrderId, NotificationScalar::String(value)) => OrderId::parse(value).is_some(),
+            (Self::SubmissionId, NotificationScalar::String(value)) => {
+                SubmissionId::parse(value).is_some()
+            }
+            (Self::ViolationCode, NotificationScalar::String(value)) => {
+                RiskViolationCode::parse(value).is_some()
+            }
+            _ => false,
+        }
+    }
+}
+
+struct AccountId;
+
+impl AccountId {
+    fn parse(value: &str) -> Option<()> {
+        (!value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && !looks_like_secret(value))
+        .then_some(())
+    }
+}
+
+struct OrderId;
+
+impl OrderId {
+    fn parse(value: &str) -> Option<()> {
+        (!value.is_empty()
+            && value.len() <= 64
+            && value.bytes().any(|byte| byte.is_ascii_digit())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && !looks_like_secret(value))
+        .then_some(())
+    }
+}
+
+struct SubmissionId;
+
+impl SubmissionId {
+    fn parse(value: &str) -> Option<()> {
+        is_generated_uuid(value).then_some(())
+    }
+}
+
+struct AttemptId;
+
+impl AttemptId {
+    fn parse(value: &str) -> Option<()> {
+        is_generated_uuid(value).then_some(())
     }
 }
 
@@ -349,10 +432,10 @@ impl NotificationContent {
                 ));
             };
             value.validate()?;
-            if !template.accepts(parameter_key, value) {
+            if !template.accepts(parameter_key) || !parameter_key.accepts(value) {
                 return Err(NotificationValidationError::new(
                     "INVALID_NOTIFICATION_CONTENT",
-                    "通知参数类型不受支持",
+                    "通知参数值不受支持",
                 ));
             }
         }
@@ -414,7 +497,7 @@ pub enum NotificationAction {
 
 impl NotificationAction {
     fn validate(&self) -> Result<(), NotificationValidationError> {
-        if matches!(self, Self::OpenTrading { order_id: Some(order_id) } if !is_safe_scalar_string(order_id))
+        if matches!(self, Self::OpenTrading { order_id: Some(order_id) } if OrderId::parse(order_id).is_none())
         {
             return Err(NotificationValidationError::new(
                 "INVALID_NOTIFICATION_ACTION",
@@ -686,6 +769,26 @@ pub enum ClientNotificationFailedStep {
     Bootstrap,
 }
 
+impl ClientNotificationFailedStep {
+    fn is_normalized_list(value: &str) -> bool {
+        let mut previous = None;
+        for step in value.split(',') {
+            let rank = match step {
+                "config" => 0,
+                "profiles" => 1,
+                "connection" => 2,
+                "bootstrap" => 3,
+                _ => return false,
+            };
+            if previous.is_some_and(|prior| rank <= prior) {
+                return false;
+            }
+            previous = Some(rank);
+        }
+        previous.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateClientNotificationRequest {
@@ -698,9 +801,15 @@ pub struct CreateClientNotificationRequest {
 
 impl CreateClientNotificationRequest {
     pub fn validate(&self) -> Result<(), NotificationValidationError> {
-        if self.account_id.trim().is_empty()
-            || self.attempt_id.trim().is_empty()
+        if AccountId::parse(&self.account_id).is_none()
+            || AttemptId::parse(&self.attempt_id).is_none()
+            || !is_safe_timestamp(self.session_epoch)
             || self.failed_steps.is_empty()
+            || self
+                .failed_steps
+                .iter()
+                .enumerate()
+                .any(|(index, step)| self.failed_steps[..index].contains(step))
         {
             return Err(NotificationValidationError::new(
                 "INVALID_NOTIFICATION_REQUEST",
@@ -715,17 +824,27 @@ fn is_safe_timestamp(value: u64) -> bool {
     value <= MAX_JAVASCRIPT_SAFE_INTEGER
 }
 
-fn is_safe_scalar_string(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'@')
-        })
+fn looks_like_secret(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("sk_")
+        || lower.starts_with("sk-")
+        || lower.starts_with("api_key")
+        || lower.starts_with("api-key")
+        || lower.starts_with("secret")
+        || lower.starts_with("token")
+        || lower.starts_with("bearer")
+        || lower.starts_with("akia")
+        || value.starts_with("eyJ")
+}
+
+fn is_generated_uuid(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|parsed| {
+        parsed.get_version() == Some(Version::Random) && parsed.hyphenated().to_string() == value
+    })
 }
 
 fn validate_notification_id(id: &str) -> Result<(), NotificationValidationError> {
-    let parsed = Uuid::parse_str(id).map_err(|_| invalid_record())?;
-    if parsed.get_version() != Some(Version::Random) || parsed.hyphenated().to_string() != id {
+    if !is_generated_uuid(id) {
         return Err(invalid_record());
     }
     Ok(())
@@ -829,6 +948,135 @@ mod tests {
             raw_fallback.unwrap_err().code(),
             "INVALID_NOTIFICATION_CONTENT"
         );
+    }
+
+    #[test]
+    fn content_validation_rejects_secret_shaped_violation_codes() {
+        assert_invalid_content(NotificationContent::new(
+            "risk.orderBlocked",
+            [(
+                "violationCode",
+                NotificationScalar::String("sk_live_51NQy6iF8dFx1Q".into()),
+            )],
+            "订单被风控拦截",
+            "请检查风控设置",
+        ));
+    }
+
+    #[test]
+    fn content_validation_rejects_secret_shaped_connection_channels() {
+        assert_invalid_content(NotificationContent::new(
+            "connection.unavailable",
+            [(
+                "channel",
+                NotificationScalar::String("sk_live_channel".into()),
+            )],
+            "连接不可用",
+            "交易连接暂时不可用，请检查网络或稍后重试。",
+        ));
+    }
+
+    #[test]
+    fn content_validation_rejects_secret_shaped_failed_steps_and_environment_urls() {
+        assert_invalid_content(NotificationContent::new(
+            "account.recoveryFailed",
+            [(
+                "failedSteps",
+                NotificationScalar::String("sk_live_steps".into()),
+            )],
+            "账户恢复失败",
+            "请检查账户设置后重试。",
+        ));
+        assert_invalid_content(NotificationContent::new(
+            "environment.unavailable",
+            [(
+                "environment",
+                NotificationScalar::String("https://api.example.test/error".into()),
+            )],
+            "环境不可达",
+            "当前交易环境暂时不可达，请稍后重试。",
+        ));
+    }
+
+    #[test]
+    fn content_validation_rejects_malformed_identifier_parameters() {
+        assert_invalid_content(NotificationContent::new(
+            "order.filled",
+            [(
+                "orderId",
+                NotificationScalar::String("secret-order-id".into()),
+            )],
+            "订单已成交",
+            "订单已完全成交，请前往交易页查看。",
+        ));
+        assert_invalid_content(NotificationContent::new(
+            "order.rejected",
+            [(
+                "submissionId",
+                NotificationScalar::String("not-a-generated-uuid".into()),
+            )],
+            "订单被拒绝",
+            "订单请求被交易端拒绝，请检查订单参数。",
+        ));
+        assert_invalid_content(NotificationContent::new(
+            "account.sessionExpired",
+            [(
+                "accountId",
+                NotificationScalar::String("sk_live_account".into()),
+            )],
+            "账户会话已失效",
+            "请检查账户 API 设置。",
+        ));
+        assert_invalid_content(NotificationContent::new(
+            "account.reconciliationFailed",
+            [(
+                "attemptId",
+                NotificationScalar::String("not-a-generated-uuid".into()),
+            )],
+            "账户对账失败",
+            "请检查账户数据后重试。",
+        ));
+    }
+
+    #[test]
+    fn content_validation_accepts_only_controlled_semantic_parameter_values() {
+        assert!(NotificationContent::new(
+            "risk.orderBlocked",
+            [(
+                "violationCode",
+                NotificationScalar::String("maxOrderQty".into())
+            )],
+            "订单被风控拦截",
+            "请检查风控设置",
+        )
+        .is_ok());
+        assert!(NotificationContent::new(
+            "connection.recovered",
+            [("channel", NotificationScalar::String("api".into()))],
+            "连接已恢复",
+            "交易连接已恢复。",
+        )
+        .is_ok());
+        assert!(NotificationContent::new(
+            "environment.recovered",
+            [(
+                "environment",
+                NotificationScalar::String("production".into()),
+            )],
+            "环境已恢复",
+            "当前交易环境已恢复。",
+        )
+        .is_ok());
+        assert!(NotificationContent::new(
+            "account.recoveryFailed",
+            [(
+                "failedSteps",
+                NotificationScalar::String("config,connection".into()),
+            )],
+            "账户恢复失败",
+            "请检查账户设置后重试。",
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1081,6 +1329,10 @@ mod tests {
         let mut candidate = valid_toast_candidate();
         candidate.session_epoch = Some(MAX_JAVASCRIPT_SAFE_INTEGER + 1);
         assert_invalid_candidate(candidate);
+    }
+
+    fn assert_invalid_content(result: Result<NotificationContent, NotificationValidationError>) {
+        assert_eq!(result.unwrap_err().code(), "INVALID_NOTIFICATION_CONTENT");
     }
 
     fn assert_invalid_candidate(candidate: NotificationToastCandidate) {
