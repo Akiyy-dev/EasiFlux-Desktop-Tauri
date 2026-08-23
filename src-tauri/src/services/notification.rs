@@ -53,6 +53,14 @@ impl NotificationError {
     pub fn code(&self) -> &'static str {
         self.code
     }
+
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+
+    pub fn availability(&self) -> NotificationAvailability {
+        NotificationAvailability::new(self.code, self.message)
+    }
 }
 
 impl Display for NotificationError {
@@ -62,6 +70,40 @@ impl Display for NotificationError {
 }
 
 impl Error for NotificationError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotificationAvailability {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl NotificationAvailability {
+    pub const fn new(code: &'static str, message: &'static str) -> Self {
+        Self { code, message }
+    }
+
+    pub fn code(self) -> &'static str {
+        self.code
+    }
+
+    pub fn message(self) -> &'static str {
+        self.message
+    }
+}
+
+pub enum NotificationRuntime {
+    Available(Arc<NotificationService>),
+    Unavailable(NotificationAvailability),
+}
+
+impl NotificationRuntime {
+    pub fn service(&self) -> Result<&Arc<NotificationService>, NotificationAvailability> {
+        match self {
+            Self::Available(service) => Ok(service),
+            Self::Unavailable(availability) => Err(*availability),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishOutcome {

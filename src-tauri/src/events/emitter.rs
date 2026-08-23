@@ -6,9 +6,23 @@ use tauri::{AppHandle, Emitter};
 use crate::models::account::AccountSummary;
 use crate::models::config::{ConnectionStatus, EnvironmentStatus};
 use crate::models::market::{Depth, Kline, Ticker};
+use crate::models::notification::NotificationChangedEvent;
 use crate::models::time::{DailyPnlSnapshot, TimeSnapshot};
 use crate::models::trading::{Order, Position, PrivatePanelsSnapshot};
 use crate::services::AccountLifecycleCoordinator;
+
+const NOTIFICATION_CHANGED_EVENT: &str = "notification:changed";
+
+fn emit_notification_changed_with<F>(
+    event: &NotificationChangedEvent,
+    emit: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str, &NotificationChangedEvent) -> Result<(), String>,
+{
+    emit(NOTIFICATION_CHANGED_EVENT, event)
+        .map_err(|_| "NOTIFICATION_EVENT_EMIT_FAILED".to_string())
+}
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -139,6 +153,17 @@ impl EventEmitter {
         self.emit_account_session("environment:updated", status);
     }
 
+    pub fn emit_notification_changed(
+        &self,
+        event: &NotificationChangedEvent,
+    ) -> Result<(), String> {
+        emit_notification_changed_with(event, |name, payload| {
+            self.app
+                .emit(name, payload)
+                .map_err(|_| "NOTIFICATION_EVENT_EMIT_FAILED".to_string())
+        })
+    }
+
     pub fn emit_error(&self, message: &str) {
         let _ = self.app.emit("error:occurred", message);
         self.emit_log("error", message);
@@ -158,11 +183,18 @@ impl EventEmitter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use serde_json::json;
 
     use crate::models::config::ConnectionStatus;
+    use crate::models::notification::{
+        NotificationCategory, NotificationChange, NotificationChangedEvent, NotificationContent,
+        NotificationScope, NotificationSeverity, NotificationToastCandidate,
+    };
 
-    use super::{AccountSessionEvent, WebsocketStatusTracker};
+    use super::{emit_notification_changed_with, AccountSessionEvent, WebsocketStatusTracker};
 
     #[test]
     fn account_session_event_serializes_a_camel_case_epoch_envelope() {
@@ -199,5 +231,88 @@ mod tests {
         tracker.record("connected");
         tracker.record("unknown");
         assert_eq!(observer.status(), ConnectionStatus::Connected);
+    }
+
+    fn changed_event() -> NotificationChangedEvent {
+        NotificationChangedEvent {
+            previous_revision: "41".into(),
+            revision: "42".into(),
+            change: NotificationChange::Created,
+            affected_scopes: vec![NotificationScope::Account {
+                account_id: "primary".into(),
+            }],
+            notification_id: Some("00000000-0000-4000-8000-000000000042".into()),
+            toast_candidate: Some(NotificationToastCandidate {
+                id: "00000000-0000-4000-8000-000000000042".into(),
+                scope: NotificationScope::Account {
+                    account_id: "primary".into(),
+                },
+                session_epoch: Some(7),
+                category: NotificationCategory::ConnectionSystem,
+                severity: NotificationSeverity::Error,
+                content: NotificationContent {
+                    message_key: "connection.unavailable".into(),
+                    params: BTreeMap::new(),
+                    fallback_title: "连接不可用".into(),
+                    fallback_body: "交易连接暂时不可用，请检查网络或稍后重试。".into(),
+                },
+                action: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn notification_changed_emits_the_exact_event_name_and_json() {
+        let mut captured = None;
+
+        emit_notification_changed_with(&changed_event(), |name, payload| {
+            captured = Some((name.to_string(), serde_json::to_value(payload).unwrap()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            captured,
+            Some((
+                "notification:changed".into(),
+                json!({
+                    "previousRevision": "41",
+                    "revision": "42",
+                    "change": "created",
+                    "affectedScopes": [
+                        { "type": "account", "accountId": "primary" }
+                    ],
+                    "notificationId": "00000000-0000-4000-8000-000000000042",
+                    "toastCandidate": {
+                        "id": "00000000-0000-4000-8000-000000000042",
+                        "scope": { "type": "account", "accountId": "primary" },
+                        "sessionEpoch": 7,
+                        "category": "connectionSystem",
+                        "severity": "error",
+                        "content": {
+                            "messageKey": "connection.unavailable",
+                            "params": {},
+                            "fallbackTitle": "连接不可用",
+                            "fallbackBody": "交易连接暂时不可用，请检查网络或稍后重试。"
+                        }
+                    }
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn notification_callback_failure_is_sanitized_and_never_recurses() {
+        let calls = AtomicUsize::new(0);
+
+        let error = emit_notification_changed_with(&changed_event(), |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("apiKey=raw-secret".into())
+        })
+        .unwrap_err();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(error, "NOTIFICATION_EVENT_EMIT_FAILED");
+        assert!(!error.contains("raw-secret"));
     }
 }

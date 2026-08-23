@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use crate::models::time::{TimeSnapshot, TimeSource, TimeSyncStatus};
 
 mod coordination;
+mod notification_maintenance;
 mod rescheduling;
 
 #[test]

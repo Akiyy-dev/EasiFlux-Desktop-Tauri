@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +20,7 @@ use crate::models::config::{
 };
 use crate::models::time::{TimeSnapshot, TimeSyncStatus};
 use crate::models::trading::PrivatePanelsSnapshot;
+use crate::services::notification::NotificationRuntime;
 use crate::services::{
     AccountLifecycleCoordinator, ChartWorkspaceService, ConnectionService, DailyPnlService,
     MarketService, TimeService, TradingService,
@@ -37,6 +38,7 @@ const INTERVAL_PRIVATE_PANELS: Duration = Duration::from_secs(4);
 const INTERVAL_DAILY_PNL: Duration = Duration::from_secs(60);
 const INTERVAL_MARKET_FALLBACK: Duration = Duration::from_secs(1);
 const INTERVAL_KLINE_FLUSH: Duration = Duration::from_secs(5);
+const INTERVAL_NOTIFICATION_MAINTENANCE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskId {
@@ -48,9 +50,24 @@ pub enum TaskId {
     MarketFallback,
     KlineFlush,
     Environment,
+    NotificationMaintenance,
 }
 
 impl TaskId {
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::TimeSync,
+            Self::FundingRate,
+            Self::Balances,
+            Self::PrivatePanels,
+            Self::DailyPnl,
+            Self::MarketFallback,
+            Self::KlineFlush,
+            Self::Environment,
+            Self::NotificationMaintenance,
+        ]
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "time" | "timeSync" => Some(Self::TimeSync),
@@ -75,6 +92,7 @@ impl TaskId {
             Self::MarketFallback => Some(INTERVAL_MARKET_FALLBACK),
             Self::KlineFlush => Some(INTERVAL_KLINE_FLUSH),
             Self::Environment => None,
+            Self::NotificationMaintenance => Some(INTERVAL_NOTIFICATION_MAINTENANCE),
         }
     }
 
@@ -88,6 +106,7 @@ impl TaskId {
             Self::MarketFallback => "行情快照",
             Self::KlineFlush => "K线持久化",
             Self::Environment => "环境检测",
+            Self::NotificationMaintenance => "通知维护",
         }
     }
 
@@ -97,11 +116,15 @@ impl TaskId {
 }
 
 fn first_tick_delay(task: TaskId) -> Duration {
-    if task == TaskId::KlineFlush {
+    if matches!(task, TaskId::KlineFlush | TaskId::NotificationMaintenance) {
         task.interval().expect("periodic task has an interval")
     } else {
         Duration::ZERO
     }
+}
+
+fn begin_scheduler_start(running: &AtomicBool) -> bool {
+    !running.swap(true, Ordering::SeqCst)
 }
 
 fn configured_task_interval(task: TaskId, config: &AppConfig) -> Option<Duration> {
@@ -337,6 +360,49 @@ async fn run_reschedulable_periodic<F, Fut>(
     }
 }
 
+async fn run_fixed_periodic<F, Fut>(
+    running: Arc<AtomicBool>,
+    run_state: Arc<Mutex<TaskRunState>>,
+    first_delay: Duration,
+    interval: Duration,
+    mut execute: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + first_delay, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = run_scheduled_task(run_state.as_ref(), false, &mut execute).await;
+    }
+}
+
+async fn run_notification_maintenance_once(
+    notification: &Arc<NotificationRuntime>,
+    config: &Arc<RwLock<AppConfig>>,
+    now_ms: u64,
+) {
+    let NotificationRuntime::Available(service) = notification.as_ref() else {
+        return;
+    };
+    let configured_accounts: HashSet<String> = {
+        let config = config.read().await;
+        crate::services::account_profiles::normalize_account_ids(
+            &config.accounts,
+            &config.active_account_id,
+        )
+        .into_iter()
+        .collect()
+    };
+    if let Err(error) = service.prune(&configured_accounts, now_ms).await {
+        tracing::warn!(code = error.code(), "notification maintenance failed");
+    }
+}
+
 async fn drain_scheduled_runs<F, Fut>(
     run_state: &Mutex<TaskRunState>,
     mut execute: F,
@@ -394,6 +460,7 @@ pub struct SchedulerService {
     connection: Arc<ConnectionService>,
     ws: Arc<WsManager>,
     config: Arc<RwLock<AppConfig>>,
+    notification: Arc<NotificationRuntime>,
     emitter: EventEmitter,
     api: Arc<crate::api::ApiClient>,
     environment_status: Arc<RwLock<EnvironmentStatus>>,
@@ -415,22 +482,14 @@ impl SchedulerService {
         connection: Arc<ConnectionService>,
         ws: Arc<WsManager>,
         config: Arc<RwLock<AppConfig>>,
+        notification: Arc<NotificationRuntime>,
         emitter: EventEmitter,
         api: Arc<crate::api::ApiClient>,
         environment_status: Arc<RwLock<EnvironmentStatus>>,
         account_lifecycle: Arc<AccountLifecycleCoordinator>,
     ) -> Self {
         let mut tasks = HashMap::new();
-        for id in [
-            TaskId::TimeSync,
-            TaskId::FundingRate,
-            TaskId::Balances,
-            TaskId::PrivatePanels,
-            TaskId::DailyPnl,
-            TaskId::MarketFallback,
-            TaskId::KlineFlush,
-            TaskId::Environment,
-        ] {
+        for &id in TaskId::all() {
             tasks.insert(id, TaskRuntime::new());
         }
         let (market_fallback_interval_tx, _) =
@@ -444,6 +503,7 @@ impl SchedulerService {
             connection,
             ws,
             config,
+            notification,
             emitter,
             api,
             environment_status,
@@ -457,7 +517,7 @@ impl SchedulerService {
     }
 
     pub async fn start(&self) {
-        if self.running.swap(true, Ordering::SeqCst) {
+        if !begin_scheduler_start(&self.running) {
             return;
         }
         let market_fallback_interval = {
@@ -474,6 +534,7 @@ impl SchedulerService {
             TaskId::PrivatePanels,
             TaskId::DailyPnl,
             TaskId::KlineFlush,
+            TaskId::NotificationMaintenance,
         ] {
             if let Some(interval) = id.interval() {
                 self.spawn_periodic(id, interval).await;
@@ -531,21 +592,14 @@ impl SchedulerService {
         let scheduler = self.clone_refs();
         let run_state = runtime.run_state.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            let start = if task == TaskId::KlineFlush {
-                tokio::time::Instant::now() + first_tick_delay(task)
-            } else {
-                tokio::time::Instant::now()
-            };
-            let mut ticker = tokio::time::interval_at(start, interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                if !scheduler.running.load(Ordering::Relaxed) {
-                    break;
-                }
-                let _ =
-                    run_scheduled_task(run_state.as_ref(), false, || scheduler.execute(task)).await;
-            }
+            run_fixed_periodic(
+                scheduler.running.clone(),
+                run_state,
+                first_tick_delay(task),
+                interval,
+                || scheduler.execute(task),
+            )
+            .await;
         });
         *runtime.handle.lock().await = Some(handle);
     }
@@ -581,6 +635,7 @@ impl SchedulerService {
             connection: self.connection.clone(),
             ws: self.ws.clone(),
             config: self.config.clone(),
+            notification: self.notification.clone(),
             emitter: self.emitter.clone(),
             api: self.api.clone(),
             environment_status: self.environment_status.clone(),
@@ -608,6 +663,15 @@ impl SchedulerService {
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
             TaskId::KlineFlush => execute_kline_flush(self.chart_workspace.clone()).await,
             TaskId::Environment => self.run_environment().await,
+            TaskId::NotificationMaintenance => {
+                run_notification_maintenance_once(
+                    &self.notification,
+                    &self.config,
+                    self.time.local_now_ms(),
+                )
+                .await;
+                Ok(())
+            }
         }
     }
 
@@ -737,6 +801,7 @@ struct SchedulerRefs {
     connection: Arc<ConnectionService>,
     ws: Arc<WsManager>,
     config: Arc<RwLock<AppConfig>>,
+    notification: Arc<NotificationRuntime>,
     emitter: EventEmitter,
     api: Arc<crate::api::ApiClient>,
     environment_status: Arc<RwLock<EnvironmentStatus>>,
@@ -767,6 +832,15 @@ impl SchedulerRefs {
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
             TaskId::KlineFlush => execute_kline_flush(self.chart_workspace.clone()).await,
             TaskId::Environment => self.run_environment().await,
+            TaskId::NotificationMaintenance => {
+                run_notification_maintenance_once(
+                    &self.notification,
+                    &self.config,
+                    self.time.local_now_ms(),
+                )
+                .await;
+                Ok(())
+            }
         }
     }
 
