@@ -123,8 +123,17 @@ fn first_tick_delay(task: TaskId) -> Duration {
     }
 }
 
-fn begin_scheduler_start(running: &AtomicBool) -> bool {
-    !running.swap(true, Ordering::SeqCst)
+fn periodic_task_ids() -> &'static [TaskId] {
+    &[
+        TaskId::TimeSync,
+        TaskId::FundingRate,
+        TaskId::Balances,
+        TaskId::PrivatePanels,
+        TaskId::DailyPnl,
+        TaskId::MarketFallback,
+        TaskId::KlineFlush,
+        TaskId::NotificationMaintenance,
+    ]
 }
 
 fn configured_task_interval(task: TaskId, config: &AppConfig) -> Option<Duration> {
@@ -437,16 +446,122 @@ where
     }
 }
 
+type SchedulerHandle = tauri::async_runtime::JoinHandle<()>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerLifecycleState {
+    Stopped,
+    Starting { generation: u64 },
+    Running { generation: u64 },
+}
+
+struct SchedulerLifecycle {
+    state: SchedulerLifecycleState,
+    next_generation: u64,
+    handles: HashMap<TaskId, SchedulerHandle>,
+}
+
+impl SchedulerLifecycle {
+    fn new() -> Self {
+        Self {
+            state: SchedulerLifecycleState::Stopped,
+            next_generation: 0,
+            handles: HashMap::new(),
+        }
+    }
+
+    fn begin_start(&mut self) -> Option<u64> {
+        if self.state != SchedulerLifecycleState::Stopped {
+            return None;
+        }
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        self.state = SchedulerLifecycleState::Starting { generation };
+        Some(generation)
+    }
+
+    fn install_handles(&mut self, handles: Vec<(TaskId, SchedulerHandle)>) {
+        for (task, handle) in handles {
+            if let Some(previous) = self.handles.insert(task, handle) {
+                previous.abort();
+            }
+        }
+    }
+
+    fn finish_start(&mut self, generation: u64) {
+        debug_assert_eq!(self.state, SchedulerLifecycleState::Starting { generation });
+        self.state = SchedulerLifecycleState::Running { generation };
+    }
+
+    fn stop(&mut self) -> (bool, Vec<SchedulerHandle>) {
+        let was_active = self.state != SchedulerLifecycleState::Stopped || !self.handles.is_empty();
+        self.state = SchedulerLifecycleState::Stopped;
+        let handles = std::mem::take(&mut self.handles).into_values().collect();
+        (was_active, handles)
+    }
+
+    #[cfg(test)]
+    fn running_generation(&self) -> Option<u64> {
+        match self.state {
+            SchedulerLifecycleState::Running { generation } => Some(generation),
+            SchedulerLifecycleState::Stopped | SchedulerLifecycleState::Starting { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn handle_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    #[cfg(test)]
+    fn has_handle(&self, task: TaskId) -> bool {
+        self.handles.contains_key(&task)
+    }
+}
+
+async fn start_scheduler_lifecycle<F, PrepareFut, FinishFut>(
+    lifecycle: &Mutex<SchedulerLifecycle>,
+    running: &Arc<AtomicBool>,
+    install: F,
+) -> bool
+where
+    F: FnOnce(u64) -> PrepareFut,
+    PrepareFut: std::future::Future<Output = (Vec<(TaskId, SchedulerHandle)>, FinishFut)>,
+    FinishFut: std::future::Future<Output = ()>,
+{
+    let mut lifecycle = lifecycle.lock().await;
+    let Some(generation) = lifecycle.begin_start() else {
+        return false;
+    };
+    running.store(true, Ordering::SeqCst);
+    let (handles, finish_start) = install(generation).await;
+    lifecycle.install_handles(handles);
+    finish_start.await;
+    lifecycle.finish_start(generation);
+    true
+}
+
+async fn stop_scheduler_lifecycle(
+    lifecycle: &Mutex<SchedulerLifecycle>,
+    running: &Arc<AtomicBool>,
+) -> bool {
+    let mut lifecycle = lifecycle.lock().await;
+    running.store(false, Ordering::SeqCst);
+    let (was_active, handles) = lifecycle.stop();
+    for handle in handles {
+        handle.abort();
+    }
+    was_active
+}
+
 struct TaskRuntime {
     run_state: Arc<Mutex<TaskRunState>>,
-    handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 impl TaskRuntime {
     fn new() -> Self {
         Self {
             run_state: Arc::new(Mutex::new(TaskRunState::default())),
-            handle: Mutex::new(None),
         }
     }
 }
@@ -466,6 +581,7 @@ pub struct SchedulerService {
     environment_status: Arc<RwLock<EnvironmentStatus>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
     running: Arc<AtomicBool>,
+    lifecycle: Mutex<SchedulerLifecycle>,
     tasks: HashMap<TaskId, TaskRuntime>,
     market_fallback_interval_tx: tokio::sync::watch::Sender<Duration>,
     prev_public_connected: Arc<Mutex<bool>>,
@@ -509,6 +625,7 @@ impl SchedulerService {
             environment_status,
             account_lifecycle,
             running: Arc::new(AtomicBool::new(false)),
+            lifecycle: Mutex::new(SchedulerLifecycle::new()),
             tasks,
             market_fallback_interval_tx,
             prev_public_connected: Arc::new(Mutex::new(false)),
@@ -517,41 +634,37 @@ impl SchedulerService {
     }
 
     pub async fn start(&self) {
-        if !begin_scheduler_start(&self.running) {
-            return;
-        }
-        let market_fallback_interval = {
-            let config = self.config.read().await;
-            configured_task_interval(TaskId::MarketFallback, &config)
-                .expect("market fallback has an interval")
-        };
-        self.market_fallback_interval_tx
-            .send_replace(market_fallback_interval);
-        for id in [
-            TaskId::TimeSync,
-            TaskId::FundingRate,
-            TaskId::Balances,
-            TaskId::PrivatePanels,
-            TaskId::DailyPnl,
-            TaskId::KlineFlush,
-            TaskId::NotificationMaintenance,
-        ] {
-            if let Some(interval) = id.interval() {
-                self.spawn_periodic(id, interval).await;
-            }
-        }
-        self.spawn_market_fallback().await;
-        let _ = self.run_now(TaskId::TimeSync, true).await;
-        let _ = self.run_now(TaskId::Environment, true).await;
+        start_scheduler_lifecycle(&self.lifecycle, &self.running, |_| async {
+            let market_fallback_interval = {
+                let config = self.config.read().await;
+                configured_task_interval(TaskId::MarketFallback, &config)
+                    .expect("market fallback has an interval")
+            };
+            self.market_fallback_interval_tx
+                .send_replace(market_fallback_interval);
+            let handles = periodic_task_ids()
+                .iter()
+                .copied()
+                .map(|task| {
+                    let handle = if task == TaskId::MarketFallback {
+                        self.spawn_market_fallback()
+                    } else {
+                        self.spawn_periodic(task, task.interval().expect("periodic task"))
+                    };
+                    (task, handle)
+                })
+                .collect();
+            let finish_start = async {
+                let _ = self.run_now(TaskId::TimeSync, true).await;
+                let _ = self.run_now(TaskId::Environment, true).await;
+            };
+            (handles, finish_start)
+        })
+        .await;
     }
 
     pub async fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
-        for runtime in self.tasks.values() {
-            if let Some(handle) = runtime.handle.lock().await.take() {
-                handle.abort();
-            }
-        }
+        stop_scheduler_lifecycle(&self.lifecycle, &self.running).await;
     }
 
     pub fn set_market_fallback_interval(&self, interval: Duration) {
@@ -587,11 +700,11 @@ impl SchedulerService {
         run_scheduled_task(runtime.run_state.as_ref(), force, || self.execute(task)).await
     }
 
-    async fn spawn_periodic(&self, task: TaskId, interval: Duration) {
+    fn spawn_periodic(&self, task: TaskId, interval: Duration) -> SchedulerHandle {
         let runtime = self.tasks.get(&task).expect("task registered");
         let scheduler = self.clone_refs();
         let run_state = runtime.run_state.clone();
-        let handle = tauri::async_runtime::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             run_fixed_periodic(
                 scheduler.running.clone(),
                 run_state,
@@ -600,11 +713,10 @@ impl SchedulerService {
                 || scheduler.execute(task),
             )
             .await;
-        });
-        *runtime.handle.lock().await = Some(handle);
+        })
     }
 
-    async fn spawn_market_fallback(&self) {
+    fn spawn_market_fallback(&self) -> SchedulerHandle {
         let runtime = self
             .tasks
             .get(&TaskId::MarketFallback)
@@ -612,7 +724,7 @@ impl SchedulerService {
         let scheduler = self.clone_refs();
         let run_state = Arc::clone(&runtime.run_state);
         let receiver = self.market_fallback_interval_tx.subscribe();
-        let handle = tauri::async_runtime::spawn(run_reschedulable_periodic(
+        tauri::async_runtime::spawn(run_reschedulable_periodic(
             Arc::clone(&self.running),
             run_state,
             receiver,
@@ -621,8 +733,7 @@ impl SchedulerService {
                 let scheduler = scheduler.clone();
                 async move { scheduler.execute(TaskId::MarketFallback).await }
             },
-        ));
-        *runtime.handle.lock().await = Some(handle);
+        ))
     }
 
     fn clone_refs(&self) -> SchedulerRefs {

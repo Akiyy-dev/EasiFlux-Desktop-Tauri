@@ -153,64 +153,174 @@ async fn notification_maintenance_runs_once_per_24_hour_period() {
     handle.abort();
 }
 
-#[tokio::test(start_paused = true)]
-async fn starting_scheduler_twice_does_not_duplicate_notification_maintenance_loop() {
-    let running = Arc::new(AtomicBool::new(false));
-    let runs = Arc::new(AtomicUsize::new(0));
-    let mut handles = Vec::new();
-
-    for _ in 0..2 {
-        if begin_scheduler_start(&running) {
-            let runs_for_loop = Arc::clone(&runs);
-            handles.push(tokio::spawn(run_fixed_periodic(
-                Arc::clone(&running),
-                Arc::new(Mutex::new(TaskRunState::default())),
-                DAY,
-                DAY,
-                move || {
-                    let runs = Arc::clone(&runs_for_loop);
-                    async move {
-                        runs.fetch_add(1, Ordering::SeqCst);
-                        Ok(())
-                    }
-                },
-            )));
-        }
-    }
-
-    assert_eq!(handles.len(), 1);
-    tokio::task::yield_now().await;
-    tokio::time::advance(DAY).await;
-    tokio::task::yield_now().await;
-    assert_eq!(runs.load(Ordering::SeqCst), 1);
-
-    running.store(false, Ordering::SeqCst);
-    handles[0].abort();
+fn generation_handles(
+    generation: u64,
+    running: Arc<AtomicBool>,
+    maintenance_runs: Arc<[AtomicUsize; 3]>,
+    maintenance_started: Arc<[tokio::sync::Notify; 3]>,
+    maintenance_ticked: Arc<[tokio::sync::Notify; 3]>,
+) -> Vec<(TaskId, tauri::async_runtime::JoinHandle<()>)> {
+    periodic_task_ids()
+        .iter()
+        .copied()
+        .map(|task| {
+            let handle = if task == TaskId::NotificationMaintenance {
+                let runs = Arc::clone(&maintenance_runs);
+                let started = Arc::clone(&maintenance_started);
+                let ticked = Arc::clone(&maintenance_ticked);
+                let running = Arc::clone(&running);
+                tauri::async_runtime::JoinHandle::Tokio(tokio::spawn(async move {
+                    started[generation as usize].notify_one();
+                    run_fixed_periodic(
+                        Arc::clone(&running),
+                        Arc::new(Mutex::new(TaskRunState::default())),
+                        DAY,
+                        DAY,
+                        move || {
+                            let runs = Arc::clone(&runs);
+                            let ticked = Arc::clone(&ticked);
+                            async move {
+                                runs[generation as usize].fetch_add(1, Ordering::SeqCst);
+                                ticked[generation as usize].notify_one();
+                                Ok(())
+                            }
+                        },
+                    )
+                    .await;
+                }))
+            } else {
+                tauri::async_runtime::JoinHandle::Tokio(tokio::spawn(std::future::pending()))
+            };
+            (task, handle)
+        })
+        .collect()
 }
 
 #[tokio::test(start_paused = true)]
-async fn scheduler_shutdown_cancels_notification_maintenance() {
-    let running = Arc::new(AtomicBool::new(true));
-    let runs = Arc::new(AtomicUsize::new(0));
-    let runs_for_loop = Arc::clone(&runs);
-    let handle = tokio::spawn(run_fixed_periodic(
-        Arc::clone(&running),
-        Arc::new(Mutex::new(TaskRunState::default())),
-        DAY,
-        DAY,
-        move || {
-            let runs = Arc::clone(&runs_for_loop);
-            async move {
-                runs.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        },
-    ));
+async fn concurrent_start_stop_restart_serializes_generations_and_owns_every_handle() {
+    let lifecycle = Arc::new(Mutex::new(SchedulerLifecycle::new()));
+    let running = Arc::new(AtomicBool::new(false));
+    let maintenance_runs = Arc::new([
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ]);
+    let maintenance_started = Arc::new([
+        tokio::sync::Notify::new(),
+        tokio::sync::Notify::new(),
+        tokio::sync::Notify::new(),
+    ]);
+    let maintenance_ticked = Arc::new([
+        tokio::sync::Notify::new(),
+        tokio::sync::Notify::new(),
+        tokio::sync::Notify::new(),
+    ]);
+    let start_entered = Arc::new(tokio::sync::Notify::new());
+    let release_start = Arc::new(tokio::sync::Notify::new());
 
-    running.store(false, Ordering::SeqCst);
+    let first_start = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        let running = Arc::clone(&running);
+        let maintenance_runs = Arc::clone(&maintenance_runs);
+        let maintenance_started = Arc::clone(&maintenance_started);
+        let maintenance_ticked = Arc::clone(&maintenance_ticked);
+        let start_entered = Arc::clone(&start_entered);
+        let release_start = Arc::clone(&release_start);
+        let running_for_install = Arc::clone(&running);
+        async move {
+            start_scheduler_lifecycle(&lifecycle, &running, move |generation| async move {
+                let handles = generation_handles(
+                    generation,
+                    Arc::clone(&running_for_install),
+                    Arc::clone(&maintenance_runs),
+                    Arc::clone(&maintenance_started),
+                    Arc::clone(&maintenance_ticked),
+                );
+                let finish_start = async move {
+                    start_entered.notify_one();
+                    release_start.notified().await;
+                };
+                (handles, finish_start)
+            })
+            .await
+        }
+    });
+    start_entered.notified().await;
+
+    let stop = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        let running = Arc::clone(&running);
+        async move { stop_scheduler_lifecycle(&lifecycle, &running).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!stop.is_finished());
+
+    let restart = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        let running = Arc::clone(&running);
+        let maintenance_runs = Arc::clone(&maintenance_runs);
+        let maintenance_started_for_install = Arc::clone(&maintenance_started);
+        let maintenance_ticked_for_install = Arc::clone(&maintenance_ticked);
+        let running_for_install = Arc::clone(&running);
+        async move {
+            start_scheduler_lifecycle(&lifecycle, &running, move |generation| async move {
+                (
+                    generation_handles(
+                        generation,
+                        Arc::clone(&running_for_install),
+                        maintenance_runs,
+                        maintenance_started_for_install,
+                        maintenance_ticked_for_install,
+                    ),
+                    async {},
+                )
+            })
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!restart.is_finished());
+
+    release_start.notify_one();
+    assert!(first_start.await.unwrap());
+    assert!(stop.await.unwrap());
+    assert!(restart.await.unwrap());
+
+    {
+        let state = lifecycle.lock().await;
+        assert_eq!(state.running_generation(), Some(2));
+        assert_eq!(state.handle_count(), periodic_task_ids().len());
+        for task in periodic_task_ids() {
+            assert!(state.has_handle(*task));
+        }
+    }
+
+    let duplicate_installs = Arc::new(AtomicUsize::new(0));
+    let duplicate_installs_in_start = Arc::clone(&duplicate_installs);
+    assert!(
+        !start_scheduler_lifecycle(&lifecycle, &running, move |_| async move {
+            duplicate_installs_in_start.fetch_add(1, Ordering::SeqCst);
+            (Vec::new(), async {})
+        })
+        .await
+    );
+    assert_eq!(duplicate_installs.load(Ordering::SeqCst), 0);
+
+    maintenance_started[2].notified().await;
     tokio::time::advance(DAY).await;
-    handle.await.unwrap();
-    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(Duration::from_secs(1), maintenance_ticked[2].notified())
+        .await
+        .expect("the restarted maintenance generation should tick after 24 hours");
+    assert_eq!(maintenance_runs[1].load(Ordering::SeqCst), 0);
+    assert_eq!(maintenance_runs[2].load(Ordering::SeqCst), 1);
+
+    assert!(stop_scheduler_lifecycle(&lifecycle, &running).await);
+    tokio::time::advance(DAY).await;
+    tokio::task::yield_now().await;
+    assert_eq!(maintenance_runs[2].load(Ordering::SeqCst), 1);
+    let state = lifecycle.lock().await;
+    assert_eq!(state.running_generation(), None);
+    assert_eq!(state.handle_count(), 0);
 }
 
 #[tokio::test]

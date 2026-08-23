@@ -6,8 +6,8 @@ use tokio::sync::RwLock;
 
 use crate::models::config::AppConfig;
 use crate::models::notification::{
-    ListNotificationsRequest, NotificationFilter, NotificationPage, NotificationRecord,
-    NotificationScope, NotificationSummary, DEFAULT_NOTIFICATION_PAGE_LIMIT,
+    ListNotificationsRequest, NotificationPage, NotificationRecord, NotificationScope,
+    NotificationSummary,
 };
 use crate::services::notification::{
     NotificationAvailability, NotificationError, NotificationRuntime, ViewContext,
@@ -107,28 +107,16 @@ async fn list_notifications_inner(
     runtime: &Arc<NotificationRuntime>,
     config: &Arc<RwLock<AppConfig>>,
     lifecycle: &AccountLifecycleCoordinator,
-    account_id: Option<String>,
-    filter: Option<NotificationFilter>,
-    cursor: Option<String>,
-    limit: Option<u32>,
+    request: ListNotificationsRequest,
     now_ms: u64,
 ) -> Result<NotificationPage, NotificationCommandError> {
     let _guard = lifecycle.read_guard().await;
     let config = config.read().await;
-    let context = resolve_context(&config, account_id.as_deref())?;
+    let context = resolve_context(&config, request.account_id.as_deref())?;
     drop(config);
     let service = runtime.service()?;
     service
-        .list(
-            context,
-            ListNotificationsRequest {
-                account_id,
-                filter: filter.unwrap_or_default(),
-                cursor,
-                limit: limit.unwrap_or(DEFAULT_NOTIFICATION_PAGE_LIMIT),
-            },
-            now_ms,
-        )
+        .list(context, request, now_ms)
         .await
         .map_err(Into::into)
 }
@@ -251,19 +239,13 @@ async fn clear_account_notifications_inner(
 #[tauri::command]
 pub async fn list_notifications(
     state: State<'_, AppState>,
-    account_id: Option<String>,
-    filter: Option<NotificationFilter>,
-    cursor: Option<String>,
-    limit: Option<u32>,
+    request: ListNotificationsRequest,
 ) -> Result<NotificationPage, NotificationCommandError> {
     list_notifications_inner(
         &state.notification,
         &state.config,
         state.account_lifecycle.as_ref(),
-        account_id,
-        filter,
-        cursor,
-        limit,
+        request,
         state.time.local_now_ms(),
     )
     .await

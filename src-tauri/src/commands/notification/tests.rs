@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 
@@ -8,8 +9,9 @@ use super::*;
 use crate::error::{AppError, AppResult};
 use crate::models::config::AppConfig;
 use crate::models::notification::{
-    NotificationCategory, NotificationContent, NotificationFilter, NotificationKind,
-    NotificationRecord, NotificationScope, NotificationSeverity,
+    ListNotificationsRequest, NotificationCategory, NotificationContent, NotificationFilter,
+    NotificationKind, NotificationRecord, NotificationScope, NotificationSeverity,
+    DEFAULT_NOTIFICATION_PAGE_LIMIT,
 };
 use crate::services::notification::{
     NotificationAvailability, NotificationEmitter, NotificationRuntime, NotificationService,
@@ -44,6 +46,61 @@ struct Fixture {
     config: Arc<RwLock<AppConfig>>,
     lifecycle: AccountLifecycleCoordinator,
     events: Arc<Mutex<Vec<crate::models::notification::NotificationChangedEvent>>>,
+}
+
+#[derive(Deserialize)]
+struct ListNotificationsCommandArgs {
+    request: ListNotificationsRequest,
+}
+
+#[test]
+fn list_notifications_public_ipc_shape_is_one_nested_camel_case_request() {
+    let args: ListNotificationsCommandArgs = serde_json::from_value(json!({
+        "request": {
+            "accountId": "primary",
+            "filter": "unread",
+            "cursor": "opaque-cursor",
+            "limit": 100
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(args.request.account_id.as_deref(), Some("primary"));
+    assert_eq!(args.request.filter, NotificationFilter::Unread);
+    assert_eq!(args.request.cursor.as_deref(), Some("opaque-cursor"));
+    assert_eq!(args.request.limit, 100);
+
+    let _public_command: fn(State<'static, AppState>, ListNotificationsRequest) -> _ =
+        list_notifications;
+}
+
+#[test]
+fn list_notifications_nested_request_owns_filter_and_limit_defaults() {
+    let args: ListNotificationsCommandArgs =
+        serde_json::from_value(json!({ "request": { "accountId": "primary" } })).unwrap();
+
+    assert_eq!(args.request.filter, NotificationFilter::All);
+    assert_eq!(args.request.limit, DEFAULT_NOTIFICATION_PAGE_LIMIT);
+}
+
+#[test]
+fn list_notifications_rejects_flat_and_unknown_request_shapes() {
+    let flat = serde_json::from_value::<ListNotificationsCommandArgs>(json!({
+        "accountId": "primary",
+        "filter": "all",
+        "cursor": null,
+        "limit": 50
+    }));
+    assert!(flat.is_err());
+
+    let unknown_envelope =
+        serde_json::from_value::<ListNotificationsCommandArgs>(json!({ "payload": {} }));
+    assert!(unknown_envelope.is_err());
+
+    let unknown_filter = serde_json::from_value::<ListNotificationsCommandArgs>(json!({
+        "request": { "filter": "futureFilter" }
+    }));
+    assert!(unknown_filter.is_err());
 }
 
 fn record(id: &str, scope: NotificationScope, created_at_ms: u64) -> NotificationRecord {
@@ -136,10 +193,12 @@ async fn omitted_context_is_global_only_even_when_an_account_is_active() {
         &fixture.runtime,
         &fixture.config,
         &fixture.lifecycle,
-        None,
-        Some(NotificationFilter::All),
-        None,
-        None,
+        ListNotificationsRequest {
+            account_id: None,
+            filter: NotificationFilter::All,
+            cursor: None,
+            limit: DEFAULT_NOTIFICATION_PAGE_LIMIT,
+        },
         NOW_MS,
     )
     .await
@@ -163,10 +222,12 @@ async fn explicit_active_context_merges_account_and_global_with_default_and_max_
         &fixture.runtime,
         &fixture.config,
         &fixture.lifecycle,
-        Some("primary".into()),
-        None,
-        None,
-        None,
+        ListNotificationsRequest {
+            account_id: Some("primary".into()),
+            filter: NotificationFilter::All,
+            cursor: None,
+            limit: DEFAULT_NOTIFICATION_PAGE_LIMIT,
+        },
         NOW_MS,
     )
     .await
@@ -183,10 +244,12 @@ async fn explicit_active_context_merges_account_and_global_with_default_and_max_
         &fixture.runtime,
         &fixture.config,
         &fixture.lifecycle,
-        Some("primary".into()),
-        Some(NotificationFilter::All),
-        None,
-        Some(100),
+        ListNotificationsRequest {
+            account_id: Some("primary".into()),
+            filter: NotificationFilter::All,
+            cursor: None,
+            limit: 100,
+        },
         NOW_MS,
     )
     .await
@@ -197,10 +260,12 @@ async fn explicit_active_context_merges_account_and_global_with_default_and_max_
         &fixture.runtime,
         &fixture.config,
         &fixture.lifecycle,
-        Some("primary".into()),
-        None,
-        None,
-        Some(101),
+        ListNotificationsRequest {
+            account_id: Some("primary".into()),
+            filter: NotificationFilter::All,
+            cursor: None,
+            limit: 101,
+        },
         NOW_MS,
     )
     .await
@@ -266,10 +331,12 @@ async fn all_six_command_results_match_the_public_json_shapes() {
         &list_fixture.runtime,
         &list_fixture.config,
         &list_fixture.lifecycle,
-        None,
-        Some(NotificationFilter::All),
-        None,
-        None,
+        ListNotificationsRequest {
+            account_id: None,
+            filter: NotificationFilter::All,
+            cursor: None,
+            limit: DEFAULT_NOTIFICATION_PAGE_LIMIT,
+        },
         NOW_MS,
     )
     .await
