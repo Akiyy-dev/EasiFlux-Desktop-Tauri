@@ -1,7 +1,12 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { tauriInvoke } from '../composables/useTauriCommand'
-import type { AppConfig, SaveCredentialRequest } from '../types/models'
+import type {
+  AppConfig,
+  GeneralSettings,
+  SaveCredentialRequest,
+  UpdateGeneralSettingsRequest,
+} from '../types/models'
 import { normalizeAccountId } from '../utils/account'
 
 type RiskConfigFields = Pick<
@@ -62,6 +67,25 @@ export const useConfigStore = defineStore('config', () => {
     }
   }
 
+  function adoptGeneralSettings(settings: GeneralSettings): void {
+    latestFetchRequest += 1
+    loading.value = false
+    if (config.value) config.value = { ...config.value, ...settings }
+  }
+
+  async function updateGeneralSettings(
+    request: UpdateGeneralSettingsRequest,
+  ): Promise<GeneralSettings> {
+    const result = await tauriInvoke<GeneralSettings>('update_general_settings', {
+      request: {
+        useWebsocket: request.useWebsocket,
+        tickerPollInterval: request.tickerPollInterval,
+      },
+    })
+    adoptGeneralSettings(result)
+    return result
+  }
+
   async function saveCredentials(req: SaveCredentialRequest): Promise<void> {
     await tauriInvoke('save_credentials', { request: req })
   }
@@ -77,6 +101,8 @@ export const useConfigStore = defineStore('config', () => {
     saveConfig,
     adoptActiveAccountId,
     adoptRiskConfig,
+    adoptGeneralSettings,
+    updateGeneralSettings,
     saveCredentials,
     hasCredentials,
   }

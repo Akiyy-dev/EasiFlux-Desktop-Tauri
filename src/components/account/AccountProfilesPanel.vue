@@ -4,15 +4,26 @@ import { AppButton, AppDialog } from '../ui'
 import CredentialEditor from './CredentialEditor.vue'
 import AccountReconciliationStatus from './AccountReconciliationStatus.vue'
 import { useAccountProfilesStore } from '../../stores/accountProfiles'
+import { useConfigStore } from '../../stores/config'
+import { useConnectionStore } from '../../stores/connection'
+import { reportError } from '../../services/errorService'
 import type { AccountProfile, CredentialState } from '../../types/models'
 
 const store = useAccountProfilesStore()
+const configStore = useConfigStore()
+const connectionStore = useConnectionStore()
 const accountActionsDisabled = computed(() => store.accountMutationsBlocked)
 const editorOpen = ref(false)
 const editorMode = ref<'create' | 'edit'>('create')
 const editing = ref<AccountProfile | null>(null)
 const deleteTarget = ref<AccountProfile | null>(null)
 const lastOperation = ref<'switch' | 'delete' | null>(null)
+const pendingReconnect = ref<{ accountId: string; generation: number } | null>(null)
+const reconnectError = ref<string | null>(null)
+const reconnectPending = computed(() =>
+  pendingReconnect.value?.accountId === store.activeAccountId,
+)
+let reconnectGeneration = 0
 const panelError = computed(() => {
   if (deleteTarget.value) return null
   if (store.switching || store.reconciliationError || store.recoveryError) return null
@@ -31,6 +42,15 @@ watch(
     if (unhealthy) editorOpen.value = false
   },
 )
+watch(() => store.activeAccountId, () => {
+  invalidateReconnect()
+}, { flush: 'sync' })
+watch(() => connectionStore.connected, (connected, wasConnected) => {
+  if (!pendingReconnect.value) return
+  if (!connectionStore.reconnecting && (connected || wasConnected)) {
+    invalidateReconnect()
+  }
+}, { flush: 'sync' })
 
 function retryProfileList(): void {
   void store.refreshProfiles().catch(() => undefined)
@@ -66,6 +86,46 @@ function credentialStateLabel(state: CredentialState): string {
   }[state]
 }
 
+function handleCredentialSaved(accountId: string): void {
+  const generation = ++reconnectGeneration
+  reconnectError.value = null
+  pendingReconnect.value = accountId === store.activeAccountId
+    && connectionStore.connected
+    ? { accountId, generation }
+    : null
+}
+
+function invalidateReconnect(): void {
+  reconnectGeneration += 1
+  pendingReconnect.value = null
+  reconnectError.value = null
+}
+
+function ownsReconnect(attempt: { accountId: string; generation: number }): boolean {
+  return reconnectGeneration === attempt.generation
+    && pendingReconnect.value?.generation === attempt.generation
+    && pendingReconnect.value.accountId === attempt.accountId
+    && store.activeAccountId === attempt.accountId
+}
+
+async function reconnectActiveAccount(): Promise<void> {
+  const attempt = pendingReconnect.value
+  if (!attempt || !ownsReconnect(attempt)) {
+    invalidateReconnect()
+    return
+  }
+  reconnectError.value = null
+  try {
+    const config = configStore.config ?? await configStore.fetchConfig()
+    if (!ownsReconnect(attempt)) return
+    await connectionStore.reconnect(config.useWebsocket, () => ownsReconnect(attempt))
+    if (ownsReconnect(attempt)) invalidateReconnect()
+  } catch (error) {
+    if (!ownsReconnect(attempt)) return
+    reconnectError.value = reportError(error, '账户重新连接失败')
+  }
+}
+
 async function switchAccount(accountId: string): Promise<void> {
   lastOperation.value = 'switch'
   try {
@@ -97,6 +157,19 @@ async function confirmDelete(): Promise<void> {
       </AppButton>
     </header>
     <AccountReconciliationStatus />
+    <div v-if="reconnectPending" class="credential-reconnect">
+      <p>凭据已保存，重新连接后生效</p>
+      <p v-if="reconnectError" role="alert">
+        {{ reconnectError }}
+      </p>
+      <AppButton
+        data-testid="account-reconnect"
+        :loading="connectionStore.reconnecting"
+        @click="reconnectActiveAccount"
+      >
+        重新连接
+      </AppButton>
+    </div>
     <p v-if="panelError" role="alert">
       {{ panelError }}
     </p>
@@ -163,6 +236,7 @@ async function confirmDelete(): Promise<void> {
     :initial-base-url="editing?.baseUrl ?? 'https://api.easicoin.io'"
     :require-credentials="editing?.credentialState === 'missing'"
     @update:show="editorOpen = $event"
+    @saved="handleCredentialSaved"
   />
 
   <AppDialog
@@ -196,7 +270,8 @@ async function confirmDelete(): Promise<void> {
 <style scoped>
 .account-profiles header,
 .actions,
-.profile-list-error {
+.profile-list-error,
+.credential-reconnect {
   display: flex;
   align-items: center;
   gap: var(--ef-space-2);
@@ -207,6 +282,12 @@ async function confirmDelete(): Promise<void> {
 .profile-list-error {
   justify-content: space-between;
   color: var(--ef-color-danger);
+}
+.credential-reconnect {
+  justify-content: space-between;
+}
+.credential-reconnect p {
+  margin: 0;
 }
 ul {
   display: grid;

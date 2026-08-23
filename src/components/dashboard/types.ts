@@ -1,6 +1,6 @@
 import type { NavKey } from '../../types/navigation'
 
-export type DashboardNavTarget = Extract<NavKey, 'trading' | 'account' | 'plugins'>
+export type DashboardNavTarget = Extract<NavKey, 'trading' | 'plugins'>
 
 export type DashboardActivityType = 'update' | 'announcement'
 

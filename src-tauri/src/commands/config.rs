@@ -6,6 +6,9 @@ use crate::services::risk::validate_risk_config;
 use crate::state::AppState;
 use crate::storage::CredentialStore;
 
+mod general_settings;
+pub use general_settings::update_general_settings;
+
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> AppResult<AppConfig> {
     Ok(state.config.read().await.clone())

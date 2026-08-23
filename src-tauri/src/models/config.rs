@@ -15,6 +15,8 @@ pub const CONFIG_FILENAME: &str = "config.toml";
 pub const DEFAULT_WATCHLIST: &[&str] = &["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
 pub const KLINE_INTERVALS: &[&str] = &["1", "5", "15", "60", "240", "D"];
 pub const RECV_WINDOW_MS: u64 = 5000;
+pub const MIN_TICKER_POLL_INTERVAL_SECS: f64 = 1.0;
+pub const MAX_TICKER_POLL_INTERVAL_SECS: f64 = 3600.0;
 
 /// Normalize account id: trim whitespace, fall back to `"default"` when empty.
 pub fn normalize_account_id(account_id: &str) -> String {
@@ -157,6 +159,29 @@ impl Default for AppConfig {
             risk_max_price_deviation_pct: "5".to_string(),
             risk_max_daily_orders: 500,
             trading_day_timezone: crate::models::time::DEFAULT_TRADING_DAY_TIMEZONE.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGeneralSettingsRequest {
+    pub use_websocket: bool,
+    pub ticker_poll_interval: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneralSettings {
+    pub use_websocket: bool,
+    pub ticker_poll_interval: f64,
+}
+
+impl From<&AppConfig> for GeneralSettings {
+    fn from(config: &AppConfig) -> Self {
+        Self {
+            use_websocket: config.use_websocket,
+            ticker_poll_interval: config.ticker_poll_interval,
         }
     }
 }

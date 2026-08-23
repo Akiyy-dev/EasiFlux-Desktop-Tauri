@@ -1,21 +1,33 @@
-export type AccountSection = 'api' | 'assets' | 'risk'
+export type AccountSettingsSection = 'api' | 'assets' | 'risk'
 
-export type NavKey =
-  | 'home'
-  | 'trading'
-  | 'charts'
+export type SettingsSection =
+  | 'general'
   | 'account'
   | 'plugins'
-  | 'settings'
+  | 'notifications'
+  | 'searchCommands'
+  | 'hotkeys'
+  | 'workspace'
+  | 'appearance'
+  | 'languageRegion'
+  | 'about'
 
-export interface NavigationTarget {
-  page: NavKey
-  section?: AccountSection
-}
+export type PrimaryPage = 'home' | 'trading' | 'charts' | 'plugins' | 'settings'
+export type NavKey = PrimaryPage
 
-export type NonAccountSection = 'welcome' | 'updates' | 'installed' | 'market' | 'manage'
-export type SidebarSectionKey = AccountSection | NonAccountSection
+export type SettingsNavigationTarget =
+  | { page: 'settings'; settingsSection?: Exclude<SettingsSection, 'account'> }
+  | { page: 'settings'; settingsSection: 'account'; accountSection?: AccountSettingsSection }
 
+export type NavigationTarget =
+  | { page: Exclude<PrimaryPage, 'settings'> }
+  | SettingsNavigationTarget
+
+export type NavigationRequest = PrimaryPage | NavigationTarget
+
+export type HomeSection = 'welcome' | 'updates'
+export type PluginSection = 'installed' | 'market' | 'manage'
+export type SidebarSectionKey = HomeSection | PluginSection
 export type SidebarTarget =
-  | { page: 'account'; section: AccountSection }
-  | { page: Exclude<NavKey, 'account'>; section: NonAccountSection }
+  | { page: 'home'; section: HomeSection }
+  | { page: 'plugins'; section: PluginSection }

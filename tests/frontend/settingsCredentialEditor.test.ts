@@ -2,7 +2,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import CredentialEditor from '../../src/components/account/CredentialEditor.vue'
-import SettingsDialog from '../../src/components/settings/SettingsDialog.vue'
+import QuickSetupDialog from '../../src/components/settings/QuickSetupDialog.vue'
 import OrderPanel from '../../src/components/trading/OrderPanel.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
@@ -14,7 +14,7 @@ vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }
 
 const config: AppConfig = {
   activeSymbol: 'BTCUSDT', activeAccountId: ' primary ', watchlistSymbols: ['BTCUSDT'],
-  theme: 'dark', klineInterval: '15', useWebsocket: true,
+  theme: 'dark', klineInterval: '15', useWebsocket: false,
   wsPublicUrl: 'wss://example.test/public', wsPrivateUrl: 'wss://example.test/private',
   tickerPollInterval: 1000, windowWidth: 1200, windowHeight: 800,
   accounts: ['primary'], riskEnabled: true, riskMaxOrderQty: '10',
@@ -28,7 +28,7 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-describe('settings credential editor integration', () => {
+describe('QuickSetup credential editor integration', () => {
   let pinia: Pinia
 
   beforeEach(async () => {
@@ -42,16 +42,16 @@ describe('settings credential editor integration', () => {
           credentialState: 'present', active: true,
         }])
       }
-      if (command === 'save_config') return Promise.resolve(config)
-      if (command === 'get_connection_status') return Promise.resolve('connected')
+      if (command === 'save_credentials') return Promise.resolve(undefined)
+      if (command === 'get_connection_status') return Promise.resolve('disconnected')
       return Promise.resolve(undefined)
     })
     useConfigStore().config = config
     await useAccountProfilesStore().refreshProfiles()
   })
 
-  function mountSettings() {
-    return mount(SettingsDialog, {
+  function mountQuickSetup() {
+    return mount(QuickSetupDialog, {
       props: { show: true },
       global: {
         plugins: [pinia],
@@ -66,7 +66,7 @@ describe('settings credential editor integration', () => {
   }
 
   it('mounts the shared editor with sanitized active-profile metadata', async () => {
-    const wrapper = mountSettings()
+    const wrapper = mountQuickSetup()
     await flushPromises()
     const editor = wrapper.getComponent(CredentialEditor)
 
@@ -78,8 +78,17 @@ describe('settings credential editor integration', () => {
     expect(wrapper.html()).not.toContain('apiSecret')
   })
 
-  it('saves general settings then connects using stored Keyring credentials', async () => {
-    const wrapper = mountSettings()
+  it('contains no General settings controls', async () => {
+    const wrapper = mountQuickSetup()
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('WebSocket 实时更新')
+    expect(wrapper.text()).not.toContain('行情轮询间隔')
+    expect(wrapper.find('[role="switch"]').exists()).toBe(false)
+  })
+
+  it('saves credentials before connecting with the persisted WebSocket preference', async () => {
+    const wrapper = mountQuickSetup()
     await flushPromises()
     const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
     await edit!.trigger('click')
@@ -91,25 +100,107 @@ describe('settings credential editor integration', () => {
     await flushPromises()
 
     const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
-    expect(commands.indexOf('save_credentials')).toBeLessThan(commands.indexOf('save_config'))
-    expect(commands.indexOf('save_config')).toBeLessThan(commands.indexOf('connect'))
+    expect(commands.indexOf('save_credentials')).toBeLessThan(commands.indexOf('connect'))
+    expect(commands).not.toContain('save_config')
     expect(tauriInvoke).toHaveBeenCalledWith('connect', {
-      startRealtime: true, credential: undefined,
+      startRealtime: false, credential: undefined,
     })
     expect(wrapper.emitted('update:show')).toContainEqual([false])
+    await wrapper.setProps({ show: false })
     expect(wrapper.findAll('[data-testid="dialog"]')).toHaveLength(0)
   })
 
-  it('hides settings while editing and restores it after cancel', async () => {
-    const wrapper = mountSettings()
+  it('keeps a failed credential draft mounted and never connects', async () => {
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') {
+        return Promise.resolve([{
+          accountId: 'primary', label: 'Main account', baseUrl: 'https://trade.example',
+          credentialState: 'present', active: true,
+        }])
+      }
+      if (command === 'save_credentials') return Promise.reject(new Error('save failed'))
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountQuickSetup()
     await flushPromises()
     const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
     await edit!.trigger('click')
+    const secrets = wrapper.findAll('input[type="password"]')
+    await secrets[0].setValue('draft-key')
+    await secrets[1].setValue('draft-secret')
+    const save = wrapper.findAll('button').find((button) => button.text() === '保存')
+    await save!.trigger('click')
+    await flushPromises()
 
-    expect(wrapper.text()).not.toContain('行情轮询间隔')
-    const cancel = wrapper.findAll('button').find((button) => button.text() === '取消')
-    await cancel!.trigger('click')
-    expect(wrapper.text()).toContain('行情轮询间隔')
+    expect(wrapper.getComponent(CredentialEditor).props('show')).toBe(true)
+    expect(secrets[0].element.value).toBe('draft-key')
+    expect(secrets[1].element.value).toBe('draft-secret')
+    expect(tauriInvoke).not.toHaveBeenCalledWith('connect', expect.anything())
+  })
+
+  it('retries only connection after credentials were saved', async () => {
+    let connectAttempts = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') {
+        return Promise.resolve([{
+          accountId: 'primary', label: 'Main account', baseUrl: 'https://trade.example',
+          credentialState: 'present', active: true,
+        }])
+      }
+      if (command === 'save_credentials') return Promise.resolve(undefined)
+      if (command === 'connect') {
+        connectAttempts += 1
+        return connectAttempts === 1
+          ? Promise.reject(new Error('connect failed'))
+          : Promise.resolve(undefined)
+      }
+      if (command === 'get_connection_status') return Promise.resolve('disconnected')
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountQuickSetup()
+    await flushPromises()
+    await wrapper.findAll('button').find((button) => button.text() === '编辑凭据')!.trigger('click')
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('凭据已保存，连接失败')
+    expect(wrapper.get('[data-testid="quick-setup-retry"]').exists()).toBe(true)
+    expect(wrapper.emitted('update:show') ?? []).not.toContainEqual([false])
+
+    await wrapper.get('[data-testid="quick-setup-retry"]').trigger('click')
+    await flushPromises()
+
+    const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command === 'save_credentials')).toHaveLength(1)
+    expect(commands.filter((command) => command === 'save_config')).toHaveLength(0)
+    expect(commands.filter((command) => command === 'connect')).toHaveLength(2)
+    expect(tauriInvoke).toHaveBeenLastCalledWith('get_connection_status')
+    expect(tauriInvoke).toHaveBeenCalledWith('connect', {
+      startRealtime: false, credential: undefined,
+    })
+    expect(wrapper.emitted('update:show')).toContainEqual([false])
+  })
+
+  it('unmounts a secret draft on close and starts a clean editor after reopening', async () => {
+    const wrapper = mountQuickSetup()
+    await flushPromises()
+    const edit = wrapper.findAll('button').find((button) => button.text() === '编辑凭据')
+    await edit!.trigger('click')
+    const secrets = wrapper.findAll('input[type="password"]')
+    await secrets[0].setValue('draft-key')
+    await secrets[1].setValue('draft-secret')
+
+    await wrapper.setProps({ show: false })
+    expect(wrapper.findComponent(CredentialEditor).exists()).toBe(false)
+
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+    expect(wrapper.find('[data-testid="quick-setup-retry"]').exists()).toBe(false)
+    await wrapper.findAll('button').find((button) => button.text() === '编辑凭据')!.trigger('click')
+    const reopenedSecrets = wrapper.findAll('input[type="password"]')
+
+    expect(reopenedSecrets[0].element.value).toBe('')
+    expect(reopenedSecrets[1].element.value).toBe('')
   })
 })
 

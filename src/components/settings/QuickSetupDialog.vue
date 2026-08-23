@@ -1,24 +1,24 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { NForm, NFormItem, NInputNumber, NSwitch } from 'naive-ui'
 import CredentialEditor from '../account/CredentialEditor.vue'
 import AccountReconciliationStatus from '../account/AccountReconciliationStatus.vue'
 import { AppButton, AppDialog } from '../ui'
 import { useAccountProfilesStore } from '../../stores/accountProfiles'
 import { useConfigStore } from '../../stores/config'
 import { useConnectionStore } from '../../stores/connection'
-import { notifySuccess, reportError } from '../../services/errorService'
-import type { AppConfig } from '../../types/models'
+import { reportError } from '../../services/errorService'
+
 const props = defineProps<{ show: boolean }>()
-const emit = defineEmits<{ 'update:show': [boolean] }>()
+const emit = defineEmits<{ 'update:show': [value: boolean] }>()
 const accountProfilesStore = useAccountProfilesStore()
 const configStore = useConfigStore()
 const connectionStore = useConnectionStore()
 const editorOpen = ref(false)
-const applyingCredentialSave = ref(false)
-const useWebsocket = ref(true)
-const tickerPollInterval = ref(1)
-const flowError = ref<string | null>(null)
+const credentialsSaved = ref(false)
+const connecting = ref(false)
+const connectionError = ref<string | null>(null)
+let flowSession = 0
+
 const activeAccountId = computed(() => accountProfilesStore.activeAccountId)
 const activeProfile = computed(() =>
   accountProfilesStore.profiles.find((profile) => profile.accountId === activeAccountId.value),
@@ -28,6 +28,7 @@ const profileBaseUrl = computed(() =>
   activeProfile.value?.baseUrl ?? 'https://api.easicoin.io',
 )
 const canOpenEditor = computed(() => Boolean(activeProfile.value)
+  && !credentialsSaved.value
   && !accountProfilesStore.switching
   && !accountProfilesStore.loading
   && !accountProfilesStore.listError
@@ -44,32 +45,35 @@ const profileStatus = computed(() => {
   }
   if (accountProfilesStore.loading) return '正在加载账户配置'
   if (!activeProfile.value) return '当前账户配置不可用'
-  if (activeProfile.value.credentialState === 'unavailable') {
-    return '凭据存储不可用'
-  }
+  if (activeProfile.value.credentialState === 'unavailable') return '凭据存储不可用'
   if (activeProfile.value.credentialState === 'missing') return '需要配置账户凭据'
   return null
 })
+
+function resetFlow(): void {
+  editorOpen.value = false
+  credentialsSaved.value = false
+  connecting.value = false
+  connectionError.value = null
+}
+
 watch(
   () => props.show,
   (visible) => {
-    if (!visible) {
-      editorOpen.value = false
-      applyingCredentialSave.value = false
-      flowError.value = null
-      return
+    flowSession += 1
+    const session = flowSession
+    resetFlow()
+    if (visible) {
+      void accountProfilesStore.refreshProfiles().catch((error) => {
+        if (session === flowSession && props.show) {
+          reportError(error, '加载账户配置失败')
+        }
+      })
     }
-    editorOpen.value = false
-    applyingCredentialSave.value = false
-    flowError.value = null
-    if (configStore.config) {
-      useWebsocket.value = configStore.config.useWebsocket
-      tickerPollInterval.value = configStore.config.tickerPollInterval
-    }
-    void accountProfilesStore.refreshProfiles().catch(reportError)
   },
   { immediate: true },
 )
+
 watch(
   () => accountProfilesStore.switching
     || Boolean(accountProfilesStore.reconciliationError)
@@ -78,43 +82,62 @@ watch(
     if (unhealthy) editorOpen.value = false
   },
 )
-async function saveGeneralSettings(): Promise<void> {
-  if (!configStore.config) {
-    await configStore.fetchConfig()
-  }
-  const currentConfig = configStore.config as AppConfig | null
-  if (!currentConfig) throw new Error('设置配置不可用')
-  await configStore.saveConfig({
-    ...currentConfig,
-    useWebsocket: useWebsocket.value,
-    tickerPollInterval: Math.max(1, tickerPollInterval.value),
-  })
+
+function closeFlow(): void {
+  flowSession += 1
+  resetFlow()
+  emit('update:show', false)
 }
-async function handleCredentialSaved(): Promise<void> {
-  applyingCredentialSave.value = true
-  flowError.value = null
+
+async function connectStoredCredentials(session = flowSession): Promise<void> {
+  connecting.value = true
+  connectionError.value = null
   try {
-    await saveGeneralSettings()
-    await connectionStore.connect(useWebsocket.value)
-    notifySuccess('设置已保存')
-    emit('update:show', false)
+    const config = configStore.config ?? await configStore.fetchConfig()
+    if (session !== flowSession || !props.show) return
+    await connectionStore.connect(
+      config.useWebsocket,
+      undefined,
+      () => session === flowSession && props.show,
+    )
+    if (session === flowSession && props.show) emit('update:show', false)
   } catch (error) {
-    flowError.value = reportError(error)
-    applyingCredentialSave.value = false
-    editorOpen.value = false
+    if (session === flowSession && props.show) {
+      connectionError.value = reportError(error, '凭据已保存，连接失败')
+    }
+  } finally {
+    if (session === flowSession) connecting.value = false
   }
 }
+
+function handleCredentialSaved(): void {
+  if (credentialsSaved.value || connecting.value) return
+  credentialsSaved.value = true
+  editorOpen.value = false
+  void connectStoredCredentials()
+}
+
+function retryConnection(): void {
+  if (!credentialsSaved.value || connecting.value) return
+  void connectStoredCredentials()
+}
+
 function openEditor(): void {
   if (!canOpenEditor.value) return
-  flowError.value = null
+  connectionError.value = null
   editorOpen.value = true
 }
+
+function handleDialogVisibility(visible: boolean): void {
+  if (!visible) closeFlow()
+}
 </script>
+
 <template>
   <AppDialog
-    :show="props.show && !editorOpen && !applyingCredentialSave"
-    title="API 设置"
-    @update:show="emit('update:show', $event)"
+    :show="props.show && !editorOpen"
+    title="账户快速设置"
+    @update:show="handleDialogVisibility"
   >
     <section class="account-summary">
       <div>
@@ -123,6 +146,7 @@ function openEditor(): void {
         <small>{{ activeAccountId }} / {{ profileBaseUrl }}</small>
       </div>
       <AppButton
+        v-if="!credentialsSaved"
         :disabled="!canOpenEditor"
         @click="openEditor"
       >
@@ -141,24 +165,22 @@ function openEditor(): void {
     <p v-else-if="profileStatus" class="status-message">
       {{ profileStatus }}
     </p>
-    <p v-if="flowError" role="alert">
-      {{ flowError }}
+    <p v-if="connecting" class="status-message" role="status">
+      正在连接账户…
     </p>
-    <NForm label-placement="top">
-      <NFormItem label="WebSocket 实时更新">
-        <NSwitch v-model:value="useWebsocket" />
-      </NFormItem>
-      <NFormItem label="行情轮询间隔（秒）">
-        <NInputNumber
-          v-model:value="tickerPollInterval"
-          :min="1"
-          :step="1"
-          style="width: 100%"
-        />
-      </NFormItem>
-    </NForm>
+    <p v-if="connectionError" role="alert">
+      {{ connectionError }}
+    </p>
+    <AppButton
+      v-if="credentialsSaved && connectionError"
+      data-testid="quick-setup-retry"
+      :loading="connecting"
+      @click="retryConnection"
+    >
+      重试连接
+    </AppButton>
     <template #footer>
-      <div class="footer">
+      <div v-if="!credentialsSaved" class="footer">
         <AppButton variant="primary" :disabled="!canOpenEditor" @click="openEditor">
           保存凭据并连接
         </AppButton>
@@ -166,9 +188,8 @@ function openEditor(): void {
     </template>
   </AppDialog>
   <CredentialEditor
-    v-if="activeProfile"
+    v-if="props.show && activeProfile && !credentialsSaved"
     :show="editorOpen
-      && !applyingCredentialSave
       && !accountProfilesStore.switching
       && !accountProfilesStore.reconciliationError
       && !accountProfilesStore.recoveryRequired"
@@ -181,4 +202,5 @@ function openEditor(): void {
     @update:show="editorOpen = $event"
   />
 </template>
-<style scoped src="./SettingsDialog.css"></style>
+
+<style scoped src="./QuickSetupDialog.css"></style>

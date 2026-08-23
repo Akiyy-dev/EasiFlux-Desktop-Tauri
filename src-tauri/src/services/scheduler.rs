@@ -16,7 +16,7 @@ use crate::events::EventEmitter;
 use crate::models::account::AccountSummary;
 use crate::models::config::{
     environment_label, normalize_account_id, AppConfig, ConnectionStatus, EnvironmentStatus,
-    DEFAULT_BASE_URL,
+    DEFAULT_BASE_URL, MAX_TICKER_POLL_INTERVAL_SECS, MIN_TICKER_POLL_INTERVAL_SECS,
 };
 use crate::models::time::{TimeSnapshot, TimeSyncStatus};
 use crate::models::trading::PrivatePanelsSnapshot;
@@ -101,6 +101,22 @@ fn first_tick_delay(task: TaskId) -> Duration {
         task.interval().expect("periodic task has an interval")
     } else {
         Duration::ZERO
+    }
+}
+
+fn configured_task_interval(task: TaskId, config: &AppConfig) -> Option<Duration> {
+    if task == TaskId::MarketFallback {
+        let seconds = config.ticker_poll_interval;
+        let safe = if seconds.is_finite()
+            && (MIN_TICKER_POLL_INTERVAL_SECS..=MAX_TICKER_POLL_INTERVAL_SECS).contains(&seconds)
+        {
+            seconds
+        } else {
+            1.0
+        };
+        Some(Duration::from_secs_f64(safe))
+    } else {
+        task.interval()
     }
 }
 
@@ -286,6 +302,41 @@ where
     }
 }
 
+async fn run_reschedulable_periodic<F, Fut>(
+    running: Arc<AtomicBool>,
+    run_state: Arc<Mutex<TaskRunState>>,
+    mut intervals: tokio::sync::watch::Receiver<Duration>,
+    first_delay: Duration,
+    mut execute: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
+    let initial = *intervals.borrow();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + first_delay, initial);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            changed = intervals.changed() => {
+                if changed.is_err() || !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                let next = *intervals.borrow_and_update();
+                ticker = tokio::time::interval_at(tokio::time::Instant::now() + next, next);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            }
+            _ = ticker.tick() => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = run_scheduled_task(run_state.as_ref(), false, &mut execute).await;
+            }
+        }
+    }
+}
+
 async fn drain_scheduled_runs<F, Fut>(
     run_state: &Mutex<TaskRunState>,
     mut execute: F,
@@ -349,6 +400,7 @@ pub struct SchedulerService {
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
     running: Arc<AtomicBool>,
     tasks: HashMap<TaskId, TaskRuntime>,
+    market_fallback_interval_tx: tokio::sync::watch::Sender<Duration>,
     prev_public_connected: Arc<Mutex<bool>>,
     prev_private_connected: Arc<Mutex<bool>>,
 }
@@ -381,6 +433,8 @@ impl SchedulerService {
         ] {
             tasks.insert(id, TaskRuntime::new());
         }
+        let (market_fallback_interval_tx, _) =
+            tokio::sync::watch::channel(INTERVAL_MARKET_FALLBACK);
         Self {
             time,
             market,
@@ -396,6 +450,7 @@ impl SchedulerService {
             account_lifecycle,
             running: Arc::new(AtomicBool::new(false)),
             tasks,
+            market_fallback_interval_tx,
             prev_public_connected: Arc::new(Mutex::new(false)),
             prev_private_connected: Arc::new(Mutex::new(false)),
         }
@@ -405,19 +460,26 @@ impl SchedulerService {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
         }
+        let market_fallback_interval = {
+            let config = self.config.read().await;
+            configured_task_interval(TaskId::MarketFallback, &config)
+                .expect("market fallback has an interval")
+        };
+        self.market_fallback_interval_tx
+            .send_replace(market_fallback_interval);
         for id in [
             TaskId::TimeSync,
             TaskId::FundingRate,
             TaskId::Balances,
             TaskId::PrivatePanels,
             TaskId::DailyPnl,
-            TaskId::MarketFallback,
             TaskId::KlineFlush,
         ] {
             if let Some(interval) = id.interval() {
                 self.spawn_periodic(id, interval).await;
             }
         }
+        self.spawn_market_fallback().await;
         let _ = self.run_now(TaskId::TimeSync, true).await;
         let _ = self.run_now(TaskId::Environment, true).await;
     }
@@ -429,6 +491,10 @@ impl SchedulerService {
                 handle.abort();
             }
         }
+    }
+
+    pub fn set_market_fallback_interval(&self, interval: Duration) {
+        self.market_fallback_interval_tx.send_replace(interval);
     }
 
     pub async fn bootstrap_connection(&self) -> AppResult<()> {
@@ -481,6 +547,27 @@ impl SchedulerService {
                     run_scheduled_task(run_state.as_ref(), false, || scheduler.execute(task)).await;
             }
         });
+        *runtime.handle.lock().await = Some(handle);
+    }
+
+    async fn spawn_market_fallback(&self) {
+        let runtime = self
+            .tasks
+            .get(&TaskId::MarketFallback)
+            .expect("task registered");
+        let scheduler = self.clone_refs();
+        let run_state = Arc::clone(&runtime.run_state);
+        let receiver = self.market_fallback_interval_tx.subscribe();
+        let handle = tauri::async_runtime::spawn(run_reschedulable_periodic(
+            Arc::clone(&self.running),
+            run_state,
+            receiver,
+            Duration::ZERO,
+            move || {
+                let scheduler = scheduler.clone();
+                async move { scheduler.execute(TaskId::MarketFallback).await }
+            },
+        ));
         *runtime.handle.lock().await = Some(handle);
     }
 
@@ -640,6 +727,7 @@ impl SchedulerService {
     }
 }
 
+#[derive(Clone)]
 struct SchedulerRefs {
     time: Arc<TimeService>,
     market: Arc<MarketService>,

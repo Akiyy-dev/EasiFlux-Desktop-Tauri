@@ -1,11 +1,11 @@
-import type { NavKey, SidebarSectionKey } from '../../types/navigation'
+import type { SidebarSectionKey } from '../../types/navigation'
 
 export interface SidebarSection {
   title: string
   items: Array<{ key: SidebarSectionKey; label: string }>
 }
 
-export const sectionsByNav: Partial<Record<NavKey, SidebarSection[]>> = {
+export const sectionsByNav: Partial<Record<'home' | 'plugins', SidebarSection[]>> = {
   home: [{
     title: 'EasiFlux',
     items: [
@@ -19,14 +19,6 @@ export const sectionsByNav: Partial<Record<NavKey, SidebarSection[]>> = {
       { key: 'installed', label: '已安装插件' },
       { key: 'market', label: '插件市场' },
       { key: 'manage', label: '插件管理' },
-    ],
-  }],
-  account: [{
-    title: '账户',
-    items: [
-      { key: 'api', label: 'API 管理' },
-      { key: 'assets', label: '资产总览' },
-      { key: 'risk', label: '风险控制' },
     ],
   }],
 }

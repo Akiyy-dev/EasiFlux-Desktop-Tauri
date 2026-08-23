@@ -1,0 +1,57 @@
+.general-settings-panel {
+  display: grid;
+  gap: var(--ef-space-4);
+}
+
+.general-settings-header,
+.general-settings-error-row,
+.general-settings-reconnect {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ef-space-3);
+}
+
+.general-settings-header h2,
+.general-settings-header p,
+.general-settings-error-row p,
+.general-settings-reconnect p,
+.general-settings-error,
+.general-settings-muted {
+  margin: 0;
+}
+
+.general-settings-header h2 {
+  font-size: var(--ef-text-lg);
+}
+
+.general-settings-header p,
+.general-settings-muted,
+.general-settings-status {
+  color: var(--muted-foreground);
+}
+
+.general-settings-form {
+  max-width: 32rem;
+}
+
+.general-settings-error,
+.general-settings-error-row [role='alert'] {
+  color: var(--ef-color-danger);
+}
+
+.general-settings-reconnect {
+  padding: var(--ef-space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-md);
+  background: var(--muted);
+}
+
+@media (max-width: 640px) {
+  .general-settings-header,
+  .general-settings-error-row,
+  .general-settings-reconnect {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

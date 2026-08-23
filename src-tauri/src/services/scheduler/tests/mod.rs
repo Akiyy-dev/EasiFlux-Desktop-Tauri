@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use crate::models::time::{TimeSnapshot, TimeSource, TimeSyncStatus};
 
 mod coordination;
+mod rescheduling;
 
 #[test]
 fn task_id_parses_frontend_names() {

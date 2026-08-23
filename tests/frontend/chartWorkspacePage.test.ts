@@ -5,6 +5,7 @@ import AppShell from '../../src/components/layout/AppShell.vue'
 import NavigationRail from '../../src/components/layout/NavigationRail.vue'
 import Sidebar from '../../src/components/layout/Sidebar.vue'
 import TopBar from '../../src/components/layout/TopBar.vue'
+import SettingsCenterPage from '../../src/components/settings/SettingsCenterPage.vue'
 import { flushActiveChartWorkspace } from '../../src/services/chartWorkspaceFlushRegistry'
 import { reportError } from '../../src/services/errorService'
 import type { NavKey } from '../../src/types/navigation'
@@ -65,7 +66,8 @@ describe('chart workspace page integration', () => {
         plugins: [pinia],
         stubs: {
           DashboardPage: { template: '<div data-testid="dashboard-page" />' },
-          AccountCenterPage: { template: '<div data-testid="account-page" />' },
+          GeneralSettingsPanel: { template: '<div data-testid="general-settings-stub" />' },
+          AccountSettingsPage: { template: '<div data-testid="account-settings-stub" />' },
         },
       },
     })
@@ -80,15 +82,14 @@ describe('chart workspace page integration', () => {
     expect(wrapper.findComponent(Sidebar).exists()).toBe(false)
     expect(wrapper.find('[data-testid="trading-layout"]').exists()).toBe(false)
     expect(page.find('.ef-card').exists()).toBe(false)
-    expect(wrapper.find('[data-testid="account-page"]').exists()).toBe(false)
   })
 
-  it('keeps the same workspace instance across account navigation', async () => {
+  it('keeps the same workspace instance across settings navigation', async () => {
     const wrapper = mountShell()
     await selectPage(wrapper, 'charts')
     const first = wrapper.get('[data-testid="chart-workspace-page"]').element
 
-    await selectPage(wrapper, 'account')
+    await selectPage(wrapper, 'settings')
     await selectPage(wrapper, 'charts')
 
     expect(wrapper.get('[data-testid="chart-workspace-page"]').element).toBe(first)
@@ -105,23 +106,24 @@ describe('chart workspace page integration', () => {
     expect(wrapper.get('[data-testid="trading-layout"]').element).toBe(first)
   })
 
-  it('navigates immediately while the previous chart flush is still pending', async () => {
+  it('shows settings immediately while the previous chart flush is still pending', async () => {
     const wrapper = mountShell()
     await selectPage(wrapper, 'charts')
     const pending = deferred<void>()
     vi.mocked(flushActiveChartWorkspace).mockReturnValueOnce(pending.promise)
 
-    wrapper.findComponent(NavigationRail).vm.$emit('select', 'account')
+    wrapper.findComponent(NavigationRail).vm.$emit('select', 'settings')
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.find('[data-testid="account-page"]').exists()).toBe(true)
+    expect(wrapper.findComponent(SettingsCenterPage).exists()).toBe(true)
+    expect(wrapper.find('[data-testid="general-settings-stub"]').exists()).toBe(true)
     expect(wrapper.get('[data-testid="chart-workspace-page"]').isVisible()).toBe(false)
-    expect(wrapper.findComponent(NavigationRail).props('active')).toBe('account')
+    expect(wrapper.findComponent(NavigationRail).props('active')).toBe('settings')
 
     pending.resolve()
     await flushPromises()
-    expect(wrapper.find('[data-testid="account-page"]').exists()).toBe(true)
-    expect(wrapper.findComponent(NavigationRail).props('active')).toBe('account')
+    expect(wrapper.findComponent(SettingsCenterPage).exists()).toBe(true)
+    expect(wrapper.findComponent(NavigationRail).props('active')).toBe('settings')
   })
 
   it('reports a page flush failure and still navigates', async () => {
@@ -140,10 +142,10 @@ describe('chart workspace page integration', () => {
     const rail = wrapper.findComponent(NavigationRail).element
 
     await selectPage(wrapper, 'charts')
-    await selectPage(wrapper, 'account')
+    await selectPage(wrapper, 'settings')
 
     expect(wrapper.findComponent(TopBar).element).toBe(topBar)
     expect(wrapper.findComponent(NavigationRail).element).toBe(rail)
-    expect(wrapper.findComponent(Sidebar).exists()).toBe(true)
+    expect(wrapper.findComponent(Sidebar).exists()).toBe(false)
   })
 })

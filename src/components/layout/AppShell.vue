@@ -5,86 +5,124 @@ import TopBar from './TopBar.vue'
 import NavigationRail from './NavigationRail.vue'
 import Sidebar from './Sidebar.vue'
 import TradingLayout from './TradingLayout.vue'
-import AccountCenterPage from '../account/AccountCenterPage.vue'
 import DashboardPage from '../dashboard/DashboardPage.vue'
 import ChartWorkspacePage from '../chart/ChartWorkspacePage.vue'
+import SettingsCenterPage from '../settings/SettingsCenterPage.vue'
 import { useChartWorkspaceAutosaveHost } from '../../composables/useChartWorkspaceAutosaveHost'
 import { flushActiveChartWorkspace } from '../../services/chartWorkspaceFlushRegistry'
 import { reportError } from '../../services/errorService'
 import type {
-  AccountSection,
+  AccountSettingsSection,
+  HomeSection,
+  NavigationRequest,
   NavigationTarget,
-  NavKey,
-  NonAccountSection,
+  PluginSection,
+  PrimaryPage,
+  SettingsSection,
   SidebarSectionKey,
   SidebarTarget,
 } from '../../types/navigation'
 
-const emit = defineEmits<{
-  openSettings: []
-}>()
-
-const activePage = ref<NavKey>('home')
+const activePage = ref<PrimaryPage>('home')
+const previousNonSettingsPage = ref<Exclude<PrimaryPage, 'settings'>>('home')
+const settingsSessionId = ref(0)
 const chartsVisited = ref(false)
 const tradingVisited = ref(false)
-const activeAccountSection = ref<AccountSection>('api')
-const activeSecondary = ref<NonAccountSection>('welcome')
+const activeHomeSection = ref<HomeSection>('welcome')
+const activePluginSection = ref<PluginSection>('installed')
+const settingsTarget = ref({
+  settingsSection: 'general' as SettingsSection,
+  accountSection: 'api' as AccountSettingsSection,
+})
 const sidebarCollapsed = ref(false)
 
 useChartWorkspaceAutosaveHost()
-const sidebarTarget = computed<SidebarTarget>(() => activePage.value === 'account'
-  ? { page: 'account', section: activeAccountSection.value }
-  : { page: activePage.value, section: activeSecondary.value })
+const sidebarTarget = computed<SidebarTarget | null>(() => {
+  if (activePage.value === 'home') {
+    return { page: 'home', section: activeHomeSection.value }
+  }
+  if (activePage.value === 'plugins') {
+    return { page: 'plugins', section: activePluginSection.value }
+  }
+  return null
+})
 
 const pageTitle = computed(() => {
-  const map: Record<NavKey, string> = {
+  const map: Record<PrimaryPage, string> = {
     home: '首页',
     trading: '交易',
     charts: '图表',
-    account: '账户',
     plugins: '插件',
     settings: '设置',
   }
   return map[activePage.value]
 })
 
-function isAccountSection(value: string): value is AccountSection {
-  return value === 'api' || value === 'assets' || value === 'risk'
+function isHomeSection(value: SidebarSectionKey): value is HomeSection {
+  return value === 'welcome' || value === 'updates'
 }
 
-function isNonAccountSection(value: string): value is NonAccountSection {
-  return value === 'welcome' || value === 'updates' || value === 'installed'
-    || value === 'market' || value === 'manage'
+function isPluginSection(value: SidebarSectionKey): value is PluginSection {
+  return value === 'installed' || value === 'market' || value === 'manage'
+}
+
+function normalizeNavigation(request: NavigationRequest): NavigationTarget {
+  if (typeof request !== 'string') return request
+  if (request === 'settings') return { page: 'settings' }
+  return { page: request }
 }
 
 function applyNavigation(target: NavigationTarget): void {
-  activePage.value = target.page
-  if (target.page === 'charts') chartsVisited.value = true
-  if (target.page === 'trading') tradingVisited.value = true
-  if (target.page === 'account' && target.section) {
-    activeAccountSection.value = target.section
-  } else if (target.page === 'home') {
-    activeSecondary.value = 'welcome'
-  } else if (target.page === 'plugins') {
-    activeSecondary.value = 'installed'
+  if (target.page === 'settings') {
+    if (activePage.value !== 'settings') {
+      previousNonSettingsPage.value = activePage.value
+    }
+    settingsTarget.value = target.settingsSection === 'account'
+      ? {
+          settingsSection: 'account',
+          accountSection: target.accountSection ?? 'api',
+        }
+      : {
+          settingsSection: target.settingsSection ?? 'general',
+          accountSection: 'api',
+        }
+    settingsSessionId.value += 1
+    activePage.value = 'settings'
+    return
   }
+
+  activePage.value = target.page
+  if (target.page === 'trading') tradingVisited.value = true
+  if (target.page === 'charts') chartsVisited.value = true
+  if (target.page === 'home') activeHomeSection.value = 'welcome'
+  if (target.page === 'plugins') activePluginSection.value = 'installed'
 }
 
-function navigateTo(target: NavKey | NavigationTarget): Promise<void> {
-  const normalized = typeof target === 'string' ? { page: target } : target
-  const flush = flushActiveChartWorkspace('page').catch((error: unknown) => {
+function navigateTo(request: NavigationRequest): Promise<void> {
+  const normalized = normalizeNavigation(request)
+  if (normalized.page === 'settings'
+    && activePage.value === 'settings'
+    && typeof request === 'string') {
+    return Promise.resolve()
+  }
+  const pending = flushActiveChartWorkspace('page').catch((error: unknown) => {
     reportError(error, '图表页面切换前保存失败')
   })
   applyNavigation(normalized)
-  return flush
+  return pending
+}
+
+function returnToWorkspace(): Promise<void> {
+  return navigateTo(previousNonSettingsPage.value)
 }
 
 function selectSection(section: SidebarSectionKey): void {
-  if (activePage.value === 'account' && isAccountSection(section)) {
-    activeAccountSection.value = section
-    return
+  if (activePage.value === 'home' && isHomeSection(section)) {
+    activeHomeSection.value = section
   }
-  if (isNonAccountSection(section)) activeSecondary.value = section
+  if (activePage.value === 'plugins' && isPluginSection(section)) {
+    activePluginSection.value = section
+  }
 }
 </script>
 
@@ -95,10 +133,9 @@ function selectSection(section: SidebarSectionKey): void {
       <NavigationRail
         :active="activePage"
         @select="navigateTo"
-        @open-settings="emit('openSettings')"
       />
       <Sidebar
-        v-if="activePage !== 'charts'"
+        v-if="sidebarTarget"
         :target="sidebarTarget"
         :collapsed="sidebarCollapsed"
         @select-section="selectSection"
@@ -120,12 +157,15 @@ function selectSection(section: SidebarSectionKey): void {
           v-show="activePage === 'charts'"
           :active="activePage === 'charts'"
         />
-        <AccountCenterPage
-          v-if="activePage === 'account'"
-          :active-section="activeAccountSection"
+        <SettingsCenterPage
+          v-if="activePage === 'settings'"
+          :key="settingsSessionId"
+          :initial-section="settingsTarget.settingsSection"
+          :initial-account-section="settingsTarget.accountSection"
+          @back="returnToWorkspace"
         />
         <AppCard
-          v-if="activePage === 'plugins' || activePage === 'settings'"
+          v-if="activePage === 'plugins'"
           :title="pageTitle"
           class="placeholder"
         >

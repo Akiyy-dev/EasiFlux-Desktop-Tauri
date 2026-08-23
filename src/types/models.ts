@@ -26,6 +26,13 @@ export interface AppConfig {
   tradingDayTimezone: string
 }
 
+export interface GeneralSettings {
+  useWebsocket: boolean
+  tickerPollInterval: number
+}
+
+export type UpdateGeneralSettingsRequest = GeneralSettings
+
 export interface ApiCredential {
   apiKey: string
   apiSecret: string
