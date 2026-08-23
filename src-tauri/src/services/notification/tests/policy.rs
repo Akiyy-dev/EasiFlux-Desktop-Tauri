@@ -160,7 +160,14 @@ fn producer_context_requires_an_explicit_valid_account_scope() {
 
 #[test]
 fn producer_context_rejects_free_text_and_secret_like_source_ids() {
-    for source in ["raw server body", "bearer-secret", "token_api_value"] {
+    for source in [
+        "raw server body",
+        "bearer-secret",
+        "token_api_value",
+        "event:AKIAIOSFODNN7EXAMPLE",
+        "event:eyJhbGciOiJIUzI1NiJ9",
+        "attempt:ghp_xxxxxxxxxxxxxxxxxxxx",
+    ] {
         let error = PolicyContext::new("alpha", 4, source).unwrap_err();
         assert_eq!(error.code(), "INVALID_NOTIFICATION_CONTENT");
     }
@@ -177,4 +184,40 @@ fn producer_context_rejects_free_text_and_secret_like_source_ids() {
     )
     .unwrap_err();
     assert_eq!(error.code(), "INVALID_NOTIFICATION_CONTENT");
+}
+
+#[test]
+fn policy_rejects_uncontrolled_incident_submission_and_dedupe_components() {
+    let policy = NotificationPolicy;
+    for incident_id in [
+        "raw incident text".to_string(),
+        "incident-secret-value".to_string(),
+        "incident:edge".to_string(),
+        "a".repeat(257),
+    ] {
+        let connection = policy
+            .connection_unavailable(
+                context("connection-edge"),
+                NotificationChannel::Api,
+                &incident_id,
+            )
+            .unwrap_err();
+        assert_eq!(connection.code(), "INVALID_NOTIFICATION_CONTENT");
+
+        let environment = policy
+            .environment_unavailable(
+                context("environment-edge"),
+                NotificationEnvironment::Production,
+                &incident_id,
+            )
+            .unwrap_err();
+        assert_eq!(environment.code(), "INVALID_NOTIFICATION_CONTENT");
+    }
+
+    for submission_id in ["submission:1".to_string(), "s".repeat(257)] {
+        let error = policy
+            .order_rejected(context("rejected-event"), Some("order-1"), &submission_id)
+            .unwrap_err();
+        assert_eq!(error.code(), "INVALID_NOTIFICATION_CONTENT");
+    }
 }

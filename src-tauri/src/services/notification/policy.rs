@@ -1,9 +1,10 @@
 use crate::models::notification::{
-    AccountNotificationSection, ClientNotificationFailedStep, ClientNotificationKind,
-    CreateClientNotificationRequest, NotificationAction, NotificationCategory, NotificationChannel,
-    NotificationContent, NotificationEntity, NotificationEntityType, NotificationEnvironment,
-    NotificationInput, NotificationKind, NotificationScalar, NotificationScope,
-    NotificationSeverity, RiskViolationCode, MAX_JAVASCRIPT_SAFE_INTEGER,
+    is_safe_notification_source_event_id, AccountNotificationSection, ClientNotificationFailedStep,
+    ClientNotificationKind, CreateClientNotificationRequest, NotificationAction,
+    NotificationCategory, NotificationChannel, NotificationContent, NotificationEntity,
+    NotificationEntityType, NotificationEnvironment, NotificationInput, NotificationKind,
+    NotificationScalar, NotificationScope, NotificationSeverity, RiskViolationCode,
+    MAX_JAVASCRIPT_SAFE_INTEGER,
 };
 
 use super::NotificationError;
@@ -32,7 +33,7 @@ impl PolicyContext {
         .validate()
         .map_err(|error| NotificationError::new(error.code(), "通知账户范围无效"))?;
         if context.session_epoch > MAX_JAVASCRIPT_SAFE_INTEGER
-            || !is_safe_source_id(&context.source_event_id)
+            || !is_safe_notification_source_event_id(&context.source_event_id)
         {
             return Err(NotificationError::new(
                 "INVALID_NOTIFICATION_CONTENT",
@@ -133,12 +134,7 @@ impl NotificationPolicy {
         order_id: Option<&str>,
         submission_id: &str,
     ) -> Result<NotificationInput, NotificationError> {
-        if !is_safe_source_id(submission_id) {
-            return Err(NotificationError::new(
-                "INVALID_NOTIFICATION_CONTENT",
-                "订单提交标识无效",
-            ));
-        }
+        validate_policy_identifier(submission_id, "订单提交标识无效")?;
         let params = if let Some(order_id) = order_id {
             vec![("orderId", NotificationScalar::String(order_id.into()))]
         } else {
@@ -315,6 +311,7 @@ impl NotificationPolicy {
         incident_id: &str,
         recovered: bool,
     ) -> Result<NotificationInput, NotificationError> {
+        validate_policy_identifier(incident_id, "连接故障标识无效")?;
         let (kind, severity, key, title, body, suffix) = if recovered {
             (
                 NotificationKind::ConnectionRecovered,
@@ -386,6 +383,7 @@ impl NotificationPolicy {
         incident_id: &str,
         recovered: bool,
     ) -> Result<NotificationInput, NotificationError> {
+        validate_policy_identifier(incident_id, "环境故障标识无效")?;
         let (kind, severity, key, title, body, suffix) = if recovered {
             (
                 NotificationKind::EnvironmentRecovered,
@@ -510,22 +508,12 @@ fn risk_code(code: RiskViolationCode) -> &'static str {
     }
 }
 
-fn is_safe_source_id(value: &str) -> bool {
-    if value.is_empty()
-        || value.len() > 256
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
-    {
-        return false;
+fn validate_policy_identifier(value: &str, message: &'static str) -> Result<(), NotificationError> {
+    if value.contains(':') || !is_safe_notification_source_event_id(value) {
+        return Err(NotificationError::new(
+            "INVALID_NOTIFICATION_CONTENT",
+            message,
+        ));
     }
-    !value
-        .split([':', '-', '_'])
-        .map(str::to_ascii_lowercase)
-        .any(|segment| {
-            matches!(
-                segment.as_str(),
-                "sk" | "secret" | "token" | "bearer" | "apikey"
-            )
-        })
+    Ok(())
 }

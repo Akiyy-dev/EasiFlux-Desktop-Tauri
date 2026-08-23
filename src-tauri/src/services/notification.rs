@@ -12,8 +12,10 @@ use crate::models::notification::{
     NotificationSummary, NotificationToastCandidate, MAX_JAVASCRIPT_SAFE_INTEGER,
 };
 use crate::storage::notification_store::{
-    NotificationFileV1, NotificationLoadStatus, NotificationPartition, NotificationPersistence,
-    NotificationSourceEventIndexEntry, NotificationStore,
+    notification_file_fits_serialized_limit, NotificationFileV1, NotificationLoadStatus,
+    NotificationPartition, NotificationPersistence, NotificationSourceEventIndexEntry,
+    NotificationStore, MAX_NOTIFICATION_PARTITION_ITEMS, MAX_NOTIFICATION_SOURCE_INDEX_PER_SCOPE,
+    MAX_NOTIFICATION_SOURCE_INDEX_TOTAL,
 };
 
 pub mod policy;
@@ -23,6 +25,8 @@ pub use policy::NotificationPolicy;
 const NOTIFICATION_STORAGE_UNAVAILABLE: &str = "NOTIFICATION_STORAGE_UNAVAILABLE";
 const NOTIFICATION_SCOPE_MISMATCH: &str = "NOTIFICATION_SCOPE_MISMATCH";
 const NOTIFICATION_NOT_FOUND: &str = "NOTIFICATION_NOT_FOUND";
+const NOTIFICATION_SOURCE_INDEX_CAPACITY_EXCEEDED: &str =
+    "NOTIFICATION_SOURCE_INDEX_CAPACITY_EXCEEDED";
 const INVALID_NOTIFICATION_CURSOR: &str = "INVALID_NOTIFICATION_CURSOR";
 const MAINTENANCE_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
 
@@ -215,9 +219,12 @@ impl NotificationService {
     where
         P: NotificationPersistence + 'static,
     {
-        ensure_source_event_index(&mut file);
-        let seen_source_events = rebuild_seen_source_events(&file);
+        normalize_source_event_index(&mut file);
+        let mut normalization = HousekeepingMutation::default();
+        enforce_source_index_caps(&mut file, &mut normalization);
+        enforce_serialized_file_cap(&mut file, &mut normalization);
         let active_incidents = rebuild_active_incidents(&file);
+        let seen_source_events = rebuild_seen_source_events(&file);
         Self {
             state: tokio::sync::Mutex::new(ServiceState {
                 file,
@@ -245,23 +252,25 @@ impl NotificationService {
             ));
         }
         let mut file = outcome.file;
-        ensure_source_event_index(&mut file);
         let configured: HashSet<_> = configured_accounts.iter().cloned().collect();
-        let (affected_count, affected_scopes) = prune_file(&mut file, Some(&configured), now_ms);
+        let mut pruning = prune_file(&mut file, Some(&configured), now_ms);
+        normalize_source_event_index(&mut file);
+        enforce_source_index_caps(&mut file, &mut pruning);
+        enforce_serialized_file_cap(&mut file, &mut pruning);
         let previous_revision = file.revision;
-        if affected_count > 0 {
+        if pruning.changed {
             file.revision = file.revision.checked_add(1).ok_or_else(|| {
                 NotificationError::new("NOTIFICATION_REVISION_EXHAUSTED", "通知修订号已达上限")
             })?;
             store.save(&file).map_err(map_persistence_error)?;
         }
         let service = Self::from_snapshot(file, Arc::new(store), emit_changed, now_ms);
-        if affected_count > 0 {
+        if pruning.changed {
             let event = NotificationChangedEvent {
                 previous_revision: previous_revision.to_string(),
                 revision: (previous_revision + 1).to_string(),
                 change: NotificationChange::Reset,
-                affected_scopes,
+                affected_scopes: pruning.affected_scopes,
                 notification_id: None,
                 toast_candidate: None,
             };
@@ -280,6 +289,10 @@ impl NotificationService {
         now_ms: u64,
     ) -> Result<PublishOutcome, NotificationError> {
         let mut guard = self.state.lock().await;
+        let preparation = self.prepare_publish_locked(&mut guard, &input, now_ms)?;
+        if !preparation.should_publish {
+            return Ok(no_publish_outcome(&guard));
+        }
         let mut next = guard.clone();
         let mutation = apply_publish(&mut next, input, now_ms)?;
         self.commit_publish(&mut guard, next, mutation)
@@ -481,7 +494,7 @@ impl NotificationService {
             .items
             .remove(item_index);
         remove_empty_partitions(&mut next.file);
-        cleanup_source_event_index(&mut next.file);
+        let _ = cleanup_source_event_index(&mut next.file);
         next.seen_source_events = rebuild_seen_source_events(&next.file);
         let previous_revision = commit_file(&self.persistence, &mut guard, next)?;
         let event = NotificationChangedEvent {
@@ -535,7 +548,7 @@ impl NotificationService {
         next.file
             .partitions
             .retain(|partition| partition.scope != scope);
-        cleanup_source_event_index(&mut next.file);
+        let _ = cleanup_source_event_index(&mut next.file);
         next.seen_source_events = rebuild_seen_source_events(&next.file);
         let previous_revision = commit_file(&self.persistence, &mut guard, next)?;
         let event = NotificationChangedEvent {
@@ -569,17 +582,16 @@ impl NotificationService {
         let mut guard = self.state.lock().await;
         let mut next = guard.clone();
         next.last_pruned_at_ms = now_ms;
-        let (affected_count, affected_scopes) =
-            prune_file(&mut next.file, Some(configured_accounts), now_ms);
+        let pruning = prune_file(&mut next.file, Some(configured_accounts), now_ms);
         next.seen_source_events = rebuild_seen_source_events(&next.file);
         next.active_incidents = rebuild_active_incidents(&next.file);
         next.order_states
             .retain(|key, _| configured_accounts.contains(&key.account_id));
-        if affected_count == 0 {
+        if !pruning.changed {
             *guard = next;
             return Ok(PruneOutcome {
                 affected_count: 0,
-                affected_scopes,
+                affected_scopes: pruning.affected_scopes,
                 revision: guard.file.revision.to_string(),
             });
         }
@@ -588,14 +600,14 @@ impl NotificationService {
             previous_revision: previous_revision.to_string(),
             revision: guard.file.revision.to_string(),
             change: NotificationChange::Reset,
-            affected_scopes: affected_scopes.clone(),
+            affected_scopes: pruning.affected_scopes.clone(),
             notification_id: None,
             toast_candidate: None,
         };
         self.emit_diagnostic_only(&event);
         Ok(PruneOutcome {
-            affected_count,
-            affected_scopes,
+            affected_count: pruning.affected_count,
+            affected_scopes: pruning.affected_scopes,
             revision: guard.file.revision.to_string(),
         })
     }
@@ -610,16 +622,15 @@ impl NotificationService {
         })?;
         let mut guard = self.state.lock().await;
         let mut next = guard.clone();
-        let affected_count = next
+        let partition_existed = next
             .file
             .partitions
             .iter()
-            .find(|partition| partition.scope == scope)
-            .map_or(0, |partition| partition.items.len());
+            .any(|partition| partition.scope == scope);
         next.file
             .partitions
             .retain(|partition| partition.scope != scope);
-        cleanup_source_event_index(&mut next.file);
+        let _ = cleanup_source_event_index(&mut next.file);
         next.seen_source_events = rebuild_seen_source_events(&next.file);
         next.active_incidents.retain(|key, _| match key {
             IncidentKey::Connection(owner, _) | IncidentKey::Environment(owner, _) => {
@@ -628,7 +639,7 @@ impl NotificationService {
         });
         next.order_states
             .retain(|key, _| key.account_id != account_id);
-        if affected_count == 0 {
+        if !partition_existed {
             *guard = next;
             return Ok(());
         }
@@ -653,12 +664,10 @@ impl NotificationService {
         ViewContext::account(&observation.account_id)?;
         let key = IncidentKey::Connection(observation.account_id.clone(), observation.channel);
         let mut guard = self.state.lock().await;
-        let mut next = guard.clone();
         let policy = NotificationPolicy;
-        let input = match observation.state {
+        let (input, next_incident) = match observation.state {
             AvailabilityState::Unavailable => {
-                if next.active_incidents.contains_key(&key) {
-                    *guard = next;
+                if guard.active_incidents.contains_key(&key) {
                     return Ok(no_publish_outcome(&guard));
                 }
                 let incident_id = uuid::Uuid::new_v4().to_string();
@@ -672,13 +681,10 @@ impl NotificationService {
                 )?;
                 let input =
                     policy.connection_unavailable(context, observation.channel, &incident_id)?;
-                next.active_incidents
-                    .insert(key, ActiveIncident { id: incident_id });
-                input
+                (input, Some(ActiveIncident { id: incident_id }))
             }
             AvailabilityState::Available => {
-                let Some(incident) = next.active_incidents.remove(&key) else {
-                    *guard = next;
+                let Some(incident) = guard.active_incidents.get(&key).cloned() else {
                     return Ok(no_publish_outcome(&guard));
                 };
                 let context = policy::PolicyContext::new(
@@ -690,9 +696,22 @@ impl NotificationService {
                         incident.id
                     ),
                 )?;
-                policy.connection_recovered(context, observation.channel, &incident.id)?
+                (
+                    policy.connection_recovered(context, observation.channel, &incident.id)?,
+                    None,
+                )
             }
         };
+        let preparation = self.prepare_publish_locked(&mut guard, &input, now_ms)?;
+        if !preparation.should_publish {
+            return Ok(no_publish_outcome(&guard));
+        }
+        let mut next = guard.clone();
+        if let Some(incident) = next_incident {
+            next.active_incidents.insert(key, incident);
+        } else {
+            next.active_incidents.remove(&key);
+        }
         let mutation = apply_publish(&mut next, input, now_ms)?;
         self.commit_publish(&mut guard, next, mutation)
     }
@@ -705,12 +724,10 @@ impl NotificationService {
         ViewContext::account(&observation.account_id)?;
         let key = IncidentKey::Environment(observation.account_id.clone(), observation.environment);
         let mut guard = self.state.lock().await;
-        let mut next = guard.clone();
         let policy = NotificationPolicy;
-        let input = match observation.state {
+        let (input, next_incident) = match observation.state {
             AvailabilityState::Unavailable => {
-                if next.active_incidents.contains_key(&key) {
-                    *guard = next;
+                if guard.active_incidents.contains_key(&key) {
                     return Ok(no_publish_outcome(&guard));
                 }
                 let incident_id = uuid::Uuid::new_v4().to_string();
@@ -727,13 +744,10 @@ impl NotificationService {
                     observation.environment,
                     &incident_id,
                 )?;
-                next.active_incidents
-                    .insert(key, ActiveIncident { id: incident_id });
-                input
+                (input, Some(ActiveIncident { id: incident_id }))
             }
             AvailabilityState::Available => {
-                let Some(incident) = next.active_incidents.remove(&key) else {
-                    *guard = next;
+                let Some(incident) = guard.active_incidents.get(&key).cloned() else {
                     return Ok(no_publish_outcome(&guard));
                 };
                 let context = policy::PolicyContext::new(
@@ -745,9 +759,22 @@ impl NotificationService {
                         incident.id
                     ),
                 )?;
-                policy.environment_recovered(context, observation.environment, &incident.id)?
+                (
+                    policy.environment_recovered(context, observation.environment, &incident.id)?,
+                    None,
+                )
             }
         };
+        let preparation = self.prepare_publish_locked(&mut guard, &input, now_ms)?;
+        if !preparation.should_publish {
+            return Ok(no_publish_outcome(&guard));
+        }
+        let mut next = guard.clone();
+        if let Some(incident) = next_incident {
+            next.active_incidents.insert(key, incident);
+        } else {
+            next.active_incidents.remove(&key);
+        }
         let mutation = apply_publish(&mut next, input, now_ms)?;
         self.commit_publish(&mut guard, next, mutation)
     }
@@ -772,8 +799,7 @@ impl NotificationService {
             entity_id: entity_id.clone(),
         };
         let mut guard = self.state.lock().await;
-        let mut next = guard.clone();
-        let previous = next.order_states.get(&key).copied();
+        let previous = guard.order_states.get(&key).copied();
         if previous.is_some_and(|state| state.status.is_terminal())
             && observation.status.is_terminal()
             && previous.map(|state| state.status) != Some(observation.status)
@@ -783,6 +809,7 @@ impl NotificationService {
                 observed_status = observation.status.name(),
                 "ignored inconsistent terminal order transition"
             );
+            return Ok(no_publish_outcome(&guard));
         }
         let already_notified = previous.is_some_and(|state| state.terminal_notified);
         let should_publish = observation.status.is_terminal()
@@ -794,14 +821,15 @@ impl NotificationService {
                     previous.is_some_and(|state| !state.status.is_terminal())
                 }
             };
-        next.order_states.insert(
-            key,
-            ObservedOrderState {
-                status: observation.status,
-                terminal_notified: already_notified || should_publish,
-            },
-        );
         if !should_publish {
+            let mut next = guard.clone();
+            next.order_states.insert(
+                key,
+                ObservedOrderState {
+                    status: observation.status,
+                    terminal_notified: already_notified,
+                },
+            );
             *guard = next;
             return Ok(no_publish_outcome(&guard));
         }
@@ -832,8 +860,60 @@ impl NotificationService {
             )?,
             ObservedOrderStatus::New | ObservedOrderStatus::PartiallyFilled => unreachable!(),
         };
+        let preparation = self.prepare_publish_locked(&mut guard, &input, now_ms)?;
+        if !preparation.should_publish {
+            return Ok(no_publish_outcome(&guard));
+        }
+        let mut next = guard.clone();
+        next.order_states.insert(
+            key,
+            ObservedOrderState {
+                status: observation.status,
+                terminal_notified: true,
+            },
+        );
         let mutation = apply_publish(&mut next, input, now_ms)?;
         self.commit_publish(&mut guard, next, mutation)
+    }
+
+    fn prepare_publish_locked(
+        &self,
+        guard: &mut ServiceState,
+        input: &NotificationInput,
+        now_ms: u64,
+    ) -> Result<PublishPreparation, NotificationError> {
+        validate_publish_input(input)?;
+        if source_key(input)
+            .as_ref()
+            .is_some_and(|key| guard.seen_source_events.contains(key))
+        {
+            return Ok(PublishPreparation {
+                should_publish: false,
+            });
+        }
+
+        let mut next = guard.clone();
+        let housekeeping = prepare_file_for_publish(&mut next.file, input, now_ms)?;
+        if !housekeeping.mutation.changed {
+            return Ok(PublishPreparation {
+                should_publish: true,
+            });
+        }
+        next.seen_source_events = rebuild_seen_source_events(&next.file);
+        next.active_incidents = rebuild_active_incidents(&next.file);
+        let previous_revision = commit_file(&self.persistence, guard, next)?;
+        let event = NotificationChangedEvent {
+            previous_revision: previous_revision.to_string(),
+            revision: guard.file.revision.to_string(),
+            change: NotificationChange::Reset,
+            affected_scopes: housekeeping.mutation.affected_scopes,
+            notification_id: None,
+            toast_candidate: None,
+        };
+        self.emit_diagnostic_only(&event);
+        Ok(PublishPreparation {
+            should_publish: true,
+        })
     }
 
     fn commit_publish(
@@ -886,27 +966,21 @@ struct PublishMutation {
     affected_scopes: Vec<NotificationScope>,
 }
 
+struct PublishPreparation {
+    should_publish: bool,
+}
+
+struct PublishHousekeeping {
+    mutation: HousekeepingMutation,
+}
+
 fn apply_publish(
     next: &mut ServiceState,
     input: NotificationInput,
     now_ms: u64,
 ) -> Result<PublishMutation, NotificationError> {
-    input
-        .validate()
-        .map_err(|error| NotificationError::new(error.code(), "通知输入无效"))?;
-    if input
-        .session_epoch
-        .is_some_and(|epoch| epoch > MAX_JAVASCRIPT_SAFE_INTEGER)
-    {
-        return Err(NotificationError::new(
-            "INVALID_NOTIFICATION_CONTENT",
-            "通知会话代次无效",
-        ));
-    }
-    let source_key = input
-        .source_event_id
-        .as_ref()
-        .map(|source| (input.scope.clone(), source.clone()));
+    validate_publish_input(&input)?;
+    let source_key = source_key(&input);
     if source_key
         .as_ref()
         .is_some_and(|key| next.seen_source_events.contains(key))
@@ -918,9 +992,6 @@ fn apply_publish(
             affected_scopes: Vec::new(),
         });
     }
-
-    let (_, mut retention_scopes) = prune_file(&mut next.file, None, now_ms);
-    next.seen_source_events = rebuild_seen_source_events(&next.file);
 
     let scope = input.scope.clone();
     let session_epoch = input.session_epoch;
@@ -987,23 +1058,35 @@ fn apply_publish(
         next.seen_source_events
             .insert((source_scope, source_event_id));
     }
-    if change == NotificationChange::Created {
-        let (_, created_retention_scopes) = prune_file(&mut next.file, None, now_ms);
-        retention_scopes.extend(created_retention_scopes);
-        next.seen_source_events = rebuild_seen_source_events(&next.file);
-    }
-    let mut affected_scopes = vec![scope];
-    for retention_scope in retention_scopes {
-        if !affected_scopes.contains(&retention_scope) {
-            affected_scopes.push(retention_scope);
-        }
-    }
     Ok(PublishMutation {
         record: Some(record),
         change: Some(change),
         toast_candidate,
-        affected_scopes,
+        affected_scopes: vec![scope],
     })
+}
+
+fn validate_publish_input(input: &NotificationInput) -> Result<(), NotificationError> {
+    input
+        .validate()
+        .map_err(|error| NotificationError::new(error.code(), "通知输入无效"))?;
+    if input
+        .session_epoch
+        .is_some_and(|epoch| epoch > MAX_JAVASCRIPT_SAFE_INTEGER)
+    {
+        return Err(NotificationError::new(
+            "INVALID_NOTIFICATION_CONTENT",
+            "通知会话代次无效",
+        ));
+    }
+    Ok(())
+}
+
+fn source_key(input: &NotificationInput) -> Option<(NotificationScope, String)> {
+    input
+        .source_event_id
+        .as_ref()
+        .map(|source| (input.scope.clone(), source.clone()))
 }
 
 fn no_publish_outcome(state: &ServiceState) -> PublishOutcome {
@@ -1013,33 +1096,139 @@ fn no_publish_outcome(state: &ServiceState) -> PublishOutcome {
     }
 }
 
+#[derive(Default)]
+struct HousekeepingMutation {
+    affected_count: u64,
+    affected_scopes: Vec<NotificationScope>,
+    changed: bool,
+}
+
+impl HousekeepingMutation {
+    fn note_scope(&mut self, scope: NotificationScope) {
+        self.changed = true;
+        if !self.affected_scopes.contains(&scope) {
+            self.affected_scopes.push(scope);
+        }
+    }
+
+    fn note_removed_record(&mut self, scope: NotificationScope) {
+        self.affected_count += 1;
+        self.note_scope(scope);
+    }
+}
+
+fn prepare_file_for_publish(
+    file: &mut NotificationFileV1,
+    input: &NotificationInput,
+    now_ms: u64,
+) -> Result<PublishHousekeeping, NotificationError> {
+    let mut mutation = prune_file(file, None, now_ms);
+    let semantic_target = file
+        .partitions
+        .iter()
+        .find(|partition| partition.scope == input.scope)
+        .and_then(|partition| {
+            partition
+                .items
+                .iter()
+                .find(|record| record.dedupe_key == input.dedupe_key)
+        })
+        .cloned();
+    let protected_id = semantic_target.as_ref().map(|record| record.id.as_str());
+
+    if input.source_event_id.is_some() {
+        let scope_limit = MAX_NOTIFICATION_SOURCE_INDEX_PER_SCOPE.saturating_sub(1);
+        let total_limit = MAX_NOTIFICATION_SOURCE_INDEX_TOTAL.saturating_sub(1);
+        if protected_id.is_some_and(|id| {
+            !can_reduce_source_index_without_record(file, Some(&input.scope), scope_limit, id)
+                || !can_reduce_source_index_without_record(file, None, total_limit, id)
+        }) {
+            return Err(NotificationError::new(
+                NOTIFICATION_SOURCE_INDEX_CAPACITY_EXCEEDED,
+                "通知来源索引容量已满",
+            ));
+        }
+        for removed in
+            evict_indexed_records_to_limit(file, Some(&input.scope), scope_limit, protected_id)
+        {
+            debug_assert_ne!(protected_id, Some(removed.id.as_str()));
+            mutation.note_removed_record(removed.scope);
+        }
+        for removed in evict_indexed_records_to_limit(file, None, total_limit, protected_id) {
+            debug_assert_ne!(protected_id, Some(removed.id.as_str()));
+            mutation.note_removed_record(removed.scope);
+        }
+    }
+
+    let creates_record = !file
+        .partitions
+        .iter()
+        .find(|partition| partition.scope == input.scope)
+        .is_some_and(|partition| {
+            partition
+                .items
+                .iter()
+                .any(|record| record.dedupe_key == input.dedupe_key)
+        });
+    if creates_record {
+        while partition_record_count(file, &input.scope) >= MAX_NOTIFICATION_PARTITION_ITEMS {
+            let Some(scope) = evict_oldest_record(file, Some(&input.scope)) else {
+                break;
+            };
+            mutation.note_removed_record(scope);
+        }
+    }
+
+    Ok(PublishHousekeeping { mutation })
+}
+
+fn can_reduce_source_index_without_record(
+    file: &NotificationFileV1,
+    required_scope: Option<&NotificationScope>,
+    limit: usize,
+    protected_id: &str,
+) -> bool {
+    let mut current_count = 0_usize;
+    let mut protected_count = 0_usize;
+    for entry in &file.source_event_index {
+        if required_scope.is_some_and(|scope| scope != &entry.scope) {
+            continue;
+        }
+        current_count += 1;
+        if entry.notification_id == protected_id {
+            protected_count += 1;
+        }
+    }
+    current_count <= limit || protected_count <= limit
+}
+
 fn prune_file(
     file: &mut NotificationFileV1,
     configured_accounts: Option<&HashSet<String>>,
     now_ms: u64,
-) -> (u64, Vec<NotificationScope>) {
-    let mut affected_count = 0_u64;
-    let mut affected_scopes = Vec::new();
+) -> HousekeepingMutation {
+    let mut mutation = HousekeepingMutation::default();
     for partition in &mut file.partitions {
         let original_len = partition.items.len();
         partition.items.retain(|record| !is_expired(record, now_ms));
-        if partition.items.len() > 1_000 {
+        if partition.items.len() > MAX_NOTIFICATION_PARTITION_ITEMS {
             partition.items.sort_by(|left, right| {
                 right
                     .created_at_ms
                     .cmp(&left.created_at_ms)
                     .then_with(|| right.id.cmp(&left.id))
             });
-            partition.items.truncate(1_000);
+            partition.items.truncate(MAX_NOTIFICATION_PARTITION_ITEMS);
         }
         let removed = original_len - partition.items.len();
-        if removed > 0 {
-            affected_count += removed as u64;
-            affected_scopes.push(partition.scope.clone());
+        for _ in 0..removed {
+            mutation.note_removed_record(partition.scope.clone());
         }
     }
     if let Some(configured_accounts) = configured_accounts {
-        file.partitions.retain(|partition| {
+        let mut partition_index = 0;
+        while partition_index < file.partitions.len() {
+            let partition = &file.partitions[partition_index];
             let is_orphan = match &partition.scope {
                 NotificationScope::Global => false,
                 NotificationScope::Account { account_id } => {
@@ -1047,19 +1236,260 @@ fn prune_file(
                 }
             };
             if is_orphan {
-                affected_count += partition.items.len() as u64;
-                if !affected_scopes.contains(&partition.scope) {
-                    affected_scopes.push(partition.scope.clone());
+                let partition = file.partitions.remove(partition_index);
+                if partition.items.is_empty() {
+                    mutation.note_scope(partition.scope);
+                } else {
+                    for _ in &partition.items {
+                        mutation.note_removed_record(partition.scope.clone());
+                    }
                 }
+            } else {
+                partition_index += 1;
             }
-            !is_orphan
-        });
+        }
     }
+    file.partitions.retain(|partition| {
+        !partition.items.is_empty() || !mutation.affected_scopes.contains(&partition.scope)
+    });
+    for scope in cleanup_source_event_index(file) {
+        mutation.note_scope(scope);
+    }
+
+    enforce_source_index_caps(file, &mut mutation);
+    mutation
+}
+
+fn partition_record_count(file: &NotificationFileV1, scope: &NotificationScope) -> usize {
+    file.partitions
+        .iter()
+        .find(|partition| &partition.scope == scope)
+        .map_or(0, |partition| partition.items.len())
+}
+
+fn enforce_source_index_caps(file: &mut NotificationFileV1, mutation: &mut HousekeepingMutation) {
+    let mut per_scope = HashMap::<NotificationScope, usize>::new();
+    for entry in &file.source_event_index {
+        *per_scope.entry(entry.scope.clone()).or_default() += 1;
+    }
+    let mut over_limit_scopes: Vec<_> = per_scope
+        .into_iter()
+        .filter_map(|(scope, count)| {
+            (count > MAX_NOTIFICATION_SOURCE_INDEX_PER_SCOPE).then_some(scope)
+        })
+        .collect();
+    over_limit_scopes.sort_by(|left, right| scope_sort_key(left).cmp(&scope_sort_key(right)));
+    for scope in over_limit_scopes {
+        for removed in evict_indexed_records_to_limit(
+            file,
+            Some(&scope),
+            MAX_NOTIFICATION_SOURCE_INDEX_PER_SCOPE,
+            None,
+        ) {
+            mutation.note_removed_record(removed.scope);
+        }
+    }
+    if file.source_event_index.len() > MAX_NOTIFICATION_SOURCE_INDEX_TOTAL {
+        for removed in
+            evict_indexed_records_to_limit(file, None, MAX_NOTIFICATION_SOURCE_INDEX_TOTAL, None)
+        {
+            mutation.note_removed_record(removed.scope);
+        }
+    }
+}
+
+fn enforce_serialized_file_cap(
+    file: &mut NotificationFileV1,
+    mutation: &mut HousekeepingMutation,
+) -> usize {
+    let mut probes = 1_usize;
+    if notification_file_fits_serialized_limit(file) {
+        return probes;
+    }
+    let mut candidates: Vec<_> = file
+        .partitions
+        .iter()
+        .flat_map(|partition| {
+            partition.items.iter().map(|record| {
+                (
+                    record.created_at_ms,
+                    record.id.clone(),
+                    partition.scope.clone(),
+                )
+            })
+        })
+        .collect();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    if candidates.is_empty() {
+        return probes;
+    }
+
+    let original = file.clone();
+    let mut lower = 0_usize;
+    let mut upper = 1_usize;
+    loop {
+        probes += 1;
+        if serialized_file_fits_after_eviction(&original, &candidates[..upper]) {
+            break;
+        }
+        lower = upper;
+        if upper == candidates.len() {
+            break;
+        }
+        upper = upper.saturating_mul(2).min(candidates.len());
+    }
+    while lower + 1 < upper {
+        let middle = lower + (upper - lower) / 2;
+        probes += 1;
+        if serialized_file_fits_after_eviction(&original, &candidates[..middle]) {
+            upper = middle;
+        } else {
+            lower = middle;
+        }
+    }
+
+    let selected = &candidates[..upper];
+    remove_record_candidates(file, selected);
+    for (_, _, scope) in selected {
+        mutation.note_removed_record(scope.clone());
+    }
+    probes
+}
+
+#[cfg(test)]
+pub(super) fn enforce_serialized_file_cap_for_test(file: &mut NotificationFileV1) -> usize {
+    let mut mutation = HousekeepingMutation::default();
+    enforce_serialized_file_cap(file, &mut mutation)
+}
+
+fn serialized_file_fits_after_eviction(
+    original: &NotificationFileV1,
+    candidates: &[(u64, String, NotificationScope)],
+) -> bool {
+    let mut trial = original.clone();
+    remove_record_candidates(&mut trial, candidates);
+    notification_file_fits_serialized_limit(&trial)
+}
+
+fn remove_record_candidates(
+    file: &mut NotificationFileV1,
+    candidates: &[(u64, String, NotificationScope)],
+) {
+    let targets: HashSet<_> = candidates
+        .iter()
+        .map(|(_, id, scope)| (scope.clone(), id.clone()))
+        .collect();
+    for partition in &mut file.partitions {
+        partition
+            .items
+            .retain(|record| !targets.contains(&(partition.scope.clone(), record.id.clone())));
+    }
+    file.partitions
+        .retain(|partition| !partition.items.is_empty());
+    file.source_event_index
+        .retain(|entry| !targets.contains(&(entry.scope.clone(), entry.notification_id.clone())));
+}
+
+fn evict_indexed_records_to_limit(
+    file: &mut NotificationFileV1,
+    required_scope: Option<&NotificationScope>,
+    limit: usize,
+    protected_id: Option<&str>,
+) -> Vec<NotificationRecord> {
+    let mut index_counts = HashMap::<(NotificationScope, String), usize>::new();
+    let mut current_count = 0_usize;
+    for entry in &file.source_event_index {
+        if required_scope.is_some_and(|scope| scope != &entry.scope) {
+            continue;
+        }
+        current_count += 1;
+        *index_counts
+            .entry((entry.scope.clone(), entry.notification_id.clone()))
+            .or_default() += 1;
+    }
+    if current_count <= limit {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<_> = file
+        .partitions
+        .iter()
+        .filter(|partition| required_scope.is_none_or(|scope| scope == &partition.scope))
+        .flat_map(|partition| {
+            partition.items.iter().filter_map(|record| {
+                index_counts
+                    .get(&(partition.scope.clone(), record.id.clone()))
+                    .copied()
+                    .map(|count| (record.clone(), count))
+            })
+        })
+        .collect();
+    candidates.sort_by(|(left, _), (right, _)| {
+        let left_protected = protected_id == Some(left.id.as_str());
+        let right_protected = protected_id == Some(right.id.as_str());
+        left_protected
+            .cmp(&right_protected)
+            .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut selected = Vec::new();
+    for (record, count) in candidates {
+        current_count = current_count.saturating_sub(count);
+        selected.push(record);
+        if current_count <= limit {
+            break;
+        }
+    }
+    let targets: HashSet<_> = selected
+        .iter()
+        .map(|record| (record.scope.clone(), record.id.clone()))
+        .collect();
+    for partition in &mut file.partitions {
+        partition
+            .items
+            .retain(|record| !targets.contains(&(partition.scope.clone(), record.id.clone())));
+    }
+    let affected_scopes: HashSet<_> = selected.iter().map(|record| record.scope.clone()).collect();
     file.partitions.retain(|partition| {
         !partition.items.is_empty() || !affected_scopes.contains(&partition.scope)
     });
-    cleanup_source_event_index(file);
-    (affected_count, affected_scopes)
+    file.source_event_index
+        .retain(|entry| !targets.contains(&(entry.scope.clone(), entry.notification_id.clone())));
+    selected
+}
+
+fn evict_oldest_record(
+    file: &mut NotificationFileV1,
+    required_scope: Option<&NotificationScope>,
+) -> Option<NotificationScope> {
+    let mut oldest: Option<(usize, usize, u64, String)> = None;
+    for (partition_index, partition) in file.partitions.iter().enumerate() {
+        if required_scope.is_some_and(|scope| scope != &partition.scope) {
+            continue;
+        }
+        for (record_index, record) in partition.items.iter().enumerate() {
+            let candidate = (
+                partition_index,
+                record_index,
+                record.created_at_ms,
+                record.id.clone(),
+            );
+            if oldest.as_ref().is_none_or(|oldest| {
+                (candidate.2, candidate.3.as_str()) < (oldest.2, oldest.3.as_str())
+            }) {
+                oldest = Some(candidate);
+            }
+        }
+    }
+    let (partition_index, record_index, _, _) = oldest?;
+    let scope = file.partitions[partition_index].scope.clone();
+    file.partitions[partition_index].items.remove(record_index);
+    if file.partitions[partition_index].items.is_empty() {
+        file.partitions.remove(partition_index);
+    }
+    let _ = cleanup_source_event_index(file);
+    Some(scope)
 }
 
 fn rebuild_seen_source_events(file: &NotificationFileV1) -> HashSet<(NotificationScope, String)> {
@@ -1069,32 +1499,244 @@ fn rebuild_seen_source_events(file: &NotificationFileV1) -> HashSet<(Notificatio
         .collect()
 }
 
-fn ensure_source_event_index(file: &mut NotificationFileV1) {
+fn normalize_source_event_index(file: &mut NotificationFileV1) {
+    canonicalize_partial_incident_creation_order(file);
     let mut indexed: HashSet<_> = file
         .source_event_index
         .iter()
         .map(|entry| (entry.scope.clone(), entry.source_event_id.clone()))
         .collect();
+    let mut candidates: Vec<_> = file
+        .partitions
+        .iter()
+        .flat_map(|partition| {
+            partition.items.iter().filter_map(|record| {
+                record.source_event_id.as_ref().map(|source_event_id| {
+                    (
+                        record.created_at_ms,
+                        incident_edge_priority(record.kind),
+                        record.id.clone(),
+                        partition.scope.clone(),
+                        source_event_id.clone(),
+                    )
+                })
+            })
+        })
+        .collect();
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| scope_sort_key(&left.3).cmp(&scope_sort_key(&right.3)))
+    });
     let mut missing = Vec::new();
-    for partition in &file.partitions {
-        for record in &partition.items {
-            let Some(source_event_id) = &record.source_event_id else {
-                continue;
-            };
-            let key = (partition.scope.clone(), source_event_id.clone());
-            if indexed.insert(key) {
-                missing.push(NotificationSourceEventIndexEntry {
-                    scope: partition.scope.clone(),
-                    source_event_id: source_event_id.clone(),
-                    notification_id: record.id.clone(),
-                });
-            }
+    for (_, _, notification_id, scope, source_event_id) in candidates {
+        let key = (scope.clone(), source_event_id.clone());
+        if indexed.insert(key) {
+            missing.push(NotificationSourceEventIndexEntry {
+                scope,
+                source_event_id,
+                notification_id,
+            });
         }
     }
     file.source_event_index.extend(missing);
 }
 
-fn cleanup_source_event_index(file: &mut NotificationFileV1) {
+fn canonicalize_partial_incident_creation_order(file: &mut NotificationFileV1) {
+    let creation_positions = incident_creation_positions(file);
+    let edges: Vec<_> = file
+        .partitions
+        .iter()
+        .flat_map(|partition| partition.items.iter())
+        .filter_map(|record| {
+            incident_history_edge(record, creation_positions.get(record.id.as_str()).copied())
+        })
+        .collect();
+    let fallback_keys: HashSet<_> = edges
+        .iter()
+        .filter(|edge| edge.creation_position.is_none())
+        .map(|edge| edge.key.clone())
+        .collect();
+    if fallback_keys.is_empty() {
+        return;
+    }
+
+    let creation_entries: HashMap<_, _> = file
+        .partitions
+        .iter()
+        .flat_map(|partition| {
+            partition.items.iter().filter_map(|record| {
+                record.source_event_id.as_ref().map(|source_event_id| {
+                    (
+                        record.id.clone(),
+                        NotificationSourceEventIndexEntry {
+                            scope: partition.scope.clone(),
+                            source_event_id: source_event_id.clone(),
+                            notification_id: record.id.clone(),
+                        },
+                    )
+                })
+            })
+        })
+        .collect();
+    let fallback_record_ids: HashSet<_> = edges
+        .iter()
+        .filter(|edge| fallback_keys.contains(&edge.key))
+        .map(|edge| edge.record_id.clone())
+        .collect();
+    file.source_event_index.retain(|entry| {
+        !fallback_record_ids.contains(&entry.notification_id)
+            || creation_entries
+                .get(&entry.notification_id)
+                .is_none_or(|creation| {
+                    entry.scope != creation.scope
+                        || entry.source_event_id != creation.source_event_id
+                })
+    });
+
+    let mut keys: Vec<_> = fallback_keys.into_iter().collect();
+    keys.sort_by(|left, right| incident_key_sort_key(left).cmp(&incident_key_sort_key(right)));
+    let mut appended = HashSet::new();
+    for key in keys {
+        let key_edges: Vec<_> = edges.iter().filter(|edge| edge.key == key).collect();
+        let unavailable_incidents: HashSet<_> = key_edges
+            .iter()
+            .filter(|edge| edge.unavailable)
+            .map(|edge| edge.incident_id.as_str())
+            .collect();
+        let recovered_incidents: HashSet<_> = key_edges
+            .iter()
+            .filter(|edge| !edge.unavailable)
+            .map(|edge| edge.incident_id.as_str())
+            .collect();
+
+        let mut orphan_recoveries: Vec<_> = key_edges
+            .iter()
+            .copied()
+            .filter(|edge| {
+                !edge.unavailable && !unavailable_incidents.contains(edge.incident_id.as_str())
+            })
+            .collect();
+        sort_legacy_incident_edges(&mut orphan_recoveries);
+        append_incident_creation_entries(
+            &orphan_recoveries,
+            &creation_entries,
+            &mut appended,
+            &mut file.source_event_index,
+        );
+
+        let mut closed_incidents: Vec<_> = unavailable_incidents
+            .intersection(&recovered_incidents)
+            .copied()
+            .collect();
+        closed_incidents.sort_unstable();
+        for incident_id in closed_incidents {
+            let mut unavailable: Vec<_> = key_edges
+                .iter()
+                .copied()
+                .filter(|edge| edge.unavailable && edge.incident_id == incident_id)
+                .collect();
+            let mut recovered: Vec<_> = key_edges
+                .iter()
+                .copied()
+                .filter(|edge| !edge.unavailable && edge.incident_id == incident_id)
+                .collect();
+            sort_legacy_incident_edges(&mut unavailable);
+            sort_legacy_incident_edges(&mut recovered);
+            append_incident_creation_entries(
+                &unavailable,
+                &creation_entries,
+                &mut appended,
+                &mut file.source_event_index,
+            );
+            append_incident_creation_entries(
+                &recovered,
+                &creation_entries,
+                &mut appended,
+                &mut file.source_event_index,
+            );
+        }
+
+        let mut unclosed: Vec<_> = key_edges
+            .iter()
+            .copied()
+            .filter(|edge| {
+                edge.unavailable && !recovered_incidents.contains(edge.incident_id.as_str())
+            })
+            .collect();
+        sort_legacy_incident_edges(&mut unclosed);
+        append_incident_creation_entries(
+            &unclosed,
+            &creation_entries,
+            &mut appended,
+            &mut file.source_event_index,
+        );
+    }
+}
+
+fn incident_creation_positions(file: &NotificationFileV1) -> HashMap<String, usize> {
+    let records_by_id: HashMap<_, _> = file
+        .partitions
+        .iter()
+        .flat_map(|partition| {
+            partition
+                .items
+                .iter()
+                .map(|record| (record.id.as_str(), record))
+        })
+        .collect();
+    let mut positions = HashMap::new();
+    for (position, entry) in file.source_event_index.iter().enumerate() {
+        let Some(record) = records_by_id.get(entry.notification_id.as_str()) else {
+            continue;
+        };
+        if record.scope == entry.scope
+            && record.source_event_id.as_deref() == Some(entry.source_event_id.as_str())
+        {
+            positions.entry(record.id.clone()).or_insert(position);
+        }
+    }
+    positions
+}
+
+fn incident_key_sort_key(key: &IncidentKey) -> (&str, u8, &str) {
+    match key {
+        IncidentKey::Connection(account_id, channel) => {
+            (account_id.as_str(), 0, channel_tag(*channel))
+        }
+        IncidentKey::Environment(account_id, environment) => {
+            (account_id.as_str(), 1, environment_tag(*environment))
+        }
+    }
+}
+
+fn sort_legacy_incident_edges(edges: &mut Vec<&IncidentHistoryEdge>) {
+    edges.sort_by(|left, right| {
+        left.created_at_ms
+            .cmp(&right.created_at_ms)
+            .then_with(|| left.record_id.cmp(&right.record_id))
+            .then_with(|| left.incident_id.cmp(&right.incident_id))
+    });
+}
+
+fn append_incident_creation_entries(
+    edges: &[&IncidentHistoryEdge],
+    entries: &HashMap<String, NotificationSourceEventIndexEntry>,
+    appended: &mut HashSet<String>,
+    index: &mut Vec<NotificationSourceEventIndexEntry>,
+) {
+    for edge in edges {
+        if appended.insert(edge.record_id.clone()) {
+            if let Some(entry) = entries.get(&edge.record_id) {
+                index.push(entry.clone());
+            }
+        }
+    }
+}
+
+fn cleanup_source_event_index(file: &mut NotificationFileV1) -> Vec<NotificationScope> {
     let targets: HashSet<_> = file
         .partitions
         .iter()
@@ -1105,88 +1747,153 @@ fn cleanup_source_event_index(file: &mut NotificationFileV1) {
                 .map(|record| (partition.scope.clone(), record.id.clone()))
         })
         .collect();
-    file.source_event_index
-        .retain(|entry| targets.contains(&(entry.scope.clone(), entry.notification_id.clone())));
+    let mut affected_scopes = Vec::new();
+    file.source_event_index.retain(|entry| {
+        let keep = targets.contains(&(entry.scope.clone(), entry.notification_id.clone()));
+        if !keep && !affected_scopes.contains(&entry.scope) {
+            affected_scopes.push(entry.scope.clone());
+        }
+        keep
+    });
+    affected_scopes
+}
+
+fn scope_sort_key(scope: &NotificationScope) -> (&str, &str) {
+    match scope {
+        NotificationScope::Global => ("0", ""),
+        NotificationScope::Account { account_id } => ("1", account_id.as_str()),
+    }
 }
 
 fn rebuild_active_incidents(file: &NotificationFileV1) -> HashMap<IncidentKey, ActiveIncident> {
-    let mut records: Vec<_> = file
+    let creation_positions = incident_creation_positions(file);
+    let mut edges: Vec<_> = file
         .partitions
         .iter()
         .flat_map(|partition| partition.items.iter())
+        .filter_map(|record| {
+            incident_history_edge(record, creation_positions.get(record.id.as_str()).copied())
+        })
         .collect();
-    records.sort_by(|left, right| {
-        left.created_at_ms
-            .cmp(&right.created_at_ms)
-            .then_with(|| {
-                incident_edge_priority(left.kind).cmp(&incident_edge_priority(right.kind))
-            })
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    let fallback_keys: HashSet<_> = edges
+        .iter()
+        .filter(|edge| edge.creation_position.is_none())
+        .map(|edge| edge.key.clone())
+        .collect();
+    edges.sort_by_key(|edge| edge.creation_position.unwrap_or(usize::MAX));
     let mut incidents = HashMap::new();
-    for record in records {
-        let NotificationScope::Account { account_id } = &record.scope else {
-            continue;
-        };
-        let incident_id = record
-            .dedupe_key
-            .split(':')
-            .nth(2)
-            .filter(|value| !value.is_empty());
-        let Some(incident_id) = incident_id else {
-            continue;
-        };
-        let key = match record.kind {
-            NotificationKind::ConnectionUnavailable | NotificationKind::ConnectionRecovered => {
-                let Some(crate::models::notification::NotificationScalar::String(channel)) =
-                    record.content.params.get("channel")
-                else {
-                    continue;
-                };
-                let channel = match channel.as_str() {
-                    "api" => NotificationChannel::Api,
-                    "websocket" => NotificationChannel::Websocket,
-                    _ => continue,
-                };
-                IncidentKey::Connection(account_id.clone(), channel)
-            }
-            NotificationKind::EnvironmentUnavailable | NotificationKind::EnvironmentRecovered => {
-                let Some(crate::models::notification::NotificationScalar::String(environment)) =
-                    record.content.params.get("environment")
-                else {
-                    continue;
-                };
-                let environment = match environment.as_str() {
-                    "production" => NotificationEnvironment::Production,
-                    "development" => NotificationEnvironment::Development,
-                    "unknown" => NotificationEnvironment::Unknown,
-                    _ => continue,
-                };
-                IncidentKey::Environment(account_id.clone(), environment)
-            }
-            _ => continue,
-        };
-        match record.kind {
-            NotificationKind::ConnectionUnavailable | NotificationKind::EnvironmentUnavailable => {
-                incidents.insert(
-                    key,
-                    ActiveIncident {
-                        id: incident_id.into(),
-                    },
-                );
-            }
-            NotificationKind::ConnectionRecovered | NotificationKind::EnvironmentRecovered => {
-                if incidents
-                    .get(&key)
-                    .is_some_and(|incident| incident.id == incident_id)
-                {
-                    incidents.remove(&key);
-                }
-            }
-            _ => {}
+    for edge in edges
+        .iter()
+        .filter(|edge| !fallback_keys.contains(&edge.key))
+    {
+        if edge.unavailable {
+            incidents.insert(
+                edge.key.clone(),
+                ActiveIncident {
+                    id: edge.incident_id.clone(),
+                },
+            );
+        } else if incidents
+            .get(&edge.key)
+            .is_some_and(|incident| incident.id == edge.incident_id)
+        {
+            incidents.remove(&edge.key);
+        }
+    }
+
+    for key in fallback_keys {
+        let recovered: HashSet<_> = edges
+            .iter()
+            .filter(|edge| edge.key == key && !edge.unavailable)
+            .map(|edge| edge.incident_id.as_str())
+            .collect();
+        let latest_unclosed = edges
+            .iter()
+            .filter(|edge| {
+                edge.key == key
+                    && edge.unavailable
+                    && !recovered.contains(edge.incident_id.as_str())
+            })
+            .max_by(|left, right| {
+                left.created_at_ms
+                    .cmp(&right.created_at_ms)
+                    .then_with(|| left.record_id.cmp(&right.record_id))
+                    .then_with(|| left.incident_id.cmp(&right.incident_id))
+            });
+        if let Some(edge) = latest_unclosed {
+            incidents.insert(
+                key,
+                ActiveIncident {
+                    id: edge.incident_id.clone(),
+                },
+            );
         }
     }
     incidents
+}
+
+struct IncidentHistoryEdge {
+    key: IncidentKey,
+    incident_id: String,
+    unavailable: bool,
+    created_at_ms: u64,
+    record_id: String,
+    creation_position: Option<usize>,
+}
+
+fn incident_history_edge(
+    record: &NotificationRecord,
+    creation_position: Option<usize>,
+) -> Option<IncidentHistoryEdge> {
+    let NotificationScope::Account { account_id } = &record.scope else {
+        return None;
+    };
+    let incident_id = record
+        .dedupe_key
+        .split(':')
+        .nth(2)
+        .filter(|value| !value.is_empty())?;
+    let key = match record.kind {
+        NotificationKind::ConnectionUnavailable | NotificationKind::ConnectionRecovered => {
+            let Some(crate::models::notification::NotificationScalar::String(channel)) =
+                record.content.params.get("channel")
+            else {
+                return None;
+            };
+            let channel = match channel.as_str() {
+                "api" => NotificationChannel::Api,
+                "websocket" => NotificationChannel::Websocket,
+                _ => return None,
+            };
+            IncidentKey::Connection(account_id.clone(), channel)
+        }
+        NotificationKind::EnvironmentUnavailable | NotificationKind::EnvironmentRecovered => {
+            let Some(crate::models::notification::NotificationScalar::String(environment)) =
+                record.content.params.get("environment")
+            else {
+                return None;
+            };
+            let environment = match environment.as_str() {
+                "production" => NotificationEnvironment::Production,
+                "development" => NotificationEnvironment::Development,
+                "unknown" => NotificationEnvironment::Unknown,
+                _ => return None,
+            };
+            IncidentKey::Environment(account_id.clone(), environment)
+        }
+        _ => return None,
+    };
+    Some(IncidentHistoryEdge {
+        key,
+        incident_id: incident_id.into(),
+        unavailable: matches!(
+            record.kind,
+            NotificationKind::ConnectionUnavailable | NotificationKind::EnvironmentUnavailable
+        ),
+        created_at_ms: record.created_at_ms,
+        record_id: record.id.clone(),
+        creation_position,
+    })
 }
 
 fn channel_tag(channel: NotificationChannel) -> &'static str {

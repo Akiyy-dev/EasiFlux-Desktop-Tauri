@@ -206,9 +206,13 @@ async fn expired_semantic_record_does_not_swallow_a_new_created_toast() {
     let created = outcome.notification.unwrap();
     assert_eq!(created.created_at_ms, NOW);
     assert_eq!(created.occurrence_count, 1);
+    assert_eq!(outcome.revision, "6");
     let events = harness.events.lock().unwrap();
-    assert_eq!(events[0].change, NotificationChange::Created);
-    assert!(events[0].toast_candidate.is_some());
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].change, NotificationChange::Reset);
+    assert!(events[0].toast_candidate.is_none());
+    assert_eq!(events[1].change, NotificationChange::Created);
+    assert!(events[1].toast_candidate.is_some());
 }
 
 #[tokio::test]

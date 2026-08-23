@@ -130,7 +130,7 @@ NotificationRecord {
 - `fallbackTitle` 和 `fallbackBody` 是当前中文界面的可靠兜底；PRD-17 可以使用 `messageKey + params` 重新渲染历史通知。
 - `fallbackBody` 不保存密钥、令牌、Secret、完整服务端响应、请求签名、任意堆栈或未经脱敏的错误文本。
 - `createdAtMs` 决定稳定排序和分页；语义相同但来源不同的低频事件可以合并并更新 `updatedAtMs` 与 `occurrenceCount`，不能改变 `createdAtMs`。
-- `sourceEventId` 表示上游事件或本次业务尝试的稳定 ID。相同 `sourceEventId` 的重复投递是完全幂等的：不修改记录、不增加修订号、不发送事件。
+- `sourceEventId` 表示上游事件或本次业务尝试的稳定 ID。相同 `sourceEventId` 的重复投递是完全幂等的：不修改记录、不增加修订号、不发送事件。记录与输入共用受控标识校验：只允许 ASCII 字母数字、`-`、`_`、`:`，长度最多 256 字节，并对每个冒号分段拒绝 Secret/Token/Bearer/API key、AWS/GitHub token 和 JWT 形态，防止 `event:<secret>` 一类前缀绕过；`dedupeKey` 使用同一字符和泄密边界，长度最多 512 字节。
 - 幂等索引按 `(scope, sourceEventId)` 计算；语义合并按 `(scope, dedupeKey)` 计算，任何账户都不能命中或更新另一账户的记录。
 - 新通知默认 `readAtMs = null`。语义合并不会重置已读状态，也不会再次 Toast。连接重试在进入服务前过滤，不通过高频更新 `occurrenceCount` 刷盘。
 
@@ -169,8 +169,9 @@ OpenGeneralSettings
 - “持续连接故障”沿用现有连接状态机对外暴露的不可用状态；不为本 PRD 新增任意秒数阈值。API、私有 WebSocket 和环境探测是三个独立通道，某一通道恢复不能关闭另一通道的故障周期。
 - 网络重试、短暂 WebSocket 抖动、行情流断续、解析失败、快照、轮询和诊断信息继续只写日志。
 - 连接事件按状态边沿创建。相同状态的重复回调只增加内部幂等命中，不产生新记录；恢复后再次不可用属于新的故障周期。
-- 状态观察器在加载通知文件后从每个账户/通道最近的故障边沿恢复 active incident。应用初始即为健康且没有未关闭故障时不创建“已恢复”；若上次退出前存在未恢复故障，则本次健康探测可以关闭该 incident 并创建一次恢复通知。
+- 状态观察器在加载通知文件后从每个账户/通道最近的故障边沿恢复 active incident。因同毫秒记录不能依赖随机 UUID 排序，完整 `sourceEventIndex` 使用每条记录创建来源条目的持久追加序号作为因果顺序。合法旧文件缺失或仅部分具有某个 incident key 的创建来源顺序时，加载规范化会先按 `incidentId` 配对闭合周期，重建该 key 的完整确定顺序，再执行普通来源回填；未配对 recovery 排在前、已闭合周期按 unavailable/recovery 排列、最后一个未匹配 unavailable 排在最后并成为 active。这样规范化文件再次保存和重启后不会把补入的旧边沿误当成最新故障。应用初始即为健康且没有未关闭故障时不创建“已恢复”；若上次退出前存在未恢复故障，则本次健康探测可以关闭该 incident 并创建一次恢复通知。
 - `place_order` 命令在进入业务流程时由 Rust 生成 `submissionId`，并把它贯穿风控和 API 提交流程。风控结果改为受控 `RiskViolation { code, safeParams }`，不得再从自然语言错误反推规则；API 拒绝即使没有订单 ID，也使用 `submissionId` 关联和去重。
+- `incidentId` 和 `submissionId` 作为 dedupe key 的单个动态组件时不得包含 `:`；结构化 `sourceEventId`/`dedupeKey` 整体仍可使用冒号分隔受控组件，避免 incident 历史解析和语义键边界歧义。
 - 订单通知通过独立的 `observe_order(accountId, sessionEpoch, order, origin)` 语义入口产生，`origin` 是 `Command | Realtime | Snapshot`。启动和轮询快照只用于播种/更新上一个状态，不创建通知；命令确认的终态或私有实时流的 `non-final -> final` 转换才创建。异常的终态到另一终态转换只写诊断，不产生第二条通知。
 - 现有 `order:updated` 继续用于界面状态同步，不能直接作为通知生产源。部分成交更新、请求发送中和客户端乐观状态不创建持久通知。
 - 通用 `error:occurred`、`log:entry` 和 Toast 事件不自动转换成通知；生产者必须显式调用通知策略。
@@ -304,7 +305,7 @@ NotificationFileV1 {
 }
 ```
 
-`sourceEventIndex` 是仅供 Rust 权威服务使用的持久化幂等索引，不进入通知记录 DTO 或前端展示。它按 `(scope, sourceEventId)` 唯一并指向同作用域内的现存通知；语义合并产生的新来源 ID 也追加到该索引。旧 v1 文件缺少该字段时按空索引读取，服务再从每条记录的创建来源 `sourceEventId` 补齐。删除、清空、保留和账户清理必须同步移除指向已删除记录的条目。
+`sourceEventIndex` 是仅供 Rust 权威服务使用的持久化幂等索引，不进入通知记录 DTO 或前端展示。它按 `(scope, sourceEventId)` 唯一并指向同作用域内的现存通知；语义合并产生的新来源 ID 也追加到该索引。旧 v1 文件缺少该字段时按空索引读取，服务再从每条记录的创建来源 `sourceEventId` 补齐。删除、清空、保留和账户清理必须同步移除指向已删除记录的条目。每个 scope 最多 10,000 个来源条目，全文件最多 50,000 个；达到上限时不能只遗忘仍保留记录的来源 ID，而是只从确实持有相关索引的记录中按 `(createdAtMs,id)` 最旧优先、记录粒度淘汰，并同步删除其全部索引后先发送独立 `Reset`。语义合并目标必须优先保护：存在其他可释放索引的记录时淘汰其他记录；若目标自身持有的历史已使本次来源无法预留容量，则以稳定 `NOTIFICATION_SOURCE_INDEX_CAPACITY_EXCEEDED` 原子拒绝，不清理、不保存、不递增修订、不发送事件，也不改变观察器状态，历史来源跨重启仍保持绝对幂等。
 
 使用显式分区数组而不是把账户 ID 当作 JSON 对象键，避免保留特殊键和转义语义。加载后可以在内存中构建按作用域索引。
 
@@ -312,6 +313,7 @@ NotificationFileV1 {
 
 - 服务使用单一异步互斥锁串行化所有读改写操作。
 - 修改采用 copy-on-write：在内存副本中校验、修改、清理、计算 `nextRevision` 并序列化，包含新修订号的文件写盘成功后才替换服务内存状态。
+- 发布先在任何清理前检查精确 `(scope, sourceEventId)`，命中即绝对 no-op。若发布需要过期、容量或索引清理，服务在同一 commit gate 内先把结构变化作为独立原子提交并发送 `Reset`，再基于已提交快照执行独立 Created/Updated 提交；两个事件修订必须连续。容量在插入前预留，未留在最终快照中的记录不得发送 Created/Toast。第二阶段失败时第一阶段 Reset 保留，但发布记录和观察器的推测状态不进入内存。
 - 写入临时文件并完成刷盘后，按仓库现有配置/图表状态存储模式轮换主文件与 `.bak`，最后原子替换主文件。
 - 写入失败时保证内存快照、对外修订号和事件不提交；主文件已经轮换但临时文件提升失败时，尽力把有效备份恢复为主文件并记录告警。极端磁盘故障下不承诺主路径一定存在；恢复逻辑必须检查 `main/tmp/bak` 的剩余候选，而不是假定主文件仍在。
 - 每次成功领域修改全局递增一次 `revision`。纯查询、相同 `sourceEventId` 幂等命中和不产生实际删除的保留检查不递增修订号。
@@ -319,11 +321,12 @@ NotificationFileV1 {
 ### 9.3 启动恢复与保留
 
 - 启动时按 `main -> tmp -> bak` 顺序读取第一个严格校验通过的 v1 候选，和现有 `ChartStateStore` 恢复语义一致。若从 tmp 或 bak 恢复，使用不改变 revision 的原子规范化写入恢复主文件；规范化失败时仍可从已加载候选提供本次运行状态，并在下一次修改时重试。
-- 校验至少包含：schema、分区作用域唯一、Global 分区最多一个、账户 ID 规范化且非空、全文件通知 ID 唯一、受控枚举、有限参数、`occurrenceCount` 位于 `1..=u32::MAX`、`updatedAtMs >= createdAtMs`、`readAtMs >= createdAtMs`、时间戳不超过 JavaScript 安全整数，以及 `sourceEventIndex` 不含重复、悬空、跨作用域或不安全来源标识。
+- 校验至少包含：schema、分区作用域唯一、Global 分区最多一个、账户 ID 规范化且非空、全文件通知 ID 唯一、受控枚举、有限参数、`occurrenceCount` 位于 `1..=u32::MAX`、`updatedAtMs >= createdAtMs`、`readAtMs >= createdAtMs`、时间戳不超过 JavaScript 安全整数，以及 `sourceEventIndex` 不含重复、悬空、跨作用域、不安全来源标识或把记录的创建来源错指到另一记录。同作用域记录不能共享创建 `sourceEventId`。
+- 通知 JSON 序列化结果最多 16 MiB；save 使用有界 writer，load 在读取前检查元数据并最多读取 `16 MiB + 1` 字节后复核，避免为巨型文件无界分配。对元数据已超限的候选只读取最多 4 KiB 的受控前缀识别首个根字段 `schemaVersion`：可识别的当前/旧 schema 按损坏处理，可识别的未来 schema 返回不支持且绝不改名/覆盖，无法可靠识别版本的超限候选保持原位并阻断 load/save。每 scope 10,000 和全局 50,000 的来源索引上限在 load/save 两端都校验。合法 legacy 文件在服务加载后进行创建来源回填与 incident 顺序规范化；若这一步使索引或序列化结果越界，必须在构造权威内存状态前按记录粒度删除最旧可释放记录及其全部索引，以一次 copy-on-write 保存、连续修订和 `Reset` 提交，不能把超限快照留到下一次业务保存才失败。序列化 cap 修复先预排最旧记录，再用指数扩张与二分收敛确定一次批量淘汰前缀，序列化探测次数为对数级，不能逐记录反复扫描/序列化整个文件。
 - 只要更高优先级候选可解析且 `schemaVersion > 1`，就停止向旧候选降级。该文件属于“不支持的新版本”，不是损坏文件；应用继续启动，但通知中心进入不可用恢复态，并且当前版本不得覆盖、降级或改名该文件。
 - 所有 v1 候选都损坏时，把不可解析文件保留为带时间戳的 `.corrupt-*` 排查副本，以空通知箱启动。通知不是应用启动的硬依赖；该恢复过程不发送 Created 或补弹 Toast。
 - 存储目录不存在时按需创建；首次无文件是正常空状态，不报告错误。
-- 统一 `prune(now)` 在启动、每次创建和每 24 小时的低频维护任务中执行；查询与摘要还必须在内存中过滤已经过期但尚未完成持久清理的记录。实际清理发生时只做一次原子写、递增一次 revision 并发送 `Reset`。
+- 统一 `prune(now)` 在启动、每次创建和每 24 小时的低频维护任务中执行；查询与摘要还必须在内存中过滤已经过期但尚未完成持久清理的记录。每次结构清理阶段只做一次原子写、递增一次 revision 并发送 `Reset`；删除空的孤儿账户分区同样是结构变化，即使 `affectedCount = 0` 也必须持久化、递增 revision 并发送 `Reset`。
 - `prune` 删除超过 90 天的项目，并保证每个账户分区最多 1000 条；Global 分区同样最多 1000 条。维护任务随 AppState 启动并在应用退出时停止。
 - 清理顺序按 `createdAtMs` 最旧优先；已读与未读使用相同保留规则，通知中心不是审计日志。
 - 持久文件不加密，但只能包含已脱敏通知数据。凭据与密钥继续由系统 Keyring 管理。
@@ -425,6 +428,7 @@ update_notification_settings { NotificationSettings } -> NotificationSettings
 | 变更事件丢失 | 修订号跳跃后重新查询 | 命令与 JSON 状态为权威来源 |
 | 主文件损坏 | 按 main/tmp/bak 恢复并记录警告 | 恢复有效候选，或保留损坏副本后空箱启动；未来 schema 不覆盖 |
 | 通知设置保存失败 | 行内错误与重试 | Toast 决策继续使用最后成功设置 |
+| 来源索引容量被单一语义目标占满 | 返回稳定 `NOTIFICATION_SOURCE_INDEX_CAPACITY_EXCEEDED` | 原子拒绝新来源；保留记录、全部历史来源、修订、事件和观察器状态 |
 | 白名单动作目标暂不可用 | 通知仍标记为已读，显示轻量提示 | 不执行字符串路由或任意副作用 |
 
 通知存储失败使用稳定错误码 `NOTIFICATION_STORAGE_UNAVAILABLE`，错误 Toast 以该码在 60 秒窗口内最多显示一次；任一后续通知写入成功后重置限频状态。限频只影响 Toast，不吞掉脱敏诊断日志。
@@ -450,9 +454,11 @@ update_notification_settings { NotificationSettings } -> NotificationSettings
 - 过期 `sessionEpoch` 不创建记录；账户身份不能从当前 UI 状态推断。
 - 当前账户与全局分区合并排序、All/Unread 查询、稳定游标、limit 边界和完整未读数。
 - 单条已读/删除的当前账户可见性校验、`NOTIFICATION_SCOPE_MISMATCH`、全部可见已读、当前账户清空和 Global 保留语义。
-- 90 天、账户 1000 条、Global 1000 条、24 小时维护、一次 Reset 和相同时间戳确定排序。
+- 90 天、账户 1000 条、Global 1000 条、每 scope 来源索引 10,000、全局来源索引 50,000、文件 16 MiB、24 小时维护、每次结构阶段一次 Reset、空孤儿分区清理和相同时间戳确定排序；覆盖 legacy backfill 越界、只淘汰持有索引的记录、语义目标保护，以及唯一目标占满时跨重启容量错误与旧来源 no-op。
+- 发布时清理先发连续修订的 Reset 再发 Created/Updated；分别覆盖清理保存失败和发布保存失败的 copy-on-write 边界，且容量已满时新记录必须实际保留后才允许一次 Toast。
+- 同毫秒多故障周期跨重启使用创建来源索引顺序，API、私有 WebSocket 与环境 incident 保持独立；legacy 缺失顺序使用确定回退且不能错误关闭最后未恢复周期。
 - copy-on-write、并发串行、next revision 随文件持久化、IPC 十进制修订字符串和 previous/next 事件一致性。
-- main/tmp/bak 恢复顺序、temp 提升失败与 backup 恢复失败候选集、双文件损坏保留副本、未来 schema 不覆盖、首次无文件和孤儿账户分区清理。
+- main/tmp/bak 恢复顺序、temp 提升失败与 backup 恢复失败候选集、双文件损坏保留副本、超限 future/unknown schema 不改名不覆盖、首次无文件和孤儿账户分区清理。
 - 只有持久化成功才发送变更事件；幂等命中与失败不发送 Created，恢复和历史加载不发送 Toast candidate。
 - 账户删除通知清理失败不回滚账户删除，并返回 `NOTIFICATION_CLEANUP_PENDING`。
 

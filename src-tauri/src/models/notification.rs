@@ -8,6 +8,8 @@ use uuid::{Uuid, Version};
 pub const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const DEFAULT_NOTIFICATION_PAGE_LIMIT: u32 = 50;
 pub const MAX_NOTIFICATION_PAGE_LIMIT: u32 = 100;
+pub(crate) const MAX_NOTIFICATION_SOURCE_EVENT_ID_BYTES: usize = 256;
+pub(crate) const MAX_NOTIFICATION_DEDUPE_KEY_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -550,8 +552,8 @@ impl NotificationRecord {
             || self
                 .source_event_id
                 .as_ref()
-                .is_some_and(|id| id.trim().is_empty())
-            || self.dedupe_key.trim().is_empty()
+                .is_some_and(|id| !is_safe_notification_source_event_id(id))
+            || !is_safe_notification_dedupe_key(&self.dedupe_key)
             || self.occurrence_count == 0
             || !is_safe_timestamp(self.created_at_ms)
             || !is_safe_timestamp(self.updated_at_ms)
@@ -603,8 +605,8 @@ impl NotificationInput {
             || self
                 .source_event_id
                 .as_ref()
-                .is_some_and(|id| id.trim().is_empty())
-            || self.dedupe_key.trim().is_empty()
+                .is_some_and(|id| !is_safe_notification_source_event_id(id))
+            || !is_safe_notification_dedupe_key(&self.dedupe_key)
         {
             return Err(invalid_content());
         }
@@ -824,6 +826,35 @@ fn is_safe_timestamp(value: u64) -> bool {
     value <= MAX_JAVASCRIPT_SAFE_INTEGER
 }
 
+pub(crate) fn is_safe_notification_source_event_id(value: &str) -> bool {
+    is_safe_notification_identifier(value, MAX_NOTIFICATION_SOURCE_EVENT_ID_BYTES)
+}
+
+pub(crate) fn is_safe_notification_dedupe_key(value: &str) -> bool {
+    is_safe_notification_identifier(value, MAX_NOTIFICATION_DEDUPE_KEY_BYTES)
+}
+
+fn is_safe_notification_identifier(value: &str, max_bytes: usize) -> bool {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+        || value.split(':').any(looks_like_secret)
+    {
+        return false;
+    }
+    !value
+        .split([':', '-', '_'])
+        .map(str::to_ascii_lowercase)
+        .any(|segment| {
+            matches!(
+                segment.as_str(),
+                "sk" | "secret" | "token" | "bearer" | "apikey"
+            )
+        })
+}
+
 fn looks_like_secret(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.starts_with("sk_")
@@ -834,6 +865,13 @@ fn looks_like_secret(value: &str) -> bool {
         || lower.starts_with("token")
         || lower.starts_with("bearer")
         || lower.starts_with("akia")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("gho_")
+        || lower.starts_with("ghu_")
+        || lower.starts_with("ghs_")
+        || lower.starts_with("github_pat_")
+        || lower.starts_with("xoxb-")
+        || lower.starts_with("xoxp-")
         || value.starts_with("eyJ")
 }
 
@@ -1121,6 +1159,76 @@ mod tests {
             record.validate().unwrap_err().code(),
             "INVALID_NOTIFICATION_RECORD"
         );
+    }
+
+    #[test]
+    fn record_and_input_reject_unsafe_source_and_dedupe_identifiers() {
+        for source_event_id in [
+            "raw server body".to_string(),
+            "event/token".to_string(),
+            "event-token-value".to_string(),
+            "eyJhbGciOiJIUzI1NiJ9".to_string(),
+            "event:AKIAIOSFODNN7EXAMPLE".to_string(),
+            "event:eyJhbGciOiJIUzI1NiJ9".to_string(),
+            "attempt:ghp_xxxxxxxxxxxxxxxxxxxx".to_string(),
+            "a".repeat(257),
+        ] {
+            let mut record = valid_record();
+            record.source_event_id = Some(source_event_id.clone());
+            assert_eq!(
+                record.validate().unwrap_err().code(),
+                "INVALID_NOTIFICATION_RECORD"
+            );
+
+            let input = NotificationInput {
+                scope: record.scope,
+                category: record.category,
+                kind: record.kind,
+                severity: record.severity,
+                content: record.content,
+                entity: record.entity,
+                action: record.action,
+                source_event_id: Some(source_event_id),
+                dedupe_key: "alpha:submission-1:risk".into(),
+                session_epoch: Some(1),
+            };
+            assert_eq!(
+                input.validate().unwrap_err().code(),
+                "INVALID_NOTIFICATION_CONTENT"
+            );
+        }
+
+        for dedupe_key in [
+            "raw dedupe text".to_string(),
+            "alpha:secret:value".to_string(),
+            "alpha:AKIAIOSFODNN7EXAMPLE:risk".to_string(),
+            "alpha:eyJhbGciOiJIUzI1NiJ9:risk".to_string(),
+            "a".repeat(513),
+        ] {
+            let mut record = valid_record();
+            record.dedupe_key = dedupe_key.clone();
+            assert_eq!(
+                record.validate().unwrap_err().code(),
+                "INVALID_NOTIFICATION_RECORD"
+            );
+
+            let input = NotificationInput {
+                scope: record.scope,
+                category: record.category,
+                kind: record.kind,
+                severity: record.severity,
+                content: record.content,
+                entity: record.entity,
+                action: record.action,
+                source_event_id: record.source_event_id,
+                dedupe_key,
+                session_epoch: Some(1),
+            };
+            assert_eq!(
+                input.validate().unwrap_err().code(),
+                "INVALID_NOTIFICATION_CONTENT"
+            );
+        }
     }
 
     #[test]

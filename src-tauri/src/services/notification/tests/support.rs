@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{AppError, AppResult};
@@ -12,12 +13,18 @@ use crate::storage::notification_store::{NotificationFileV1, NotificationPersist
 #[derive(Default)]
 pub(super) struct FakePersistence {
     saves: Mutex<Vec<NotificationFileV1>>,
-    fail: Mutex<bool>,
+    attempts: AtomicUsize,
+    fail_on_attempt: Mutex<Option<usize>>,
 }
 
 impl FakePersistence {
     pub(super) fn fail_next(&self) {
-        *self.fail.lock().unwrap() = true;
+        self.fail_after_successes(0);
+    }
+
+    pub(super) fn fail_after_successes(&self, successful_saves: usize) {
+        *self.fail_on_attempt.lock().unwrap() =
+            Some(self.attempts.load(Ordering::SeqCst) + successful_saves + 1);
     }
 
     pub(super) fn saves(&self) -> Vec<NotificationFileV1> {
@@ -27,9 +34,10 @@ impl FakePersistence {
 
 impl NotificationPersistence for FakePersistence {
     fn save(&self, file: &NotificationFileV1) -> AppResult<()> {
-        let mut fail = self.fail.lock().unwrap();
-        if *fail {
-            *fail = false;
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut fail_on_attempt = self.fail_on_attempt.lock().unwrap();
+        if *fail_on_attempt == Some(attempt) {
+            *fail_on_attempt = None;
             return Err(AppError::Storage("NOTIFICATION_STORAGE_UNAVAILABLE".into()));
         }
         self.saves.lock().unwrap().push(file.clone());

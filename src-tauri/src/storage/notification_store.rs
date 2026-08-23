@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,10 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::models::config::APP_NAME;
-use crate::models::notification::{NotificationRecord, NotificationScope};
+use crate::models::notification::{
+    is_safe_notification_source_event_id, NotificationRecord, NotificationScope,
+};
 
 pub const NOTIFICATION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_NOTIFICATION_PARTITION_ITEMS: usize = 1_000;
+pub const MAX_NOTIFICATION_SOURCE_INDEX_PER_SCOPE: usize = 10_000;
+pub const MAX_NOTIFICATION_SOURCE_INDEX_TOTAL: usize = 50_000;
+pub const MAX_NOTIFICATION_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_NOTIFICATION_SCHEMA_SNIFF_BYTES: u64 = 4 * 1024;
 
 const TEMP_SUFFIX: &str = ".tmp";
 const BACKUP_SUFFIX: &str = ".bak";
@@ -174,6 +180,12 @@ impl NotificationStore {
                 Ok(Candidate::Corrupt) => {
                     corrupt_candidates.push((path.to_path_buf(), path_kind));
                 }
+                Ok(Candidate::OversizedUnknown) => {
+                    return Err(storage_unavailable_without_io(
+                        "oversized_unknown_schema",
+                        path_kind,
+                    ));
+                }
                 Err(error) => return Err(storage_unavailable("read", path_kind, error)),
             }
         }
@@ -208,7 +220,7 @@ impl NotificationStore {
             existing_candidate(&paths.backup, "backup")?,
             Some(Candidate::Valid(_))
         );
-        let bytes = serde_json::to_vec_pretty(file).map_err(|_| invalid_file())?;
+        let bytes = serialize_file(file)?;
 
         if let Some(parent) = paths.main.parent() {
             fs::create_dir_all(parent)
@@ -377,6 +389,7 @@ enum Candidate {
     Valid(NotificationFileV1),
     Future(u32),
     Corrupt,
+    OversizedUnknown,
 }
 
 fn existing_candidate(path: &Path, path_kind: &'static str) -> AppResult<Option<Candidate>> {
@@ -390,7 +403,30 @@ fn existing_candidate(path: &Path, path_kind: &'static str) -> AppResult<Option<
 }
 
 fn read_candidate(path: &Path) -> std::io::Result<Candidate> {
-    let bytes = fs::read(path)?;
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_NOTIFICATION_FILE_BYTES as u64 {
+        let mut prefix = Vec::with_capacity(MAX_NOTIFICATION_SCHEMA_SNIFF_BYTES as usize);
+        File::open(path)?
+            .take(MAX_NOTIFICATION_SCHEMA_SNIFF_BYTES)
+            .read_to_end(&mut prefix)?;
+        return Ok(match sniff_leading_schema_version(&prefix) {
+            Some(schema_version) if schema_version > NOTIFICATION_SCHEMA_VERSION => {
+                Candidate::Future(schema_version)
+            }
+            Some(_) => Candidate::Corrupt,
+            None => Candidate::OversizedUnknown,
+        });
+    }
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_NOTIFICATION_FILE_BYTES)
+        .min(MAX_NOTIFICATION_FILE_BYTES);
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(path)?
+        .take(MAX_NOTIFICATION_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_NOTIFICATION_FILE_BYTES {
+        return Ok(Candidate::Corrupt);
+    }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Ok(Candidate::Corrupt);
     };
@@ -416,6 +452,47 @@ fn read_candidate(path: &Path) -> std::io::Result<Candidate> {
     }
 }
 
+fn sniff_leading_schema_version(bytes: &[u8]) -> Option<u32> {
+    let mut index = 0_usize;
+    skip_ascii_whitespace(bytes, &mut index);
+    if bytes.get(index) != Some(&b'{') {
+        return None;
+    }
+    index += 1;
+    skip_ascii_whitespace(bytes, &mut index);
+    const KEY: &[u8] = br#""schemaVersion""#;
+    if !bytes.get(index..)?.starts_with(KEY) {
+        return None;
+    }
+    index += KEY.len();
+    skip_ascii_whitespace(bytes, &mut index);
+    if bytes.get(index) != Some(&b':') {
+        return None;
+    }
+    index += 1;
+    skip_ascii_whitespace(bytes, &mut index);
+    let digits_start = index;
+    let mut value = 0_u32;
+    while let Some(byte @ b'0'..=b'9') = bytes.get(index).copied() {
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+        index += 1;
+    }
+    if index == digits_start
+        || !bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b',' | b'}'))
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], index: &mut usize) {
+    while bytes.get(*index).is_some_and(u8::is_ascii_whitespace) {
+        *index += 1;
+    }
+}
+
 fn ensure_supported_save_target(paths: &NotificationPaths) -> AppResult<()> {
     for (path, path_kind) in [
         (&paths.main, "main"),
@@ -425,7 +502,7 @@ fn ensure_supported_save_target(paths: &NotificationPaths) -> AppResult<()> {
         match existing_candidate(path, path_kind)? {
             None | Some(Candidate::Corrupt) => continue,
             Some(Candidate::Valid(_)) => return Ok(()),
-            Some(Candidate::Future(_)) => {
+            Some(Candidate::Future(_)) | Some(Candidate::OversizedUnknown) => {
                 return Err(storage_unavailable_without_io("future_schema", path_kind));
             }
         }
@@ -434,11 +511,14 @@ fn ensure_supported_save_target(paths: &NotificationPaths) -> AppResult<()> {
 }
 
 fn validate_file(file: &NotificationFileV1) -> AppResult<()> {
-    if file.schema_version != NOTIFICATION_SCHEMA_VERSION {
+    if file.schema_version != NOTIFICATION_SCHEMA_VERSION
+        || file.source_event_index.len() > MAX_NOTIFICATION_SOURCE_INDEX_TOTAL
+    {
         return Err(invalid_file());
     }
     let mut scopes = HashSet::new();
     let mut record_ids = HashSet::new();
+    let mut creating_sources = HashMap::new();
     for partition in &file.partitions {
         if partition.items.len() > MAX_NOTIFICATION_PARTITION_ITEMS {
             return Err(invalid_file());
@@ -451,6 +531,12 @@ fn validate_file(file: &NotificationFileV1) -> AppResult<()> {
             record.validate().map_err(|_| invalid_file())?;
             if record.scope != partition.scope || !record_ids.insert(record.id.clone()) {
                 return Err(invalid_file());
+            }
+            if let Some(source_event_id) = &record.source_event_id {
+                let key = (partition.scope.clone(), source_event_id.clone());
+                if creating_sources.insert(key, record.id.clone()).is_some() {
+                    return Err(invalid_file());
+                }
             }
         }
     }
@@ -465,13 +551,21 @@ fn validate_file(file: &NotificationFileV1) -> AppResult<()> {
         })
         .collect();
     let mut indexed_sources = HashSet::new();
+    let mut indexed_per_scope = HashMap::<NotificationScope, usize>::new();
     for entry in &file.source_event_index {
         entry.scope.validate().map_err(|_| invalid_file())?;
-        if !is_safe_source_event_id(&entry.source_event_id)
-            || !indexed_sources.insert((entry.scope.clone(), entry.source_event_id.as_str()))
+        let source_key = (entry.scope.clone(), entry.source_event_id.clone());
+        let scope_count = indexed_per_scope.entry(entry.scope.clone()).or_default();
+        *scope_count += 1;
+        if *scope_count > MAX_NOTIFICATION_SOURCE_INDEX_PER_SCOPE
+            || !is_safe_notification_source_event_id(&entry.source_event_id)
+            || !indexed_sources.insert(source_key.clone())
             || !records_by_id
                 .get(entry.notification_id.as_str())
                 .is_some_and(|scope| *scope == &entry.scope)
+            || creating_sources
+                .get(&source_key)
+                .is_some_and(|record_id| record_id != &entry.notification_id)
         {
             return Err(invalid_file());
         }
@@ -479,24 +573,45 @@ fn validate_file(file: &NotificationFileV1) -> AppResult<()> {
     Ok(())
 }
 
-fn is_safe_source_event_id(value: &str) -> bool {
-    if value.is_empty()
-        || value.len() > 256
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
-    {
-        return false;
+fn serialize_file(file: &NotificationFileV1) -> AppResult<Vec<u8>> {
+    let mut writer = SizeLimitedWriter::new(MAX_NOTIFICATION_FILE_BYTES);
+    serde_json::to_writer_pretty(&mut writer, file).map_err(|_| invalid_file())?;
+    Ok(writer.bytes)
+}
+
+pub(crate) fn notification_file_fits_serialized_limit(file: &NotificationFileV1) -> bool {
+    serialize_file(file).is_ok()
+}
+
+struct SizeLimitedWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl SizeLimitedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
     }
-    !value
-        .split([':', '-', '_'])
-        .map(str::to_ascii_lowercase)
-        .any(|segment| {
-            matches!(
-                segment.as_str(),
-                "sk" | "secret" | "token" | "bearer" | "apikey"
-            )
-        })
+}
+
+impl Write for SizeLimitedWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "notification file exceeds byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> PathBuf {

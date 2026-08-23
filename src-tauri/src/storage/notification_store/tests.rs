@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::{
     FailurePoint, NotificationFileV1, NotificationLoadStatus, NotificationPartition,
     NotificationPersistence, NotificationSourceEventIndexEntry, NotificationStore, RecoverySource,
-    NOTIFICATION_SCHEMA_VERSION,
+    MAX_NOTIFICATION_FILE_BYTES, NOTIFICATION_SCHEMA_VERSION,
 };
 use crate::error::AppError;
 use crate::models::notification::{
@@ -91,6 +91,42 @@ fn oversized_file(revision: u64) -> NotificationFileV1 {
                 })
                 .collect(),
         }],
+    }
+}
+
+fn source_index_file(entries_per_scope: &[usize], padding: usize) -> NotificationFileV1 {
+    let mut partitions = Vec::new();
+    let mut source_event_index = Vec::new();
+    for (scope_index, entry_count) in entries_per_scope.iter().copied().enumerate() {
+        let scope = NotificationScope::Account {
+            account_id: format!("scope-{scope_index}"),
+        };
+        let record = sample_record(
+            &format!("00000000-0000-4000-8000-{:012x}", scope_index + 1),
+            scope.clone(),
+            100 + scope_index as u64,
+        );
+        let notification_id = record.id.clone();
+        partitions.push(NotificationPartition {
+            scope: scope.clone(),
+            items: vec![record],
+        });
+        source_event_index.extend((0..entry_count).map(|entry_index| {
+            NotificationSourceEventIndexEntry {
+                scope: scope.clone(),
+                source_event_id: format!(
+                    "semantic-{scope_index}-{entry_index}-{}",
+                    "x".repeat(padding)
+                ),
+                notification_id: notification_id.clone(),
+            }
+        }));
+    }
+    NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision: 1,
+        source_event_index,
+        partitions,
     }
 }
 
@@ -690,5 +726,207 @@ fn source_event_index_rejects_duplicates_dangling_cross_scope_and_unsafe_ids() {
         base.source_event_index = index;
         assert!(store.save(&base).is_err());
     }
+    cleanup(&root);
+}
+
+#[test]
+fn records_reject_duplicate_creating_sources_and_misdirected_creation_index_entries() {
+    let root = test_root("record-source-uniqueness");
+    let store = NotificationStore::with_path(store_path(&root));
+    let mut duplicate = sample_file(1);
+    let mut second = sample_record(
+        "00000000-0000-4000-8000-000000000002",
+        NotificationScope::Global,
+        200,
+    );
+    second.source_event_id = duplicate.partitions[0].items[0].source_event_id.clone();
+    duplicate.partitions[0].items.push(second);
+    assert!(store.save(&duplicate).is_err());
+
+    let mut misdirected = sample_file(1);
+    let second = sample_record(
+        "00000000-0000-4000-8000-000000000002",
+        NotificationScope::Global,
+        200,
+    );
+    let wrong_target = second.id.clone();
+    let creating_source = misdirected.partitions[0].items[0]
+        .source_event_id
+        .clone()
+        .unwrap();
+    misdirected.partitions[0].items.push(second);
+    misdirected.source_event_index = vec![NotificationSourceEventIndexEntry {
+        scope: NotificationScope::Global,
+        source_event_id: creating_source,
+        notification_id: wrong_target,
+    }];
+    assert!(store.save(&misdirected).is_err());
+    cleanup(&root);
+}
+
+#[test]
+fn unsafe_legacy_record_source_is_corruption_but_does_not_poison_the_next_save() {
+    let root = test_root("unsafe-legacy-source");
+    let path = store_path(&root);
+    let store = NotificationStore::with_path(path.clone());
+    let mut value = serde_json::to_value(sample_file(3)).unwrap();
+    value.as_object_mut().unwrap().remove("sourceEventIndex");
+    value["partitions"][0]["items"][0]["sourceEventId"] =
+        serde_json::Value::String("event:AKIAIOSFODNN7EXAMPLE".into());
+    write_json(&path, &value);
+
+    let outcome = store.load().unwrap();
+    assert_eq!(outcome.status, NotificationLoadStatus::ResetFromCorruption);
+    assert_eq!(outcome.file, NotificationFileV1::empty());
+    assert!(!path.exists());
+
+    let replacement = sample_file(4);
+    store.save(&replacement).unwrap();
+    assert_eq!(store.load().unwrap().file, replacement);
+    cleanup(&root);
+}
+
+#[test]
+fn legacy_file_with_duplicate_creating_sources_is_corruption() {
+    let root = test_root("duplicate-legacy-source");
+    let path = store_path(&root);
+    let mut file = sample_file(3);
+    let mut duplicate = sample_record(
+        "00000000-0000-4000-8000-000000000002",
+        NotificationScope::Global,
+        200,
+    );
+    duplicate.source_event_id = file.partitions[0].items[0].source_event_id.clone();
+    file.partitions[0].items.push(duplicate);
+    let mut value = serde_json::to_value(file).unwrap();
+    value.as_object_mut().unwrap().remove("sourceEventIndex");
+    write_json(&path, &value);
+
+    let outcome = NotificationStore::with_path(path).load().unwrap();
+
+    assert_eq!(outcome.status, NotificationLoadStatus::ResetFromCorruption);
+    assert_eq!(outcome.file, NotificationFileV1::empty());
+    cleanup(&root);
+}
+
+#[test]
+fn source_index_limits_accept_the_boundary_and_reject_scope_and_total_plus_one() {
+    let scope_root = test_root("source-index-scope-limit");
+    let scope_store = NotificationStore::with_path(store_path(&scope_root));
+    let mut scope_file = source_index_file(&[10_000], 0);
+    scope_store.save(&scope_file).unwrap();
+    scope_file
+        .source_event_index
+        .push(NotificationSourceEventIndexEntry {
+            scope: scope_file.partitions[0].scope.clone(),
+            source_event_id: "semantic-over-scope-limit".into(),
+            notification_id: scope_file.partitions[0].items[0].id.clone(),
+        });
+    assert!(scope_store.save(&scope_file).is_err());
+    cleanup(&scope_root);
+
+    let total_root = test_root("source-index-total-limit");
+    let total_store = NotificationStore::with_path(store_path(&total_root));
+    let mut total_file = source_index_file(&[10_000, 10_000, 10_000, 10_000, 10_000, 0], 0);
+    total_store.save(&total_file).unwrap();
+    total_file
+        .source_event_index
+        .push(NotificationSourceEventIndexEntry {
+            scope: total_file.partitions[5].scope.clone(),
+            source_event_id: "semantic-over-total-limit".into(),
+            notification_id: total_file.partitions[5].items[0].id.clone(),
+        });
+    assert!(total_store.save(&total_file).is_err());
+    cleanup(&total_root);
+}
+
+#[test]
+fn serialized_file_cap_rejects_large_saves_and_loads_as_corruption() {
+    let save_root = test_root("serialized-save-cap");
+    let save_store = NotificationStore::with_path(store_path(&save_root));
+    let large = source_index_file(&[10_000, 10_000, 10_000, 10_000, 10_000], 230);
+    assert!(save_store.save(&large).is_err());
+    cleanup(&save_root);
+
+    let load_root = test_root("serialized-load-cap");
+    let path = store_path(&load_root);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut boundary = serde_json::to_vec(&NotificationFileV1::empty()).unwrap();
+    boundary.resize(MAX_NOTIFICATION_FILE_BYTES, b' ');
+    fs::write(&path, &boundary).unwrap();
+    let store = NotificationStore::with_path(path.clone());
+    let outcome = store.load().unwrap();
+    assert_eq!(outcome.status, NotificationLoadStatus::Clean);
+    assert_eq!(outcome.file, NotificationFileV1::empty());
+
+    boundary.push(b' ');
+    fs::write(&path, boundary).unwrap();
+    let outcome = store.load().unwrap();
+    assert_eq!(outcome.status, NotificationLoadStatus::ResetFromCorruption);
+    assert_eq!(outcome.file, NotificationFileV1::empty());
+    cleanup(&load_root);
+}
+
+#[test]
+fn oversized_future_main_and_temp_are_detected_without_rename_or_overwrite() {
+    for label in ["main", "temp"] {
+        let root = test_root(&format!("oversized-future-{label}"));
+        let path = store_path(&root);
+        let candidate_path = if label == "main" {
+            path.clone()
+        } else {
+            NotificationStore::temp_path_for_test(&path)
+        };
+        fs::create_dir_all(candidate_path.parent().unwrap()).unwrap();
+        let mut future = br#"{"schemaVersion":2,"futureData":""#.to_vec();
+        future.resize(MAX_NOTIFICATION_FILE_BYTES, b'x');
+        future.extend_from_slice(br#""}"#);
+        assert!(future.len() > MAX_NOTIFICATION_FILE_BYTES);
+        fs::write(&candidate_path, &future).unwrap();
+        let store = NotificationStore::with_path(path.clone());
+
+        let outcome = store.load().unwrap();
+
+        assert_eq!(
+            outcome.status,
+            NotificationLoadStatus::UnsupportedSchema { found: 2 }
+        );
+        assert_eq!(fs::read(&candidate_path).unwrap(), future);
+        assert!(store.save(&sample_file(1)).is_err());
+        assert_eq!(fs::read(&candidate_path).unwrap(), future);
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+                .count(),
+            0
+        );
+        cleanup(&root);
+    }
+}
+
+#[test]
+fn oversized_candidate_with_unrecognized_schema_prefix_is_preserved_and_blocks_saves() {
+    let root = test_root("oversized-unknown-schema");
+    let path = store_path(&root);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut bytes = vec![b' '; MAX_NOTIFICATION_FILE_BYTES];
+    bytes.extend_from_slice(br#"{"schemaVersion":2}"#);
+    fs::write(&path, &bytes).unwrap();
+    let store = NotificationStore::with_path(path.clone());
+
+    assert_storage_unavailable(store.load().unwrap_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(store.save(&sample_file(1)).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .count(),
+        0
+    );
     cleanup(&root);
 }
