@@ -828,7 +828,10 @@ describe('notification authoritative mutations and settings', () => {
     const item = record('mark-read-before-old-page')
     const store = await openedStore(item)
     const olderPage = deferred<NotificationPage>()
-    mocks.list.mockReturnValueOnce(olderPage.promise)
+    const repairPage = deferred<NotificationPage>()
+    mocks.list
+      .mockReturnValueOnce(olderPage.promise)
+      .mockReturnValueOnce(repairPage.promise)
     const reloading = store.reload()
     await tick()
     const marked = { ...item, readAtMs: item.createdAtMs + 1 }
@@ -839,15 +842,19 @@ describe('notification authoritative mutations and settings', () => {
     })
 
     await expect(store.markRead(item.id)).resolves.toBe(true)
-    const loadingReleasedBeforeOldPage = !store.initialLoading
+    const repairOwnsLoadingAfterMutation = store.initialLoading
     emit(changed('revision-1', 'revision-2', [{ type: 'account', accountId: 'primary' }]))
     olderPage.resolve(page([item], 'revision-1', undefined, 1))
     await reloading
+    repairPage.resolve(page([marked], 'revision-2', undefined, 0))
+    await tick()
 
-    expect(loadingReleasedBeforeOldPage).toBe(true)
+    expect(repairOwnsLoadingAfterMutation).toBe(true)
+    expect(mocks.list).toHaveBeenCalledTimes(3)
     expect(store.items).toEqual([marked])
     expect(store.unreadCount).toBe(0)
     expect(store.observedRevision).toBe('revision-2')
+    expect(store.initialLoading).toBe(false)
     expect(store.error).toBeNull()
   })
 
@@ -855,21 +862,111 @@ describe('notification authoritative mutations and settings', () => {
     const item = record('remove-before-old-page')
     const store = await openedStore(item)
     const olderPage = deferred<NotificationPage>()
-    mocks.list.mockReturnValueOnce(olderPage.promise)
+    const repairPage = deferred<NotificationPage>()
+    mocks.list
+      .mockReturnValueOnce(olderPage.promise)
+      .mockReturnValueOnce(repairPage.promise)
     const reloading = store.reload()
     await tick()
     mocks.remove.mockResolvedValueOnce({ unreadCount: 0, revision: 'revision-2' })
 
     await expect(store.remove(item.id)).resolves.toBe(true)
-    const loadingReleasedBeforeOldPage = !store.initialLoading
+    const repairOwnsLoadingAfterMutation = store.initialLoading
     emit(changed('revision-1', 'revision-2', [{ type: 'account', accountId: 'primary' }]))
     olderPage.resolve(page([item], 'revision-1', undefined, 1))
     await reloading
+    repairPage.resolve(page([], 'revision-2', undefined, 0))
+    await tick()
 
-    expect(loadingReleasedBeforeOldPage).toBe(true)
+    expect(repairOwnsLoadingAfterMutation).toBe(true)
+    expect(mocks.list).toHaveBeenCalledTimes(3)
     expect(store.items).toEqual([])
     expect(store.unreadCount).toBe(0)
     expect(store.observedRevision).toBe('revision-2')
+    expect(store.initialLoading).toBe(false)
+    expect(store.error).toBeNull()
+  })
+
+  it('repairs an event refresh canceled by an accepted mark-read response without merging its old page', async () => {
+    const itemA = record('mark-read-repair-a')
+    const itemB = record('mark-read-repair-b')
+    const store = await openedStore(itemA)
+    const olderEventPage = deferred<NotificationPage>()
+    const repairPage = deferred<NotificationPage>()
+    mocks.list
+      .mockReturnValueOnce(olderEventPage.promise)
+      .mockReturnValueOnce(repairPage.promise)
+    const toastB = candidate(itemB.id, itemB.scope)
+
+    emit(changed('revision-1', 'revision-2', [itemB.scope], {
+      change: 'created',
+      notificationId: itemB.id,
+      toastCandidate: toastB,
+    }))
+    await tick()
+    const markedA = { ...itemA, readAtMs: itemA.createdAtMs + 1 }
+    mocks.markRead.mockResolvedValueOnce({
+      notification: markedA,
+      unreadCount: 1,
+      revision: 'revision-3',
+    })
+
+    await expect(store.markRead(itemA.id)).resolves.toBe(true)
+    emit(changed('revision-2', 'revision-3', [itemA.scope]))
+    await tick()
+    olderEventPage.resolve(page([itemA, itemB], 'revision-2', undefined, 2))
+    await tick()
+
+    expect(store.items).toEqual([markedA])
+    expect(store.unreadCount).toBe(1)
+    expect(store.observedRevision).toBe('revision-3')
+
+    repairPage.resolve(page([markedA, itemB], 'revision-3', undefined, 1))
+    await tick()
+
+    expect(mocks.list).toHaveBeenCalledTimes(3)
+    expect(store.items).toEqual([markedA, itemB])
+    expect(store.unreadCount).toBe(1)
+    expect(store.observedRevision).toBe('revision-3')
+    expect(store.error).toBeNull()
+  })
+
+  it('repairs an event refresh canceled by an accepted remove response without merging its old page', async () => {
+    const itemA = record('remove-repair-a')
+    const itemB = record('remove-repair-b')
+    const store = await openedStore(itemA)
+    const olderEventPage = deferred<NotificationPage>()
+    const repairPage = deferred<NotificationPage>()
+    mocks.list
+      .mockReturnValueOnce(olderEventPage.promise)
+      .mockReturnValueOnce(repairPage.promise)
+    const toastB = candidate(itemB.id, itemB.scope)
+
+    emit(changed('revision-1', 'revision-2', [itemB.scope], {
+      change: 'created',
+      notificationId: itemB.id,
+      toastCandidate: toastB,
+    }))
+    await tick()
+    mocks.remove.mockResolvedValueOnce({ unreadCount: 1, revision: 'revision-3' })
+
+    await expect(store.remove(itemA.id)).resolves.toBe(true)
+    emit(changed('revision-2', 'revision-3', [itemA.scope]))
+    await tick()
+    olderEventPage.resolve(page([itemA, itemB], 'revision-2', undefined, 2))
+    await tick()
+
+    expect(store.items).toEqual([])
+    expect(store.unreadCount).toBe(1)
+    expect(store.observedRevision).toBe('revision-3')
+
+    repairPage.resolve(page([itemB], 'revision-3', undefined, 1))
+    await tick()
+
+    expect(mocks.list).toHaveBeenCalledTimes(3)
+    expect(store.items).toEqual([itemB])
+    expect(store.unreadCount).toBe(1)
+    expect(store.observedRevision).toBe('revision-3')
     expect(store.error).toBeNull()
   })
 
@@ -1008,18 +1105,24 @@ describe('notification authoritative mutations and settings', () => {
     await store.setAccount('primary')
     await store.open()
     const olderPage = deferred<NotificationPage>()
-    mocks.list.mockReturnValueOnce(olderPage.promise)
+    const repairPage = deferred<NotificationPage>()
+    mocks.list
+      .mockReturnValueOnce(olderPage.promise)
+      .mockReturnValueOnce(repairPage.promise)
     const reloading = store.reload()
     await tick()
+    const marked = { ...item, readAtMs: item.createdAtMs + 1 }
     mocks.markRead.mockResolvedValueOnce({
-      notification: { ...item, readAtMs: item.createdAtMs + 1 },
+      notification: marked,
       unreadCount: 0,
       revision: 'revision-2',
     })
     await store.markRead(item.id)
-    const pageLoadingReleased = !store.initialLoading
     olderPage.reject(new Error('stale page failed'))
     await reloading
+    repairPage.resolve(page([marked], 'revision-2', 'cursor-1', 0))
+    await tick()
+    const pageLoadingReleased = !store.initialLoading
 
     const olderMore = deferred<NotificationPage>()
     mocks.list.mockReturnValueOnce(olderMore.promise)
