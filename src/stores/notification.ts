@@ -67,6 +67,7 @@ export const useNotificationStore = defineStore('notification', () => {
   let summaryRequestId = 0
   let pageRequestId = 0
   let moreRequestId = 0
+  let readAuthorityEpoch = 0
   let settingsLoadRequestId = 0
   let settingsVersion = 0
   let settingsDrain: Promise<void> | null = null
@@ -125,6 +126,16 @@ export const useNotificationStore = defineStore('notification', () => {
     pageError.value = null
   }
 
+  function invalidateReadAuthority(): void {
+    ++readAuthorityEpoch
+    ++summaryRequestId
+    ++pageRequestId
+    ++moreRequestId
+    initialLoading.value = false
+    loadingMore.value = false
+    pageError.value = null
+  }
+
   function invalidateMutationOwnership(): void {
     markReadOwners.clear()
     removeOwners.clear()
@@ -139,9 +150,9 @@ export const useNotificationStore = defineStore('notification', () => {
   async function refreshSummary(
     owner = lifecycleId,
     generation = loadGeneration.value,
-    pageWins = false,
   ): Promise<void> {
     const requestId = ++summaryRequestId
+    const authorityEpoch = readAuthorityEpoch
     const capturedAccountId = accountId.value
     const capturedFilter = filter.value
     const capturedRevision = observedRevision.value
@@ -149,8 +160,9 @@ export const useNotificationStore = defineStore('notification', () => {
       const summary = await getNotificationSummary(capturedAccountId)
       if (
         requestId !== summaryRequestId
+        || authorityEpoch !== readAuthorityEpoch
         || !ownsContext(owner, generation, capturedAccountId, capturedFilter)
-        || (pageWins && pageAuthorityGeneration === generation)
+        || pageAuthorityGeneration === generation
       ) return
       unreadCount.value = summary.unreadCount
       adoptRevision(capturedRevision, summary.revision)
@@ -158,8 +170,9 @@ export const useNotificationStore = defineStore('notification', () => {
     } catch (summaryError) {
       if (
         requestId === summaryRequestId
+        && authorityEpoch === readAuthorityEpoch
         && ownsContext(owner, generation, capturedAccountId, capturedFilter)
-        && (!pageWins || pageAuthorityGeneration !== generation)
+        && pageAuthorityGeneration !== generation
       ) {
         dataError.value = localErrorMessage(summaryError)
       }
@@ -171,6 +184,7 @@ export const useNotificationStore = defineStore('notification', () => {
     generation: number,
   ): Promise<void> {
     const requestId = ++pageRequestId
+    const authorityEpoch = readAuthorityEpoch
     const capturedAccountId = accountId.value
     const capturedFilter = filter.value
     const capturedRevision = observedRevision.value
@@ -184,6 +198,7 @@ export const useNotificationStore = defineStore('notification', () => {
       })
       if (
         requestId !== pageRequestId
+        || authorityEpoch !== readAuthorityEpoch
         || !ownsContext(owner, generation, capturedAccountId, capturedFilter)
       ) return
       pageAuthorityGeneration = generation
@@ -196,6 +211,7 @@ export const useNotificationStore = defineStore('notification', () => {
     } catch (pageLoadError) {
       if (
         requestId === pageRequestId
+        && authorityEpoch === readAuthorityEpoch
         && ownsContext(owner, generation, capturedAccountId, capturedFilter)
       ) {
         dataError.value = localErrorMessage(pageLoadError)
@@ -203,6 +219,7 @@ export const useNotificationStore = defineStore('notification', () => {
     } finally {
       if (
         requestId === pageRequestId
+        && authorityEpoch === readAuthorityEpoch
         && ownsContext(owner, generation, capturedAccountId, capturedFilter)
       ) {
         initialLoading.value = false
@@ -292,14 +309,18 @@ export const useNotificationStore = defineStore('notification', () => {
     const owner = lifecycleId
     const requestId = ++settingsLoadRequestId
     const capturedVersion = settingsVersion
-    settingsSaveStatus.value = 'loading'
-    settingsError.value = null
+    const saveOwnsAuthority = settingsDrain !== null
+    if (!saveOwnsAuthority) {
+      settingsSaveStatus.value = 'loading'
+      settingsError.value = null
+    }
     try {
       const loaded = await getNotificationSettings()
       if (
         requestId !== settingsLoadRequestId
         || !ownsLifecycle(owner)
         || capturedVersion !== settingsVersion
+        || saveOwnsAuthority
       ) return
       settingsDraft.value = copySettings(loaded)
       settingsCommitted.value = copySettings(loaded)
@@ -309,6 +330,7 @@ export const useNotificationStore = defineStore('notification', () => {
         requestId === settingsLoadRequestId
         && ownsLifecycle(owner)
         && capturedVersion === settingsVersion
+        && !saveOwnsAuthority
       ) {
         settingsSaveStatus.value = 'error'
         settingsError.value = localErrorMessage(loadError)
@@ -362,6 +384,7 @@ export const useNotificationStore = defineStore('notification', () => {
     ++summaryRequestId
     ++pageRequestId
     ++moreRequestId
+    ++readAuthorityEpoch
     ++settingsLoadRequestId
     ++settingsVersion
     initialized = false
@@ -402,7 +425,7 @@ export const useNotificationStore = defineStore('notification', () => {
     invalidateLoadMore()
     invalidateMutationOwnership()
     clearPage(true)
-    const loads: Promise<void>[] = [refreshSummary(owner, generation, hadInitializedPage)]
+    const loads: Promise<void>[] = [refreshSummary(owner, generation)]
     if (hadInitializedPage) loads.push(queryFirstPage(owner, generation))
     await Promise.all(loads)
   }
@@ -427,6 +450,7 @@ export const useNotificationStore = defineStore('notification', () => {
     const capturedFilter = filter.value
     const capturedRevision = observedRevision.value
     const requestId = ++moreRequestId
+    const authorityEpoch = readAuthorityEpoch
     loadingMore.value = true
     pageError.value = null
     try {
@@ -438,6 +462,7 @@ export const useNotificationStore = defineStore('notification', () => {
       })
       if (
         requestId !== moreRequestId
+        || authorityEpoch !== readAuthorityEpoch
         || !ownsContext(owner, generation, capturedAccountId, capturedFilter)
       ) return
       const knownIds = new Set(items.value.map((item) => item.id))
@@ -451,12 +476,15 @@ export const useNotificationStore = defineStore('notification', () => {
     } catch (loadError) {
       if (
         requestId === moreRequestId
+        && authorityEpoch === readAuthorityEpoch
         && ownsContext(owner, generation, capturedAccountId, capturedFilter)
       ) {
         pageError.value = localErrorMessage(loadError)
       }
     } finally {
-      if (requestId === moreRequestId) loadingMore.value = false
+      if (requestId === moreRequestId && authorityEpoch === readAuthorityEpoch) {
+        loadingMore.value = false
+      }
     }
   }
 
@@ -485,6 +513,7 @@ export const useNotificationStore = defineStore('notification', () => {
     try {
       const result = await markNotificationRead(capturedAccountId, id)
       if (!ownsContext(owner, generation, capturedAccountId, capturedFilter)) return false
+      invalidateReadAuthority()
       if (capturedFilter === 'unread') {
         items.value = items.value.filter((item) => item.id !== id)
       } else {
@@ -522,6 +551,7 @@ export const useNotificationStore = defineStore('notification', () => {
     try {
       const result = await deleteNotification(capturedAccountId, id)
       if (!ownsContext(owner, generation, capturedAccountId, capturedFilter)) return false
+      invalidateReadAuthority()
       items.value = items.value.filter((item) => item.id !== id)
       unreadCount.value = result.unreadCount
       adoptRevision(capturedRevision, result.revision)
@@ -562,6 +592,7 @@ export const useNotificationStore = defineStore('notification', () => {
     try {
       const result = await markVisibleNotificationsRead(capturedAccountId)
       if (!ownsContext(owner, generation, capturedAccountId, capturedFilter)) return false
+      invalidateReadAuthority()
       unreadCount.value = result.unreadCount
       adoptRevision(capturedRevision, result.revision)
       await refreshAfterMutation(false)
@@ -597,6 +628,7 @@ export const useNotificationStore = defineStore('notification', () => {
     try {
       const result = await clearAccountNotifications(capturedAccountId)
       if (!ownsContext(owner, generation, capturedAccountId, capturedFilter)) return false
+      invalidateReadAuthority()
       unreadCount.value = result.unreadCount
       adoptRevision(capturedRevision, result.revision)
       await refreshAfterMutation(true, false)

@@ -569,6 +569,31 @@ describe('notification store context, paging, revisions, and Toasts', () => {
     expect(store.observedRevision).toBe('revision-page-newer')
   })
 
+  it('keeps an opened page authoritative when the older startup summary resolves later', async () => {
+    const olderSummary = deferred<{ unreadCount: number; revision: string }>()
+    const newerPage = deferred<NotificationPage>()
+    mocks.summary.mockReturnValueOnce(olderSummary.promise)
+    mocks.list.mockReturnValueOnce(newerPage.promise)
+    const store = useNotificationStore()
+
+    const starting = store.start()
+    await tick()
+    const opening = store.open()
+    const current = record('startup-page-newer', { type: 'global' })
+    newerPage.resolve(page([current], 'revision-page-newer', undefined, 7))
+    await opening
+    expect(store.items).toEqual([current])
+    expect(store.unreadCount).toBe(7)
+    expect(store.observedRevision).toBe('revision-page-newer')
+
+    olderSummary.resolve({ unreadCount: 99, revision: 'revision-summary-older' })
+    await starting
+
+    expect(store.items).toEqual([current])
+    expect(store.unreadCount).toBe(7)
+    expect(store.observedRevision).toBe('revision-page-newer')
+  })
+
   it('retains a successful cache on continuous relevant soft refresh failure', async () => {
     const cached = record('cached')
     mocks.list.mockResolvedValueOnce(page([cached], 'revision-1', 'cursor', 1))
@@ -798,6 +823,220 @@ describe('notification authoritative mutations and settings', () => {
     await store.open()
     return store
   }
+
+  it('preserves accepted mark-read authority against an older same-context page and matching event', async () => {
+    const item = record('mark-read-before-old-page')
+    const store = await openedStore(item)
+    const olderPage = deferred<NotificationPage>()
+    mocks.list.mockReturnValueOnce(olderPage.promise)
+    const reloading = store.reload()
+    await tick()
+    const marked = { ...item, readAtMs: item.createdAtMs + 1 }
+    mocks.markRead.mockResolvedValueOnce({
+      notification: marked,
+      unreadCount: 0,
+      revision: 'revision-2',
+    })
+
+    await expect(store.markRead(item.id)).resolves.toBe(true)
+    const loadingReleasedBeforeOldPage = !store.initialLoading
+    emit(changed('revision-1', 'revision-2', [{ type: 'account', accountId: 'primary' }]))
+    olderPage.resolve(page([item], 'revision-1', undefined, 1))
+    await reloading
+
+    expect(loadingReleasedBeforeOldPage).toBe(true)
+    expect(store.items).toEqual([marked])
+    expect(store.unreadCount).toBe(0)
+    expect(store.observedRevision).toBe('revision-2')
+    expect(store.error).toBeNull()
+  })
+
+  it('preserves accepted remove authority against an older same-context page and matching event', async () => {
+    const item = record('remove-before-old-page')
+    const store = await openedStore(item)
+    const olderPage = deferred<NotificationPage>()
+    mocks.list.mockReturnValueOnce(olderPage.promise)
+    const reloading = store.reload()
+    await tick()
+    mocks.remove.mockResolvedValueOnce({ unreadCount: 0, revision: 'revision-2' })
+
+    await expect(store.remove(item.id)).resolves.toBe(true)
+    const loadingReleasedBeforeOldPage = !store.initialLoading
+    emit(changed('revision-1', 'revision-2', [{ type: 'account', accountId: 'primary' }]))
+    olderPage.resolve(page([item], 'revision-1', undefined, 1))
+    await reloading
+
+    expect(loadingReleasedBeforeOldPage).toBe(true)
+    expect(store.items).toEqual([])
+    expect(store.unreadCount).toBe(0)
+    expect(store.observedRevision).toBe('revision-2')
+    expect(store.error).toBeNull()
+  })
+
+  it('preserves accepted mark-read authority against an older same-context summary', async () => {
+    const store = useNotificationStore()
+    await store.start()
+    await store.setAccount('primary')
+    const olderSummary = deferred<{ unreadCount: number; revision: string }>()
+    mocks.summary.mockReturnValueOnce(olderSummary.promise)
+    emit(changed('revision-1', 'revision-event', [{ type: 'account', accountId: 'primary' }]))
+    await tick()
+    const item = record('mark-read-before-old-summary')
+    const marked = { ...item, readAtMs: item.createdAtMs + 1 }
+    mocks.markRead.mockResolvedValueOnce({
+      notification: marked,
+      unreadCount: 0,
+      revision: 'revision-mutation',
+    })
+
+    await expect(store.markRead(item.id)).resolves.toBe(true)
+    emit(changed(
+      'revision-event',
+      'revision-mutation',
+      [{ type: 'account', accountId: 'primary' }],
+    ))
+    olderSummary.resolve({ unreadCount: 99, revision: 'revision-event' })
+    await tick()
+
+    expect(store.unreadCount).toBe(0)
+    expect(store.observedRevision).toBe('revision-mutation')
+    expect(store.error).toBeNull()
+  })
+
+  it('preserves accepted remove authority against an older same-context summary', async () => {
+    const store = useNotificationStore()
+    await store.start()
+    await store.setAccount('primary')
+    const olderSummary = deferred<{ unreadCount: number; revision: string }>()
+    mocks.summary.mockReturnValueOnce(olderSummary.promise)
+    emit(changed('revision-1', 'revision-event', [{ type: 'account', accountId: 'primary' }]))
+    await tick()
+    const item = record('remove-before-old-summary')
+    mocks.remove.mockResolvedValueOnce({
+      unreadCount: 0,
+      revision: 'revision-mutation',
+    })
+
+    await expect(store.remove(item.id)).resolves.toBe(true)
+    emit(changed(
+      'revision-event',
+      'revision-mutation',
+      [{ type: 'account', accountId: 'primary' }],
+    ))
+    olderSummary.resolve({ unreadCount: 99, revision: 'revision-event' })
+    await tick()
+
+    expect(store.unreadCount).toBe(0)
+    expect(store.observedRevision).toBe('revision-mutation')
+    expect(store.error).toBeNull()
+  })
+
+  it('preserves accepted mark-read authority against an older same-context load-more', async () => {
+    const item = record('mark-read-before-old-more')
+    mocks.list.mockResolvedValueOnce(page([item], 'revision-1', 'cursor-1', 1))
+    const store = useNotificationStore()
+    await store.start()
+    await store.setAccount('primary')
+    await store.open()
+    const olderMore = deferred<NotificationPage>()
+    mocks.list.mockReturnValueOnce(olderMore.promise)
+    const loading = store.loadMore()
+    await tick()
+    const marked = { ...item, readAtMs: item.createdAtMs + 1 }
+    mocks.markRead.mockResolvedValueOnce({
+      notification: marked,
+      unreadCount: 0,
+      revision: 'revision-2',
+    })
+
+    await expect(store.markRead(item.id)).resolves.toBe(true)
+    const loadingReleasedBeforeOldMore = !store.loadingMore
+    emit(changed('revision-1', 'revision-2', [{ type: 'account', accountId: 'primary' }]))
+    olderMore.resolve(page(
+      [item, record('stale-mark-read-more')],
+      'revision-1',
+      'cursor-stale',
+      2,
+    ))
+    await loading
+
+    expect(loadingReleasedBeforeOldMore).toBe(true)
+    expect(store.items).toEqual([marked])
+    expect(store.nextCursor).toBe('cursor-1')
+    expect(store.unreadCount).toBe(0)
+    expect(store.observedRevision).toBe('revision-2')
+    expect(store.pageError).toBeNull()
+  })
+
+  it('preserves accepted remove authority against an older same-context load-more', async () => {
+    const item = record('remove-before-old-more')
+    mocks.list.mockResolvedValueOnce(page([item], 'revision-1', 'cursor-1', 1))
+    const store = useNotificationStore()
+    await store.start()
+    await store.setAccount('primary')
+    await store.open()
+    const olderMore = deferred<NotificationPage>()
+    mocks.list.mockReturnValueOnce(olderMore.promise)
+    const loading = store.loadMore()
+    await tick()
+    mocks.remove.mockResolvedValueOnce({ unreadCount: 0, revision: 'revision-2' })
+
+    await expect(store.remove(item.id)).resolves.toBe(true)
+    const loadingReleasedBeforeOldMore = !store.loadingMore
+    emit(changed('revision-1', 'revision-2', [{ type: 'account', accountId: 'primary' }]))
+    olderMore.resolve(page(
+      [item, record('stale-remove-more')],
+      'revision-1',
+      'cursor-stale',
+      2,
+    ))
+    await loading
+
+    expect(loadingReleasedBeforeOldMore).toBe(true)
+    expect(store.items).toEqual([])
+    expect(store.nextCursor).toBe('cursor-1')
+    expect(store.unreadCount).toBe(0)
+    expect(store.observedRevision).toBe('revision-2')
+    expect(store.pageError).toBeNull()
+  })
+
+  it('releases older read loading and error ownership when mutation authority is accepted', async () => {
+    const item = record('mutation-before-old-errors')
+    mocks.list.mockResolvedValueOnce(page([item], 'revision-1', 'cursor-1', 1))
+    const store = useNotificationStore()
+    await store.start()
+    await store.setAccount('primary')
+    await store.open()
+    const olderPage = deferred<NotificationPage>()
+    mocks.list.mockReturnValueOnce(olderPage.promise)
+    const reloading = store.reload()
+    await tick()
+    mocks.markRead.mockResolvedValueOnce({
+      notification: { ...item, readAtMs: item.createdAtMs + 1 },
+      unreadCount: 0,
+      revision: 'revision-2',
+    })
+    await store.markRead(item.id)
+    const pageLoadingReleased = !store.initialLoading
+    olderPage.reject(new Error('stale page failed'))
+    await reloading
+
+    const olderMore = deferred<NotificationPage>()
+    mocks.list.mockReturnValueOnce(olderMore.promise)
+    const loading = store.loadMore()
+    await tick()
+    mocks.remove.mockResolvedValueOnce({ unreadCount: 0, revision: 'revision-3' })
+    await store.remove(item.id)
+    const moreLoadingReleased = !store.loadingMore
+    olderMore.reject(new Error('stale load-more failed'))
+    await loading
+
+    expect(pageLoadingReleased).toBe(true)
+    expect(moreLoadingReleased).toBe(true)
+    expect(store.error).toBeNull()
+    expect(store.pageError).toBeNull()
+    expect(store.observedRevision).toBe('revision-3')
+  })
 
   it('keeps mark-read immutable before response and applies the returned record only on success', async () => {
     const item = record('mark-read')
@@ -1397,6 +1636,58 @@ describe('notification authoritative mutations and settings', () => {
 
     expect(store.settingsDraft).toEqual(draft)
     expect(store.settingsCommitted).toEqual(draft)
+  })
+
+  it('ignores a load started during save when the save resolves first', async () => {
+    const store = useNotificationStore()
+    await store.start()
+    const save = deferred<NotificationSettings>()
+    const load = deferred<NotificationSettings>()
+    mocks.updateSettings.mockReturnValueOnce(save.promise)
+    mocks.getSettings.mockReturnValueOnce(load.promise)
+    const draft = { ...enabledSettings, tradingToast: false }
+    const staleLoaded = { ...enabledSettings, riskAccountToast: false }
+
+    const saving = store.updateSettings(draft)
+    const loading = store.loadSettings()
+    const statusWhileSaveOwnsAuthority = store.settingsSaveStatus
+    save.resolve(draft)
+    await saving
+    load.resolve(staleLoaded)
+    await loading
+
+    expect(statusWhileSaveOwnsAuthority).toBe('saving')
+    expect(store.settingsDraft).toEqual(draft)
+    expect(store.settingsCommitted).toEqual(draft)
+    expect(store.settingsSaveStatus).toBe('saved')
+    expect(store.settingsError).toBeNull()
+  })
+
+  it('ignores a load started during save when the load resolves first', async () => {
+    const store = useNotificationStore()
+    await store.start()
+    const save = deferred<NotificationSettings>()
+    const load = deferred<NotificationSettings>()
+    mocks.updateSettings.mockReturnValueOnce(save.promise)
+    mocks.getSettings.mockReturnValueOnce(load.promise)
+    const draft = { ...enabledSettings, tradingToast: false }
+    const staleLoaded = { ...enabledSettings, riskAccountToast: false }
+
+    const saving = store.updateSettings(draft)
+    const loading = store.loadSettings()
+    load.resolve(staleLoaded)
+    await loading
+
+    expect(store.settingsDraft).toEqual(draft)
+    expect(store.settingsCommitted).toEqual(enabledSettings)
+    expect(store.settingsSaveStatus).toBe('saving')
+
+    save.resolve(draft)
+    await saving
+    expect(store.settingsDraft).toEqual(draft)
+    expect(store.settingsCommitted).toEqual(draft)
+    expect(store.settingsSaveStatus).toBe('saved')
+    expect(store.settingsError).toBeNull()
   })
 
   it('does not let an old settings drain own a save started after stop and restart', async () => {
