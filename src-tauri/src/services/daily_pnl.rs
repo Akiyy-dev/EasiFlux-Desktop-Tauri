@@ -7,13 +7,16 @@ use std::str::FromStr;
 use tokio::sync::RwLock;
 
 use crate::api::response::extract_list;
-use crate::api::PrivateApi;
 use crate::api::response::get_str;
+use crate::api::PrivateApi;
 use crate::error::AppResult;
 use crate::events::EventEmitter;
 use crate::models::config::AppConfig;
 use crate::models::time::DailyPnlSnapshot;
-use crate::services::time::{normalize_epoch_ms_i64, resolve_trading_day_timezone, trading_day_bounds, TimeService};
+use crate::models::trading::SessionContext;
+use crate::services::time::{
+    normalize_epoch_ms_i64, resolve_trading_day_timezone, trading_day_bounds, TimeService,
+};
 
 pub struct DailyPnlService {
     api: Arc<crate::api::ApiClient>,
@@ -37,7 +40,7 @@ impl DailyPnlService {
         }
     }
 
-    pub async fn refresh(&self) -> AppResult<DailyPnlSnapshot> {
+    pub async fn refresh(&self, context: &SessionContext) -> AppResult<DailyPnlSnapshot> {
         let (timezone, server_time) = {
             let cfg = self.config.read().await;
             (
@@ -57,7 +60,7 @@ impl DailyPnlService {
         )
         .await?;
         let snapshot = build_snapshot(&payload, server_time, day_start, day_end, &timezone);
-        self.emitter.emit_daily_pnl_updated(&snapshot);
+        self.emitter.emit_daily_pnl_updated(context, &snapshot);
         Ok(snapshot)
     }
 }
@@ -82,15 +85,18 @@ fn build_snapshot(
         if closed_time < day_start || closed_time >= day_end {
             continue;
         }
-        let pnl_raw = get_str(row, &[
-            "closedPnl",
-            "closed_pnl",
-            "realisedPnl",
-            "realised_pnl",
-            "realizedPnl",
-            "realized_pnl",
-            "pnl",
-        ])
+        let pnl_raw = get_str(
+            row,
+            &[
+                "closedPnl",
+                "closed_pnl",
+                "realisedPnl",
+                "realised_pnl",
+                "realizedPnl",
+                "realized_pnl",
+                "pnl",
+            ],
+        )
         .unwrap_or_else(|| "0".into());
         total += Decimal::from_str(&pnl_raw).unwrap_or(Decimal::ZERO);
     }
@@ -109,13 +115,7 @@ fn build_snapshot(
 fn record_key(row: &Value) -> String {
     if let Some(id) = get_str(
         row,
-        &[
-            "id",
-            "closedPnlId",
-            "closed_pnl_id",
-            "orderId",
-            "order_id",
-        ],
+        &["id", "closedPnlId", "closed_pnl_id", "orderId", "order_id"],
     ) {
         return id;
     }
@@ -125,7 +125,13 @@ fn record_key(row: &Value) -> String {
     let size = get_str(row, &["closedSize", "closed_size", "qty", "size"]).unwrap_or_default();
     let pnl = get_str(
         row,
-        &["closedPnl", "closed_pnl", "pnl", "realisedPnl", "realised_pnl"],
+        &[
+            "closedPnl",
+            "closed_pnl",
+            "pnl",
+            "realisedPnl",
+            "realised_pnl",
+        ],
     )
     .unwrap_or_default();
     format!("{symbol}:{side}:{closed_time}:{size}:{pnl}")

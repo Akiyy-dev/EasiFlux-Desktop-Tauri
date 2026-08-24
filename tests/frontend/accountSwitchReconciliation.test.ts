@@ -241,7 +241,7 @@ describe('post-switch reconciliation', () => {
     await store.refreshProfiles()
     await store.retryReconciliation()
     const accepted = store.handleSessionEvent(
-      { sessionEpoch: 0, payload: 'connected' },
+      { accountId: 'primary', sessionEpoch: 0, payload: 'connected' },
       (status) => connection.setWsStatus(status),
     )
 

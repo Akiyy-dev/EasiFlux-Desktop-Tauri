@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,13 +12,21 @@ use crate::api::PublicApi;
 use crate::auth::time_sync::sync_from_server;
 use crate::auth::{Signer, TimeSync};
 use crate::error::{AppError, AppResult};
-use crate::models::config::{ApiCredential, DEFAULT_BASE_URL, RECV_WINDOW_MS};
+use crate::models::config::{
+    canonical_api_base_url, ApiCredential, DEFAULT_BASE_URL, RECV_WINDOW_MS,
+};
+use crate::models::trading::SessionContext;
 
 use super::endpoints;
-use super::response::{error_message, is_sign_error, is_success_response, is_timestamp_error};
+use super::response::{classify_auth_failure, is_success_response, AuthFailureKind};
 
 /// Ordered query pairs for private GET signing (SDK insertion order).
 pub type QueryParams = Vec<(String, String)>;
+pub(crate) type AuthFailureObserver = Arc<
+    dyn Fn(SessionContext, AuthFailureKind) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, Clone, Copy)]
 struct HttpTimeoutPolicy {
@@ -34,12 +44,7 @@ impl HttpTimeoutPolicy {
 }
 
 pub fn normalize_base_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        DEFAULT_BASE_URL.to_string()
-    } else {
-        trimmed.to_string()
-    }
+    canonical_api_base_url(url).unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -49,6 +54,8 @@ pub struct ApiClient {
     credential: Arc<RwLock<Option<ApiCredential>>>,
     signer: Arc<RwLock<Option<Signer>>>,
     time_sync: Arc<TimeSync>,
+    session_context: Arc<RwLock<Option<SessionContext>>>,
+    auth_failure_observer: Arc<std::sync::RwLock<Option<AuthFailureObserver>>>,
 }
 
 impl ApiClient {
@@ -68,6 +75,8 @@ impl ApiClient {
             credential: Arc::new(RwLock::new(None)),
             signer: Arc::new(RwLock::new(None)),
             time_sync: Arc::new(TimeSync::new()),
+            session_context: Arc::new(RwLock::new(None)),
+            auth_failure_observer: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -77,6 +86,13 @@ impl ApiClient {
 
     pub async fn set_credential(&self, credential: ApiCredential) {
         let credential = credential.normalize();
+        if !credential.is_valid() {
+            *self.base_url.write().await = String::new();
+            *self.credential.write().await = None;
+            *self.signer.write().await = None;
+            *self.session_context.write().await = None;
+            return;
+        }
         let base = normalize_base_url(&credential.base_url);
         *self.base_url.write().await = base;
         *self.signer.write().await = Some(Signer::new(
@@ -86,9 +102,25 @@ impl ApiClient {
         *self.credential.write().await = Some(credential);
     }
 
+    pub(crate) async fn set_credential_for_session(
+        &self,
+        credential: ApiCredential,
+        context: SessionContext,
+    ) {
+        self.set_credential(credential).await;
+        *self.session_context.write().await = Some(context);
+    }
+
+    pub(crate) fn set_auth_failure_observer(&self, observer: AuthFailureObserver) {
+        if let Ok(mut current) = self.auth_failure_observer.write() {
+            *current = Some(observer);
+        }
+    }
+
     pub async fn clear_credential(&self) {
         *self.credential.write().await = None;
         *self.signer.write().await = None;
+        *self.session_context.write().await = None;
     }
 
     pub async fn set_base_url(&self, base_url: &str) {
@@ -110,7 +142,7 @@ impl ApiClient {
     ) -> AppResult<Value> {
         let url = format!("{}{}", self.base_url().await, path);
         let response = self.http.get(&url).query(&params).send().await?;
-        self.parse_response(response, None).await
+        self.parse_response(response, None, None).await
     }
 
     pub async fn private_get(&self, path: &str, params: QueryParams) -> AppResult<Value> {
@@ -126,6 +158,7 @@ impl ApiClient {
     }
 
     async fn private_get_once(&self, path: &str, params: &QueryParams) -> AppResult<Value> {
+        let context = self.session_context.read().await.clone();
         let query = encode_query(params);
         let headers = self.sign_headers(&query, "").await?;
         let base = format!("{}{}", self.base_url().await, path);
@@ -139,7 +172,7 @@ impl ApiClient {
             req = req.header(k, v);
         }
         let response = req.send().await?;
-        self.parse_response(response, None).await
+        self.parse_response(response, None, context).await
     }
 
     pub async fn private_post(&self, path: &str, body: Value) -> AppResult<Value> {
@@ -155,6 +188,7 @@ impl ApiClient {
     }
 
     async fn private_post_once(&self, path: &str, body: Value) -> AppResult<Value> {
+        let context = self.session_context.read().await.clone();
         let url = format!("{}{}", self.base_url().await, path);
         let body_text =
             serde_json::to_string(&body).map_err(|e| AppError::Internal(e.to_string()))?;
@@ -167,7 +201,7 @@ impl ApiClient {
             req = req.header(k, v);
         }
         let response = req.body(body_text).send().await?;
-        self.parse_response(response, Some(path)).await
+        self.parse_response(response, Some(path), context).await
     }
 
     async fn ensure_time_sync(&self) -> AppResult<()> {
@@ -196,17 +230,28 @@ impl ApiClient {
         &self,
         response: reqwest::Response,
         path: Option<&str>,
+        context: Option<SessionContext>,
     ) -> AppResult<Value> {
         let status = response.status();
+        let status_auth_failure =
+            classify_auth_failure(Some(status.as_u16()), &serde_json::json!({}));
         let text = response.text().await?;
         if text.is_empty() {
             if status.is_success() {
                 return Ok(json!({}));
             }
+            if status_auth_failure != AuthFailureKind::Other {
+                return Err(AppError::AuthFailure(status_auth_failure));
+            }
             return Err(AppError::Connection(format!("HTTP {}", status)));
         }
-        let payload: Value = serde_json::from_str(&text)
-            .map_err(|_| AppError::Connection("API 响应格式无效".into()))?;
+        let payload: Value = match serde_json::from_str(&text) {
+            Ok(payload) => payload,
+            Err(_) if status_auth_failure != AuthFailureKind::Other => {
+                return Err(AppError::AuthFailure(status_auth_failure));
+            }
+            Err(_) => return Err(AppError::Connection("API 响应格式无效".into())),
+        };
         if status.is_success() && path == Some(endpoints::CREATE_ORDER) {
             match super::response::classify_create_order_outcome(&payload) {
                 super::response::CreateOrderOutcome::Rejected => {
@@ -221,18 +266,32 @@ impl ApiClient {
                 }
             }
         }
+        let auth_failure = classify_auth_failure(Some(status.as_u16()), &payload);
+        if auth_failure == AuthFailureKind::SessionExpired {
+            let observer = self
+                .auth_failure_observer
+                .read()
+                .ok()
+                .and_then(|observer| observer.clone());
+            if let (Some(context), Some(observer)) = (context, observer) {
+                if let Some(notification_id) = observer(context, auth_failure).await {
+                    return Err(AppError::Notified {
+                        code: "AUTH_SESSION_EXPIRED",
+                        message: "账户会话已失效",
+                        notification_id,
+                    });
+                }
+            }
+        }
         if !status.is_success() {
+            if auth_failure != AuthFailureKind::Other {
+                return Err(AppError::AuthFailure(auth_failure));
+            }
             return Err(AppError::Connection(format!("HTTP {}", status)));
         }
         if !is_success_response(&payload) {
-            let msg = error_message(&payload).unwrap_or_else(|| "API 返回错误".into());
-            if is_timestamp_error(&payload) {
-                return Err(AppError::Trading("timestamp: 请求时间校验失败".into()));
-            }
-            if is_sign_error(&payload) || is_sign_error_message(&msg) {
-                return Err(AppError::Trading(
-                    "sign: 签名校验失败（请重新保存 API Secret）".into(),
-                ));
+            if auth_failure != AuthFailureKind::Other {
+                return Err(AppError::AuthFailure(auth_failure));
             }
             return Err(AppError::Trading("API 返回错误".into()));
         }
@@ -241,21 +300,10 @@ impl ApiClient {
 }
 
 fn should_retry_private_request(error: &AppError) -> bool {
-    match error {
-        AppError::Trading(msg) => {
-            msg.contains("timestamp")
-                || msg.contains("recv_window")
-                || msg.contains("sign")
-                || msg.contains("error sign")
-        }
-        AppError::Connection(msg) => msg.contains("timestamp") || msg.contains("recv_window"),
-        AppError::TradingFailure(_) => false,
-        _ => false,
-    }
-}
-
-fn is_sign_error_message(message: &str) -> bool {
-    message.contains("error sign") || message.contains("invalid signature")
+    matches!(
+        error,
+        AppError::AuthFailure(AuthFailureKind::Timestamp | AuthFailureKind::Signature)
+    )
 }
 
 impl Default for ApiClient {
@@ -279,6 +327,7 @@ mod tests {
     use super::*;
     use crate::auth::Signer;
     use crate::models::config::RECV_WINDOW_MS;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn public_get_from_raw_response(response: String) -> AppError {
         use std::io::{Read, Write};
@@ -309,6 +358,68 @@ mod tests {
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn private_session_expired_returns_the_single_committed_notification_id() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = std::thread::spawn(move || {
+            for body in [
+                r#"{"code":0,"data":{"time":"1782850580"}}"#,
+                r#"{"code":26200003,"message":"provider secret expired text"}"#,
+            ] {
+                let (mut socket, _) = listener.accept().expect("accept test request");
+                let mut request = [0_u8; 2048];
+                let _ = socket.read(&mut request).expect("read test request");
+                let response = raw_response("200 OK", body);
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write test response");
+            }
+        });
+        let client = ApiClient::new();
+        client
+            .set_credential_for_session(
+                ApiCredential {
+                    label: "Alpha".into(),
+                    api_key: "key".into(),
+                    api_secret: "secret".into(),
+                    base_url: format!("http://{address}"),
+                },
+                SessionContext {
+                    account_id: "alpha".into(),
+                    session_epoch: 4,
+                },
+            )
+            .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured_calls = Arc::clone(&calls);
+        client.set_auth_failure_observer(Arc::new(move |context, failure| {
+            assert_eq!(context.account_id, "alpha");
+            assert_eq!(context.session_epoch, 4);
+            assert_eq!(failure, AuthFailureKind::SessionExpired);
+            captured_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some("committed-notification-id".to_string()) })
+        }));
+
+        let error = client
+            .private_get("/private/test", Vec::new())
+            .await
+            .expect_err("documented session expiry must fail");
+        server.join().expect("test server exits");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::json!({
+                "code": "AUTH_SESSION_EXPIRED",
+                "message": "账户会话已失效",
+                "notificationId": "committed-notification-id",
+            })
+        );
     }
 
     #[tokio::test]
@@ -347,12 +458,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn documented_http_403_is_rate_limited_even_without_json_but_401_and_429_are_other() {
+        for body in ["", "<html>provider secret</html>"] {
+            let error = public_get_from_raw_response(raw_response("403 Forbidden", body)).await;
+            assert!(matches!(
+                error,
+                AppError::AuthFailure(AuthFailureKind::RateLimited)
+            ));
+        }
+        for code in [26200003, 26200002, 26200004, 99999999] {
+            let error = public_get_from_raw_response(raw_response(
+                "403 Forbidden",
+                &serde_json::json!({"code": code, "message": "session expired"}).to_string(),
+            ))
+            .await;
+            assert!(matches!(
+                error,
+                AppError::AuthFailure(AuthFailureKind::RateLimited)
+            ));
+        }
+        for status in ["401 Unauthorized", "429 Too Many Requests"] {
+            let error = public_get_from_raw_response(raw_response(status, "")).await;
+            assert!(
+                matches!(error, AppError::Connection(_)),
+                "{status}: {error:?}"
+            );
+        }
+        let spoof = public_get_from_raw_response(raw_response(
+            "401 Unauthorized",
+            r#"{"code":99999999,"message":"session expired invalid api key"}"#,
+        ))
+        .await;
+        assert!(!matches!(
+            spoof,
+            AppError::AuthFailure(AuthFailureKind::SessionExpired)
+        ));
+    }
+
+    #[tokio::test]
     async fn set_base_url_normalizes_public_request_target() {
         let client = ApiClient::new();
 
         client.set_base_url(" https://sandbox.example.test/ ").await;
 
         assert_eq!(client.base_url().await, "https://sandbox.example.test");
+    }
+
+    #[tokio::test]
+    async fn unsafe_credential_url_is_quarantined_without_production_fallback_or_raw_error() {
+        const UNSAFE: &str = "https://user:raw-secret@127.0.0.1:9/api?token=raw";
+        let client = ApiClient::new();
+
+        client
+            .set_credential(ApiCredential {
+                label: "unsafe".into(),
+                api_key: "key".into(),
+                api_secret: "secret".into(),
+                base_url: UNSAFE.into(),
+            })
+            .await;
+
+        assert!(!client.has_credential().await);
+        assert_eq!(client.base_url().await, "");
+        assert_ne!(client.base_url().await, DEFAULT_BASE_URL);
+        let error = client
+            .public_get("/common/timestamp", HashMap::new())
+            .await
+            .expect_err("quarantined client must not send a request");
+        let rendered = serde_json::to_string(&error).unwrap();
+        assert!(!rendered.contains("raw-secret"));
+        assert!(!rendered.contains("token="));
+        assert!(!rendered.contains("127.0.0.1"));
     }
 
     #[test]

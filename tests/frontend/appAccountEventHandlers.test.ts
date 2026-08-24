@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../../src/App.vue'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useAccountStore } from '../../src/stores/account'
+import { useConfigStore } from '../../src/stores/config'
 import type { AppConfig, Balance } from '../../src/types/models'
 
 const mocks = vi.hoisted(() => ({
@@ -88,24 +89,44 @@ describe('App account-bound event handlers', () => {
   })
 
   it('does not write a stale balance event into the account store', () => {
+    useConfigStore().config = config
     useAccountProfilesStore().adoptSessionEpoch(2)
     const balance: Balance = {
       asset: 'USDT', available: '10', frozen: '0', total: '10',
     }
 
-    mocks.listeners.get('balance:updated')?.({ sessionEpoch: 1, payload: balance })
+    mocks.listeners.get('balance:updated')?.({
+      accountId: 'primary', sessionEpoch: 1, payload: balance,
+    })
 
     expect(useAccountStore().balances).toEqual([])
   })
 
   it('accepts the current epoch balance payload', () => {
+    useConfigStore().config = config
     useAccountProfilesStore().adoptSessionEpoch(2)
     const balance: Balance = {
       asset: 'USDT', available: '10', frozen: '0', total: '10',
     }
 
-    mocks.listeners.get('balance:updated')?.({ sessionEpoch: 2, payload: balance })
+    mocks.listeners.get('balance:updated')?.({
+      accountId: 'primary', sessionEpoch: 2, payload: balance,
+    })
 
     expect(useAccountStore().balances).toEqual([balance])
+  })
+
+  it('rejects a current-epoch event owned by a different account', () => {
+    useConfigStore().config = config
+    useAccountProfilesStore().adoptSessionEpoch(2)
+    const balance: Balance = {
+      asset: 'USDT', available: '99', frozen: '0', total: '99',
+    }
+
+    mocks.listeners.get('balance:updated')?.({
+      accountId: 'backup', sessionEpoch: 2, payload: balance,
+    })
+
+    expect(useAccountStore().balances).toEqual([])
   })
 })

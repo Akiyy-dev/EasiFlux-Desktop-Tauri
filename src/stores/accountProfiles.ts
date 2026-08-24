@@ -49,6 +49,13 @@ function errorMessage(error: unknown): string {
   return '请求失败'
 }
 
+function parseEventAccountId(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim()
+  if (normalized.length === 0 || normalized !== value) return null
+  return normalized
+}
+
 export const useAccountProfilesStore = defineStore('accountProfiles', () => {
   const profiles = ref<AccountProfile[]>([])
   const loading = ref(false)
@@ -132,6 +139,9 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
     handler: (payload: T) => void,
   ): boolean {
     if (transitionPending.value || recoveryRequired.value) return false
+    const eventAccountId = parseEventAccountId(event.accountId)
+    if (eventAccountId === null || eventAccountId !== activeAccountId.value) return false
+    if (!Number.isSafeInteger(event.sessionEpoch) || event.sessionEpoch < 0) return false
     const decision = decideAccountSessionEpoch(sessionEpoch.value, event.sessionEpoch)
     if (decision === 'reject') return false
     if (decision === 'advance') {

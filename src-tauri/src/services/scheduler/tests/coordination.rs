@@ -505,7 +505,7 @@ fn late_old_owner_drop_cannot_clear_a_newer_owner_token() {
 }
 
 #[tokio::test]
-async fn environment_probe_finishes_before_account_switch_returns() {
+async fn environment_probe_does_not_block_account_switch() {
     let coordinator = AccountLifecycleCoordinator::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let release_probe = Arc::new(tokio::sync::Notify::new());
@@ -532,23 +532,53 @@ async fn environment_probe_finishes_before_account_switch_returns() {
         record(&switch_events, "switch:return");
     });
     tokio::pin!(switch);
-    assert!(matches!(
-        futures_util::poll!(&mut switch),
-        std::task::Poll::Pending
-    ));
+    tokio::time::timeout(Duration::from_secs(1), switch.as_mut())
+        .await
+        .expect("environment probing must remain independent of account switching");
+
+    assert_eq!(*events.lock().unwrap(), ["probe:primary", "switch:return"]);
 
     release_probe.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        let (probe_result, ()) = tokio::join!(probe.as_mut(), switch.as_mut());
-        probe_result.unwrap();
-    })
-    .await
-    .expect("environment probe and switch should serialize without deadlock");
+    tokio::time::timeout(Duration::from_secs(1), probe.as_mut())
+        .await
+        .expect("environment probe should finish after the switch")
+        .unwrap();
 
     assert_eq!(
         *events.lock().unwrap(),
-        ["probe:primary", "emit:primary", "switch:return"]
+        ["probe:primary", "switch:return", "emit:primary"]
     );
+}
+
+#[tokio::test]
+async fn environment_commit_fence_blocks_switch_until_status_event_and_observer_finish() {
+    let coordinator = Arc::new(AccountLifecycleCoordinator::new());
+    let entered_commit = Arc::new(tokio::sync::Notify::new());
+    let release_commit = Arc::new(tokio::sync::Notify::new());
+    let commit = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        let entered = Arc::clone(&entered_commit);
+        let release = Arc::clone(&release_commit);
+        async move {
+            let _guard = coordinator.read_guard().await;
+            entered.notify_one();
+            release.notified().await;
+        }
+    });
+    entered_commit.notified().await;
+
+    let mutation = coordinator.mutation_guard();
+    tokio::pin!(mutation);
+    assert!(matches!(
+        futures_util::poll!(&mut mutation),
+        std::task::Poll::Pending
+    ));
+
+    release_commit.notify_one();
+    commit.await.unwrap();
+    let _mutation_guard = tokio::time::timeout(Duration::from_secs(1), mutation.as_mut())
+        .await
+        .expect("switch should proceed only after the environment commit fence drops");
 }
 
 #[tokio::test]

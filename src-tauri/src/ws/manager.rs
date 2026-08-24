@@ -16,6 +16,7 @@ use crate::events::EventEmitter;
 use crate::models::config::normalize_account_id;
 use crate::models::config::AppConfig;
 use crate::models::trading::{Order, OrderStreamContext};
+use crate::services::connection::{ConnectionObservationSource, SessionNotificationObserver};
 use crate::services::trading::OrderNotificationObserver;
 use crate::services::{AccountLifecycleCoordinator, MarketService};
 
@@ -32,6 +33,8 @@ const RECONNECT_SECS: u64 = 3;
 const PRIVATE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const PRIVATE_AUTH_ERROR: &str = "私有 WebSocket 鉴权失败";
 const PRIVATE_SUBSCRIPTION_ERROR: &str = "私有 WebSocket 订阅失败";
+const PUBLIC_SESSION_ERROR: &str = "公共 WebSocket 会话不可用";
+const PRIVATE_SESSION_ERROR: &str = "私有 WebSocket 会话不可用";
 
 #[derive(Clone, Copy)]
 enum FreshnessDomain {
@@ -273,6 +276,7 @@ pub struct WsManager {
     private_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     freshness: Arc<WsFreshness>,
     notification_observer: OrderNotificationObserver,
+    session_notification_observer: SessionNotificationObserver,
     config: Arc<RwLock<AppConfig>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
     order_observation_buffer: Arc<Mutex<OrderObservationBuffer>>,
@@ -286,6 +290,7 @@ impl WsManager {
         notification_observer: OrderNotificationObserver,
         config: Arc<RwLock<AppConfig>>,
         account_lifecycle: Arc<AccountLifecycleCoordinator>,
+        session_notification_observer: SessionNotificationObserver,
     ) -> Self {
         Self {
             ws_public_url: Arc::new(RwLock::new(WS_PUBLIC.to_string())),
@@ -303,6 +308,7 @@ impl WsManager {
             private_task: Arc::new(Mutex::new(None)),
             freshness: Arc::new(WsFreshness::default()),
             notification_observer,
+            session_notification_observer,
             config,
             account_lifecycle,
             order_observation_buffer: Arc::new(Mutex::new(OrderObservationBuffer::default())),
@@ -389,7 +395,8 @@ impl WsManager {
         self.order_snapshot_seeded.store(false, Ordering::Release);
         *self.active_symbol.write().await = symbol.to_string();
         self.running.store(true, Ordering::Relaxed);
-        self.emitter.emit_websocket("connecting");
+        self.emitter
+            .emit_websocket_for_session(&context, "connecting");
 
         let ws_public = self.ws_public_url.read().await.clone();
         let ws_private = self.ws_private_url.read().await.clone();
@@ -407,6 +414,7 @@ impl WsManager {
         let subscriptions = self.subscriptions.clone();
         let freshness = self.freshness.clone();
         let notification_observer = self.notification_observer.clone();
+        let session_notification_observer = self.session_notification_observer.clone();
         let config = self.config.clone();
         let account_lifecycle = self.account_lifecycle.clone();
         let order_observation_buffer = self.order_observation_buffer.clone();
@@ -419,6 +427,7 @@ impl WsManager {
             let sym = symbol_owned.clone();
             let subs = subscriptions.clone();
             let session_freshness = freshness.clone();
+            let stream_context = context.clone();
             let handle = tauri::async_runtime::spawn(async move {
                 run_public_loop(
                     ws_public,
@@ -429,6 +438,7 @@ impl WsManager {
                     running_p,
                     pc,
                     session_freshness,
+                    stream_context,
                 )
                 .await;
             });
@@ -445,6 +455,7 @@ impl WsManager {
                 let subs = subscriptions.clone();
                 let session_freshness = freshness.clone();
                 let observer = notification_observer.clone();
+                let session_observer = session_notification_observer.clone();
                 let session_config = config.clone();
                 let lifecycle = account_lifecycle.clone();
                 let observation_buffer = order_observation_buffer.clone();
@@ -462,6 +473,7 @@ impl WsManager {
                         prc,
                         session_freshness,
                         observer,
+                        session_observer,
                         session_config,
                         lifecycle,
                         stream_context,
@@ -540,6 +552,19 @@ impl WsManager {
         )
         .await;
     }
+
+    pub(crate) async fn activate_committed_session(&self, context: &OrderStreamContext) {
+        if self.is_private_connected() {
+            self.session_notification_observer
+                .observe_connection_status_guarded(
+                    context,
+                    ConnectionObservationSource::PrivateWebsocket,
+                    crate::models::config::ConnectionStatus::Connected,
+                    local_timestamp_ms(),
+                )
+                .await;
+        }
+    }
 }
 
 async fn run_public_loop(
@@ -551,6 +576,7 @@ async fn run_public_loop(
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     freshness: Arc<WsFreshness>,
+    context: OrderStreamContext,
 ) {
     while running.load(Ordering::Relaxed) {
         let topics = topic_snapshot(&subscriptions, false).await;
@@ -567,14 +593,15 @@ async fn run_public_loop(
             &running,
             &connected,
             &freshness,
+            &context,
         )
         .await
         {
             Ok(()) => connected.store(false, Ordering::Relaxed),
-            Err(e) => {
+            Err(_) => {
                 connected.store(false, Ordering::Relaxed);
-                tracing::warn!("公共 WebSocket 错误：{}", e);
-                emitter.emit_websocket("error");
+                tracing::warn!("public websocket session unavailable");
+                emitter.emit_websocket_for_session(&context, "error");
             }
         }
         freshness.reset_public();
@@ -597,6 +624,7 @@ async fn run_private_loop(
     connected: Arc<AtomicBool>,
     freshness: Arc<WsFreshness>,
     notification_observer: OrderNotificationObserver,
+    session_notification_observer: SessionNotificationObserver,
     config: Arc<RwLock<AppConfig>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
     context: OrderStreamContext,
@@ -620,6 +648,7 @@ async fn run_private_loop(
             &connected,
             &freshness,
             &notification_observer,
+            &session_notification_observer,
             &config,
             &account_lifecycle,
             &context,
@@ -628,11 +657,21 @@ async fn run_private_loop(
         .await
         {
             Ok(()) => connected.store(false, Ordering::Relaxed),
-            Err(e) => {
-                connected.store(false, Ordering::Relaxed);
-                tracing::warn!("私有 WebSocket 错误：{}", e);
-                emitter.emit_error(&format!("私有 WebSocket 异常：{}", e));
-                emitter.emit_websocket("error");
+            Err(_) => {
+                report_private_failure_if_running(&running, || async {
+                    connected.store(false, Ordering::Relaxed);
+                    tracing::warn!("private websocket session unavailable");
+                    emitter.emit_websocket_for_session(&context, "error");
+                    session_notification_observer
+                        .observe_connection_status(
+                            &context,
+                            ConnectionObservationSource::PrivateWebsocket,
+                            crate::models::config::ConnectionStatus::Error,
+                            local_timestamp_ms(),
+                        )
+                        .await;
+                })
+                .await;
             }
         }
         freshness.reset_private();
@@ -641,6 +680,18 @@ async fn run_private_loop(
         }
         tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
     }
+}
+
+async fn report_private_failure_if_running<F, Fut>(running: &AtomicBool, report: F) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if !running.load(Ordering::Acquire) {
+        return false;
+    }
+    report().await;
+    true
 }
 
 async fn run_public_session(
@@ -652,14 +703,17 @@ async fn run_public_session(
     running: &Arc<AtomicBool>,
     connected: &Arc<AtomicBool>,
     freshness: &Arc<WsFreshness>,
+    context: &OrderStreamContext,
 ) -> Result<(), String> {
-    let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
+    let (stream, _) = connect_async(url)
+        .await
+        .map_err(|_| PUBLIC_SESSION_ERROR.to_string())?;
     let (mut write, mut read) = stream.split();
     if !running.load(Ordering::Relaxed) {
         return Ok(());
     }
     connected.store(true, Ordering::Relaxed);
-    emitter.emit_websocket("connected");
+    emitter.emit_websocket_for_session(context, "connected");
 
     if let Some(market) = market {
         let interval = market.kline_interval().await;
@@ -671,7 +725,7 @@ async fn run_public_session(
             build_subscribe_message(topics).to_string().into(),
         ))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| PUBLIC_SESSION_ERROR.to_string())?;
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     loop {
@@ -680,17 +734,17 @@ async fn run_public_session(
         }
         tokio::select! {
             _ = heartbeat.tick() => {
-                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|e| e.to_string())?;
+                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|_| PUBLIC_SESSION_ERROR.to_string())?;
             }
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            handle_message(&value, symbol, emitter, market, Some(freshness));
+                            handle_message(&value, symbol, emitter, market, Some(freshness), context);
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return Err("连接已关闭".into()),
-                    Some(Err(e)) => return Err(e.to_string()),
+                    Some(Err(_)) => return Err(PUBLIC_SESSION_ERROR.to_string()),
                     _ => {}
                 }
             }
@@ -698,54 +752,14 @@ async fn run_public_session(
     }
 }
 
-fn has_consistent_auth_identity(response: &Value) -> bool {
-    let top_level = response.get("op");
-    let nested = response
-        .get("request")
-        .and_then(|request| request.get("op"));
-    let mut saw_identity = false;
-    for identity in [top_level, nested].into_iter().flatten() {
-        saw_identity = true;
-        if identity.as_str() != Some("auth") {
-            return false;
-        }
-    }
-    saw_identity
-}
-
-fn auth_code_is_success(code: &Value) -> bool {
-    if let Some(code) = code.as_i64() {
-        return code == 0 || code == 200;
-    }
-    code.as_str()
-        .is_some_and(|code| matches!(code, "0" | "200") || code.eq_ignore_ascii_case("success"))
-}
-
 fn validate_private_auth_ack(response: &Value) -> Result<(), &'static str> {
-    if !has_consistent_auth_identity(response) {
-        return Err(PRIVATE_AUTH_ERROR);
-    }
-
-    let mut has_success = false;
-    let mut has_failure = false;
-    if let Some(success) = response.get("success") {
-        if success.as_bool() == Some(true) {
-            has_success = true;
-        } else {
-            has_failure = true;
-        }
-    }
-    for field in ["code", "retCode", "ret_code"] {
-        if let Some(code) = response.get(field) {
-            if auth_code_is_success(code) {
-                has_success = true;
-            } else {
-                has_failure = true;
-            }
-        }
-    }
-
-    if has_success && !has_failure {
+    if response.get("op").and_then(Value::as_str) == Some("auth")
+        && response.get("success").and_then(Value::as_bool) == Some(true)
+        && response.get("request").is_none()
+        && ["code", "retCode", "ret_code"]
+            .iter()
+            .all(|field| response.get(*field).is_none())
+    {
         Ok(())
     } else {
         Err(PRIVATE_AUTH_ERROR)
@@ -815,12 +829,15 @@ async fn run_private_session(
     connected: &Arc<AtomicBool>,
     freshness: &Arc<WsFreshness>,
     notification_observer: &OrderNotificationObserver,
+    session_notification_observer: &SessionNotificationObserver,
     config: &Arc<RwLock<AppConfig>>,
     account_lifecycle: &Arc<AccountLifecycleCoordinator>,
     context: &OrderStreamContext,
     order_observation_buffer: &Arc<Mutex<OrderObservationBuffer>>,
 ) -> Result<(), String> {
-    let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
+    let (stream, _) = connect_async(url)
+        .await
+        .map_err(|_| PRIVATE_SESSION_ERROR.to_string())?;
     let (mut write, mut read) = stream.split();
 
     let expires = default_auth_expires_ms(time_sync.timestamp_ms());
@@ -831,10 +848,21 @@ async fn run_private_session(
         topics,
         running,
         connected,
-        || emitter.emit_websocket("connected"),
+        || {},
         PRIVATE_AUTH_TIMEOUT,
     )
     .await?;
+    if connected.load(Ordering::Relaxed) {
+        emitter.emit_websocket_for_session(context, "connected");
+        session_notification_observer
+            .observe_connection_status(
+                context,
+                ConnectionObservationSource::PrivateWebsocket,
+                crate::models::config::ConnectionStatus::Connected,
+                local_timestamp_ms(),
+            )
+            .await;
+    }
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     loop {
@@ -843,13 +871,13 @@ async fn run_private_session(
         }
         tokio::select! {
             _ = heartbeat.tick() => {
-                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|e| e.to_string())?;
+                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|_| PRIVATE_SESSION_ERROR.to_string())?;
             }
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            handle_message(&value, symbol, emitter, market, Some(freshness));
+                            handle_message(&value, symbol, emitter, market, Some(freshness), context);
                             observe_private_orders(
                                 &value,
                                 notification_observer,
@@ -862,7 +890,7 @@ async fn run_private_session(
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return Err("连接已关闭".into()),
-                    Some(Err(e)) => return Err(e.to_string()),
+                    Some(Err(_)) => return Err(PRIVATE_SESSION_ERROR.to_string()),
                     _ => {}
                 }
             }
@@ -983,6 +1011,7 @@ fn handle_message(
     emitter: &EventEmitter,
     market: Option<&Arc<MarketService>>,
     freshness: Option<&WsFreshness>,
+    context: &OrderStreamContext,
 ) {
     if let Some(freshness) = freshness {
         record_message_freshness(message, freshness, local_timestamp_ms());
@@ -1025,15 +1054,19 @@ fn handle_message(
         }
         "order" => {
             let data = message.get("data").unwrap_or(message);
-            dispatch_list(data, |item| emitter.emit_order(parse_order(item)));
+            dispatch_list(data, |item| emitter.emit_order(context, parse_order(item)));
         }
         "position" => {
             let data = message.get("data").unwrap_or(message);
-            dispatch_list(data, |item| emitter.emit_position(parse_position(item)));
+            dispatch_list(data, |item| {
+                emitter.emit_position(context, parse_position(item))
+            });
         }
         "balance" => {
             let data = message.get("data").unwrap_or(message);
-            dispatch_list(data, |item| emitter.emit_balance(parse_balance(item)));
+            dispatch_list(data, |item| {
+                emitter.emit_balance(context, parse_balance(item))
+            });
         }
         _ => {}
     }
@@ -1075,8 +1108,9 @@ mod tests {
     use super::{
         abort_and_wait_for_tasks, abort_wait_and_reset_freshness, authenticate_and_subscribe,
         await_private_auth_response, observe_manual_order_snapshots_for_session,
-        record_message_freshness, seed_order_gate, validate_private_auth_ack, FreshnessDomain,
-        OrderObservationBuffer, WsFreshness, PRIVATE_AUTH_ERROR, PRIVATE_SUBSCRIPTION_ERROR,
+        record_message_freshness, report_private_failure_if_running, seed_order_gate,
+        validate_private_auth_ack, FreshnessDomain, OrderObservationBuffer, WsFreshness,
+        PRIVATE_AUTH_ERROR, PRIVATE_SUBSCRIPTION_ERROR,
     };
     use crate::models::config::AppConfig;
     use crate::models::notification::{ListNotificationsRequest, NotificationFilter};
@@ -1829,15 +1863,10 @@ mod tests {
     fn private_auth_ack_requires_an_explicit_compatible_success() {
         assert_eq!(PRIVATE_AUTH_ERROR, "私有 WebSocket 鉴权失败");
         assert_eq!(PRIVATE_SUBSCRIPTION_ERROR, "私有 WebSocket 订阅失败");
-        for response in [
-            json!({"op": "auth", "success": true}),
-            json!({"request": {"op": "auth"}, "code": 0}),
-            json!({"op": "auth", "retCode": "0"}),
-            json!({"op": "auth", "ret_code": 200}),
-            json!({"op": "auth", "code": "SUCCESS"}),
-        ] {
-            assert_eq!(validate_private_auth_ack(&response), Ok(()));
-        }
+        assert_eq!(
+            validate_private_auth_ack(&json!({"op": "auth", "success": true})),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1854,10 +1883,29 @@ mod tests {
             json!({"op": "subscribe", "success": true}),
             json!({"success": true}),
             json!({"op": "auth", "success": "true"}),
+            json!({"request": {"op": "auth"}, "code": 0}),
+            json!({"op": "auth", "retCode": "0"}),
+            json!({"op": "auth", "ret_code": 200}),
+            json!({"op": "auth", "code": "SUCCESS"}),
         ] {
             let error = validate_private_auth_ack(&response).unwrap_err();
             assert_eq!(error, PRIVATE_AUTH_ERROR);
             assert!(!error.contains("401"));
+        }
+    }
+
+    #[test]
+    fn private_websocket_auth_spoof_messages_remain_one_sanitized_protocol_error() {
+        for response in [
+            json!({"op": "auth", "success": false, "message": "session expired"}),
+            json!({"op": "auth", "success": false, "code": 26200003}),
+            json!({"op": "auth", "success": false, "message": "apiKey=raw-secret"}),
+        ] {
+            let error = validate_private_auth_ack(&response).unwrap_err();
+            assert_eq!(error, PRIVATE_AUTH_ERROR);
+            assert!(!error.contains("expired"));
+            assert!(!error.contains("26200003"));
+            assert!(!error.contains("raw-secret"));
         }
     }
 
@@ -1941,6 +1989,20 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert!(!connected.load(Ordering::SeqCst));
         assert!(!emitted_connected.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn private_loop_error_after_manual_stop_has_no_failure_side_effect() {
+        let running = AtomicBool::new(false);
+        let reports = AtomicUsize::new(0);
+
+        let reported = report_private_failure_if_running(&running, || async {
+            reports.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(!reported);
+        assert_eq!(reports.load(Ordering::SeqCst), 0);
     }
 
     #[test]

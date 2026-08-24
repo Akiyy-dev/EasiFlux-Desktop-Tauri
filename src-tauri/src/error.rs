@@ -2,12 +2,15 @@ use serde::Serialize;
 use std::fmt::Display;
 use thiserror::Error;
 
+use crate::api::response::AuthFailureKind;
 use crate::models::trading::TradingFailure;
 
 #[derive(Debug, Clone, Error)]
 pub enum AppError {
     #[error("认证失败: {0}")]
     Auth(String),
+    #[error("认证失败")]
+    AuthFailure(AuthFailureKind),
     #[error("连接错误: {0}")]
     Connection(String),
     #[error("交易错误: {0}")]
@@ -30,6 +33,8 @@ pub enum AppError {
         message: &'static str,
         notification_id: String,
     },
+    #[error("{0}")]
+    Observed(&'static str),
 }
 
 impl Serialize for AppError {

@@ -251,4 +251,11 @@ impl AccountLifecyclePort for FakeLifecyclePort {
         self.public_environment_activations
             .fetch_add(1, Ordering::SeqCst);
     }
+
+    async fn activate_session(&self, context: &crate::models::trading::SessionContext) {
+        self.events.lock().unwrap().push(format!(
+            "activate:{}:{}",
+            context.account_id, context.session_epoch
+        ));
+    }
 }

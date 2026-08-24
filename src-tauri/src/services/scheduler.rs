@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, watch, Mutex, Notify, RwLock};
 
 use crate::api::diagnostic::{warn_if_parse_empty, warn_if_raw_parsed_mismatch};
@@ -15,11 +16,13 @@ use crate::error::{AppError, AppResult};
 use crate::events::EventEmitter;
 use crate::models::account::AccountSummary;
 use crate::models::config::{
-    environment_label, normalize_account_id, AppConfig, ConnectionStatus, EnvironmentStatus,
+    canonical_api_base_url, normalize_account_id, AppConfig, ConnectionStatus, EnvironmentStatus,
     DEFAULT_BASE_URL, MAX_TICKER_POLL_INTERVAL_SECS, MIN_TICKER_POLL_INTERVAL_SECS,
 };
+use crate::models::notification::NotificationEnvironment;
 use crate::models::time::{TimeSnapshot, TimeSyncStatus};
-use crate::models::trading::{OrderStreamContext, PrivatePanelsSnapshot};
+use crate::models::trading::{PrivatePanelsSnapshot, SessionContext};
+use crate::services::connection::SessionNotificationObserver;
 #[cfg(test)]
 use crate::services::market::run_generation_owned_kline_storage;
 use crate::services::notification::NotificationRuntime;
@@ -124,7 +127,7 @@ impl TaskId {
     }
 
     fn requires_account_lifecycle(self) -> bool {
-        self != Self::KlineFlush
+        !matches!(self, Self::KlineFlush | Self::Environment)
     }
 }
 
@@ -231,13 +234,59 @@ where
     F: FnMut(TaskId) -> Fut,
     Fut: std::future::Future<Output = AppResult<()>>,
 {
+    run_bootstrap_tasks_with_errors(tasks, &mut run)
+        .await
+        .into_iter()
+        .map(|(task, _)| task)
+        .collect()
+}
+
+async fn run_bootstrap_tasks_with_errors<F, Fut>(
+    tasks: &[TaskId],
+    mut run: F,
+) -> Vec<(TaskId, AppError)>
+where
+    F: FnMut(TaskId) -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
     let mut failed = Vec::new();
     for task in tasks {
-        if run(*task).await.is_err() {
-            failed.push(*task);
+        if let Err(error) = run(*task).await {
+            failed.push((*task, error));
         }
     }
     failed
+}
+
+async fn run_bootstrap_account_phase<C, CFut, F, Fut>(
+    coordinator: &AccountLifecycleCoordinator,
+    connected: C,
+    run: F,
+) -> (Vec<TaskId>, Vec<(TaskId, AppError)>)
+where
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = bool>,
+    F: FnMut(TaskId) -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
+    let _guard = coordinator.read_guard().await;
+    let tasks = bootstrap_tasks(connected().await);
+    let account_tasks = tasks
+        .iter()
+        .copied()
+        .filter(|task| *task != TaskId::Environment)
+        .collect::<Vec<_>>();
+    let failed = run_bootstrap_tasks_with_errors(&account_tasks, run).await;
+    (tasks, failed)
+}
+
+fn bootstrap_failure_needs_generic_error(error: &AppError) -> bool {
+    !matches!(
+        error,
+        AppError::Notified { .. }
+            | AppError::Observed(_)
+            | AppError::AuthFailure(crate::api::response::AuthFailureKind::SessionExpired)
+    )
 }
 
 fn bootstrap_failure_error(failed: &[TaskId]) -> AppError {
@@ -267,6 +316,16 @@ fn environment_task_result(status: &EnvironmentStatus) -> AppResult<()> {
         Ok(())
     } else {
         Err(AppError::Connection("环境检测失败".into()))
+    }
+}
+
+async fn capture_session_context(
+    config: &Arc<RwLock<AppConfig>>,
+    account_lifecycle: &AccountLifecycleCoordinator,
+) -> SessionContext {
+    SessionContext {
+        account_id: normalize_account_id(&config.read().await.active_account_id),
+        session_epoch: account_lifecycle.current_session_epoch(),
     }
 }
 
@@ -3079,6 +3138,7 @@ pub struct SchedulerService {
     api: Arc<crate::api::ApiClient>,
     environment_status: Arc<RwLock<EnvironmentStatus>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    notification_observer: SessionNotificationObserver,
     lifecycle: Arc<StdMutex<SchedulerLifecycle>>,
     kline_flush: Arc<KlineFlushCoordinator>,
     market_fallback_interval_tx: tokio::sync::watch::Sender<Duration>,
@@ -3102,6 +3162,7 @@ impl SchedulerService {
         api: Arc<crate::api::ApiClient>,
         environment_status: Arc<RwLock<EnvironmentStatus>>,
         account_lifecycle: Arc<AccountLifecycleCoordinator>,
+        notification_observer: SessionNotificationObserver,
     ) -> Self {
         let (market_fallback_interval_tx, _) =
             tokio::sync::watch::channel(INTERVAL_MARKET_FALLBACK);
@@ -3124,6 +3185,7 @@ impl SchedulerService {
                 api: Arc::clone(&api),
                 environment_status: Arc::clone(&environment_status),
                 account_lifecycle: Arc::clone(&account_lifecycle),
+                notification_observer: notification_observer.clone(),
                 kline_flush: Arc::clone(&kline_flush),
                 prev_public_connected: Arc::clone(&prev_public_connected),
                 prev_private_connected: Arc::clone(&prev_private_connected),
@@ -3159,6 +3221,7 @@ impl SchedulerService {
             api,
             environment_status,
             account_lifecycle,
+            notification_observer,
             lifecycle,
             kline_flush,
             market_fallback_interval_tx,
@@ -3222,23 +3285,32 @@ impl SchedulerService {
     }
 
     async fn bootstrap_connection_inner(&self) -> AppResult<()> {
-        let _guard = self.account_lifecycle.read_guard().await;
-        let connected = self.connection.status().await == ConnectionStatus::Connected;
-        let tasks = bootstrap_tasks(connected);
-        // The account lifecycle guard is already held: call the non-locking inner path
-        // directly. This also keeps strict snapshots independent from regular coalescing.
-        let failed = run_bootstrap_tasks(&tasks, |task| {
-            self.execute_inner(task, ExecutionMode::Bootstrap)
-        })
+        let (tasks, mut failed) = run_bootstrap_account_phase(
+            self.account_lifecycle.as_ref(),
+            || async { self.connection.status().await == ConnectionStatus::Connected },
+            |task| self.execute_inner(task, ExecutionMode::Bootstrap),
+        )
         .await;
-        for task in &failed {
-            self.emitter
-                .emit_error(&format!("连接后{}同步失败", task.bootstrap_label()));
+        if let Err(error) = self.run_environment().await {
+            failed.push((TaskId::Environment, error));
+        }
+        failed.sort_by_key(|(failed_task, _)| {
+            tasks
+                .iter()
+                .position(|task| task == failed_task)
+                .unwrap_or(usize::MAX)
+        });
+        for (task, error) in &failed {
+            if bootstrap_failure_needs_generic_error(error) {
+                self.emitter
+                    .emit_error(&format!("连接后{}同步失败", task.bootstrap_label()));
+            }
         }
         if failed.is_empty() {
             Ok(())
         } else {
-            Err(bootstrap_failure_error(&failed))
+            let failed_tasks = failed.into_iter().map(|(task, _)| task).collect::<Vec<_>>();
+            Err(bootstrap_failure_error(&failed_tasks))
         }
     }
 
@@ -3262,7 +3334,10 @@ impl SchedulerService {
             TaskId::FundingRate => self.run_funding_rate().await,
             TaskId::Balances => self.run_balances(mode).await,
             TaskId::PrivatePanels => self.run_private_panels(mode).await,
-            TaskId::DailyPnl => self.daily_pnl.refresh().await.map(|_| ()),
+            TaskId::DailyPnl => {
+                let context = capture_session_context(&self.config, &self.account_lifecycle).await;
+                self.daily_pnl.refresh(&context).await.map(|_| ())
+            }
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
             TaskId::KlineFlush => {
                 execute_kline_flush(
@@ -3298,10 +3373,7 @@ impl SchedulerService {
             mode,
             self.ws.is_balance_healthy(PRIVATE_STALE_MS),
             || async {
-                let account_id = {
-                    let cfg = self.config.read().await;
-                    normalize_account_id(&cfg.active_account_id)
-                };
+                let context = capture_session_context(&self.config, &self.account_lifecycle).await;
                 let params = build_order_query_params(
                     None, None, None, None, None, None, None, None, None, None,
                 );
@@ -3313,11 +3385,14 @@ impl SchedulerService {
                     .map(|b| b.total.parse::<f64>().unwrap_or(0.0))
                     .sum::<f64>()
                     .to_string();
-                self.emitter.emit_account_snapshot(AccountSummary {
-                    account_id,
-                    balances,
-                    total_equity,
-                });
+                self.emitter.emit_account_snapshot(
+                    &context,
+                    AccountSummary {
+                        account_id: context.account_id.clone(),
+                        balances,
+                        total_equity,
+                    },
+                );
                 Ok(())
             },
         )
@@ -3332,12 +3407,9 @@ impl SchedulerService {
             mode,
             self.ws.is_private_panels_healthy(PRIVATE_STALE_MS),
             || async {
+                let context = capture_session_context(&self.config, &self.account_lifecycle).await;
                 let symbol = self.market.active_symbol().await;
                 let sym = Some(symbol.as_str());
-                let context = OrderStreamContext {
-                    account_id: normalize_account_id(&self.config.read().await.active_account_id),
-                    session_epoch: self.account_lifecycle.current_session_epoch(),
-                };
                 let open_orders = self.trading.fetch_open_orders_unobserved(sym).await?;
                 let order_history = self
                     .trading
@@ -3359,12 +3431,14 @@ impl SchedulerService {
                 let positions = parse_positions(&payload);
                 warn_if_parse_empty(&self.emitter, "position/list", &payload, positions.len());
                 warn_if_raw_parsed_mismatch(&self.emitter, "position/list", &meta, positions.len());
-                self.emitter
-                    .emit_private_panels_snapshot(PrivatePanelsSnapshot {
+                self.emitter.emit_private_panels_snapshot(
+                    &context,
+                    PrivatePanelsSnapshot {
                         open_orders,
                         order_history,
                         positions,
-                    });
+                    },
+                );
                 Ok(())
             },
         )
@@ -3420,6 +3494,8 @@ impl SchedulerService {
             &self.time,
             &self.emitter,
             &self.environment_status,
+            &self.account_lifecycle,
+            &self.notification_observer,
         )
         .await
     }
@@ -3440,6 +3516,7 @@ struct SchedulerRefs {
     api: Arc<crate::api::ApiClient>,
     environment_status: Arc<RwLock<EnvironmentStatus>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    notification_observer: SessionNotificationObserver,
     kline_flush: Arc<KlineFlushCoordinator>,
     prev_public_connected: Arc<Mutex<bool>>,
     prev_private_connected: Arc<Mutex<bool>>,
@@ -3462,7 +3539,10 @@ impl SchedulerRefs {
             }
             TaskId::Balances => self.run_balances(mode).await,
             TaskId::PrivatePanels => self.run_private_panels(mode).await,
-            TaskId::DailyPnl => self.daily_pnl.refresh().await.map(|_| ()),
+            TaskId::DailyPnl => {
+                let context = capture_session_context(&self.config, &self.account_lifecycle).await;
+                self.daily_pnl.refresh(&context).await.map(|_| ())
+            }
             TaskId::MarketFallback => self.run_market_fallback(mode).await,
             TaskId::KlineFlush => {
                 execute_kline_flush(
@@ -3493,10 +3573,7 @@ impl SchedulerRefs {
             mode,
             self.ws.is_balance_healthy(PRIVATE_STALE_MS),
             || async {
-                let account_id = {
-                    let cfg = self.config.read().await;
-                    normalize_account_id(&cfg.active_account_id)
-                };
+                let context = capture_session_context(&self.config, &self.account_lifecycle).await;
                 let params = build_order_query_params(
                     None, None, None, None, None, None, None, None, None, None,
                 );
@@ -3508,11 +3585,14 @@ impl SchedulerRefs {
                     .map(|b| b.total.parse::<f64>().unwrap_or(0.0))
                     .sum::<f64>()
                     .to_string();
-                self.emitter.emit_account_snapshot(AccountSummary {
-                    account_id,
-                    balances,
-                    total_equity,
-                });
+                self.emitter.emit_account_snapshot(
+                    &context,
+                    AccountSummary {
+                        account_id: context.account_id.clone(),
+                        balances,
+                        total_equity,
+                    },
+                );
                 Ok(())
             },
         )
@@ -3527,12 +3607,9 @@ impl SchedulerRefs {
             mode,
             self.ws.is_private_panels_healthy(PRIVATE_STALE_MS),
             || async {
+                let context = capture_session_context(&self.config, &self.account_lifecycle).await;
                 let symbol = self.market.active_symbol().await;
                 let sym = Some(symbol.as_str());
-                let context = OrderStreamContext {
-                    account_id: normalize_account_id(&self.config.read().await.active_account_id),
-                    session_epoch: self.account_lifecycle.current_session_epoch(),
-                };
                 let open_orders = self.trading.fetch_open_orders_unobserved(sym).await?;
                 let order_history = self
                     .trading
@@ -3554,12 +3631,14 @@ impl SchedulerRefs {
                 let positions = parse_positions(&payload);
                 warn_if_parse_empty(&self.emitter, "position/list", &payload, positions.len());
                 warn_if_raw_parsed_mismatch(&self.emitter, "position/list", &meta, positions.len());
-                self.emitter
-                    .emit_private_panels_snapshot(PrivatePanelsSnapshot {
+                self.emitter.emit_private_panels_snapshot(
+                    &context,
+                    PrivatePanelsSnapshot {
                         open_orders,
                         order_history,
                         positions,
-                    });
+                    },
+                );
                 Ok(())
             },
         )
@@ -3613,8 +3692,94 @@ impl SchedulerRefs {
             &self.time,
             &self.emitter,
             &self.environment_status,
+            &self.account_lifecycle,
+            &self.notification_observer,
         )
         .await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnvironmentProbeSnapshot {
+    context: SessionContext,
+    probe_base_url: Option<String>,
+    safe_base_url: String,
+    environment_key: String,
+    environment: NotificationEnvironment,
+    label: &'static str,
+}
+
+impl EnvironmentProbeSnapshot {
+    fn new(context: SessionContext, base_url: &str) -> Self {
+        let parsed = canonical_api_base_url(base_url)
+            .and_then(|canonical| reqwest::Url::parse(&canonical).ok());
+        let (probe_base_url, safe_base_url, environment, label, identity) = match parsed {
+            Some(mut url) => {
+                if matches!(
+                    (url.scheme(), url.port()),
+                    ("https", Some(443)) | ("http", Some(80))
+                ) {
+                    let _ = url.set_port(None);
+                }
+                let normalized_path = url.path().trim_end_matches('/').to_string();
+                url.set_path(&normalized_path);
+                let normalized = url.to_string().trim_end_matches('/').to_string();
+                let production = url.scheme() == "https"
+                    && url.host_str() == Some("api.easicoin.io")
+                    && url.port().is_none()
+                    && normalized_path.is_empty();
+                if production {
+                    (
+                        Some(normalized.clone()),
+                        "production".to_string(),
+                        NotificationEnvironment::Production,
+                        "正式",
+                        normalized,
+                    )
+                } else {
+                    (
+                        Some(normalized.clone()),
+                        "custom-environment".to_string(),
+                        NotificationEnvironment::Development,
+                        "开发",
+                        normalized,
+                    )
+                }
+            }
+            None => (
+                None,
+                "invalid-environment".to_string(),
+                NotificationEnvironment::Unknown,
+                "未知",
+                "invalid".to_string(),
+            ),
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"easiflux.environment.v1\0");
+        digest.update(identity.as_bytes());
+        let environment_key = format!("env-v1-{:x}", digest.finalize());
+        Self {
+            context,
+            probe_base_url,
+            safe_base_url,
+            environment_key,
+            environment,
+            label,
+        }
+    }
+}
+
+fn confirmed_environment_status(
+    snapshot: &EnvironmentProbeSnapshot,
+    reachable: bool,
+    checked_at: u64,
+) -> EnvironmentStatus {
+    EnvironmentStatus {
+        label: snapshot.label.to_string(),
+        base_url: snapshot.safe_base_url.clone(),
+        reachable,
+        checked_at,
+        error: (!reachable).then(|| "环境不可达".to_string()),
     }
 }
 
@@ -3629,37 +3794,67 @@ async fn probe_environment(
     time: &Arc<TimeService>,
     emitter: &EventEmitter,
     environment_status: &Arc<RwLock<EnvironmentStatus>>,
+    account_lifecycle: &Arc<AccountLifecycleCoordinator>,
+    notification_observer: &SessionNotificationObserver,
 ) -> AppResult<()> {
-    let active_account_id = {
+    let (active_account_id, selected_base_url) = {
         let config = config.read().await;
-        normalize_account_id(&config.active_account_id)
+        let active_account_id = normalize_account_id(&config.active_account_id);
+        let selected_base_url = CredentialStore::load(&active_account_id)?
+            .map(|credential| credential.base_url)
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        (active_account_id, selected_base_url)
     };
-    let selected_base_url = CredentialStore::load(&active_account_id)?
-        .map(|credential| credential.base_url)
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-    let client = environment_probe_client(&selected_base_url).await;
-    let base_url = client.base_url().await;
+    let snapshot = EnvironmentProbeSnapshot::new(
+        SessionContext {
+            account_id: active_account_id,
+            session_epoch: account_lifecycle.current_session_epoch(),
+        },
+        &selected_base_url,
+    );
+    let reachable = if let Some(base_url) = snapshot.probe_base_url.as_deref() {
+        let client = environment_probe_client(base_url).await;
+        PublicApi::server_time(&client).await.is_ok()
+    } else {
+        false
+    };
     let checked_at = time.local_now_ms();
-    let status = match PublicApi::server_time(&client).await {
-        Ok(_) => EnvironmentStatus {
-            label: environment_label(&base_url).to_string(),
-            base_url,
-            reachable: true,
-            checked_at,
-            error: None,
-        },
-        Err(error) => EnvironmentStatus {
-            label: environment_label(&base_url).to_string(),
-            base_url,
-            reachable: false,
-            checked_at,
-            error: Some(error.user_message()),
-        },
+    let _commit_guard = account_lifecycle.read_guard().await;
+    let current_base_url = {
+        let current_account = normalize_account_id(&config.read().await.active_account_id);
+        if current_account != snapshot.context.account_id
+            || account_lifecycle.current_session_epoch() != snapshot.context.session_epoch
+        {
+            return Ok(());
+        }
+        CredentialStore::load(&current_account)?
+            .map(|credential| credential.base_url)
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
     };
-    publish_environment_task_status(environment_status, status, |status| {
-        emitter.emit_environment_updated(status);
+    if EnvironmentProbeSnapshot::new(snapshot.context.clone(), &current_base_url).environment_key
+        != snapshot.environment_key
+    {
+        return Ok(());
+    }
+    let status = confirmed_environment_status(&snapshot, reachable, checked_at);
+    let task_result = publish_environment_task_status(environment_status, status, |status| {
+        emitter.emit_environment_updated(&snapshot.context, status);
     })
-    .await
+    .await;
+    notification_observer
+        .observe_environment_guarded(
+            &snapshot.context,
+            &snapshot.environment_key,
+            snapshot.environment,
+            reachable,
+            checked_at,
+        )
+        .await;
+    if reachable {
+        task_result
+    } else {
+        Err(AppError::Observed("环境检测失败"))
+    }
 }
 
 #[cfg(test)]

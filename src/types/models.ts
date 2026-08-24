@@ -81,6 +81,7 @@ export interface AccountSwitchResult {
 }
 
 export interface AccountSessionEvent<T> {
+  accountId: string
   sessionEpoch: number
   payload: T
 }

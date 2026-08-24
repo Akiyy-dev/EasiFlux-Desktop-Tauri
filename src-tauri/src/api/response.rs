@@ -38,6 +38,33 @@ pub enum CreateOrderOutcome<'a> {
     Ambiguous,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailureKind {
+    SessionExpired,
+    MissingCredential,
+    CredentialStorage,
+    SigningConfiguration,
+    Timestamp,
+    Signature,
+    AccessDenied,
+    RateLimited,
+    Other,
+}
+
+pub fn classify_auth_failure(http_status: Option<u16>, payload: &Value) -> AuthFailureKind {
+    if http_status == Some(403) {
+        return AuthFailureKind::RateLimited;
+    }
+    match payload.get("code").and_then(Value::as_i64) {
+        Some(26200003 | 20011005) => AuthFailureKind::SessionExpired,
+        Some(26200002) => AuthFailureKind::Timestamp,
+        Some(26200004) => AuthFailureKind::Signature,
+        Some(26200005 | 26200008 | 26200010) => AuthFailureKind::AccessDenied,
+        Some(26200006 | 26200018) => AuthFailureKind::RateLimited,
+        _ => AuthFailureKind::Other,
+    }
+}
+
 pub fn extract_data(payload: &Value) -> &Value {
     payload.get("data").unwrap_or(payload)
 }
@@ -217,48 +244,30 @@ pub fn response_code(payload: &Value) -> Option<String> {
 }
 
 pub fn is_auth_error(payload: &Value) -> bool {
-    if let Some(code) = response_code(payload) {
-        if matches!(
-            code.as_str(),
-            "26200002" | "26200003" | "26200004" | "26200005" | "26200010" | "20011005"
-        ) {
-            return true;
-        }
-    }
-    let msg = error_message(payload).unwrap_or_default().to_lowercase();
-    msg.contains("timestamp") || msg.contains("recv_window")
+    payload
+        .get("code")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| {
+            matches!(
+                code,
+                26200002 | 26200003 | 26200004 | 26200005 | 26200008 | 26200010 | 20011005
+            )
+        })
 }
 
 pub fn is_rate_limit_error(payload: &Value) -> bool {
-    if let Some(code) = response_code(payload) {
-        if matches!(code.as_str(), "26200006" | "26200018" | "10200616") {
-            return true;
-        }
-    }
-    false
+    matches!(
+        payload.get("code").and_then(Value::as_i64),
+        Some(26200006 | 26200018)
+    )
 }
 
 pub fn is_timestamp_error(payload: &Value) -> bool {
-    if let Some(code) = response_code(payload) {
-        if code == "26200002" {
-            return true;
-        }
-    }
-    let msg = error_message(payload).unwrap_or_default().to_lowercase();
-    msg.contains("timestamp") || msg.contains("recv_window")
+    payload.get("code").and_then(Value::as_i64) == Some(26200002)
 }
 
 pub fn is_sign_error(payload: &Value) -> bool {
-    if let Some(code) = response_code(payload) {
-        if matches!(
-            code.as_str(),
-            "26200003" | "26200004" | "26200005" | "20011005"
-        ) {
-            return true;
-        }
-    }
-    let msg = error_message(payload).unwrap_or_default().to_lowercase();
-    msg.contains("error sign") || msg.contains("invalid signature") || msg.contains("sign!")
+    payload.get("code").and_then(Value::as_i64) == Some(26200004)
 }
 
 pub fn error_message(payload: &Value) -> Option<String> {
@@ -355,6 +364,78 @@ mod tests {
         assert!(is_timestamp_error(
             &json!({"code": 26200002, "msg": "timestamp"})
         ));
+    }
+
+    #[test]
+    fn auth_failure_classification_uses_only_documented_exact_codes() {
+        let cases = [
+            (26200003, AuthFailureKind::SessionExpired),
+            (20011005, AuthFailureKind::SessionExpired),
+            (26200002, AuthFailureKind::Timestamp),
+            (26200004, AuthFailureKind::Signature),
+            (26200005, AuthFailureKind::AccessDenied),
+            (26200008, AuthFailureKind::AccessDenied),
+            (26200010, AuthFailureKind::AccessDenied),
+            (26200006, AuthFailureKind::RateLimited),
+            (26200018, AuthFailureKind::RateLimited),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(
+                classify_auth_failure(None, &json!({"code": code, "message": "expired 已过期"})),
+                expected,
+                "code {code}",
+            );
+        }
+
+        for payload in [
+            json!({"code": 99999999, "message": "session expired"}),
+            json!({"status": "SESSION_EXPIRED", "message": "会话已过期"}),
+            json!({"status": 26200003, "message": "会话已过期"}),
+            json!({"errorCode": 26200003, "message": "会话已过期"}),
+            json!({"code": "26200003", "message": "会话已过期"}),
+            json!({"message": "invalid api_key"}),
+        ] {
+            assert_eq!(
+                classify_auth_failure(Some(401), &payload),
+                AuthFailureKind::Other
+            );
+        }
+        assert_ne!(
+            classify_auth_failure(Some(403), &json!({"message": "expired"})),
+            AuthFailureKind::SessionExpired,
+        );
+        for code in [26200003, 26200002, 26200004, 99999999] {
+            assert_eq!(
+                classify_auth_failure(Some(403), &json!({"code": code})),
+                AuthFailureKind::RateLimited,
+            );
+        }
+    }
+
+    #[test]
+    fn auth_failure_classification_keeps_transient_and_local_failures_distinct() {
+        assert_eq!(
+            classify_auth_failure(None, &json!({"code": 26200002})),
+            AuthFailureKind::Timestamp
+        );
+        assert_eq!(
+            classify_auth_failure(None, &json!({"code": 26200003})),
+            AuthFailureKind::SessionExpired
+        );
+        assert_eq!(
+            classify_auth_failure(None, &json!({"code": 26200006})),
+            AuthFailureKind::RateLimited
+        );
+        assert_eq!(
+            classify_auth_failure(Some(403), &json!({"message": "forbidden"})),
+            AuthFailureKind::RateLimited
+        );
+        for status in [401, 429] {
+            assert_eq!(
+                classify_auth_failure(Some(status), &json!({"message": "session expired"})),
+                AuthFailureKind::Other
+            );
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 
 use super::super::*;
-use crate::api::response::classify_create_order_failure;
+use crate::api::response::{classify_create_order_failure, AuthFailureKind};
 use crate::models::config::{ApiCredential, AppConfig, RiskConfig};
 use crate::models::notification::{ListNotificationsRequest, NotificationFilter, NotificationKind};
 use crate::models::trading::{OrderStatus, SubmissionContext, TradingFailureKind};
@@ -609,17 +609,27 @@ async fn noncanonical_create_order_codes_are_ambiguous_and_keep_the_reservation(
 }
 
 #[tokio::test]
-async fn generic_provider_timestamp_and_sign_failures_keep_quota_and_publish_nothing() {
+async fn documented_non_session_auth_failures_keep_quota_and_publish_nothing() {
     let cases = [
         (
-            "generic-provider",
+            "access-denied",
+            AuthFailureKind::AccessDenied,
             vec![json!({
                 "code": 26200010,
                 "message": "private-provider-detail"
             })],
         ),
         (
+            "rate-limited",
+            AuthFailureKind::RateLimited,
+            vec![json!({
+                "code": 26200006,
+                "message": "private-provider-detail"
+            })],
+        ),
+        (
             "timestamp",
+            AuthFailureKind::Timestamp,
             vec![
                 json!({"code": 26200002, "message": "private-timestamp-detail"}),
                 json!({"code": 0, "data": {"time": "1782850580"}}),
@@ -628,15 +638,16 @@ async fn generic_provider_timestamp_and_sign_failures_keep_quota_and_publish_not
         ),
         (
             "sign",
+            AuthFailureKind::Signature,
             vec![
-                json!({"code": 26200003, "message": "private-sign-detail"}),
+                json!({"code": 26200004, "message": "private-sign-detail"}),
                 json!({"code": 0, "data": {"time": "1782850580"}}),
-                json!({"code": 26200003, "message": "private-sign-detail"}),
+                json!({"code": 26200004, "message": "private-sign-detail"}),
             ],
         ),
     ];
 
-    for (label, responses) in cases {
+    for (label, expected_failure, responses) in cases {
         let harness = ObserverHarness::new(&format!("ambiguous-{label}"));
         let risk_path = std::env::temp_dir().join(format!(
             "easiflux-ambiguous-{label}-risk-{}-{}",
@@ -671,7 +682,10 @@ async fn generic_provider_timestamp_and_sign_failures_keep_quota_and_publish_not
         server.join().expect("test server exits");
 
         assert!(
-            matches!(result, Err(AppError::Trading(_))),
+            matches!(
+                &result,
+                Err(AppError::AuthFailure(actual)) if *actual == expected_failure
+            ),
             "{label}: {result:?}"
         );
         let rendered = serde_json::to_string(&result.unwrap_err()).unwrap();

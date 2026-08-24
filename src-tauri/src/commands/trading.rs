@@ -88,7 +88,7 @@ pub async fn refresh_private_panels(
             .ws
             .observe_manual_order_snapshots(&context, &order_snapshots)
             .await;
-        let positions = state.account.refresh_positions(sym).await?;
+        let positions = state.account.refresh_positions(&context, sym).await?;
         for order in &order_history {
             state.analytics.record_order(order.clone()).await;
         }

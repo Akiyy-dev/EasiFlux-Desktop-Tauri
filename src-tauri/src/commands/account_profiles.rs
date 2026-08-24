@@ -3,6 +3,7 @@ use tauri::State;
 use crate::error::AppResult;
 use crate::models::account::{AccountProfile, AccountSwitchResult};
 use crate::models::config::{ApiCredential, AppConfig, ConnectionStatus};
+use crate::models::trading::SessionContext;
 use crate::services::account_profiles::{
     self, AccountLifecyclePort, AccountProfileListPort, CredentialRepository,
     KeyringCredentialRepository,
@@ -85,17 +86,27 @@ impl AccountLifecyclePort for StateLifecyclePort<'_> {
         self.state
             .connection
             .connect_for_session(
-                account_id,
+                SessionContext {
+                    account_id: crate::models::config::normalize_account_id(account_id),
+                    session_epoch,
+                },
                 realtime,
                 &symbol,
                 Some(credential),
-                session_epoch,
             )
             .await
     }
 
     async fn activate_public_environment(&self, credential: &ApiCredential) {
         activate_public_base_url(self.state.api.as_ref(), credential).await;
+    }
+
+    async fn activate_session(&self, context: &SessionContext) {
+        self.state
+            .connection
+            .activate_committed_session(context)
+            .await;
+        self.state.ws.activate_committed_session(context).await;
     }
 
     async fn clear_account_data(&self) {

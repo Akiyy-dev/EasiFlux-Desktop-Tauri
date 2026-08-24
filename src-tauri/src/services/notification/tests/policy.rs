@@ -133,6 +133,7 @@ fn connection_and_environment_policy_keep_incidents_independent() {
         .environment_unavailable(
             context("environment-i3"),
             NotificationEnvironment::Production,
+            "env-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "i3",
         )
         .unwrap();
@@ -140,6 +141,7 @@ fn connection_and_environment_policy_keep_incidents_independent() {
         .environment_recovered(
             context("environment-i3-recovered"),
             NotificationEnvironment::Production,
+            "env-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "i3",
         )
         .unwrap();
@@ -208,6 +210,7 @@ fn policy_rejects_uncontrolled_incident_submission_and_dedupe_components() {
             .environment_unavailable(
                 context("environment-edge"),
                 NotificationEnvironment::Production,
+                "env-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &incident_id,
             )
             .unwrap_err();

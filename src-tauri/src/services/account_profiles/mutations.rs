@@ -82,6 +82,9 @@ pub(crate) async fn save_credentials<P: AccountLifecyclePort>(
     if credential.label.is_empty() {
         credential.label = account_id.clone();
     }
+    if !credential.is_valid() {
+        return Err(AppError::Auth("API 服务地址无效".into()));
+    }
     port.save_credential(&account_id, &credential)
         .map_err(|_| AppError::Auth("保存账户凭据失败".into()))?;
 

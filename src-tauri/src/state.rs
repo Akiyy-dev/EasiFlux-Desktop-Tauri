@@ -7,6 +7,7 @@ use crate::events::EventEmitter;
 use crate::models::chart_workspace::ChartWorkspaceKey;
 use crate::models::config::{AppConfig, EnvironmentStatus};
 use crate::plugin::PluginRegistry;
+use crate::services::connection::SessionNotificationObserver;
 use crate::services::notification::{
     NotificationEmitter, NotificationRuntime, NotificationService,
 };
@@ -83,7 +84,7 @@ impl AppState {
         let trade_log = Arc::new(TradeLogStore::new());
         let analytics = Arc::new(AnalyticsService::new(api.clone()));
         let account_lifecycle = Arc::new(AccountLifecycleCoordinator::new());
-        let emitter = EventEmitter::new(app.clone(), account_lifecycle.clone());
+        let emitter = EventEmitter::new(app.clone());
         let notification_emitter: NotificationEmitter = Arc::new({
             let emitter = emitter.clone();
             move |event| emitter.emit_notification_changed(event)
@@ -94,6 +95,27 @@ impl AppState {
             chrono::Utc::now().timestamp_millis().max(0) as u64,
             notification_emitter,
         );
+        let session_notification_observer = SessionNotificationObserver::new(
+            notification.clone(),
+            config.clone(),
+            account_lifecycle.clone(),
+        );
+        let auth_observer: crate::api::client::AuthFailureObserver = Arc::new({
+            let observer = session_notification_observer.clone();
+            move |context, failure| {
+                let observer = observer.clone();
+                Box::pin(async move {
+                    observer
+                        .observe_auth_failure_guarded(
+                            &context,
+                            failure,
+                            chrono::Utc::now().timestamp_millis().max(0) as u64,
+                        )
+                        .await
+                })
+            }
+        });
+        api.set_auth_failure_observer(auth_observer);
 
         let time_sync = api.time_sync();
         let ws = Arc::new(WsManager::new(
@@ -102,6 +124,7 @@ impl AppState {
             OrderNotificationObserver::new(notification.clone()),
             config.clone(),
             account_lifecycle.clone(),
+            session_notification_observer.clone(),
         ));
         let time = Arc::new(TimeService::new(time_sync, api.clone(), emitter.clone()));
         let chart_state_store = Arc::new(ChartStateStore::new());
@@ -132,6 +155,7 @@ impl AppState {
             emitter.clone(),
             time.clone(),
             account_lifecycle.clone(),
+            session_notification_observer.clone(),
         ));
         let risk = Arc::new(RwLock::new(RiskService::new(risk_config)));
         let trading = Arc::new(TradingService::new(
@@ -176,6 +200,7 @@ impl AppState {
             api.clone(),
             environment_status.clone(),
             account_lifecycle.clone(),
+            session_notification_observer,
         ));
 
         let plugins = Arc::new(RwLock::new(PluginRegistry::new()));

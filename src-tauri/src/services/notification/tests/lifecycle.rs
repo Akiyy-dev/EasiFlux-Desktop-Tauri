@@ -1872,6 +1872,8 @@ async fn api_websocket_and_environment_incidents_are_independent_edges() {
     let environment = EnvironmentObservation {
         account_id: "alpha".into(),
         session_epoch: 7,
+        environment_key: "env-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .into(),
         environment: NotificationEnvironment::Production,
         state: AvailabilityState::Unavailable,
     };
@@ -1945,19 +1947,23 @@ async fn healthy_noop_observations_still_require_a_valid_account_scope() {
         .unwrap_err();
     assert_eq!(connection_error.code(), "INVALID_NOTIFICATION_SCOPE");
 
-    let environment_error = harness
-        .service
-        .observe_environment(
-            EnvironmentObservation {
-                account_id: "token-secret".into(),
-                session_epoch: 1,
-                environment: NotificationEnvironment::Production,
-                state: AvailabilityState::Available,
-            },
-            NOW,
-        )
-        .await
-        .unwrap_err();
+    let environment_error =
+        harness
+            .service
+            .observe_environment(
+                EnvironmentObservation {
+                    account_id: "token-secret".into(),
+                    session_epoch: 1,
+                    environment_key:
+                        "env-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .into(),
+                    environment: NotificationEnvironment::Production,
+                    state: AvailabilityState::Available,
+                },
+                NOW,
+            )
+            .await
+            .unwrap_err();
     assert_eq!(environment_error.code(), "INVALID_NOTIFICATION_SCOPE");
 }
 
@@ -2633,6 +2639,8 @@ async fn same_millisecond_multi_cycle_incidents_rebuild_in_source_index_causal_o
     let environment = EnvironmentObservation {
         account_id: "alpha".into(),
         session_epoch: 7,
+        environment_key: "env-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .into(),
         environment: NotificationEnvironment::Production,
         state: AvailabilityState::Unavailable,
     };

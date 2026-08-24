@@ -1,6 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::models::account::AccountSwitchResult;
 use crate::models::config::{normalize_account_id, ApiCredential, AppConfig, ConnectionStatus};
+use crate::models::trading::SessionContext;
 
 use super::{
     normalize_account_ids, safe_load, valid_credential, AccountLifecycleCoordinator,
@@ -82,6 +83,11 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
     }
     port.clear_account_data().await;
     let session_epoch = coordinator.advance_session_epoch();
+    port.activate_session(&SessionContext {
+        account_id: target_id.clone(),
+        session_epoch,
+    })
+    .await;
     Ok(AccountSwitchResult {
         active_account_id: target_id,
         connected: former_status == ConnectionStatus::Connected,

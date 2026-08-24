@@ -4,6 +4,7 @@ use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use crate::models::time::{TimeSnapshot, TimeSource, TimeSyncStatus};
 
 mod coordination;
+mod environment_notifications;
 mod notification_maintenance;
 mod rescheduling;
 mod round4_lifecycle;
@@ -203,6 +204,53 @@ async fn bootstrap_runs_every_applicable_task_and_collects_failures() {
     assert!(!visible.contains("raw-secret"));
     assert!(!visible.contains("apiKey"));
     assert!(!visible.contains("keyring"));
+}
+
+#[tokio::test]
+async fn queued_bootstrap_snapshots_connection_status_only_after_switch_commits() {
+    let coordinator = Arc::new(AccountLifecycleCoordinator::new());
+    let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mutation = coordinator.mutation_guard().await;
+    let phase = run_bootstrap_account_phase(
+        coordinator.as_ref(),
+        {
+            let connected = Arc::clone(&connected);
+            move || async move { connected.load(std::sync::atomic::Ordering::SeqCst) }
+        },
+        |_| async { Ok(()) },
+    );
+    tokio::pin!(phase);
+    assert!(matches!(
+        futures_util::poll!(&mut phase),
+        std::task::Poll::Pending
+    ));
+
+    connected.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(mutation);
+    let (tasks, failed) = phase.await;
+
+    assert!(failed.is_empty());
+    assert!(tasks.contains(&TaskId::Balances));
+    assert!(tasks.contains(&TaskId::PrivatePanels));
+    assert!(tasks.contains(&TaskId::DailyPnl));
+}
+
+#[test]
+fn bootstrap_observer_owned_failures_never_emit_a_second_generic_error() {
+    for error in [
+        AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            message: "账户会话已失效",
+            notification_id: "committed-id".into(),
+        },
+        AppError::AuthFailure(crate::api::response::AuthFailureKind::SessionExpired),
+        AppError::Observed("环境检测失败"),
+    ] {
+        assert!(!bootstrap_failure_needs_generic_error(&error));
+    }
+    assert!(bootstrap_failure_needs_generic_error(
+        &AppError::Connection("ordinary failure".into())
+    ));
 }
 
 #[tokio::test]

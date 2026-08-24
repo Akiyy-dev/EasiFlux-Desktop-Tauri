@@ -7,7 +7,7 @@ use crate::api::ApiClient;
 use crate::error::AppResult;
 use crate::events::EventEmitter;
 use crate::models::account::{AccountSummary, Balance};
-use crate::models::trading::Position;
+use crate::models::trading::{Position, SessionContext};
 use crate::services::AnalyticsService;
 
 pub struct AccountService {
@@ -29,19 +29,23 @@ impl AccountService {
         }
     }
 
-    pub async fn refresh_balances(&self) -> AppResult<Vec<Balance>> {
+    pub async fn refresh_balances(&self, context: &SessionContext) -> AppResult<Vec<Balance>> {
         let params =
             build_order_query_params(None, None, None, None, None, None, None, None, None, None);
         let payload = self.api.private_get(endpoints::BALANCES, params).await?;
         let balances = parse_balances(&payload);
         warn_if_parse_empty(&self.emitter, "account/balance", &payload, balances.len());
         for balance in &balances {
-            self.emitter.emit_balance(balance.clone());
+            self.emitter.emit_balance(context, balance.clone());
         }
         Ok(balances)
     }
 
-    pub async fn refresh_positions(&self, symbol: Option<&str>) -> AppResult<Vec<Position>> {
+    pub async fn refresh_positions(
+        &self,
+        context: &SessionContext,
+        symbol: Option<&str>,
+    ) -> AppResult<Vec<Position>> {
         let params =
             build_order_query_params(symbol, None, None, None, None, None, None, None, None, None);
         let payload = self.api.private_get(endpoints::POSITIONS, params).await?;
@@ -50,7 +54,7 @@ impl AccountService {
         warn_if_parse_empty(&self.emitter, "position/list", &payload, positions.len());
         warn_if_raw_parsed_mismatch(&self.emitter, "position/list", &meta, positions.len());
         for position in &positions {
-            self.emitter.emit_position(position.clone());
+            self.emitter.emit_position(context, position.clone());
             self.analytics.record_position(position.clone()).await;
         }
         Ok(positions)
@@ -58,18 +62,18 @@ impl AccountService {
 
     pub async fn refresh_account(
         &self,
-        account_id: &str,
+        context: &SessionContext,
         _symbol: Option<&str>,
     ) -> AppResult<AccountSummary> {
-        let balances = self.refresh_balances().await?;
-        let _positions = self.refresh_positions(None).await?;
+        let balances = self.refresh_balances(context).await?;
+        let _positions = self.refresh_positions(context, None).await?;
         let total_equity = balances
             .iter()
             .map(|b| b.total.parse::<f64>().unwrap_or(0.0))
             .sum::<f64>()
             .to_string();
         Ok(AccountSummary {
-            account_id: account_id.to_string(),
+            account_id: context.account_id.clone(),
             balances,
             total_equity,
         })

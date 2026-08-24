@@ -8,8 +8,7 @@ use crate::models::config::{ConnectionStatus, EnvironmentStatus};
 use crate::models::market::{Depth, Kline, Ticker};
 use crate::models::notification::NotificationChangedEvent;
 use crate::models::time::{DailyPnlSnapshot, TimeSnapshot};
-use crate::models::trading::{Order, Position, PrivatePanelsSnapshot};
-use crate::services::AccountLifecycleCoordinator;
+use crate::models::trading::{Order, Position, PrivatePanelsSnapshot, SessionContext};
 
 const NOTIFICATION_CHANGED_EVENT: &str = "notification:changed";
 
@@ -27,6 +26,7 @@ where
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountSessionEvent<T> {
+    account_id: String,
     session_epoch: u64,
     payload: T,
 }
@@ -61,22 +61,26 @@ impl WebsocketStatusTracker {
 #[derive(Clone)]
 pub struct EventEmitter {
     app: AppHandle,
-    account_lifecycle: Arc<AccountLifecycleCoordinator>,
     websocket_status: WebsocketStatusTracker,
 }
 
 impl EventEmitter {
-    pub fn new(app: AppHandle, account_lifecycle: Arc<AccountLifecycleCoordinator>) -> Self {
+    pub fn new(app: AppHandle) -> Self {
         Self {
             app,
-            account_lifecycle,
             websocket_status: WebsocketStatusTracker::default(),
         }
     }
 
-    fn emit_account_session<T: serde::Serialize + ?Sized>(&self, event: &str, payload: &T) {
+    fn emit_account_session<T: serde::Serialize + ?Sized>(
+        &self,
+        context: &SessionContext,
+        event: &str,
+        payload: &T,
+    ) {
         let envelope = AccountSessionEvent {
-            session_epoch: self.account_lifecycle.current_session_epoch(),
+            account_id: context.account_id.clone(),
+            session_epoch: context.session_epoch,
             payload,
         };
         let _ = self.app.emit(event, &envelope);
@@ -86,14 +90,14 @@ impl EventEmitter {
         let _ = self.app.emit("app:ready", version);
     }
 
-    pub fn emit_connection(&self, status: &str) {
-        self.emit_account_session("connection:status", status);
+    pub fn emit_connection_for_session(&self, context: &SessionContext, status: &str) {
+        self.emit_account_session(context, "connection:status", status);
         self.emit_log("info", &format!("API 连接状态: {}", status));
     }
 
-    pub fn emit_websocket(&self, status: &str) {
+    pub fn emit_websocket_for_session(&self, context: &SessionContext, status: &str) {
         self.websocket_status.record(status);
-        self.emit_account_session("websocket:status", status);
+        self.emit_account_session(context, "websocket:status", status);
         self.emit_log("info", &format!("WebSocket 状态: {}", status));
     }
 
@@ -113,44 +117,40 @@ impl EventEmitter {
         let _ = self.app.emit("market:kline", klines);
     }
 
-    pub fn emit_order(&self, order: Order) {
-        self.emit_order_event(&order);
+    pub fn emit_order(&self, context: &SessionContext, order: Order) {
+        self.emit_account_session(context, "order:updated", &order);
     }
 
-    fn emit_order_event(&self, order: &Order) {
-        self.emit_account_session("order:updated", order);
+    pub fn emit_position(&self, context: &SessionContext, position: Position) {
+        self.emit_account_session(context, "position:updated", &position);
     }
 
-    pub fn emit_position(&self, position: Position) {
-        self.emit_position_event(&position);
-    }
-
-    fn emit_position_event(&self, position: &Position) {
-        self.emit_account_session("position:updated", position);
-    }
-
-    pub fn emit_balance(&self, balance: crate::models::account::Balance) {
-        self.emit_account_session("balance:updated", &balance);
+    pub fn emit_balance(&self, context: &SessionContext, balance: crate::models::account::Balance) {
+        self.emit_account_session(context, "balance:updated", &balance);
     }
 
     pub fn emit_time_updated(&self, snapshot: &TimeSnapshot) {
         let _ = self.app.emit("time:updated", snapshot);
     }
 
-    pub fn emit_account_snapshot(&self, snapshot: AccountSummary) {
-        self.emit_account_session("account:snapshot", &snapshot);
+    pub fn emit_account_snapshot(&self, context: &SessionContext, snapshot: AccountSummary) {
+        self.emit_account_session(context, "account:snapshot", &snapshot);
     }
 
-    pub fn emit_private_panels_snapshot(&self, snapshot: PrivatePanelsSnapshot) {
-        self.emit_account_session("private-panels:snapshot", &snapshot);
+    pub fn emit_private_panels_snapshot(
+        &self,
+        context: &SessionContext,
+        snapshot: PrivatePanelsSnapshot,
+    ) {
+        self.emit_account_session(context, "private-panels:snapshot", &snapshot);
     }
 
-    pub fn emit_daily_pnl_updated(&self, snapshot: &DailyPnlSnapshot) {
-        self.emit_account_session("daily-pnl:updated", snapshot);
+    pub fn emit_daily_pnl_updated(&self, context: &SessionContext, snapshot: &DailyPnlSnapshot) {
+        self.emit_account_session(context, "daily-pnl:updated", snapshot);
     }
 
-    pub fn emit_environment_updated(&self, status: &EnvironmentStatus) {
-        self.emit_account_session("environment:updated", status);
+    pub fn emit_environment_updated(&self, context: &SessionContext, status: &EnvironmentStatus) {
+        self.emit_account_session(context, "environment:updated", status);
     }
 
     pub fn emit_notification_changed(
@@ -199,6 +199,7 @@ mod tests {
     #[test]
     fn account_session_event_serializes_a_camel_case_epoch_envelope() {
         let envelope = AccountSessionEvent {
+            account_id: "primary".into(),
             session_epoch: 7,
             payload: json!({ "orderId": "old-order" }),
         };
@@ -206,6 +207,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(envelope).unwrap(),
             json!({
+                "accountId": "primary",
                 "sessionEpoch": 7,
                 "payload": { "orderId": "old-order" },
             })

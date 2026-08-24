@@ -101,3 +101,21 @@ async fn orphan_keyring_entry_absent_from_config_requires_complete_credentials()
     assert!(result.is_err());
     assert!(!port.runtime_config().accounts.contains(&"orphan".into()));
 }
+
+#[tokio::test]
+async fn save_rejects_unsafe_base_urls_before_keyring_or_config_mutation() {
+    let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
+    let mut request = draft("new", "key", "secret");
+    request.base_url = "https://user:raw-secret@example.test/api?token=raw".into();
+
+    let error = save_credentials(&AccountLifecycleCoordinator::new(), &port, request)
+        .await
+        .expect_err("credential-bearing URL must be rejected");
+
+    assert_eq!(error.to_string(), "认证失败: API 服务地址无效");
+    assert!(!port.credentials.lock().unwrap().contains_key("new"));
+    assert!(!port.runtime_config().accounts.contains(&"new".into()));
+    assert!(port.events().is_empty());
+    assert!(!error.to_string().contains("raw-secret"));
+    assert!(!error.to_string().contains("token="));
+}

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::api::response::AuthFailureKind;
 use crate::api::{ApiClient, PublicApi};
 
 use crate::auth::Signer;
@@ -9,14 +10,242 @@ use crate::error::{AppError, AppResult};
 use crate::events::EventEmitter;
 
 use crate::models::config::{normalize_account_id, ApiCredential, AppConfig, ConnectionStatus};
+use crate::models::notification::{NotificationChannel, NotificationEnvironment};
 use crate::models::time::TimeSyncStatus;
-use crate::models::trading::OrderStreamContext;
+use crate::models::trading::{OrderStreamContext, SessionContext};
 
+use crate::services::notification::{
+    AvailabilityState, ConnectionObservation, EnvironmentObservation, NotificationRuntime,
+};
 use crate::services::{AccountLifecycleCoordinator, MarketService, TimeService};
 
 use crate::storage::CredentialStore;
 
 use crate::ws::WsManager;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionObservationSource {
+    Api,
+    PrivateWebsocket,
+    PublicWebsocket,
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionNotificationObserver {
+    runtime: Arc<NotificationRuntime>,
+    config: Arc<tokio::sync::RwLock<AppConfig>>,
+    account_lifecycle: Arc<AccountLifecycleCoordinator>,
+}
+
+impl SessionNotificationObserver {
+    pub(crate) fn new(
+        runtime: Arc<NotificationRuntime>,
+        config: Arc<tokio::sync::RwLock<AppConfig>>,
+        account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    ) -> Self {
+        Self {
+            runtime,
+            config,
+            account_lifecycle,
+        }
+    }
+
+    async fn is_current_guarded(&self, context: &SessionContext) -> bool {
+        let active_account_id = normalize_account_id(&self.config.read().await.active_account_id);
+        let current_epoch = self.account_lifecycle.current_session_epoch();
+        active_account_id == context.account_id && current_epoch == context.session_epoch
+    }
+
+    pub(crate) async fn observe_connection_status(
+        &self,
+        context: &SessionContext,
+        source: ConnectionObservationSource,
+        status: ConnectionStatus,
+        now_ms: u64,
+    ) -> Option<String> {
+        let _guard = self.account_lifecycle.read_guard().await;
+        self.observe_connection_status_guarded(context, source, status, now_ms)
+            .await
+    }
+
+    pub(crate) async fn observe_connection_status_guarded(
+        &self,
+        context: &SessionContext,
+        source: ConnectionObservationSource,
+        status: ConnectionStatus,
+        now_ms: u64,
+    ) -> Option<String> {
+        let channel = match source {
+            ConnectionObservationSource::Api => NotificationChannel::Api,
+            ConnectionObservationSource::PrivateWebsocket => NotificationChannel::Websocket,
+            ConnectionObservationSource::PublicWebsocket => return None,
+        };
+        let state = match status {
+            ConnectionStatus::Connected => AvailabilityState::Available,
+            ConnectionStatus::Error => AvailabilityState::Unavailable,
+            ConnectionStatus::Connecting | ConnectionStatus::Disconnected => return None,
+        };
+        if !self.is_current_guarded(context).await {
+            return None;
+        }
+        let service = match self.runtime.service() {
+            Ok(service) => service,
+            Err(availability) => {
+                tracing::warn!(
+                    code = availability.code(),
+                    "connection notification observer unavailable"
+                );
+                return None;
+            }
+        };
+        match service
+            .observe_connection(
+                ConnectionObservation {
+                    account_id: context.account_id.clone(),
+                    session_epoch: context.session_epoch,
+                    channel,
+                    state,
+                },
+                now_ms,
+            )
+            .await
+        {
+            Ok(outcome) => outcome.notification.map(|record| record.id),
+            Err(error) => {
+                tracing::warn!(
+                    code = error.code(),
+                    "connection notification observation failed"
+                );
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn observe_environment(
+        &self,
+        context: &SessionContext,
+        environment_key: &str,
+        environment: NotificationEnvironment,
+        reachable: bool,
+        now_ms: u64,
+    ) -> Option<String> {
+        let _guard = self.account_lifecycle.read_guard().await;
+        self.observe_environment_guarded(context, environment_key, environment, reachable, now_ms)
+            .await
+    }
+
+    pub(crate) async fn observe_environment_guarded(
+        &self,
+        context: &SessionContext,
+        environment_key: &str,
+        environment: NotificationEnvironment,
+        reachable: bool,
+        now_ms: u64,
+    ) -> Option<String> {
+        if !self.is_current_guarded(context).await {
+            return None;
+        }
+        let service = match self.runtime.service() {
+            Ok(service) => service,
+            Err(availability) => {
+                tracing::warn!(
+                    code = availability.code(),
+                    "environment notification observer unavailable"
+                );
+                return None;
+            }
+        };
+        match service
+            .observe_environment(
+                EnvironmentObservation {
+                    account_id: context.account_id.clone(),
+                    session_epoch: context.session_epoch,
+                    environment_key: environment_key.to_string(),
+                    environment,
+                    state: if reachable {
+                        AvailabilityState::Available
+                    } else {
+                        AvailabilityState::Unavailable
+                    },
+                },
+                now_ms,
+            )
+            .await
+        {
+            Ok(outcome) => outcome.notification.map(|record| record.id),
+            Err(error) => {
+                tracing::warn!(
+                    code = error.code(),
+                    "environment notification observation failed"
+                );
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn observe_auth_failure(
+        &self,
+        context: &SessionContext,
+        failure: AuthFailureKind,
+        now_ms: u64,
+    ) -> Option<String> {
+        let _guard = self.account_lifecycle.read_guard().await;
+        self.observe_auth_failure_guarded(context, failure, now_ms)
+            .await
+    }
+
+    pub(crate) async fn observe_auth_failure_guarded(
+        &self,
+        context: &SessionContext,
+        failure: AuthFailureKind,
+        now_ms: u64,
+    ) -> Option<String> {
+        if failure != AuthFailureKind::SessionExpired || !self.is_current_guarded(context).await {
+            return None;
+        }
+        let service = match self.runtime.service() {
+            Ok(service) => service,
+            Err(availability) => {
+                tracing::warn!(
+                    code = availability.code(),
+                    "session notification observer unavailable"
+                );
+                return None;
+            }
+        };
+        match service
+            .observe_session_expired(context.account_id.clone(), context.session_epoch, now_ms)
+            .await
+        {
+            Ok(outcome) => outcome.notification.map(|record| record.id),
+            Err(error) => {
+                tracing::warn!(
+                    code = error.code(),
+                    "session notification observation failed"
+                );
+                None
+            }
+        }
+    }
+}
+
+fn notified_connection_error(error: AppError, notification_id: Option<String>) -> AppError {
+    match notification_id {
+        Some(notification_id) => match error {
+            AppError::AuthFailure(AuthFailureKind::SessionExpired) => AppError::Notified {
+                code: "AUTH_SESSION_EXPIRED",
+                message: "账户会话已失效",
+                notification_id,
+            },
+            _ => AppError::Notified {
+                code: "CONNECTION_UNAVAILABLE",
+                message: "交易连接暂时不可用",
+                notification_id,
+            },
+        },
+        None => error,
+    }
+}
 
 pub struct ConnectionService {
     api: Arc<ApiClient>,
@@ -34,7 +263,12 @@ pub struct ConnectionService {
     status: Arc<tokio::sync::RwLock<ConnectionStatus>>,
 
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
+
+    notification_observer: SessionNotificationObserver,
 }
+
+#[cfg(test)]
+mod tests;
 
 impl ConnectionService {
     pub fn new(
@@ -51,6 +285,8 @@ impl ConnectionService {
         time: Arc<TimeService>,
 
         account_lifecycle: Arc<AccountLifecycleCoordinator>,
+
+        notification_observer: SessionNotificationObserver,
     ) -> Self {
         Self {
             api,
@@ -68,6 +304,8 @@ impl ConnectionService {
             status: Arc::new(tokio::sync::RwLock::new(ConnectionStatus::Disconnected)),
 
             account_lifecycle,
+
+            notification_observer,
         }
     }
 
@@ -75,11 +313,11 @@ impl ConnectionService {
         *self.status.read().await
     }
 
-    async fn set_status(&self, status: ConnectionStatus) {
+    async fn set_status(&self, context: &SessionContext, status: ConnectionStatus) {
         *self.status.write().await = status;
 
         self.emitter
-            .emit_connection(&format!("{:?}", status).to_lowercase());
+            .emit_connection_for_session(context, &format!("{:?}", status).to_lowercase());
     }
 
     pub async fn connect(
@@ -93,46 +331,46 @@ impl ConnectionService {
 
         credential: Option<ApiCredential>,
     ) -> AppResult<()> {
-        self.connect_for_session(
-            account_id,
-            start_realtime,
-            symbol,
-            credential,
-            self.account_lifecycle.current_session_epoch(),
-        )
-        .await
+        let context = SessionContext {
+            account_id: normalize_account_id(account_id),
+            session_epoch: self.account_lifecycle.current_session_epoch(),
+        };
+        self.connect_for_session(context, start_realtime, symbol, credential)
+            .await
     }
 
     pub(crate) async fn connect_for_session(
         &self,
-        account_id: &str,
+        context: SessionContext,
         start_realtime: bool,
         symbol: &str,
         credential: Option<ApiCredential>,
-        session_epoch: u64,
     ) -> AppResult<()> {
-        self.set_status(ConnectionStatus::Connecting).await;
+        self.set_status(&context, ConnectionStatus::Connecting)
+            .await;
 
         match self
-            .connect_inner(
-                account_id,
-                start_realtime,
-                symbol,
-                credential,
-                session_epoch,
-            )
+            .connect_inner(&context, start_realtime, symbol, credential)
             .await
         {
             Ok(()) => Ok(()),
 
             Err(e) => {
-                let msg = e.user_message();
-
-                self.set_status(ConnectionStatus::Error).await;
-
-                self.emitter.emit_error(&msg);
-
-                Err(e)
+                self.set_status(&context, ConnectionStatus::Error).await;
+                let notification_id = match &e {
+                    AppError::Connection(_) => {
+                        self.notification_observer
+                            .observe_connection_status_guarded(
+                                &context,
+                                ConnectionObservationSource::Api,
+                                ConnectionStatus::Error,
+                                local_timestamp_ms(),
+                            )
+                            .await
+                    }
+                    _ => None,
+                };
+                Err(notified_connection_error(e, notification_id))
             }
         }
     }
@@ -140,19 +378,18 @@ impl ConnectionService {
     async fn connect_inner(
         &self,
 
-        account_id: &str,
+        context: &SessionContext,
 
         start_realtime: bool,
 
         symbol: &str,
 
         credential: Option<ApiCredential>,
-
-        session_epoch: u64,
     ) -> AppResult<()> {
         if !start_realtime {
             self.ws.stop().await;
-            self.emitter.emit_websocket("disconnected");
+            self.emitter
+                .emit_websocket_for_session(context, "disconnected");
         }
 
         let credential = match credential {
@@ -160,7 +397,7 @@ impl ConnectionService {
                 c = c.normalize();
 
                 if !c.has_secret() {
-                    let stored = CredentialStore::load(account_id)?
+                    let stored = CredentialStore::load(&context.account_id)?
                         .ok_or_else(|| AppError::Auth("未找到 API 凭据".into()))?;
 
                     c.api_secret = stored.api_secret;
@@ -183,7 +420,7 @@ impl ConnectionService {
                 c
             }
 
-            None => CredentialStore::load(account_id)?
+            None => CredentialStore::load(&context.account_id)?
                 .ok_or_else(|| AppError::Auth("未找到 API 凭据".into()))?
                 .normalize(),
         };
@@ -194,7 +431,9 @@ impl ConnectionService {
             ));
         }
 
-        self.api.set_credential(credential.clone()).await;
+        self.api
+            .set_credential_for_session(credential.clone(), context.clone())
+            .await;
         let snapshot = self.time.sync().await?;
         if snapshot.sync_status == TimeSyncStatus::Failed {
             return Err(AppError::Connection(
@@ -223,42 +462,67 @@ impl ConnectionService {
 
             self.ws.subscribe_all(symbol, &kline_interval).await;
 
-            if let Err(e) = self
-                .ws
-                .start(
-                    symbol,
-                    OrderStreamContext {
-                        account_id: normalize_account_id(account_id),
-                        session_epoch,
-                    },
-                )
-                .await
-            {
-                self.emitter
-                    .emit_error(&format!("WebSocket 启动失败: {}", e));
-
-                self.emitter.emit_websocket("error");
+            if let Err(e) = self.ws.start(symbol, context.clone()).await {
+                self.emitter.emit_websocket_for_session(context, "error");
+                tracing::warn!(error_kind = ?std::mem::discriminant(&e), "WebSocket startup failed");
             }
         }
 
-        self.set_status(ConnectionStatus::Connected).await;
+        self.set_status(context, ConnectionStatus::Connected).await;
+        self.notification_observer
+            .observe_connection_status_guarded(
+                context,
+                ConnectionObservationSource::Api,
+                ConnectionStatus::Connected,
+                local_timestamp_ms(),
+            )
+            .await;
 
         self.emitter.emit_log("info", "API 连接成功");
 
         Ok(())
     }
 
+    pub(crate) async fn activate_committed_session(&self, context: &SessionContext) {
+        if self.status().await == ConnectionStatus::Connected {
+            self.notification_observer
+                .observe_connection_status_guarded(
+                    context,
+                    ConnectionObservationSource::Api,
+                    ConnectionStatus::Connected,
+                    local_timestamp_ms(),
+                )
+                .await;
+        }
+    }
+
     pub async fn disconnect(&self) {
+        let context = SessionContext {
+            account_id: normalize_account_id(&self.config.read().await.active_account_id),
+            session_epoch: self.account_lifecycle.current_session_epoch(),
+        };
         self.ws.stop().await;
-        self.emitter.emit_websocket("disconnected");
+        self.emitter
+            .emit_websocket_for_session(&context, "disconnected");
 
         self.api.clear_credential().await;
 
-        self.set_status(ConnectionStatus::Disconnected).await;
+        self.set_status(&context, ConnectionStatus::Disconnected)
+            .await;
     }
 
     pub async fn refresh_realtime(&self, symbol: &str) -> AppResult<()> {
-        let use_ws = self.config.read().await.use_websocket;
+        let (use_ws, account_id) = {
+            let config = self.config.read().await;
+            (
+                config.use_websocket,
+                normalize_account_id(&config.active_account_id),
+            )
+        };
+        let context = OrderStreamContext {
+            account_id,
+            session_epoch: self.account_lifecycle.current_session_epoch(),
+        };
 
         if !use_ws || self.status().await != ConnectionStatus::Connected {
             return Ok(());
@@ -268,10 +532,6 @@ impl ConnectionService {
 
         self.ws.subscribe_all(symbol, &kline_interval).await;
 
-        let context = OrderStreamContext {
-            account_id: normalize_account_id(&self.config.read().await.active_account_id),
-            session_epoch: self.account_lifecycle.current_session_epoch(),
-        };
         self.ws.start(symbol, context).await?;
 
         Ok(())
@@ -288,4 +548,11 @@ impl ConnectionService {
 
         Ok(())
     }
+}
+
+fn local_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }

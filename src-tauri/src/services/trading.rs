@@ -337,6 +337,7 @@ impl TradingService {
         context: SubmissionContext,
         request: PlaceOrderRequest,
     ) -> AppResult<Order> {
+        let session_context = OrderStreamContext::from(&context);
         let now_ms = self.time.now_ms();
         let reference_price = self
             .cache
@@ -352,7 +353,7 @@ impl TradingService {
             now_ms,
             |order| async move {
                 let _ = self.trade_log.append_order(&order);
-                self.emitter.emit_order(order.clone());
+                self.emitter.emit_order(&session_context, order.clone());
                 self.emitter
                     .emit_log("info", &format!("下单成功: {}", order.order_id));
                 self.analytics.record_order(order).await;
@@ -378,7 +379,7 @@ impl TradingService {
             )
             .await;
         let _ = self.trade_log.append_order(&order);
-        self.emitter.emit_order(order.clone());
+        self.emitter.emit_order(&context, order.clone());
         self.emitter
             .emit_log("info", &format!("撤单成功: {}", order.order_id));
         self.analytics.record_order(order.clone()).await;
@@ -392,7 +393,7 @@ impl TradingService {
     ) -> AppResult<Vec<Order>> {
         let orders = self.fetch_open_orders(context, symbol).await?;
         for order in &orders {
-            self.emitter.emit_order(order.clone());
+            self.emitter.emit_order(context, order.clone());
             self.analytics.record_order(order.clone()).await;
         }
         Ok(orders)

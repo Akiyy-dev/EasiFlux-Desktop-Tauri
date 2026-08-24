@@ -8,9 +8,20 @@ pub struct SubmissionContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrderStreamContext {
+pub struct SessionContext {
     pub account_id: String,
     pub session_epoch: u64,
+}
+
+pub use SessionContext as OrderStreamContext;
+
+impl From<&SubmissionContext> for SessionContext {
+    fn from(context: &SubmissionContext) -> Self {
+        Self {
+            account_id: context.account_id.clone(),
+            session_epoch: context.session_epoch,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

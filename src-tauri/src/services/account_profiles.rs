@@ -4,6 +4,7 @@ mod switching;
 
 use crate::error::{AppError, AppResult};
 use crate::models::config::{ApiCredential, AppConfig, ConnectionStatus};
+use crate::models::trading::SessionContext;
 use crate::storage::CredentialStore;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,6 +33,7 @@ pub(crate) trait AccountLifecyclePort: Send + Sync {
         session_epoch: u64,
     ) -> AppResult<()>;
     async fn activate_public_environment(&self, credential: &ApiCredential);
+    async fn activate_session(&self, context: &SessionContext);
     async fn clear_account_data(&self);
 }
 

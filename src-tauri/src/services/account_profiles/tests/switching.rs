@@ -75,7 +75,12 @@ async fn disconnected_switch_persists_without_reconnecting() {
     assert_eq!(port.public_environment_activation_count(), 1);
     assert_eq!(
         port.events(),
-        ["preflight:backup", "disconnect", "persist:backup"]
+        [
+            "preflight:backup",
+            "disconnect",
+            "persist:backup",
+            "activate:backup:1",
+        ]
     );
 }
 
@@ -141,7 +146,8 @@ async fn connected_switch_disconnects_persists_and_reconnects() {
             "preflight:backup",
             "disconnect",
             "persist:backup",
-            "connect:backup"
+            "connect:backup",
+            "activate:backup:1",
         ]
     );
 }
@@ -306,6 +312,7 @@ async fn simultaneous_switch_and_delete_are_serialized() {
             "disconnect",
             "persist:backup",
             "connect:backup",
+            "activate:backup:1",
             "delete:spare",
             "persist:backup"
         ]
@@ -339,6 +346,7 @@ async fn shared_guard_serializes_public_connection_and_config_mutations() {
             "disconnect",
             "persist:backup",
             "connect:backup",
+            "activate:backup:1",
             "public:connect",
             "public:disconnect",
             "public:config"
@@ -458,7 +466,8 @@ async fn account_switch_waits_for_in_flight_order_lifecycle() {
             "preflight:backup",
             "disconnect",
             "persist:backup",
-            "connect:backup"
+            "connect:backup",
+            "activate:backup:1",
         ]
     );
     let _ = std::fs::remove_dir_all(root);

@@ -7,7 +7,8 @@ use crate::api::PrivateApi;
 use crate::error::AppResult;
 use crate::models::account::{AccountSummary, Balance, FundingBalance};
 use crate::models::api_requests::ApiTransferRequest;
-use crate::models::trading::{Position, TradeStats};
+use crate::models::config::normalize_account_id;
+use crate::models::trading::{Position, SessionContext, TradeStats};
 use crate::services::account_profiles::{
     run_account_private_mutation, run_account_private_operation,
 };
@@ -23,18 +24,23 @@ pub async fn refresh_account(state: State<'_, AppState>) -> AppResult<AccountSum
                 config.active_symbol.clone(),
             )
         };
-        state
-            .account
-            .refresh_account(&account_id, Some(&symbol))
-            .await
+        let context = SessionContext {
+            account_id: normalize_account_id(&account_id),
+            session_epoch: state.account_lifecycle.current_session_epoch(),
+        };
+        state.account.refresh_account(&context, Some(&symbol)).await
     })
     .await
 }
 
 #[tauri::command]
 pub async fn refresh_balances(state: State<'_, AppState>) -> AppResult<Vec<Balance>> {
-    run_account_private_operation(state.account_lifecycle.as_ref(), || {
-        state.account.refresh_balances()
+    run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        let context = SessionContext {
+            account_id: normalize_account_id(&state.config.read().await.active_account_id),
+            session_epoch: state.account_lifecycle.current_session_epoch(),
+        };
+        state.account.refresh_balances(&context).await
     })
     .await
 }
@@ -44,8 +50,15 @@ pub async fn refresh_positions(
     state: State<'_, AppState>,
     symbol: Option<String>,
 ) -> AppResult<Vec<Position>> {
-    run_account_private_operation(state.account_lifecycle.as_ref(), || {
-        state.account.refresh_positions(symbol.as_deref())
+    run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        let context = SessionContext {
+            account_id: normalize_account_id(&state.config.read().await.active_account_id),
+            session_epoch: state.account_lifecycle.current_session_epoch(),
+        };
+        state
+            .account
+            .refresh_positions(&context, symbol.as_deref())
+            .await
     })
     .await
 }

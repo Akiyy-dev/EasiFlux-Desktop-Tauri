@@ -142,6 +142,7 @@ pub struct ConnectionObservation {
 pub struct EnvironmentObservation {
     pub account_id: String,
     pub session_epoch: u64,
+    pub environment_key: String,
     pub environment: NotificationEnvironment,
     pub state: AvailabilityState,
 }
@@ -233,7 +234,7 @@ struct ServiceState {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum IncidentKey {
     Connection(String, NotificationChannel),
-    Environment(String, NotificationEnvironment),
+    Environment(String, String),
 }
 
 #[derive(Debug, Clone)]
@@ -772,7 +773,11 @@ impl NotificationService {
         now_ms: u64,
     ) -> Result<PublishOutcome, NotificationError> {
         ViewContext::account(&observation.account_id)?;
-        let key = IncidentKey::Environment(observation.account_id.clone(), observation.environment);
+        validate_environment_key(&observation.environment_key)?;
+        let key = IncidentKey::Environment(
+            observation.account_id.clone(),
+            observation.environment_key.clone(),
+        );
         let mut guard = self.state.lock().await;
         let policy = NotificationPolicy;
         let (input, next_incident) = match observation.state {
@@ -786,12 +791,13 @@ impl NotificationService {
                     observation.session_epoch,
                     format!(
                         "environment:{}:{incident_id}:unavailable",
-                        environment_tag(observation.environment)
+                        observation.environment_key
                     ),
                 )?;
                 let input = policy.environment_unavailable(
                     context,
                     observation.environment,
+                    &observation.environment_key,
                     &incident_id,
                 )?;
                 (input, Some(ActiveIncident { id: incident_id }))
@@ -805,12 +811,16 @@ impl NotificationService {
                     observation.session_epoch,
                     format!(
                         "environment:{}:{}:recovered",
-                        environment_tag(observation.environment),
-                        incident.id
+                        observation.environment_key, incident.id
                     ),
                 )?;
                 (
-                    policy.environment_recovered(context, observation.environment, &incident.id)?,
+                    policy.environment_recovered(
+                        context,
+                        observation.environment,
+                        &observation.environment_key,
+                        &incident.id,
+                    )?,
                     None,
                 )
             }
@@ -826,6 +836,22 @@ impl NotificationService {
         }
         let mutation = apply_prepared_publish(&mut next, prepared)?;
         self.commit_publish(&mut guard, next, mutation)
+    }
+
+    pub async fn observe_session_expired(
+        &self,
+        account_id: String,
+        session_epoch: u64,
+        now_ms: u64,
+    ) -> Result<PublishOutcome, NotificationError> {
+        ViewContext::account(&account_id)?;
+        let context = policy::PolicyContext::new(
+            account_id,
+            session_epoch,
+            format!("session:{session_epoch}:expired"),
+        )?;
+        let input = NotificationPolicy.session_expired(context)?;
+        self.publish(input, now_ms).await
     }
 
     pub async fn observe_order(
@@ -2068,8 +2094,8 @@ fn incident_key_sort_key(key: &IncidentKey) -> (&str, u8, &str) {
         IncidentKey::Connection(account_id, channel) => {
             (account_id.as_str(), 0, channel_tag(*channel))
         }
-        IncidentKey::Environment(account_id, environment) => {
-            (account_id.as_str(), 1, environment_tag(*environment))
+        IncidentKey::Environment(account_id, environment_key) => {
+            (account_id.as_str(), 1, environment_key.as_str())
         }
     }
 }
@@ -2230,18 +2256,27 @@ fn incident_history_edge(
             IncidentKey::Connection(account_id.clone(), channel)
         }
         NotificationKind::EnvironmentUnavailable | NotificationKind::EnvironmentRecovered => {
-            let Some(crate::models::notification::NotificationScalar::String(environment)) =
-                record.content.params.get("environment")
-            else {
-                return None;
-            };
-            let environment = match environment.as_str() {
-                "production" => NotificationEnvironment::Production,
-                "development" => NotificationEnvironment::Development,
-                "unknown" => NotificationEnvironment::Unknown,
-                _ => return None,
-            };
-            IncidentKey::Environment(account_id.clone(), environment)
+            let environment_key = record
+                .entity
+                .as_ref()
+                .filter(|entity| {
+                    entity.entity_type
+                        == crate::models::notification::NotificationEntityType::Environment
+                })
+                .map(|entity| entity.id.clone())
+                .or_else(|| {
+                    record
+                        .content
+                        .params
+                        .get("environment")
+                        .and_then(|value| match value {
+                            crate::models::notification::NotificationScalar::String(value) => {
+                                Some(format!("legacy-{value}"))
+                            }
+                            _ => None,
+                        })
+                })?;
+            IncidentKey::Environment(account_id.clone(), environment_key)
         }
         _ => return None,
     };
@@ -2265,11 +2300,21 @@ fn channel_tag(channel: NotificationChannel) -> &'static str {
     }
 }
 
-fn environment_tag(environment: NotificationEnvironment) -> &'static str {
-    match environment {
-        NotificationEnvironment::Production => "production",
-        NotificationEnvironment::Development => "development",
-        NotificationEnvironment::Unknown => "unknown",
+fn validate_environment_key(environment_key: &str) -> Result<(), NotificationError> {
+    let digest = environment_key
+        .strip_prefix("env-v1-")
+        .ok_or_else(|| NotificationError::new("INVALID_NOTIFICATION_CONTENT", "环境标识无效"))?;
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(NotificationError::new(
+            "INVALID_NOTIFICATION_CONTENT",
+            "环境标识无效",
+        ))
     }
 }
 

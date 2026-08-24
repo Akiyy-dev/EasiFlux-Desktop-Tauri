@@ -6,7 +6,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::chart_workspace::ChartWorkspaceKey;
 use crate::models::config::{normalize_account_id, ConnectionStatus};
 use crate::models::market::{Depth, Kline, Ticker};
-use crate::models::trading::OrderStreamContext;
+use crate::models::trading::SessionContext;
 use crate::services::account_profiles::run_account_public_operation;
 use crate::state::AppState;
 
@@ -147,32 +147,53 @@ async fn schedule_chart_context_refresh(
             let config = state.config.clone();
             let ws = state.ws.clone();
             tauri::async_runtime::spawn(async move {
-                run_account_public_operation(account_lifecycle.as_ref(), || async {
-                    if let Err(error) = market.backfill_gaps(&key.symbol, &key.interval).await {
-                        emitter.emit_error(&format!("K线回填失败: {error}"));
-                    }
-                    if connection.status().await != ConnectionStatus::Connected {
-                        return;
-                    }
-                    if let Err(error) = market.refresh_snapshot(&key.symbol).await {
-                        emitter.emit_error(&format!("行情快照失败: {error}"));
-                    }
-                    let context = OrderStreamContext {
-                        account_id: normalize_account_id(&config.read().await.active_account_id),
-                        session_epoch: account_lifecycle.current_session_epoch(),
-                    };
-                    match trading.refresh_orders(&context, None).await {
-                        Ok(orders) => ws.observe_manual_order_snapshots(&context, &orders).await,
-                        Err(error) => emitter.emit_error(&format!("订单刷新失败: {error}")),
-                    }
-                    if let Err(error) = account.refresh_positions(None).await {
-                        emitter.emit_error(&format!("持仓刷新失败: {error}"));
-                    }
-                })
+                run_chart_refresh_for_active_session(
+                    account_lifecycle.as_ref(),
+                    config.as_ref(),
+                    |context| async move {
+                        if let Err(error) = market.backfill_gaps(&key.symbol, &key.interval).await {
+                            emitter.emit_error(&format!("K线回填失败: {error}"));
+                        }
+                        if connection.status().await != ConnectionStatus::Connected {
+                            return;
+                        }
+                        if let Err(error) = market.refresh_snapshot(&key.symbol).await {
+                            emitter.emit_error(&format!("行情快照失败: {error}"));
+                        }
+                        match trading.refresh_orders(&context, None).await {
+                            Ok(orders) => {
+                                ws.observe_manual_order_snapshots(&context, &orders).await
+                            }
+                            Err(error) => emitter.emit_error(&format!("订单刷新失败: {error}")),
+                        }
+                        if let Err(error) = account.refresh_positions(&context, None).await {
+                            emitter.emit_error(&format!("持仓刷新失败: {error}"));
+                        }
+                    },
+                )
                 .await;
             });
         }
     }
+}
+
+async fn run_chart_refresh_for_active_session<T, F, Fut>(
+    account_lifecycle: &crate::services::AccountLifecycleCoordinator,
+    config: &tokio::sync::RwLock<crate::models::config::AppConfig>,
+    operation: F,
+) -> T
+where
+    F: FnOnce(SessionContext) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    run_account_public_operation(account_lifecycle, || async {
+        let context = SessionContext {
+            account_id: normalize_account_id(&config.read().await.active_account_id),
+            session_epoch: account_lifecycle.current_session_epoch(),
+        };
+        operation(context).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -308,6 +329,9 @@ pub async fn fetch_fiat_rate(
 mod tests {
     use super::*;
     use crate::models::chart_workspace::ChartWorkspaceKey;
+    use crate::models::config::AppConfig;
+    use crate::services::AccountLifecycleCoordinator;
+    use std::sync::Arc;
 
     fn key(symbol: &str, interval: &str) -> ChartWorkspaceKey {
         ChartWorkspaceKey::parse(symbol, interval).unwrap()
@@ -335,5 +359,30 @@ mod tests {
             chart_context_refresh_plan(&key("BTCUSDT", "1"), &key("ETHUSDT", "1")),
             ChartContextRefreshPlan::SymbolAndAccount
         );
+    }
+
+    #[tokio::test]
+    async fn queued_chart_refresh_captures_context_after_account_switch_commits() {
+        let lifecycle = Arc::new(AccountLifecycleCoordinator::new());
+        let config = Arc::new(tokio::sync::RwLock::new(AppConfig::default()));
+        let mutation = lifecycle.mutation_guard().await;
+        let refresh = run_chart_refresh_for_active_session(
+            lifecycle.as_ref(),
+            config.as_ref(),
+            |context| async move { context },
+        );
+        tokio::pin!(refresh);
+        assert!(matches!(
+            futures_util::poll!(&mut refresh),
+            std::task::Poll::Pending
+        ));
+
+        config.write().await.active_account_id = "backup".into();
+        lifecycle.advance_session_epoch();
+        drop(mutation);
+
+        let context = refresh.await;
+        assert_eq!(context.account_id, "backup");
+        assert_eq!(context.session_epoch, 1);
     }
 }

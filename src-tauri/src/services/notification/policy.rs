@@ -371,28 +371,32 @@ impl NotificationPolicy {
         &self,
         context: PolicyContext,
         environment: NotificationEnvironment,
+        environment_key: &str,
         incident_id: &str,
     ) -> Result<NotificationInput, NotificationError> {
-        self.environment_edge(context, environment, incident_id, false)
+        self.environment_edge(context, environment, environment_key, incident_id, false)
     }
 
     pub fn environment_recovered(
         &self,
         context: PolicyContext,
         environment: NotificationEnvironment,
+        environment_key: &str,
         incident_id: &str,
     ) -> Result<NotificationInput, NotificationError> {
-        self.environment_edge(context, environment, incident_id, true)
+        self.environment_edge(context, environment, environment_key, incident_id, true)
     }
 
     fn environment_edge(
         &self,
         context: PolicyContext,
         environment: NotificationEnvironment,
+        environment_key: &str,
         incident_id: &str,
         recovered: bool,
     ) -> Result<NotificationInput, NotificationError> {
         validate_policy_identifier(incident_id, "环境故障标识无效")?;
+        validate_policy_identifier(environment_key, "环境标识无效")?;
         let (kind, severity, key, title, body, suffix) = if recovered {
             (
                 NotificationKind::EnvironmentRecovered,
@@ -428,13 +432,12 @@ impl NotificationPolicy {
             ),
             Some(NotificationEntity {
                 entity_type: NotificationEntityType::Environment,
-                id: environment_name(environment).into(),
+                id: environment_key.into(),
             }),
             None,
             format!(
                 "{}:{}:{incident_id}:{suffix}",
-                context.account_id,
-                environment_name(environment)
+                context.account_id, environment_key
             ),
         )
     }
