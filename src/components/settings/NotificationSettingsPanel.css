@@ -1,0 +1,69 @@
+.notification-settings-panel {
+  display: grid;
+  gap: var(--ef-space-4);
+}
+
+.notification-settings-header,
+.notification-settings-error-row,
+.notification-settings-clear {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ef-space-3);
+}
+
+.notification-settings-header h2,
+.notification-settings-header p,
+.notification-settings-error-row p,
+.notification-settings-clear h3,
+.notification-settings-clear p,
+.notification-settings-muted,
+.notification-settings-error {
+  margin: 0;
+}
+
+.notification-settings-header h2,
+.notification-settings-clear h3 {
+  font-size: var(--ef-text-lg);
+}
+
+.notification-settings-header p,
+.notification-settings-muted,
+.notification-settings-status {
+  color: var(--muted-foreground);
+}
+
+.notification-settings-switches {
+  display: grid;
+  max-width: 32rem;
+  gap: var(--ef-space-3);
+}
+
+.notification-settings-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ef-space-3);
+}
+
+.notification-settings-clear {
+  align-items: flex-start;
+  flex-direction: column;
+  padding: var(--ef-space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-md);
+  background: var(--muted);
+}
+
+.notification-settings-error,
+.notification-settings-error-row [role='alert'] {
+  color: var(--ef-color-danger);
+}
+
+@media (max-width: 640px) {
+  .notification-settings-header,
+  .notification-settings-error-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

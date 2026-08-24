@@ -23,7 +23,7 @@ function mountShell() {
         DashboardPage: { template: '<div />' },
         SettingsCenterPage: {
           props: ['initialSection', 'initialAccountSection'],
-          template: '<section data-testid="settings-content" :data-account-section="initialAccountSection"><h1>{{ initialSection }}</h1></section>',
+          template: '<section data-testid="settings-content" :data-account-section="initialAccountSection"><h2 v-if="initialSection === \'notifications\'" id="notification-settings-title">通知设置</h2><h1 v-else>{{ initialSection }}</h1></section>',
         },
       },
     },
@@ -61,18 +61,22 @@ describe('notification action navigation', () => {
     if (page === 'trading') {
       expect(wrapper.find('[data-testid="settings-content"]').exists()).toBe(false)
     } else {
-      expect(wrapper.get('[data-testid="settings-content"]').text()).toContain(section)
+      if (section === 'notifications') {
+        expect(wrapper.get('#notification-settings-title').text()).toBe('通知设置')
+      } else {
+        expect(wrapper.get('[data-testid="settings-content"]').text()).toContain(section)
+      }
       expect(wrapper.get('[data-testid="settings-content"]').attributes('data-account-section')).toBe(accountSection ?? 'api')
     }
   })
 
-  it('focuses the rendered settings heading after notification-settings navigation without changing the placeholder markup', async () => {
+  it('focuses the stable notification settings heading after notification-settings navigation', async () => {
     const wrapper = mountShell()
     wrapper.getComponent(TopBar).vm.$emit('action', { type: 'openNotificationSettings' })
     await flushPromises()
     await wrapper.vm.$nextTick()
 
-    const heading = wrapper.get('[data-testid="settings-content"] h1')
+    const heading = wrapper.get('#notification-settings-title')
     expect(heading.attributes('tabindex')).toBe('-1')
     expect(document.activeElement).toBe(heading.element)
     wrapper.unmount()
@@ -87,7 +91,7 @@ describe('notification action navigation', () => {
     await flushPromises()
     await wrapper.vm.$nextTick()
 
-    const heading = wrapper.get('[data-testid="settings-content"] h1')
+    const heading = wrapper.get('#notification-settings-title')
     expect(heading.attributes('tabindex')).toBe('-1')
     expect(document.activeElement).toBe(heading.element)
     pendingFlush.resolve()

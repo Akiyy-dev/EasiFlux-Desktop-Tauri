@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import GeneralSettingsPanel from './GeneralSettingsPanel.vue'
+import NotificationSettingsPanel from './NotificationSettingsPanel.vue'
 import AccountSettingsPage from './AccountSettingsPage.vue'
 import AboutSettingsPanel from './AboutSettingsPanel.vue'
 import SettingsPlaceholder from './SettingsPlaceholder.vue'
@@ -39,6 +40,7 @@ function selectSection(section: SettingsSection): void {
           v-else-if="activeSection === 'account'"
           :initial-section="props.initialAccountSection"
         />
+        <NotificationSettingsPanel v-else-if="activeSection === 'notifications'" />
         <AboutSettingsPanel v-else-if="activeSection === 'about'" />
         <SettingsPlaceholder v-else :section="SETTINGS_SECTION_BY_KEY[activeSection]" />
       </div>

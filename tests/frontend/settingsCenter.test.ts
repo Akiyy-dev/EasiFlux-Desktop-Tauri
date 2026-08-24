@@ -33,7 +33,6 @@ vi.mock('../../src/components/market/KlineChart.vue', () => ({
 
 const placeholderDescriptions = {
   plugins: '管理插件的启用状态、权限与插件级配置。',
-  notifications: '配置通知渠道、提醒方式与免打扰规则。',
   searchCommands: '配置全局搜索与命令面板的行为。',
   hotkeys: '查看并管理应用快捷键。',
   workspace: '配置窗口布局、工作区保存与恢复行为。',
@@ -56,6 +55,9 @@ function mountCenter(props: Record<string, unknown> = {}) {
           props: ['initialSection'],
           template: '<div data-testid="account-settings-stub" />',
         },
+        NotificationSettingsPanel: {
+          template: '<section data-testid="notification-settings-stub"><h2 id="notification-settings-title">通知设置</h2></section>',
+        },
       },
     },
   })
@@ -77,6 +79,9 @@ function mountShell() {
         AccountSettingsPage: {
           props: ['initialSection'],
           template: '<div data-testid="account-settings-stub" :data-initial-section="initialSection" />',
+        },
+        NotificationSettingsPanel: {
+          template: '<section data-testid="notification-settings-stub"><h2 id="notification-settings-title">通知设置</h2></section>',
         },
       },
     },
@@ -176,6 +181,13 @@ describe('SettingsCenterPage presentation', () => {
 
     expect(wrapper.findComponent('[data-testid="account-settings-stub"]').props('initialSection'))
       .toBe('assets')
+  })
+
+  it('mounts the real notification settings section instead of its former placeholder', () => {
+    const wrapper = mountCenter({ initialSection: 'notifications' })
+
+    expect(wrapper.get('[data-testid="notification-settings-stub"]').text()).toContain('通知设置')
+    expect(wrapper.find('[data-testid="settings-placeholder"]').exists()).toBe(false)
   })
 
   it('emits back once from the header control', async () => {
