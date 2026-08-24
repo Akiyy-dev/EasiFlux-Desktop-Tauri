@@ -54,15 +54,14 @@ describe('NotificationItem', () => {
     expect(article.get('time').attributes('datetime')).toBe(new Date(record.createdAtMs).toISOString())
   })
 
-  it('emits the exact record for click, Enter, and Space activation', async () => {
+  it.each(['Enter', ' '])('does not duplicate %s activation when the native button click follows keydown', async (key) => {
     const wrapper = mountItem()
     const primary = wrapper.get('button[type="button"]')
 
+    await primary.trigger('keydown', { key })
     await primary.trigger('click')
-    await primary.trigger('keydown', { key: 'Enter' })
-    await primary.trigger('keydown', { key: ' ' })
 
-    expect(wrapper.emitted('activate')).toEqual([[record], [record], [record]])
+    expect(wrapper.emitted('activate')).toEqual([[record]])
   })
 
   it('emits delete only when Delete is pressed on the primary or delete button is clicked', async () => {
@@ -81,5 +80,13 @@ describe('NotificationItem', () => {
 
     expect(wrapper.get('article').attributes('aria-busy')).toBe('true')
     expect(wrapper.findAll('button').every((button) => button.attributes('disabled') !== undefined)).toBe(true)
+  })
+
+  it('renders unread titles with stronger typography than read titles', () => {
+    const unreadTitle = mountItem().get('.notification-item__title').element
+    const readTitle = mountItem({ record: { ...record, readAtMs: record.createdAtMs + 1 } })
+      .get('.notification-item__title').element
+
+    expect(getComputedStyle(unreadTitle).fontWeight).not.toBe(getComputedStyle(readTitle).fontWeight)
   })
 })

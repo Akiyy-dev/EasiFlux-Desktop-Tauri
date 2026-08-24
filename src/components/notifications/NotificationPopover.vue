@@ -7,7 +7,10 @@ import { useNotificationStore } from '../../stores/notification'
 import { useTimeStore } from '../../stores/time'
 import type { NotificationRecord, NotificationUiAction } from '../../types/notification'
 
-const props = defineProps<{ show: boolean }>()
+const props = defineProps<{
+  show: boolean
+  triggerElement?: { contains: (target: unknown) => boolean } | null
+}>()
 const emit = defineEmits<{
   'update:show': [show: boolean]
   action: [action: NotificationUiAction]
@@ -19,7 +22,7 @@ const {
   accountId, error, filter, initialLoading, items, loadingMore, markAllReadPending,
   markReadPendingIds, nextCursor, pageError, removePendingIds, unreadCount,
 } = storeToRefs(notificationStore)
-const panel = ref<{ focus: () => void } | null>(null)
+const panel = ref<{ focus: () => void; contains: (target: unknown) => boolean } | null>(null)
 
 function close(): void {
   if (props.show) emit('update:show', false)
@@ -32,12 +35,20 @@ function onEscape(event: { key: string; preventDefault: () => void }): void {
   }
 }
 
+function onOutsidePointer(event: { target: unknown }): void {
+  const target = event.target
+  if (!panel.value || panel.value.contains(target) || props.triggerElement?.contains(target)) return
+  close()
+}
+
 function addDocumentListeners(): void {
   globalThis.document.addEventListener('keydown', onEscape)
+  globalThis.document.addEventListener('mousedown', onOutsidePointer)
 }
 
 function removeDocumentListeners(): void {
   globalThis.document.removeEventListener('keydown', onEscape)
+  globalThis.document.removeEventListener('mousedown', onOutsidePointer)
 }
 
 watch(() => props.show, async (isOpen, wasOpen) => {

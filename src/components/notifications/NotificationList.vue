@@ -82,6 +82,12 @@ function itemsFor(today: boolean): NotificationRecord[] {
       {{ filter === 'all' ? '暂无通知' : '未读通知为空' }}
     </p>
     <div v-else class="notification-list__items">
+      <div v-if="error" class="notification-list__error" role="status" aria-live="polite">
+        <span>{{ error }}</span>
+        <button data-testid="notification-retry-first" type="button" @click="emit('retryFirst')">
+          重试
+        </button>
+      </div>
       <template v-for="group in [{ label: '今天', values: itemsFor(true) }, { label: '更早', values: itemsFor(false) }]" :key="group.label">
         <h3 v-if="group.values.length" class="notification-list__group-title">
           {{ group.label }}

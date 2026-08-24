@@ -69,6 +69,15 @@ describe('NotificationList', () => {
     expect(page.findAll('article')).toHaveLength(2)
     expect(page.emitted('retryPage')).toHaveLength(1)
   })
+
+  it('keeps cached items visible with a polite first-page error and retry action', async () => {
+    const wrapper = mountList({ error: '刷新通知失败' })
+
+    expect(wrapper.findAll('article')).toHaveLength(2)
+    expect(wrapper.get('[role="status"]').text()).toContain('刷新通知失败')
+    await wrapper.get('[data-testid="notification-retry-first"]').trigger('click')
+    expect(wrapper.emitted('retryFirst')).toHaveLength(1)
+  })
 })
 
 describe('NotificationPopover', () => {
@@ -108,6 +117,20 @@ describe('NotificationPopover', () => {
     await wrapper.setProps({ show: false })
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     expect(wrapper.emitted('update:show')).toEqual([[false]])
+  })
+
+  it('requests close when a document click lands outside the controlled popover panel', async () => {
+    setActivePinia(createPinia())
+    const wrapper = mount(NotificationPopover, { props: { show: true }, attachTo: document.body })
+    const outside = document.createElement('button')
+    document.body.append(outside)
+
+    outside.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    await flushPromises()
+
+    expect(wrapper.emitted('update:show')).toEqual([[false]])
+    wrapper.unmount()
+    outside.remove()
   })
 
   it.each([

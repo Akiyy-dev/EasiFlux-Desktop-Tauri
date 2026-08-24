@@ -30,6 +30,12 @@ function mountShell() {
   })
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
 describe('notification action navigation', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
@@ -69,6 +75,23 @@ describe('notification action navigation', () => {
     const heading = wrapper.get('[data-testid="settings-content"] h1')
     expect(heading.attributes('tabindex')).toBe('-1')
     expect(document.activeElement).toBe(heading.element)
+    wrapper.unmount()
+  })
+
+  it('focuses notification settings before an unrelated pending chart flush resolves', async () => {
+    const pendingFlush = deferred<void>()
+    vi.mocked(flushActiveChartWorkspace).mockReturnValueOnce(pendingFlush.promise)
+    const wrapper = mountShell()
+
+    wrapper.getComponent(TopBar).vm.$emit('action', { type: 'openNotificationSettings' })
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    const heading = wrapper.get('[data-testid="settings-content"] h1')
+    expect(heading.attributes('tabindex')).toBe('-1')
+    expect(document.activeElement).toBe(heading.element)
+    pendingFlush.resolve()
+    await flushPromises()
     wrapper.unmount()
   })
 })

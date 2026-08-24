@@ -15,7 +15,7 @@ const props = defineProps<{
 const appStore = useAppStore()
 const { version } = storeToRefs(appStore)
 const showNotifications = ref(false)
-const bell = ref<{ focus: () => void } | null>(null)
+const bell = ref<{ focus: () => void; contains: (target: unknown) => boolean } | null>(null)
 
 const emit = defineEmits<{ action: [action: NotificationUiAction] }>()
 
@@ -57,7 +57,11 @@ function badgeLabel(unreadCount: number | null): string | null {
       <AppButton variant="ghost" size="sm" icon-only title="网络（占位）" disabled>
         <AppIcon :icon="Wifi" :size="16" />
       </AppButton>
-      <NotificationPopover v-model:show="showNotifications" @action="emit('action', $event)">
+      <NotificationPopover
+        v-model:show="showNotifications"
+        :trigger-element="bell"
+        @action="emit('action', $event)"
+      >
         <template #trigger="{ unreadCount }">
           <button
             ref="bell"

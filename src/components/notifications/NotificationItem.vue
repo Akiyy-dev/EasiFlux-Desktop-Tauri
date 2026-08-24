@@ -62,11 +62,6 @@ function activate(): void {
 }
 
 function handlePrimaryKeydown(event: { key: string; preventDefault: () => void }): void {
-  if (event.key === 'Enter' || event.key === ' ') {
-    event.preventDefault()
-    activate()
-    return
-  }
   if (event.key === 'Delete') {
     event.preventDefault()
     if (!pending.value) emit('delete', props.record.id)
@@ -89,7 +84,11 @@ function handlePrimaryKeydown(event: { key: string; preventDefault: () => void }
     >
       <span class="notification-item__headline">
         <AppIcon :icon="severityIcons[record.severity]" :size="16" aria-hidden="true" />
-        <span class="notification-item__title">{{ record.content.fallbackTitle || '通知' }}</span>
+        <span
+          class="notification-item__title"
+          :class="{ 'notification-item__title--unread': unread }"
+          :style="{ fontWeight: unread ? '700' : '400' }"
+        >{{ record.content.fallbackTitle || '通知' }}</span>
         <span v-if="unread" class="notification-item__unread">未读</span>
       </span>
       <span class="notification-item__body">{{ record.content.fallbackBody || '暂无详情' }}</span>
@@ -120,7 +119,8 @@ function handlePrimaryKeydown(event: { key: string; preventDefault: () => void }
 .notification-item[data-unread="true"] { border-left: 3px solid var(--accent); }
 .notification-item__primary { flex: 1; min-width: 0; border: 0; padding: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .notification-item__headline, .notification-item__meta { display: flex; align-items: center; gap: var(--ef-space-2); }
-.notification-item__title { font-weight: var(--ef-text-label-weight); }
+.notification-item__title { font-weight: 400; }
+.notification-item__title--unread { font-weight: 700; }
 .notification-item__unread { font-size: var(--ef-text-caption-size); font-weight: var(--ef-text-label-weight); }
 .notification-item__body { display: block; margin-top: var(--ef-space-1); color: var(--text-secondary); }
 .notification-item__meta, .notification-item__action-hint { display: block; margin-top: var(--ef-space-1); color: var(--text-secondary); font-size: var(--ef-text-caption-size); }
