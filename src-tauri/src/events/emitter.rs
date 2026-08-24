@@ -14,6 +14,54 @@ use crate::models::time::{DailyPnlSnapshot, TimeSnapshot};
 use crate::models::trading::{Order, Position, PrivatePanelsSnapshot, SessionContext};
 
 const NOTIFICATION_CHANGED_EVENT: &str = "notification:changed";
+const ERROR_OCCURRED_EVENT: &str = "error:occurred";
+const LOG_ENTRY_EVENT: &str = "log:entry";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ErrorDeliveryFailure {
+    LogEntry,
+    ErrorOccurred,
+}
+
+impl ErrorDeliveryFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::LogEntry => "ERROR_LOG_ENTRY_EMIT_FAILED",
+            Self::ErrorOccurred => "ERROR_OCCURRED_EVENT_EMIT_FAILED",
+        }
+    }
+
+    fn event_name(self) -> &'static str {
+        match self {
+            Self::LogEntry => LOG_ENTRY_EVENT,
+            Self::ErrorOccurred => ERROR_OCCURRED_EVENT,
+        }
+    }
+}
+
+fn emit_error_with<F, E>(
+    message: &str,
+    timestamp: i64,
+    mut emit: F,
+) -> Result<(), ErrorDeliveryFailure>
+where
+    F: FnMut(&str, &serde_json::Value) -> Result<(), E>,
+{
+    let event_id = Uuid::new_v4().to_string();
+    let log_entry = serde_json::json!({
+        "eventId": &event_id,
+        "level": "error",
+        "message": message,
+        "timestamp": timestamp,
+    });
+    emit(LOG_ENTRY_EVENT, &log_entry).map_err(|_| ErrorDeliveryFailure::LogEntry)?;
+
+    let error_event = serde_json::json!({
+        "eventId": event_id,
+        "message": message,
+    });
+    emit(ERROR_OCCURRED_EVENT, &error_event).map_err(|_| ErrorDeliveryFailure::ErrorOccurred)
+}
 
 fn emit_notification_changed_with<F>(
     event: &NotificationChangedEvent,
@@ -200,15 +248,18 @@ impl EventEmitter {
     }
 
     pub fn emit_error(&self, message: &str) {
-        let event_id = Uuid::new_v4().to_string();
-        let _ = self.emit(
-            "error:occurred",
-            &serde_json::json!({
-                "eventId": event_id,
-                "message": message,
-            }),
+        let result = emit_error_with(
+            message,
+            chrono::Utc::now().timestamp_millis(),
+            |name, payload| self.emit(name, payload),
         );
-        self.emit_log_entry("error", message, Some(&event_id));
+        if let Err(failure) = result {
+            tracing::warn!(
+                code = failure.code(),
+                event = failure.event_name(),
+                "error delivery event dispatch failed"
+            );
+        }
     }
 
     pub fn emit_log(&self, level: &str, message: &str) {
@@ -224,7 +275,7 @@ impl EventEmitter {
         if let Some(event_id) = event_id {
             entry["eventId"] = serde_json::Value::String(event_id.to_string());
         }
-        let _ = self.emit("log:entry", &entry);
+        let _ = self.emit(LOG_ENTRY_EVENT, &entry);
     }
 }
 
@@ -242,7 +293,10 @@ mod tests {
         NotificationScope, NotificationSeverity, NotificationToastCandidate,
     };
 
-    use super::{emit_notification_changed_with, AccountSessionEvent, WebsocketStatusTracker};
+    use super::{
+        emit_error_with, emit_notification_changed_with, AccountSessionEvent,
+        WebsocketStatusTracker,
+    };
 
     #[test]
     fn account_session_event_serializes_a_camel_case_epoch_envelope() {
@@ -367,6 +421,66 @@ mod tests {
     }
 
     #[test]
+    fn error_delivery_stops_after_a_sanitized_log_failure() {
+        let mut attempts = Vec::new();
+
+        let failure = emit_error_with(
+            "private backend failure",
+            1_725_000_000_123,
+            |name, payload| {
+                attempts.push((name.to_string(), payload.clone()));
+                Err::<(), _>("apiKey=raw-secret")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0, "log:entry");
+        assert_eq!(attempts[0].1["level"], "error");
+        assert_eq!(attempts[0].1["message"], "private backend failure");
+        assert_eq!(attempts[0].1["timestamp"], 1_725_000_000_123_i64);
+        let event_id = attempts[0].1["eventId"].as_str().unwrap();
+        assert_eq!(
+            Uuid::parse_str(event_id).unwrap().get_version(),
+            Some(Version::Random)
+        );
+        assert_eq!(failure.code(), "ERROR_LOG_ENTRY_EMIT_FAILED");
+        assert_eq!(failure.event_name(), "log:entry");
+        assert!(!format!("{failure:?}").contains("raw-secret"));
+        assert!(!format!("{failure:?}").contains("private backend failure"));
+    }
+
+    #[test]
+    fn error_delivery_reports_a_distinct_sanitized_toast_failure_after_one_log() {
+        let mut attempts = Vec::new();
+
+        let failure = emit_error_with(
+            "private backend failure",
+            1_725_000_000_123,
+            |name, payload| {
+                attempts.push((name.to_string(), payload.clone()));
+                if name == "log:entry" {
+                    Ok(())
+                } else {
+                    Err("token=raw-secret")
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].0, "log:entry");
+        assert_eq!(attempts[1].0, "error:occurred");
+        let event_id = attempts[0].1["eventId"].as_str().unwrap();
+        assert_eq!(attempts[1].1["eventId"], event_id);
+        assert_eq!(attempts[1].1["message"], "private backend failure");
+        assert_eq!(failure.code(), "ERROR_OCCURRED_EVENT_EMIT_FAILED");
+        assert_eq!(failure.event_name(), "error:occurred");
+        assert!(!format!("{failure:?}").contains("raw-secret"));
+        assert!(!format!("{failure:?}").contains("private backend failure"));
+    }
+
+    #[test]
     fn error_and_log_envelopes_share_one_opaque_event_id() {
         let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let emitter = super::EventEmitter::new_test(sink.clone());
@@ -375,16 +489,16 @@ mod tests {
 
         let events = sink.lock().unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].0, "error:occurred");
-        assert_eq!(events[1].0, "log:entry");
+        assert_eq!(events[0].0, "log:entry");
+        assert_eq!(events[1].0, "error:occurred");
         let event_id = events[0].1["eventId"].as_str().unwrap();
         let uuid = Uuid::parse_str(event_id).unwrap();
         assert_eq!(uuid.get_version(), Some(Version::Random));
+        assert_eq!(events[0].1["level"], "error");
         assert_eq!(events[0].1["message"], "后台任务失败");
+        assert!(events[0].1["timestamp"].is_i64());
         assert_eq!(events[1].1["eventId"], event_id);
-        assert_eq!(events[1].1["level"], "error");
         assert_eq!(events[1].1["message"], "后台任务失败");
-        assert!(events[1].1["timestamp"].is_i64());
     }
 
     #[test]

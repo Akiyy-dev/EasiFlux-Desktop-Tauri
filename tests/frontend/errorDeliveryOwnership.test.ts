@@ -77,6 +77,48 @@ describe('error delivery ownership', () => {
     expect(useLogStore().entries).toEqual([])
   })
 
+  it('does not consume a backend event ID until a MessageApi delivers its Toast', async () => {
+    vi.resetModules()
+    const freshErrorService = await import('../../src/services/errorService')
+    const workingProvider = { error: vi.fn() }
+    const event = { eventId: 'backend:event:late-provider', message: '后台任务失败' }
+
+    freshErrorService.showBackendError(event)
+    expect(workingProvider.error).not.toHaveBeenCalled()
+
+    freshErrorService.installMessageApi(workingProvider as never)
+    freshErrorService.showBackendError(event)
+    freshErrorService.showBackendError(event)
+
+    expect(workingProvider.error).toHaveBeenCalledOnce()
+    expect(workingProvider.error).toHaveBeenCalledWith('后台任务失败')
+    expect(useLogStore().entries).toEqual([])
+  })
+
+  it('does not consume a backend event ID when MessageApi delivery throws', async () => {
+    vi.resetModules()
+    const freshErrorService = await import('../../src/services/errorService')
+    const throwingProvider = {
+      error: vi.fn(() => {
+        throw new Error('provider unavailable')
+      }),
+    }
+    const workingProvider = { error: vi.fn() }
+    const event = { eventId: 'backend:event:provider-throws', message: '后台任务失败' }
+
+    freshErrorService.installMessageApi(throwingProvider as never)
+    expect(() => freshErrorService.showBackendError(event)).toThrow('provider unavailable')
+
+    freshErrorService.installMessageApi(workingProvider as never)
+    freshErrorService.showBackendError(event)
+    freshErrorService.showBackendError(event)
+
+    expect(throwingProvider.error).toHaveBeenCalledOnce()
+    expect(workingProvider.error).toHaveBeenCalledOnce()
+    expect(workingProvider.error).toHaveBeenCalledWith('后台任务失败')
+    expect(useLogStore().entries).toEqual([])
+  })
+
   it('drops malformed backend envelopes at the adapter boundary', () => {
     showBackendError({ eventId: 7, message: 'untrusted' } as never)
     showBackendError({ eventId: 'valid', message: null } as never)

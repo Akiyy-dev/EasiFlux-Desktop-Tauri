@@ -43,15 +43,17 @@ export function showBackendError(event: BackendErrorEvent | unknown): string | u
   if (typeof candidate.eventId !== 'string'
     || candidate.eventId.length === 0
     || typeof candidate.message !== 'string') return undefined
+  const provider = messageApi
+  if (provider === null) return candidate.message
   if (seenBackendEventIds.has(candidate.eventId)) return candidate.message
 
+  provider.error(candidate.message)
   seenBackendEventIds.add(candidate.eventId)
   backendEventOrder.push(candidate.eventId)
   if (backendEventOrder.length > MAX_SEEN_BACKEND_EVENTS) {
     const oldest = backendEventOrder.shift()
     if (oldest !== undefined) seenBackendEventIds.delete(oldest)
   }
-  messageApi?.error(candidate.message)
   return candidate.message
 }
 
