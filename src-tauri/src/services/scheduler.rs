@@ -281,12 +281,7 @@ where
 }
 
 fn bootstrap_failure_needs_generic_error(error: &AppError) -> bool {
-    !matches!(
-        error,
-        AppError::Notified { .. }
-            | AppError::Observed(_)
-            | AppError::AuthFailure(crate::api::response::AuthFailureKind::SessionExpired)
-    )
+    !matches!(error, AppError::Notified { .. } | AppError::Observed(_))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

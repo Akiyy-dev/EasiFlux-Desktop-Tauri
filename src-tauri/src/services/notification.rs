@@ -167,6 +167,7 @@ impl NotificationRuntime {
 pub struct PublishOutcome {
     pub notification: Option<NotificationRecord>,
     pub revision: String,
+    pub(crate) committed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -498,7 +499,19 @@ impl NotificationService {
         input: NotificationInput,
         now_ms: u64,
     ) -> Result<PublishOutcome, NotificationError> {
+        validate_publish_input(&input)?;
+        let source = source_key(&input);
         let mut guard = self.state.lock().await;
+        if let Some(source) = source.filter(|source| guard.seen_source_events.contains(source)) {
+            let notification = record_for_source(&guard.file, &source).ok_or_else(|| {
+                NotificationError::new("NOTIFICATION_STATE_CONFLICT", "通知状态已发生冲突")
+            })?;
+            return Ok(PublishOutcome {
+                notification: Some(notification.clone()),
+                revision: guard.file.revision.to_string(),
+                committed: false,
+            });
+        }
         let Some(prepared) = self.prepare_publish_locked(&mut guard, &input, now_ms)? else {
             return Ok(no_publish_outcome(&guard));
         };
@@ -1249,6 +1262,7 @@ impl NotificationService {
         Ok(PublishOutcome {
             notification: Some(record),
             revision: guard.file.revision.to_string(),
+            committed: true,
         })
     }
 
@@ -1498,6 +1512,7 @@ fn no_publish_outcome(state: &ServiceState) -> PublishOutcome {
     PublishOutcome {
         notification: None,
         revision: state.file.revision.to_string(),
+        committed: false,
     }
 }
 

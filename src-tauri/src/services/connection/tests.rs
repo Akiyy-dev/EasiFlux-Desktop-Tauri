@@ -48,6 +48,10 @@ struct Harness {
 }
 
 fn harness() -> Harness {
+    harness_from_file(NotificationFileV1::empty())
+}
+
+fn harness_from_file(file: NotificationFileV1) -> Harness {
     let persistence = Arc::new(MemoryPersistence::default());
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&events);
@@ -56,7 +60,7 @@ fn harness() -> Harness {
         Ok(())
     });
     let service = Arc::new(NotificationService::from_snapshot(
-        NotificationFileV1::empty(),
+        file,
         Arc::clone(&persistence),
         emitter,
         NOW,
@@ -396,19 +400,21 @@ async fn only_typed_session_expired_auth_failure_can_publish_a_session_notificat
     let notification_id = harness
         .observer
         .observe_auth_failure(&context, AuthFailureKind::SessionExpired, NOW + 1)
-        .await;
-    assert!(notification_id.is_some());
-    assert!(harness
+        .await
+        .expect("first session edge returns its durable marker");
+    let replay_id = harness
         .observer
         .observe_auth_failure(&context, AuthFailureKind::SessionExpired, NOW + 2)
         .await
-        .is_none());
+        .expect("source replay returns the same durable marker");
+    assert_eq!(replay_id, notification_id);
     assert_eq!(
         records(&harness)[0].kind,
         NotificationKind::AccountSessionExpired
     );
     assert_eq!(harness.persistence.files.lock().unwrap().len(), 1);
     assert_eq!(harness.events.lock().unwrap().len(), 1);
+    assert_eq!(harness.diagnostics.lock().unwrap().len(), 1);
     assert_eq!(
         records(&harness)[0].scope,
         NotificationScope::Account {
@@ -492,7 +498,11 @@ async fn private_api_session_expiry_commits_once_and_returns_only_the_real_recor
 
     assert!(matches!(
         repeated,
-        crate::error::AppError::AuthFailure(AuthFailureKind::SessionExpired)
+        crate::error::AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            notification_id,
+            ..
+        } if notification_id == committed_id
     ));
     assert_eq!(harness.persistence.files.lock().unwrap().len(), 1);
     assert_eq!(harness.events.lock().unwrap().len(), 1);
@@ -500,6 +510,39 @@ async fn private_api_session_expiry_commits_once_and_returns_only_the_real_recor
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].id, committed_id);
     assert_eq!(records[0].kind, NotificationKind::AccountSessionExpired);
+    assert_eq!(harness.diagnostics.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_and_restart_session_replay_keep_one_commit_and_one_diagnostic() {
+    let first_run = harness();
+    let context = context("alpha", 0);
+    let (left, right) = tokio::join!(
+        first_run
+            .observer
+            .observe_auth_failure(&context, AuthFailureKind::SessionExpired, NOW,),
+        first_run
+            .observer
+            .observe_auth_failure(&context, AuthFailureKind::SessionExpired, NOW,),
+    );
+    let left = left.expect("first concurrent observation returns a marker");
+    let right = right.expect("replayed concurrent observation returns a marker");
+    assert_eq!(left, right);
+    assert_eq!(first_run.persistence.files.lock().unwrap().len(), 1);
+    assert_eq!(first_run.events.lock().unwrap().len(), 1);
+    assert_eq!(first_run.diagnostics.lock().unwrap().len(), 1);
+
+    let persisted = first_run.persistence.files.lock().unwrap()[0].clone();
+    let restarted = harness_from_file(persisted);
+    let restart_id = restarted
+        .observer
+        .observe_auth_failure(&context, AuthFailureKind::SessionExpired, NOW + 1)
+        .await
+        .expect("restart replay returns the persisted marker");
+    assert_eq!(restart_id, left);
+    assert!(restarted.persistence.files.lock().unwrap().is_empty());
+    assert!(restarted.events.lock().unwrap().is_empty());
+    assert!(restarted.diagnostics.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -687,6 +730,22 @@ async fn notification_persistence_failure_is_diagnostic_only_and_never_emits_or_
     assert!(notification_id.is_none());
     assert!(harness.persistence.files.lock().unwrap().is_empty());
     assert!(harness.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn session_notification_persistence_failure_returns_no_marker_or_diagnostic() {
+    let harness = harness();
+    harness.persistence.fail_next.store(true, Ordering::SeqCst);
+
+    let notification_id = harness
+        .observer
+        .observe_auth_failure(&context("alpha", 0), AuthFailureKind::SessionExpired, NOW)
+        .await;
+
+    assert!(notification_id.is_none());
+    assert!(harness.persistence.files.lock().unwrap().is_empty());
+    assert!(harness.events.lock().unwrap().is_empty());
+    assert!(harness.diagnostics.lock().unwrap().is_empty());
 }
 
 #[test]

@@ -1381,7 +1381,14 @@ async fn session_expired_create_order_preserves_typed_notification_provenance_an
 
     assert!(matches!(
         replay,
-        AppError::AuthFailure(AuthFailureKind::SessionExpired)
+        AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            notification_id,
+            cause: Some(NotificationCause::AuthFailure(
+                AuthFailureKind::SessionExpired
+            )),
+            ..
+        } if notification_id == committed_id
     ));
     let records = harness.records("alpha").await;
     assert_eq!(records.len(), 1);
@@ -1546,7 +1553,14 @@ async fn committed_session_expiry_survives_risk_release_save_failure_and_replay(
     ));
     assert!(matches!(
         replay_error,
-        AppError::AuthFailure(AuthFailureKind::SessionExpired)
+        AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            notification_id,
+            cause: Some(NotificationCause::AuthFailure(
+                AuthFailureKind::SessionExpired
+            )),
+            ..
+        } if notification_id == committed_id
     ));
     let records = harness.records("alpha").await;
     assert_eq!(records.len(), 1);

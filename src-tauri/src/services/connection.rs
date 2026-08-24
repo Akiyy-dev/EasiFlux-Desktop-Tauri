@@ -220,11 +220,13 @@ impl SessionNotificationObserver {
             .observe_session_expired(context.account_id.clone(), context.session_epoch, now_ms)
             .await
         {
-            Ok(outcome) => outcome.notification.map(|record| {
-                self.emitter
-                    .emit_diagnostic("NOTIFIED_SESSION_FAILURE:AUTH_SESSION_EXPIRED", false);
-                record.id
-            }),
+            Ok(outcome) => {
+                if outcome.committed {
+                    self.emitter
+                        .emit_diagnostic("NOTIFIED_SESSION_FAILURE:AUTH_SESSION_EXPIRED", false);
+                }
+                outcome.notification.map(|record| record.id)
+            }
             Err(error) => {
                 tracing::warn!(
                     code = error.code(),

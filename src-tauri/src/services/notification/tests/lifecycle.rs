@@ -391,7 +391,8 @@ async fn startup_legal_backfill_commits_reset_immediately_and_is_restart_stable(
         .publish(input(scope, "legacy-source", "different-dedupe"), NOW + 1)
         .await
         .unwrap();
-    assert!(duplicate.notification.is_none());
+    assert!(duplicate.notification.is_some());
+    assert!(!duplicate.committed);
     assert_eq!(duplicate.revision, "13");
     assert!(restart_events.lock().unwrap().is_empty());
     let _ = fs::remove_dir_all(root);
@@ -1001,7 +1002,8 @@ async fn identical_source_is_a_noop_before_expiry_housekeeping() {
         .await
         .unwrap();
 
-    assert!(outcome.notification.is_none());
+    assert!(outcome.notification.is_some());
+    assert!(!outcome.committed);
     assert_eq!(outcome.revision, "8");
     assert!(harness.persistence.saves().is_empty());
     assert!(harness.events.lock().unwrap().is_empty());
@@ -1151,7 +1153,8 @@ async fn serialized_reservation_evicts_before_created_and_is_restart_idempotent(
         .publish(input(scope, "pending-source", "pending-dedupe"), NOW + 2)
         .await
         .unwrap();
-    assert!(duplicate.notification.is_none());
+    assert!(duplicate.notification.is_some());
+    assert!(!duplicate.committed);
     assert_eq!(duplicate.revision, "72");
     assert!(restart_events.lock().unwrap().is_empty());
     drop(restarted);
@@ -1275,7 +1278,8 @@ async fn serialized_reservation_protects_semantic_target_and_resets_before_updat
         .await
         .unwrap();
 
-    assert!(duplicate.notification.is_none());
+    assert!(duplicate.notification.is_some());
+    assert!(!duplicate.committed);
     assert_eq!(duplicate.revision, "82");
     assert!(restart_events.lock().unwrap().is_empty());
     drop(restarted);
@@ -1545,7 +1549,8 @@ async fn source_cap_rejects_a_new_semantic_source_when_target_owns_all_history_a
         )
         .await
         .unwrap();
-    assert!(duplicate.notification.is_none());
+    assert!(duplicate.notification.is_some());
+    assert!(!duplicate.committed);
     assert_eq!(duplicate.revision, "50");
     let error = restarted
         .publish(

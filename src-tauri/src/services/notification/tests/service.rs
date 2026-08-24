@@ -273,9 +273,79 @@ async fn identical_scope_and_source_event_is_an_absolute_no_op() {
     let first = harness.service.publish(item.clone(), NOW).await.unwrap();
     let second = harness.service.publish(item, NOW + 1).await.unwrap();
 
-    assert!(first.notification.is_some());
-    assert!(second.notification.is_none());
+    let first_id = first.notification.unwrap().id;
+    assert!(first.committed);
+    assert_eq!(second.notification.unwrap().id, first_id);
+    assert!(!second.committed);
     assert_eq!(second.revision, "1");
+    assert_eq!(harness.persistence.saves().len(), 1);
+    assert_eq!(harness.events.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_and_restart_source_replay_return_the_stable_live_record() {
+    let scope = NotificationScope::Account {
+        account_id: "alpha".into(),
+    };
+    let item = input(
+        scope.clone(),
+        "session:7:expired",
+        "alpha:session:7:expired",
+    );
+    let first_run = harness(NotificationFileV1::empty());
+
+    let (left, right) = tokio::join!(
+        first_run.service.publish(item.clone(), NOW),
+        first_run.service.publish(item.clone(), NOW),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    let left_id = left.notification.unwrap().id;
+    let right_id = right.notification.unwrap().id;
+    assert_eq!(left_id, right_id);
+    assert_eq!(
+        [left.committed, right.committed]
+            .into_iter()
+            .filter(|value| *value)
+            .count(),
+        1
+    );
+    assert_eq!(first_run.persistence.saves().len(), 1);
+    assert_eq!(first_run.events.lock().unwrap().len(), 1);
+
+    let persisted = first_run.persistence.saves().pop().unwrap();
+    let restarted = harness(persisted);
+    let replay = restarted.service.publish(item, NOW + 1).await.unwrap();
+    assert_eq!(replay.notification.unwrap().id, left_id);
+    assert!(!replay.committed);
+    assert!(restarted.persistence.saves().is_empty());
+    assert!(restarted.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn source_publish_persistence_failure_returns_no_replay_marker_or_state() {
+    let harness = harness(NotificationFileV1::empty());
+    harness.persistence.fail_next();
+    let item = input(
+        NotificationScope::Account {
+            account_id: "alpha".into(),
+        },
+        "session:7:expired",
+        "alpha:session:7:expired",
+    );
+
+    let error = harness
+        .service
+        .publish(item.clone(), NOW)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "NOTIFICATION_STORAGE_UNAVAILABLE");
+    assert!(harness.persistence.saves().is_empty());
+    assert!(harness.events.lock().unwrap().is_empty());
+
+    let retry = harness.service.publish(item, NOW + 1).await.unwrap();
+    assert!(retry.committed);
+    assert!(retry.notification.is_some());
     assert_eq!(harness.persistence.saves().len(), 1);
     assert_eq!(harness.events.lock().unwrap().len(), 1);
 }
@@ -398,7 +468,8 @@ async fn source_id_remains_an_absolute_no_op_after_merge_and_unrelated_creation(
         .await
         .unwrap();
 
-    assert!(replay.notification.is_none());
+    assert!(replay.notification.is_some());
+    assert!(!replay.committed);
     assert_eq!(replay.revision, "3");
     assert_eq!(harness.persistence.saves().len(), 3);
     assert_eq!(harness.events.lock().unwrap().len(), 3);
@@ -429,7 +500,8 @@ async fn creating_source_id_remains_idempotent_after_a_merge_and_restart() {
         .await
         .unwrap();
 
-    assert!(replay.notification.is_none());
+    assert!(replay.notification.is_some());
+    assert!(!replay.committed);
     assert_eq!(replay.revision, "2");
     assert!(restarted.persistence.saves().is_empty());
     assert!(restarted.events.lock().unwrap().is_empty());
@@ -460,7 +532,8 @@ async fn semantic_merge_later_source_id_is_an_absolute_no_op_after_restart() {
         .await
         .unwrap();
 
-    assert!(replay.notification.is_none());
+    assert!(replay.notification.is_some());
+    assert!(!replay.committed);
     assert_eq!(replay.revision, "2");
     assert!(restarted.persistence.saves().is_empty());
     assert!(restarted.events.lock().unwrap().is_empty());
@@ -1060,7 +1133,7 @@ async fn delete_and_clear_remove_only_their_records_source_event_index_entries()
         .unwrap()
         .notification
         .unwrap();
-    harness
+    let alpha = harness
         .service
         .publish(
             input(
@@ -1073,6 +1146,8 @@ async fn delete_and_clear_remove_only_their_records_source_event_index_entries()
             NOW,
         )
         .await
+        .unwrap()
+        .notification
         .unwrap();
 
     harness
@@ -1099,4 +1174,31 @@ async fn delete_and_clear_remove_only_their_records_source_event_index_entries()
         .unwrap()
         .source_event_index
         .is_empty());
+
+    let recreated_global = harness
+        .service
+        .publish(
+            input(NotificationScope::Global, "global-source", "global"),
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+    let recreated_alpha = harness
+        .service
+        .publish(
+            input(
+                NotificationScope::Account {
+                    account_id: "alpha".into(),
+                },
+                "alpha-source",
+                "alpha",
+            ),
+            NOW + 4,
+        )
+        .await
+        .unwrap();
+    assert!(recreated_global.committed);
+    assert!(recreated_alpha.committed);
+    assert_ne!(recreated_global.notification.unwrap().id, global.id);
+    assert_ne!(recreated_alpha.notification.unwrap().id, alpha.id);
 }

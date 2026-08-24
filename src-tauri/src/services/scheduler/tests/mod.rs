@@ -236,7 +236,7 @@ async fn queued_bootstrap_snapshots_connection_status_only_after_switch_commits(
 }
 
 #[test]
-fn bootstrap_observer_owned_failures_never_emit_a_second_generic_error() {
+fn bootstrap_suppresses_only_owned_markers_and_delivers_bare_session_failure_once() {
     for error in [
         AppError::Notified {
             code: "AUTH_SESSION_EXPIRED",
@@ -246,14 +246,28 @@ fn bootstrap_observer_owned_failures_never_emit_a_second_generic_error() {
                 crate::api::response::AuthFailureKind::SessionExpired,
             )),
         },
-        AppError::AuthFailure(crate::api::response::AuthFailureKind::SessionExpired),
         AppError::Observed("环境检测失败"),
     ] {
         assert!(!bootstrap_failure_needs_generic_error(&error));
     }
+    let bare_session = AppError::AuthFailure(crate::api::response::AuthFailureKind::SessionExpired);
+    assert!(bootstrap_failure_needs_generic_error(&bare_session));
     assert!(bootstrap_failure_needs_generic_error(
         &AppError::Connection("ordinary failure".into())
     ));
+
+    let sink = Arc::new(StdMutex::new(Vec::new()));
+    let emitter = EventEmitter::new_test(Arc::clone(&sink));
+    emit_bootstrap_failure_diagnostics(
+        &emitter,
+        BootstrapDeliveryOwnership::Background,
+        &[(TaskId::Balances, bare_session)],
+    );
+    let events = sink.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, "log:entry");
+    assert_eq!(events[1].0, "error:occurred");
+    assert_eq!(events[0].1["eventId"], events[1].1["eventId"]);
 }
 
 #[test]
