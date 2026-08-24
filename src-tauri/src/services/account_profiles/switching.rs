@@ -105,7 +105,7 @@ async fn rollback_switch<P: AccountLifecyclePort>(
 ) -> AppError {
     let mut rollback_errors = Vec::new();
     if let Err(error) = port.persist_config(former_config) {
-        rollback_errors.push(error.to_string());
+        rollback_errors.push(error);
     }
     port.replace_runtime_config(former_config.clone()).await;
     if former_status == ConnectionStatus::Connected {
@@ -119,7 +119,7 @@ async fn rollback_switch<P: AccountLifecyclePort>(
                 )
                 .await
             {
-                rollback_errors.push(error.to_string());
+                rollback_errors.push(error);
             }
         }
     }
@@ -127,9 +127,17 @@ async fn rollback_switch<P: AccountLifecyclePort>(
         primary
     } else {
         port.disconnect().await;
+        if let Some(index) = rollback_errors
+            .iter()
+            .position(|error| matches!(error, AppError::Notified { .. }))
+        {
+            return rollback_errors.swap_remove(index);
+        }
+        if matches!(primary, AppError::Notified { .. }) {
+            return primary;
+        }
         AppError::Internal(format!(
-            "{ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER}: {primary}；回滚失败：{}",
-            rollback_errors.join("; ")
+            "{ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER}: 账户切换失败且恢复原账户失败"
         ))
     }
 }

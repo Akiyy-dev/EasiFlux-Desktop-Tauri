@@ -431,9 +431,16 @@ async fn private_api_session_expiry_commits_once_and_returns_only_the_real_recor
             code,
             message,
             notification_id,
+            cause,
         } => {
             assert_eq!(code, "AUTH_SESSION_EXPIRED");
             assert_eq!(message, "账户会话已失效");
+            assert_eq!(
+                cause,
+                Some(crate::error::NotificationCause::AuthFailure(
+                    AuthFailureKind::SessionExpired
+                ))
+            );
             notification_id
         }
         other => panic!("first expiry must return committed notification ID: {other:?}"),
@@ -492,6 +499,135 @@ async fn guarded_post_commit_activation_recovers_incidents_while_mutation_lock_i
     drop(mutation);
 
     assert_eq!(records(&harness).len(), 4);
+}
+
+#[tokio::test]
+async fn prospective_target_is_suppressed_while_restored_current_session_owns_incidents() {
+    let harness = harness();
+    let former = context("alpha", 0);
+    let prospective = context("beta", 1);
+    for source in [
+        ConnectionObservationSource::Api,
+        ConnectionObservationSource::PrivateWebsocket,
+    ] {
+        assert!(harness
+            .observer
+            .observe_connection_status(&former, source, ConnectionStatus::Error, NOW)
+            .await
+            .is_some());
+    }
+
+    let mutation = harness.lifecycle.mutation_guard().await;
+    harness.config.write().await.active_account_id = "beta".into();
+    tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        for source in [
+            ConnectionObservationSource::Api,
+            ConnectionObservationSource::PrivateWebsocket,
+        ] {
+            assert!(harness
+                .observer
+                .observe_connection_status_guarded(
+                    &prospective,
+                    source,
+                    ConnectionStatus::Error,
+                    NOW + 1,
+                )
+                .await
+                .is_none());
+        }
+        assert!(harness
+            .observer
+            .observe_auth_failure_guarded(&prospective, AuthFailureKind::SessionExpired, NOW + 1,)
+            .await
+            .is_none());
+
+        harness.config.write().await.active_account_id = "alpha".into();
+        for source in [
+            ConnectionObservationSource::Api,
+            ConnectionObservationSource::PrivateWebsocket,
+        ] {
+            assert!(harness
+                .observer
+                .observe_connection_status_guarded(
+                    &former,
+                    source,
+                    ConnectionStatus::Connected,
+                    NOW + 2,
+                )
+                .await
+                .is_some());
+        }
+
+        let connection_id = harness
+            .observer
+            .observe_connection_status_guarded(
+                &former,
+                ConnectionObservationSource::Api,
+                ConnectionStatus::Error,
+                NOW + 3,
+            )
+            .await
+            .expect("restored current account owns its connection failure");
+        let connection_error = notified_connection_error(
+            crate::error::AppError::Connection("sanitized".into()),
+            Some(connection_id.clone()),
+        );
+        assert_eq!(
+            serde_json::to_value(connection_error).unwrap(),
+            serde_json::json!({
+                "code": "CONNECTION_UNAVAILABLE",
+                "message": "交易连接暂时不可用",
+                "notificationId": connection_id,
+            })
+        );
+
+        let auth_id = harness
+            .observer
+            .observe_auth_failure_guarded(&former, AuthFailureKind::SessionExpired, NOW + 4)
+            .await
+            .expect("restored current account owns its session expiry");
+        let auth_error = notified_connection_error(
+            crate::error::AppError::AuthFailure(AuthFailureKind::SessionExpired),
+            Some(auth_id.clone()),
+        );
+        assert_eq!(
+            serde_json::to_value(auth_error).unwrap(),
+            serde_json::json!({
+                "code": "AUTH_SESSION_EXPIRED",
+                "message": "账户会话已失效",
+                "notificationId": auth_id,
+            })
+        );
+    })
+    .await
+    .expect("rollback observations must not reacquire the lifecycle lock");
+    drop(mutation);
+
+    assert!(harness
+        .observer
+        .observe_connection_status(
+            &prospective,
+            ConnectionObservationSource::PrivateWebsocket,
+            ConnectionStatus::Error,
+            NOW + 5,
+        )
+        .await
+        .is_none());
+    let records = records(&harness);
+    assert_eq!(records.len(), 6);
+    assert!(records.iter().all(|record| {
+        record.scope
+            == NotificationScope::Account {
+                account_id: "alpha".into(),
+            }
+    }));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.kind == NotificationKind::AccountSessionExpired)
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

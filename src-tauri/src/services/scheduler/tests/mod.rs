@@ -242,6 +242,9 @@ fn bootstrap_observer_owned_failures_never_emit_a_second_generic_error() {
             code: "AUTH_SESSION_EXPIRED",
             message: "账户会话已失效",
             notification_id: "committed-id".into(),
+            cause: Some(crate::error::NotificationCause::AuthFailure(
+                crate::api::response::AuthFailureKind::SessionExpired,
+            )),
         },
         AppError::AuthFailure(crate::api::response::AuthFailureKind::SessionExpired),
         AppError::Observed("环境检测失败"),

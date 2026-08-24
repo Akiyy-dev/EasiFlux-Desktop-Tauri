@@ -7,9 +7,11 @@ use serde_json::json;
 
 use super::super::*;
 use crate::api::response::{classify_create_order_failure, AuthFailureKind};
+use crate::error::NotificationCause;
 use crate::models::config::{ApiCredential, AppConfig, RiskConfig};
 use crate::models::notification::{ListNotificationsRequest, NotificationFilter, NotificationKind};
-use crate::models::trading::{OrderStatus, SubmissionContext, TradingFailureKind};
+use crate::models::trading::{OrderStatus, SessionContext, SubmissionContext, TradingFailureKind};
+use crate::services::connection::SessionNotificationObserver;
 use crate::services::notification::{
     NotificationEmitter, NotificationRuntime, NotificationService, OrderObservationOrigin,
     ViewContext,
@@ -149,6 +151,22 @@ async fn api_client_for_responses(
     std::thread::JoinHandle<()>,
     Arc<Mutex<Vec<String>>>,
 ) {
+    api_client_for_http_responses(
+        responses_after_initial_time
+            .into_iter()
+            .map(|payload| (200, payload))
+            .collect(),
+    )
+    .await
+}
+
+async fn api_client_for_http_responses(
+    responses_after_initial_time: Vec<(u16, serde_json::Value)>,
+) -> (
+    Arc<ApiClient>,
+    std::thread::JoinHandle<()>,
+    Arc<Mutex<Vec<String>>>,
+) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let address = listener.local_addr().expect("test server address");
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -158,8 +176,9 @@ async fn api_client_for_responses(
             "code": 0,
             "data": {"time": "1782850580"}
         }))
+        .map(|payload| (200, payload))
         .chain(responses_after_initial_time);
-        for payload in responses {
+        for (status, payload) in responses {
             let response_body = serde_json::to_string(&payload).unwrap();
             let (mut socket, _) = listener.accept().expect("accept API request");
             captured
@@ -167,12 +186,70 @@ async fn api_client_for_responses(
                 .unwrap()
                 .push(read_http_request(&mut socket));
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                "HTTP/1.1 {status} TEST\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
                 response_body.len()
             );
             socket
                 .write_all(response.as_bytes())
                 .expect("write API response");
+        }
+    });
+    let client = Arc::new(ApiClient::new());
+    client
+        .set_credential(ApiCredential {
+            api_key: "test-key".into(),
+            api_secret: "test-secret".into(),
+            base_url: format!("http://{address}"),
+            label: "test".into(),
+        })
+        .await;
+    (client, server, requests)
+}
+
+enum RawOrderReply {
+    Body(&'static str),
+    DropConnection,
+}
+
+async fn api_client_for_raw_order_reply(
+    reply: RawOrderReply,
+) -> (
+    Arc<ApiClient>,
+    std::thread::JoinHandle<()>,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind raw test server");
+    let address = listener.local_addr().expect("raw test server address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        let (mut time_socket, _) = listener.accept().expect("accept initial time request");
+        captured
+            .lock()
+            .unwrap()
+            .push(read_http_request(&mut time_socket));
+        let time_body = r#"{"code":0,"data":{"time":"1782850580"}}"#;
+        let time_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{time_body}",
+            time_body.len()
+        );
+        time_socket
+            .write_all(time_response.as_bytes())
+            .expect("write initial time response");
+
+        let (mut order_socket, _) = listener.accept().expect("accept raw order request");
+        captured
+            .lock()
+            .unwrap()
+            .push(read_http_request(&mut order_socket));
+        if let RawOrderReply::Body(body) = reply {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            order_socket
+                .write_all(response.as_bytes())
+                .expect("write raw order response");
         }
     });
     let client = Arc::new(ApiClient::new());
@@ -609,40 +686,213 @@ async fn noncanonical_create_order_codes_are_ambiguous_and_keep_the_reservation(
 }
 
 #[tokio::test]
-async fn documented_non_session_auth_failures_keep_quota_and_publish_nothing() {
+async fn raw_http_empty_malformed_and_socket_drop_keep_quota_without_side_effects() {
+    for (label, reply) in [
+        ("empty", RawOrderReply::Body("")),
+        (
+            "malformed",
+            RawOrderReply::Body("not-json raw-provider-secret"),
+        ),
+        ("socket-drop", RawOrderReply::DropConnection),
+    ] {
+        let harness = ObserverHarness::new(&format!("raw-order-{label}"));
+        let risk_path = std::env::temp_dir().join(format!(
+            "easiflux-raw-order-{label}-risk-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+            RiskConfig {
+                max_daily_orders: 1,
+                ..Default::default()
+            },
+            RiskUsageStore::with_path(risk_path.clone()),
+        )));
+        let (api, server, requests) = api_client_for_raw_order_reply(reply).await;
+        let context = SubmissionContext {
+            submission_id: uuid::Uuid::new_v4().to_string(),
+            account_id: "alpha".into(),
+            session_epoch: 1,
+        };
+        let success_effects = Arc::new(AtomicUsize::new(0));
+        let counted_effects = Arc::clone(&success_effects);
+
+        let result = execute_place_order(
+            api.as_ref(),
+            &risk,
+            &harness.observer,
+            &context,
+            market_request(None),
+            None,
+            NOW_MS,
+            move |_| async move {
+                counted_effects.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        server.join().expect("raw order server exits");
+
+        assert!(
+            matches!(
+                &result,
+                Err(AppError::Internal(_)) | Err(AppError::Connection(_))
+            ),
+            "{label}: {result:?}"
+        );
+        let rendered = serde_json::to_string(&result.unwrap_err()).unwrap();
+        assert!(!rendered.contains("raw-provider-secret"), "{label}");
+        assert_eq!(success_effects.load(Ordering::SeqCst), 0, "{label}");
+        assert!(harness.records("alpha").await.is_empty(), "{label}");
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with("POST "))
+                .count(),
+            1,
+            "{label}"
+        );
+        assert_eq!(
+            RiskUsageStore::with_path(risk_path.clone())
+                .load()
+                .unwrap()
+                .unwrap()
+                .occupied_orders,
+            1,
+            "{label} must keep its reservation on disk"
+        );
+        assert!(
+            risk.read()
+                .await
+                .reserve_order(&market_request(None), None, NOW_MS + 1)
+                .is_err(),
+            "{label} must keep its reservation in memory"
+        );
+
+        let _ = std::fs::remove_file(risk_path);
+    }
+}
+
+#[tokio::test]
+async fn documented_response_auth_failures_release_quota_without_order_side_effects() {
     let cases = [
+        (
+            "session-invalid-key",
+            AuthFailureKind::SessionExpired,
+            vec![(
+                200,
+                json!({
+                    "code": 26200003,
+                    "message": "private-provider-detail"
+                }),
+            )],
+        ),
+        (
+            "session-key-not-found",
+            AuthFailureKind::SessionExpired,
+            vec![(
+                200,
+                json!({
+                    "code": 20011005,
+                    "message": "private-provider-detail"
+                }),
+            )],
+        ),
         (
             "access-denied",
             AuthFailureKind::AccessDenied,
-            vec![json!({
-                "code": 26200010,
-                "message": "private-provider-detail"
-            })],
+            vec![(
+                200,
+                json!({
+                    "code": 26200005,
+                    "message": "private-provider-detail"
+                }),
+            )],
+        ),
+        (
+            "user-banned",
+            AuthFailureKind::AccessDenied,
+            vec![(
+                200,
+                json!({
+                    "code": 26200008,
+                    "message": "private-provider-detail"
+                }),
+            )],
+        ),
+        (
+            "ip-mismatch",
+            AuthFailureKind::AccessDenied,
+            vec![(
+                200,
+                json!({
+                    "code": 26200010,
+                    "message": "private-provider-detail"
+                }),
+            )],
         ),
         (
             "rate-limited",
             AuthFailureKind::RateLimited,
-            vec![json!({
-                "code": 26200006,
-                "message": "private-provider-detail"
-            })],
+            vec![(
+                200,
+                json!({
+                    "code": 26200006,
+                    "message": "private-provider-detail"
+                }),
+            )],
+        ),
+        (
+            "ip-rate-limited",
+            AuthFailureKind::RateLimited,
+            vec![(
+                200,
+                json!({
+                    "code": 26200018,
+                    "message": "private-provider-detail"
+                }),
+            )],
+        ),
+        (
+            "http-403-precedes-session-body",
+            AuthFailureKind::RateLimited,
+            vec![(
+                403,
+                json!({
+                    "code": 26200003,
+                    "message": "private-provider-detail"
+                }),
+            )],
         ),
         (
             "timestamp",
             AuthFailureKind::Timestamp,
             vec![
-                json!({"code": 26200002, "message": "private-timestamp-detail"}),
-                json!({"code": 0, "data": {"time": "1782850580"}}),
-                json!({"code": 26200002, "message": "private-timestamp-detail"}),
+                (
+                    200,
+                    json!({"code": 26200002, "message": "private-timestamp-detail"}),
+                ),
+                (200, json!({"code": 0, "data": {"time": "1782850580"}})),
+                (
+                    200,
+                    json!({"code": 26200002, "message": "private-timestamp-detail"}),
+                ),
             ],
         ),
         (
             "sign",
             AuthFailureKind::Signature,
             vec![
-                json!({"code": 26200004, "message": "private-sign-detail"}),
-                json!({"code": 0, "data": {"time": "1782850580"}}),
-                json!({"code": 26200004, "message": "private-sign-detail"}),
+                (
+                    200,
+                    json!({"code": 26200004, "message": "private-sign-detail"}),
+                ),
+                (200, json!({"code": 0, "data": {"time": "1782850580"}})),
+                (
+                    200,
+                    json!({"code": 26200004, "message": "private-sign-detail"}),
+                ),
             ],
         ),
     ];
@@ -661,7 +911,7 @@ async fn documented_non_session_auth_failures_keep_quota_and_publish_nothing() {
             },
             RiskUsageStore::with_path(risk_path.clone()),
         )));
-        let (api, server, _) = api_client_for_responses(responses).await;
+        let (api, server, _) = api_client_for_http_responses(responses).await;
         let context = SubmissionContext {
             submission_id: uuid::Uuid::new_v4().to_string(),
             account_id: "alpha".into(),
@@ -676,7 +926,7 @@ async fn documented_non_session_auth_failures_keep_quota_and_publish_nothing() {
             market_request(None),
             None,
             NOW_MS,
-            |_| async {},
+            |_| async { panic!("documented authentication failures cannot run success effects") },
         )
         .await;
         server.join().expect("test server exits");
@@ -691,25 +941,144 @@ async fn documented_non_session_auth_failures_keep_quota_and_publish_nothing() {
         let rendered = serde_json::to_string(&result.unwrap_err()).unwrap();
         assert!(!rendered.contains("private-"), "{label}: {rendered}");
         assert!(harness.records("alpha").await.is_empty(), "{label}");
-        assert!(
-            risk.read()
-                .await
-                .reserve_order(&market_request(None), None, NOW_MS + 1)
-                .is_err(),
-            "{label} must keep its reservation in memory"
-        );
         assert_eq!(
             RiskUsageStore::with_path(risk_path.clone())
                 .load()
                 .unwrap()
                 .unwrap()
                 .occupied_orders,
-            1,
-            "{label} must keep its reservation on disk"
+            0,
+            "{label} must release its reservation on disk"
+        );
+        assert!(
+            risk.read()
+                .await
+                .reserve_order(&market_request(None), None, NOW_MS + 1)
+                .is_ok(),
+            "{label} must release its reservation in memory"
         );
 
         let _ = std::fs::remove_file(risk_path);
     }
+}
+
+#[tokio::test]
+async fn session_expired_create_order_preserves_typed_notification_provenance_and_releases_once() {
+    let harness = ObserverHarness::new("session-expired-create-order");
+    let risk_path = std::env::temp_dir().join(format!(
+        "easiflux-session-expired-create-order-risk-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig {
+            max_daily_orders: 1,
+            ..Default::default()
+        },
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let (api, server, _) = api_client_for_responses(vec![
+        json!({"code": 26200003, "message": "raw provider expired detail"}),
+        json!({"code": 20011005, "message": "different raw provider detail"}),
+    ])
+    .await;
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 0,
+    };
+    api.set_credential_for_session(
+        ApiCredential {
+            api_key: "test-key".into(),
+            api_secret: "test-secret".into(),
+            base_url: api.base_url().await,
+            label: "test".into(),
+        },
+        SessionContext {
+            account_id: context.account_id.clone(),
+            session_epoch: context.session_epoch,
+        },
+    )
+    .await;
+    let session_observer = SessionNotificationObserver::new(
+        Arc::new(NotificationRuntime::Available(Arc::clone(&harness.service))),
+        Arc::new(tokio::sync::RwLock::new(AppConfig {
+            active_account_id: "alpha".into(),
+            ..Default::default()
+        })),
+        Arc::new(crate::services::AccountLifecycleCoordinator::new()),
+    );
+    api.set_auth_failure_observer(Arc::new(move |context, failure| {
+        let observer = session_observer.clone();
+        Box::pin(async move {
+            observer
+                .observe_auth_failure(&context, failure, NOW_MS)
+                .await
+        })
+    }));
+
+    let first = execute_place_order(
+        api.as_ref(),
+        &risk,
+        &harness.observer,
+        &context,
+        market_request(None),
+        None,
+        NOW_MS,
+        |_| async { panic!("session expiry cannot run success effects") },
+    )
+    .await
+    .expect_err("session expiry must fail");
+    let committed_id = match first {
+        AppError::Notified {
+            code,
+            notification_id,
+            cause: Some(NotificationCause::AuthFailure(AuthFailureKind::SessionExpired)),
+            ..
+        } => {
+            assert_eq!(code, "AUTH_SESSION_EXPIRED");
+            notification_id
+        }
+        other => panic!("expected typed notification-backed auth failure, got {other:?}"),
+    };
+    let replay = execute_place_order(
+        api.as_ref(),
+        &risk,
+        &harness.observer,
+        &context,
+        market_request(None),
+        None,
+        NOW_MS + 1,
+        |_| async { panic!("session expiry replay cannot run success effects") },
+    )
+    .await
+    .expect_err("session expiry replay must fail");
+    server.join().expect("test server exits");
+
+    assert!(matches!(
+        replay,
+        AppError::AuthFailure(AuthFailureKind::SessionExpired)
+    ));
+    let records = harness.records("alpha").await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, committed_id);
+    assert_eq!(records[0].kind, NotificationKind::AccountSessionExpired);
+    assert!(records
+        .iter()
+        .all(|record| record.kind != NotificationKind::OrderRejected));
+    assert_eq!(
+        RiskUsageStore::with_path(risk_path.clone())
+            .load()
+            .unwrap()
+            .unwrap()
+            .occupied_orders,
+        0
+    );
+    let persisted = std::fs::read_to_string(&harness.path).unwrap();
+    assert!(!persisted.contains("raw provider"));
+    assert!(!persisted.contains("expired detail"));
+
+    let _ = std::fs::remove_file(risk_path);
 }
 
 #[tokio::test]

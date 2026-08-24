@@ -12,6 +12,7 @@ pub(super) struct FailurePlan {
     pub preflight: bool,
     pub target_connect: bool,
     pub former_connect: bool,
+    pub former_connect_notified: Option<String>,
     pub persist_for: Option<String>,
     pub restore_persist: bool,
     pub credential_load_for: Option<String>,
@@ -235,6 +236,16 @@ impl AccountLifecyclePort for FakeLifecyclePort {
         }
         if failures.former_connect && account_id == "primary" {
             return Err(AppError::Connection("former connection failed".into()));
+        }
+        if account_id == "primary" {
+            if let Some(notification_id) = failures.former_connect_notified.clone() {
+                return Err(AppError::Notified {
+                    code: "CONNECTION_UNAVAILABLE",
+                    message: "交易连接暂时不可用",
+                    notification_id,
+                    cause: None,
+                });
+            }
         }
         drop(failures);
         *self.status.lock().unwrap() = ConnectionStatus::Connected;

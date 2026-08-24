@@ -276,13 +276,13 @@ async fn rollback_failure_requires_recovery_and_finishes_disconnected() {
             .to_string();
 
         assert!(error.contains("ACCOUNT_SWITCH_RECOVERY_REQUIRED:"));
-        assert!(error.contains("target connection failed"));
-        let rollback_detail = if restore_persist {
-            "persist primary failed"
-        } else {
-            "former connection failed"
-        };
-        assert!(error.contains(rollback_detail));
+        assert_eq!(
+            error,
+            "内部错误: ACCOUNT_SWITCH_RECOVERY_REQUIRED: 账户切换失败且恢复原账户失败"
+        );
+        assert!(!error.contains("target connection failed"));
+        assert!(!error.contains("persist primary failed"));
+        assert!(!error.contains("former connection failed"));
         assert_eq!(coordinator.current_session_epoch(), 0);
         assert_eq!(port.analytics_clear_count(), 0);
         assert_eq!(port.public_base_url(), "https://primary.example.test");
@@ -291,6 +291,34 @@ async fn rollback_failure_requires_recovery_and_finishes_disconnected() {
         assert_eq!(*port.status.lock().unwrap(), ConnectionStatus::Disconnected);
         assert_eq!(port.events().last().map(String::as_str), Some("disconnect"));
     }
+}
+
+#[tokio::test]
+async fn rollback_notification_backed_failure_preserves_the_exact_structured_id() {
+    let port = FakeLifecyclePort::new(ConnectionStatus::Connected);
+    let coordinator = AccountLifecycleCoordinator::new();
+    let notification_id = uuid::Uuid::new_v4().to_string();
+    {
+        let mut failures = port.failures.lock().unwrap();
+        failures.target_connect = true;
+        failures.former_connect_notified = Some(notification_id.clone());
+    }
+
+    let error = switch_account(&coordinator, &port, "backup", None)
+        .await
+        .expect_err("rollback connection incident must fail the switch");
+
+    assert_eq!(
+        serde_json::to_value(&error).unwrap(),
+        serde_json::json!({
+            "code": "CONNECTION_UNAVAILABLE",
+            "message": "交易连接暂时不可用",
+            "notificationId": notification_id,
+        })
+    );
+    assert!(matches!(error, AppError::Notified { cause: None, .. }));
+    assert_eq!(coordinator.current_session_epoch(), 0);
+    assert_eq!(*port.status.lock().unwrap(), ConnectionStatus::Disconnected);
 }
 
 #[tokio::test]

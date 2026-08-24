@@ -22,6 +22,7 @@ use crate::models::config::{
 use crate::models::notification::NotificationEnvironment;
 use crate::models::time::{TimeSnapshot, TimeSyncStatus};
 use crate::models::trading::{PrivatePanelsSnapshot, SessionContext};
+use crate::services::account_profiles::{CredentialRepository, KeyringCredentialRepository};
 use crate::services::connection::SessionNotificationObserver;
 #[cfg(test)]
 use crate::services::market::run_generation_owned_kline_storage;
@@ -30,7 +31,6 @@ use crate::services::{
     AccountLifecycleCoordinator, ChartWorkspaceService, ConnectionService, DailyPnlService,
     MarketService, TimeService, TradingService,
 };
-use crate::storage::CredentialStore;
 use crate::ws::WsManager;
 
 pub const PUBLIC_STALE_MS: u64 = 5_000;
@@ -3489,6 +3489,7 @@ impl SchedulerService {
     }
 
     async fn run_environment(&self) -> AppResult<()> {
+        let credentials = KeyringCredentialRepository;
         probe_environment(
             &self.config,
             &self.time,
@@ -3496,6 +3497,7 @@ impl SchedulerService {
             &self.environment_status,
             &self.account_lifecycle,
             &self.notification_observer,
+            &credentials,
         )
         .await
     }
@@ -3687,6 +3689,7 @@ impl SchedulerRefs {
     }
 
     async fn run_environment(&self) -> AppResult<()> {
+        let credentials = KeyringCredentialRepository;
         probe_environment(
             &self.config,
             &self.time,
@@ -3694,6 +3697,7 @@ impl SchedulerRefs {
             &self.environment_status,
             &self.account_lifecycle,
             &self.notification_observer,
+            &credentials,
         )
         .await
     }
@@ -3796,11 +3800,13 @@ async fn probe_environment(
     environment_status: &Arc<RwLock<EnvironmentStatus>>,
     account_lifecycle: &Arc<AccountLifecycleCoordinator>,
     notification_observer: &SessionNotificationObserver,
+    credentials: &dyn CredentialRepository,
 ) -> AppResult<()> {
     let (active_account_id, selected_base_url) = {
         let config = config.read().await;
         let active_account_id = normalize_account_id(&config.active_account_id);
-        let selected_base_url = CredentialStore::load(&active_account_id)?
+        let selected_base_url = credentials
+            .load(&active_account_id)?
             .map(|credential| credential.base_url)
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         (active_account_id, selected_base_url)
@@ -3827,7 +3833,8 @@ async fn probe_environment(
         {
             return Ok(());
         }
-        CredentialStore::load(&current_account)?
+        credentials
+            .load(&current_account)?
             .map(|credential| credential.base_url)
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
     };

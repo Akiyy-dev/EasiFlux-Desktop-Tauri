@@ -34,7 +34,6 @@ pub struct ListEnvelopeMeta {
 pub enum CreateOrderOutcome<'a> {
     Accepted(&'a Value),
     Rejected,
-    ProviderFailure,
     Ambiguous,
 }
 
@@ -289,24 +288,7 @@ pub fn classify_create_order_outcome(payload: &Value) -> CreateOrderOutcome<'_> 
         return CreateOrderOutcome::Ambiguous;
     };
     if code.as_i64() != Some(0) {
-        return if code.as_i64().is_some_and(|code| {
-            matches!(
-                code,
-                26200002
-                    | 26200003
-                    | 26200004
-                    | 26200005
-                    | 26200006
-                    | 26200010
-                    | 26200018
-                    | 20011005
-                    | 10200616
-            )
-        }) {
-            CreateOrderOutcome::ProviderFailure
-        } else {
-            CreateOrderOutcome::Ambiguous
-        };
+        return CreateOrderOutcome::Ambiguous;
     }
     let Some(candidate) = payload.get("data").filter(|data| data.is_object()) else {
         return CreateOrderOutcome::Ambiguous;

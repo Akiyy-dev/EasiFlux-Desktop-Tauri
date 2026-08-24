@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
+#[cfg(not(test))]
+use tauri::Emitter;
 
 use crate::models::account::AccountSummary;
 use crate::models::config::{ConnectionStatus, EnvironmentStatus};
@@ -60,14 +62,47 @@ impl WebsocketStatusTracker {
 
 #[derive(Clone)]
 pub struct EventEmitter {
+    #[cfg(not(test))]
     app: AppHandle,
+    #[cfg(test)]
+    test_sink: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     websocket_status: WebsocketStatusTracker,
 }
 
 impl EventEmitter {
+    fn emit<T: serde::Serialize + ?Sized>(&self, event: &str, payload: &T) -> Result<(), ()> {
+        #[cfg(not(test))]
+        {
+            self.app.emit(event, payload).map_err(|_| ())
+        }
+        #[cfg(test)]
+        {
+            let value = serde_json::to_value(payload).map_err(|_| ())?;
+            self.test_sink
+                .lock()
+                .map_err(|_| ())?
+                .push((event.into(), value));
+            Ok(())
+        }
+    }
+
+    #[cfg(not(test))]
     pub fn new(app: AppHandle) -> Self {
         Self {
             app,
+            websocket_status: WebsocketStatusTracker::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new(_app: AppHandle) -> Self {
+        Self::new_test(Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test(sink: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>) -> Self {
+        Self {
+            test_sink: sink,
             websocket_status: WebsocketStatusTracker::default(),
         }
     }
@@ -83,11 +118,11 @@ impl EventEmitter {
             session_epoch: context.session_epoch,
             payload,
         };
-        let _ = self.app.emit(event, &envelope);
+        let _ = self.emit(event, &envelope);
     }
 
     pub fn emit_app_ready(&self, version: &str) {
-        let _ = self.app.emit("app:ready", version);
+        let _ = self.emit("app:ready", version);
     }
 
     pub fn emit_connection_for_session(&self, context: &SessionContext, status: &str) {
@@ -106,15 +141,15 @@ impl EventEmitter {
     }
 
     pub fn emit_ticker(&self, ticker: Ticker) {
-        let _ = self.app.emit("market:ticker", &ticker);
+        let _ = self.emit("market:ticker", &ticker);
     }
 
     pub fn emit_depth(&self, depth: Depth) {
-        let _ = self.app.emit("market:depth", &depth);
+        let _ = self.emit("market:depth", &depth);
     }
 
     pub fn emit_klines(&self, klines: &[Kline]) {
-        let _ = self.app.emit("market:kline", klines);
+        let _ = self.emit("market:kline", klines);
     }
 
     pub fn emit_order(&self, context: &SessionContext, order: Order) {
@@ -130,7 +165,7 @@ impl EventEmitter {
     }
 
     pub fn emit_time_updated(&self, snapshot: &TimeSnapshot) {
-        let _ = self.app.emit("time:updated", snapshot);
+        let _ = self.emit("time:updated", snapshot);
     }
 
     pub fn emit_account_snapshot(&self, context: &SessionContext, snapshot: AccountSummary) {
@@ -158,21 +193,20 @@ impl EventEmitter {
         event: &NotificationChangedEvent,
     ) -> Result<(), String> {
         emit_notification_changed_with(event, |name, payload| {
-            self.app
-                .emit(name, payload)
+            self.emit(name, payload)
                 .map_err(|_| "NOTIFICATION_EVENT_EMIT_FAILED".to_string())
         })
     }
 
     pub fn emit_error(&self, message: &str) {
-        let _ = self.app.emit("error:occurred", message);
+        let _ = self.emit("error:occurred", message);
         self.emit_log("error", message);
     }
 
     pub fn emit_log(&self, level: &str, message: &str) {
-        let _ = self.app.emit(
+        let _ = self.emit(
             "log:entry",
-            serde_json::json!({
+            &serde_json::json!({
                 "level": level,
                 "message": message,
                 "timestamp": chrono::Utc::now().timestamp_millis(),

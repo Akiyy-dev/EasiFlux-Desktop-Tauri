@@ -487,6 +487,7 @@ where
                     code: "RISK_ORDER_BLOCKED",
                     message: "订单被风控拦截",
                     notification_id,
+                    cause: None,
                 },
                 None => violation.into(),
             });
@@ -615,6 +616,25 @@ where
 
 fn is_certain_submission_failure(error: &AppError) -> bool {
     is_confirmed_submission_rejection(error)
+        || matches!(
+            error,
+            AppError::AuthFailure(
+                crate::api::response::AuthFailureKind::SessionExpired
+                    | crate::api::response::AuthFailureKind::Timestamp
+                    | crate::api::response::AuthFailureKind::Signature
+                    | crate::api::response::AuthFailureKind::AccessDenied
+                    | crate::api::response::AuthFailureKind::RateLimited
+            )
+        )
+        || matches!(
+            error,
+            AppError::Notified {
+                cause: Some(crate::error::NotificationCause::AuthFailure(
+                    crate::api::response::AuthFailureKind::SessionExpired
+                )),
+                ..
+            }
+        )
 }
 
 fn is_confirmed_submission_rejection(error: &AppError) -> bool {
@@ -666,6 +686,7 @@ fn finalize_submission_failure(
             code: "ORDER_REJECTED",
             message: "订单请求被交易端拒绝",
             notification_id,
+            cause: None,
         };
     }
     if rollback_failed {
@@ -806,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn only_typed_rejection_is_a_certain_submission_failure() {
+    fn only_closed_typed_no_submit_failures_are_certain() {
         let ambiguous = [
             AppError::Auth("safe".into()),
             AppError::Connection("safe".into()),
@@ -820,14 +841,34 @@ mod tests {
                 code: "ORDER_REJECTED",
                 message: "订单请求被交易端拒绝",
                 notification_id: uuid::Uuid::new_v4().to_string(),
+                cause: None,
             },
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::MissingCredential),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::CredentialStorage),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::SigningConfiguration),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::Other),
         ];
         assert!(ambiguous
             .iter()
             .all(|error| !is_certain_submission_failure(error)));
-        assert!(is_certain_submission_failure(&AppError::TradingFailure(
-            crate::models::trading::TradingFailure::rejected(),
-        )));
+        for certain in [
+            AppError::TradingFailure(crate::models::trading::TradingFailure::rejected()),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::SessionExpired),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::Timestamp),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::Signature),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::AccessDenied),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::RateLimited),
+            AppError::Notified {
+                code: "AUTH_SESSION_EXPIRED",
+                message: "账户会话已失效",
+                notification_id: uuid::Uuid::new_v4().to_string(),
+                cause: Some(crate::error::NotificationCause::AuthFailure(
+                    crate::api::response::AuthFailureKind::SessionExpired,
+                )),
+            },
+        ] {
+            assert!(is_certain_submission_failure(&certain), "{certain:?}");
+        }
     }
 
     #[tokio::test]

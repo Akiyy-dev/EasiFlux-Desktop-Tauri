@@ -236,11 +236,15 @@ fn notified_connection_error(error: AppError, notification_id: Option<String>) -
                 code: "AUTH_SESSION_EXPIRED",
                 message: "账户会话已失效",
                 notification_id,
+                cause: Some(crate::error::NotificationCause::AuthFailure(
+                    AuthFailureKind::SessionExpired,
+                )),
             },
             _ => AppError::Notified {
                 code: "CONNECTION_UNAVAILABLE",
                 message: "交易连接暂时不可用",
                 notification_id,
+                cause: None,
             },
         },
         None => error,

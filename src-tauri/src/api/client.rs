@@ -252,20 +252,6 @@ impl ApiClient {
             }
             Err(_) => return Err(AppError::Connection("API 响应格式无效".into())),
         };
-        if status.is_success() && path == Some(endpoints::CREATE_ORDER) {
-            match super::response::classify_create_order_outcome(&payload) {
-                super::response::CreateOrderOutcome::Rejected => {
-                    return Err(AppError::TradingFailure(
-                        crate::models::trading::TradingFailure::rejected(),
-                    ));
-                }
-                super::response::CreateOrderOutcome::Accepted(_) => {}
-                super::response::CreateOrderOutcome::ProviderFailure => {}
-                super::response::CreateOrderOutcome::Ambiguous => {
-                    return Err(AppError::Internal("订单提交结果不明确".into()));
-                }
-            }
-        }
         let auth_failure = classify_auth_failure(Some(status.as_u16()), &payload);
         if auth_failure == AuthFailureKind::SessionExpired {
             let observer = self
@@ -279,20 +265,31 @@ impl ApiClient {
                         code: "AUTH_SESSION_EXPIRED",
                         message: "账户会话已失效",
                         notification_id,
+                        cause: Some(crate::error::NotificationCause::AuthFailure(auth_failure)),
                     });
                 }
             }
         }
+        if auth_failure != AuthFailureKind::Other {
+            return Err(AppError::AuthFailure(auth_failure));
+        }
         if !status.is_success() {
-            if auth_failure != AuthFailureKind::Other {
-                return Err(AppError::AuthFailure(auth_failure));
-            }
             return Err(AppError::Connection(format!("HTTP {}", status)));
         }
-        if !is_success_response(&payload) {
-            if auth_failure != AuthFailureKind::Other {
-                return Err(AppError::AuthFailure(auth_failure));
+        if path == Some(endpoints::CREATE_ORDER) {
+            match super::response::classify_create_order_outcome(&payload) {
+                super::response::CreateOrderOutcome::Rejected => {
+                    return Err(AppError::TradingFailure(
+                        crate::models::trading::TradingFailure::rejected(),
+                    ));
+                }
+                super::response::CreateOrderOutcome::Accepted(_) => {}
+                super::response::CreateOrderOutcome::Ambiguous => {
+                    return Err(AppError::Internal("订单提交结果不明确".into()));
+                }
             }
+        }
+        if !is_success_response(&payload) {
             return Err(AppError::Trading("API 返回错误".into()));
         }
         Ok(payload)

@@ -123,7 +123,7 @@ impl PrivateApi {
                     crate::models::trading::TradingFailure::rejected(),
                 ));
             }
-            CreateOrderOutcome::ProviderFailure | CreateOrderOutcome::Ambiguous => {
+            CreateOrderOutcome::Ambiguous => {
                 return Err(AppError::Internal("订单提交结果不明确".into()));
             }
         };

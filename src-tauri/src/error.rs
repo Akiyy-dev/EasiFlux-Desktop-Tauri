@@ -5,6 +5,11 @@ use thiserror::Error;
 use crate::api::response::AuthFailureKind;
 use crate::models::trading::TradingFailure;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationCause {
+    AuthFailure(AuthFailureKind),
+}
+
 #[derive(Debug, Clone, Error)]
 pub enum AppError {
     #[error("认证失败: {0}")]
@@ -32,6 +37,7 @@ pub enum AppError {
         code: &'static str,
         message: &'static str,
         notification_id: String,
+        cause: Option<NotificationCause>,
     },
     #[error("{0}")]
     Observed(&'static str),
@@ -47,6 +53,7 @@ impl Serialize for AppError {
                 code,
                 message,
                 notification_id,
+                ..
             } => {
                 use serde::ser::SerializeStruct;
                 let mut value = serializer.serialize_struct("CommandError", 3)?;
@@ -167,6 +174,7 @@ mod tests {
             code: "ORDER_REJECTED",
             message: "订单请求被交易端拒绝",
             notification_id: notification_id.clone(),
+            cause: None,
         };
         assert_eq!(
             serde_json::to_value(notified).unwrap(),
