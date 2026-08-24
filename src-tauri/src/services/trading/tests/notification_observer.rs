@@ -21,10 +21,24 @@ use crate::storage::{NotificationStore, RiskUsageStore};
 
 const NOW_MS: u64 = 1_784_606_400_000;
 
+struct CountingNotificationPersistence {
+    inner: NotificationStore,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl NotificationPersistence for CountingNotificationPersistence {
+    fn save(&self, file: &NotificationFileV1) -> AppResult<()> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        self.inner.save(file)
+    }
+}
+
 struct ObserverHarness {
     observer: OrderNotificationObserver,
     service: Arc<NotificationService>,
     path: PathBuf,
+    emitted_events: Arc<AtomicUsize>,
+    save_attempts: Option<Arc<AtomicUsize>>,
 }
 
 impl ObserverHarness {
@@ -36,11 +50,42 @@ impl ObserverHarness {
                 uuid::Uuid::new_v4(),
             ))
             .join("notifications.v1.json");
-        Self::load(path)
+        let emitted_events = Arc::new(AtomicUsize::new(0));
+        let emitted_by_callback = Arc::clone(&emitted_events);
+        let emitter: NotificationEmitter = Arc::new(move |_| {
+            emitted_by_callback.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let store = NotificationStore::with_path(path.clone());
+        let file = store.load().unwrap().file;
+        let save_attempts = Arc::new(AtomicUsize::new(0));
+        let persistence = Arc::new(CountingNotificationPersistence {
+            inner: store,
+            attempts: Arc::clone(&save_attempts),
+        });
+        let service = Arc::new(NotificationService::from_snapshot(
+            file,
+            persistence,
+            emitter,
+            NOW_MS,
+        ));
+        let runtime = Arc::new(NotificationRuntime::Available(Arc::clone(&service)));
+        Self {
+            observer: OrderNotificationObserver::new(runtime),
+            service,
+            path,
+            emitted_events,
+            save_attempts: Some(save_attempts),
+        }
     }
 
     fn load(path: PathBuf) -> Self {
-        let emitter: NotificationEmitter = Arc::new(|_| Ok(()));
+        let emitted_events = Arc::new(AtomicUsize::new(0));
+        let emitted_by_callback = Arc::clone(&emitted_events);
+        let emitter: NotificationEmitter = Arc::new(move |_| {
+            emitted_by_callback.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
         let service = Arc::new(
             NotificationService::load(
                 NotificationStore::with_path(path.clone()),
@@ -55,6 +100,8 @@ impl ObserverHarness {
             observer: OrderNotificationObserver::new(runtime),
             service,
             path,
+            emitted_events,
+            save_attempts: None,
         }
     }
 
@@ -77,6 +124,95 @@ impl ObserverHarness {
             .unwrap()
             .items
     }
+}
+
+struct DelayedAuthFailureServer {
+    handle: std::thread::JoinHandle<()>,
+    order_received: std::sync::mpsc::Receiver<()>,
+    release_response: std::sync::mpsc::Sender<()>,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+fn accept_delayed_request(listener: &std::net::TcpListener) -> std::net::TcpStream {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((socket, _)) => {
+                socket
+                    .set_nonblocking(false)
+                    .expect("restore blocking test socket");
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("bound delayed request read");
+                return socket;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for delayed API request"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => panic!("accept delayed API request: {error}"),
+        }
+    }
+}
+
+async fn api_client_for_delayed_session_expiry() -> (Arc<ApiClient>, DelayedAuthFailureServer) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind delayed API server");
+    listener
+        .set_nonblocking(true)
+        .expect("bound delayed API accept");
+    let address = listener.local_addr().expect("delayed API server address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let (order_received_tx, order_received) = std::sync::mpsc::channel();
+    let (release_response, release_response_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let responses = [
+            r#"{"code":0,"data":{"time":"1782850580"}}"#,
+            r#"{"code":26200003,"message":"raw provider expired detail"}"#,
+            r#"{"code":20011005,"message":"different raw provider detail"}"#,
+        ];
+        for (index, response_body) in responses.into_iter().enumerate() {
+            let mut socket = accept_delayed_request(&listener);
+            captured
+                .lock()
+                .unwrap()
+                .push(read_http_request(&mut socket));
+            if index == 1 {
+                order_received_tx.send(()).expect("signal order request");
+                release_response_rx
+                    .recv()
+                    .expect("release delayed order response");
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write delayed API response");
+        }
+    });
+    let client = Arc::new(ApiClient::new());
+    client
+        .set_credential(ApiCredential {
+            api_key: "test-key".into(),
+            api_secret: "test-secret".into(),
+            base_url: format!("http://{address}"),
+            label: "test".into(),
+        })
+        .await;
+    (
+        client,
+        DelayedAuthFailureServer {
+            handle,
+            order_received,
+            release_response,
+            requests,
+        },
+    )
 }
 
 impl Drop for ObserverHarness {
@@ -1079,6 +1215,201 @@ async fn session_expired_create_order_preserves_typed_notification_provenance_an
     assert!(!persisted.contains("expired detail"));
 
     let _ = std::fs::remove_file(risk_path);
+}
+
+#[tokio::test]
+async fn committed_session_expiry_survives_risk_release_save_failure_and_replay() {
+    let harness = ObserverHarness::new("session-expired-release-save-failure");
+    let risk_root = std::env::temp_dir().join(format!(
+        "easiflux-private-risk-release-path-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk_path = risk_root.join("risk_usage.toml");
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig {
+            max_daily_orders: 1,
+            ..Default::default()
+        },
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let (api, server) = api_client_for_delayed_session_expiry().await;
+    let DelayedAuthFailureServer {
+        handle: server_handle,
+        order_received,
+        release_response,
+        requests,
+    } = server;
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 0,
+    };
+    api.set_credential_for_session(
+        ApiCredential {
+            api_key: "test-key".into(),
+            api_secret: "test-secret".into(),
+            base_url: api.base_url().await,
+            label: "test".into(),
+        },
+        SessionContext {
+            account_id: context.account_id.clone(),
+            session_epoch: context.session_epoch,
+        },
+    )
+    .await;
+    let session_observer = SessionNotificationObserver::new(
+        Arc::new(NotificationRuntime::Available(Arc::clone(&harness.service))),
+        Arc::new(tokio::sync::RwLock::new(AppConfig {
+            active_account_id: "alpha".into(),
+            ..Default::default()
+        })),
+        Arc::new(crate::services::AccountLifecycleCoordinator::new()),
+    );
+    api.set_auth_failure_observer(Arc::new(move |context, failure| {
+        let observer = session_observer.clone();
+        Box::pin(async move {
+            observer
+                .observe_auth_failure(&context, failure, NOW_MS)
+                .await
+        })
+    }));
+
+    let api_for_order = Arc::clone(&api);
+    let risk_for_order = Arc::clone(&risk);
+    let observer_for_order = harness.observer.clone();
+    let context_for_order = context.clone();
+    let success_effects = Arc::new(AtomicUsize::new(0));
+    let success_effects_for_order = Arc::clone(&success_effects);
+    let order_task = tokio::spawn(async move {
+        execute_place_order(
+            api_for_order.as_ref(),
+            &risk_for_order,
+            &observer_for_order,
+            &context_for_order,
+            market_request(None),
+            None,
+            NOW_MS,
+            move |_| {
+                let success_effects = Arc::clone(&success_effects_for_order);
+                async move {
+                    success_effects.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await
+    });
+
+    tokio::task::spawn_blocking(move || {
+        order_received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("order request reaches delayed server")
+    })
+    .await
+    .expect("order request waiter exits");
+    let private_storage_detail = PathBuf::from(format!("{}.tmp", risk_path.display()));
+    std::fs::create_dir(&private_storage_detail).expect("force release save failure");
+    release_response
+        .send(())
+        .expect("release session-expired response");
+
+    let primary_error = order_task
+        .await
+        .expect("order task exits")
+        .expect_err("session expiry must fail");
+    let first_records = harness.records("alpha").await;
+    let committed_id = first_records
+        .first()
+        .expect("session-expired notification committed")
+        .id
+        .clone();
+    let revision_before_replay = harness.service.revision().await;
+    let disk_before_replay = std::fs::read(&harness.path).unwrap();
+    let events_before_replay = harness.emitted_events.load(Ordering::SeqCst);
+    let saves_before_replay = harness
+        .save_attempts
+        .as_ref()
+        .expect("fresh harness counts real store saves")
+        .load(Ordering::SeqCst);
+    let replay_error = api
+        .private_get("/private/test", Vec::new())
+        .await
+        .expect_err("replayed session expiry must fail");
+    server_handle.join().expect("delayed API server exits");
+
+    assert_eq!(
+        serde_json::to_value(&primary_error).unwrap(),
+        json!({
+            "code": "AUTH_SESSION_EXPIRED",
+            "message": "账户会话已失效",
+            "notificationId": committed_id,
+        })
+    );
+    assert!(matches!(
+        &primary_error,
+        AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            cause: Some(NotificationCause::AuthFailure(
+                AuthFailureKind::SessionExpired
+            )),
+            ..
+        }
+    ));
+    assert!(matches!(
+        replay_error,
+        AppError::AuthFailure(AuthFailureKind::SessionExpired)
+    ));
+    let records = harness.records("alpha").await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, NotificationKind::AccountSessionExpired);
+    assert!(records
+        .iter()
+        .all(|record| record.kind != NotificationKind::OrderRejected));
+    assert_eq!(events_before_replay, 1);
+    assert_eq!(harness.emitted_events.load(Ordering::SeqCst), 1);
+    assert_eq!(saves_before_replay, 1);
+    assert_eq!(
+        harness
+            .save_attempts
+            .as_ref()
+            .unwrap()
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(harness.service.revision().await, revision_before_replay);
+    assert_eq!(std::fs::read(&harness.path).unwrap(), disk_before_replay);
+    assert_eq!(success_effects.load(Ordering::SeqCst), 0);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        RiskUsageStore::with_path(risk_path.clone())
+            .load()
+            .unwrap()
+            .unwrap()
+            .occupied_orders,
+        1
+    );
+    let memory_violation = risk
+        .read()
+        .await
+        .reserve_order(&market_request(None), None, NOW_MS + 1)
+        .expect_err("occupied in-memory quota must reject before persistence");
+    assert_eq!(
+        memory_violation.code,
+        crate::models::risk::RiskViolationCode::DailyOrderLimit
+    );
+    let returned = serde_json::to_string(&primary_error).unwrap();
+    let persisted = std::fs::read_to_string(&harness.path).unwrap();
+    for private_detail in [
+        "raw provider expired detail",
+        "different raw provider detail",
+        risk_root.to_string_lossy().as_ref(),
+    ] {
+        assert!(!returned.contains(private_detail));
+        assert!(!persisted.contains(private_detail));
+    }
+
+    std::fs::remove_dir(&private_storage_detail).unwrap();
+    std::fs::remove_dir_all(&risk_root).unwrap();
 }
 
 #[tokio::test]

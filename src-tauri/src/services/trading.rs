@@ -607,7 +607,7 @@ where
                     release_error_kind = ?std::mem::discriminant(&release_error),
                     "risk reservation rollback failed"
                 );
-                return Err(AppError::Internal("订单提交失败且风控预占回滚失败".into()));
+                return Err(finalize_submission_failure(submit_error, true, None));
             }
             Err(submit_error)
         }
@@ -681,6 +681,9 @@ fn finalize_submission_failure(
     rollback_failed: bool,
     notification_id: Option<String>,
 ) -> AppError {
+    if matches!(&submit_error, AppError::Notified { cause: Some(_), .. }) {
+        return submit_error;
+    }
     if let Some(notification_id) = notification_id {
         return AppError::Notified {
             code: "ORDER_REJECTED",
