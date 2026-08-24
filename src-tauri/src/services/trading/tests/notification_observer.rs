@@ -22,7 +22,7 @@ use crate::storage::{NotificationStore, RiskUsageStore};
 const NOW_MS: u64 = 1_784_606_400_000;
 
 #[test]
-fn notified_placement_result_owns_one_log_only_diagnostic() {
+fn non_session_notified_placement_results_retain_one_log_only_diagnostic() {
     let sink = Arc::new(Mutex::new(Vec::new()));
     let emitter = EventEmitter::new_test(Arc::clone(&sink));
     let notified = AppError::Notified {
@@ -52,6 +52,42 @@ fn notified_placement_result_owns_one_log_only_diagnostic() {
     );
     assert!(matches!(ordinary, Err(AppError::Trading(_))));
     assert_eq!(sink.lock().unwrap().len(), 1);
+
+    let risk_block = deliver_notified_placement(
+        &emitter,
+        Err::<(), _>(AppError::Notified {
+            code: "RISK_ORDER_BLOCKED",
+            message: "订单被风控拦截",
+            notification_id: "notification-risk-1".into(),
+            cause: None,
+        }),
+    );
+    assert!(matches!(risk_block, Err(AppError::Notified { .. })));
+    let events = sink.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[1].1["message"],
+        "NOTIFIED_PLACEMENT_FAILURE:RISK_ORDER_BLOCKED"
+    );
+    assert!(events.iter().all(|(name, _)| name != "error:occurred"));
+    drop(events);
+
+    let invalid_session = deliver_notified_placement(
+        &emitter,
+        Err::<(), _>(AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            message: "账户会话已失效",
+            notification_id: "".into(),
+            cause: None,
+        }),
+    );
+    assert!(matches!(invalid_session, Err(AppError::Notified { .. })));
+    let events = sink.lock().unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events[2].1["message"],
+        "NOTIFIED_PLACEMENT_FAILURE:AUTH_SESSION_EXPIRED"
+    );
 }
 
 struct CountingNotificationPersistence {
@@ -1129,6 +1165,124 @@ async fn documented_response_auth_failures_release_quota_without_order_side_effe
 
         let _ = std::fs::remove_file(risk_path);
     }
+}
+
+#[tokio::test]
+async fn place_order_session_expiry_has_one_durable_diagnostic_owner() {
+    let harness = ObserverHarness::new("place-order-session-delivery");
+    let risk_path = std::env::temp_dir().join(format!(
+        "easiflux-place-order-session-delivery-risk-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig {
+            max_daily_orders: 1,
+            ..Default::default()
+        },
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let (api, server, _) = api_client_for_responses(vec![json!({
+        "code": 26200003,
+        "message": "raw provider expired detail"
+    })])
+    .await;
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 0,
+    };
+    api.set_credential_for_session(
+        ApiCredential {
+            api_key: "test-key".into(),
+            api_secret: "test-secret".into(),
+            base_url: api.base_url().await,
+            label: "test".into(),
+        },
+        SessionContext {
+            account_id: context.account_id.clone(),
+            session_epoch: context.session_epoch,
+        },
+    )
+    .await;
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
+    let emitter = EventEmitter::new_test(Arc::clone(&diagnostics));
+    let lifecycle = Arc::new(crate::services::AccountLifecycleCoordinator::new());
+    let session_observer = SessionNotificationObserver::new(
+        Arc::new(NotificationRuntime::Available(Arc::clone(&harness.service))),
+        Arc::new(tokio::sync::RwLock::new(AppConfig {
+            active_account_id: "alpha".into(),
+            ..Default::default()
+        })),
+        lifecycle,
+        emitter.clone(),
+    );
+    api.set_auth_failure_observer(Arc::new(move |context, failure| {
+        let observer = session_observer.clone();
+        Box::pin(async move {
+            observer
+                .observe_auth_failure(&context, failure, NOW_MS)
+                .await
+        })
+    }));
+    let trading = TradingService::new(
+        Arc::clone(&api),
+        risk,
+        Arc::new(TradeLogStore::new()),
+        Arc::new(CacheStore::new()),
+        emitter,
+        Arc::new(TimeService::new(
+            api.time_sync(),
+            Arc::clone(&api),
+            EventEmitter::new_test(Arc::new(Mutex::new(Vec::new()))),
+        )),
+        Arc::new(AnalyticsService::new(Arc::clone(&api))),
+        Arc::new(NotificationRuntime::Available(Arc::clone(&harness.service))),
+    );
+
+    let result = trading.place_order(context, market_request(None)).await;
+    server.join().expect("test server exits");
+
+    assert!(matches!(
+        result,
+        Err(AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            ..
+        })
+    ));
+    assert_eq!(
+        harness
+            .save_attempts
+            .as_ref()
+            .unwrap()
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(harness.emitted_events.load(Ordering::SeqCst), 1);
+    let records = harness.records("alpha").await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, NotificationKind::AccountSessionExpired);
+    let diagnostics = diagnostics.lock().unwrap();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|(name, _)| name == "log:entry")
+            .count(),
+        1
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|(name, _)| name == "error:occurred")
+            .count(),
+        0
+    );
+    assert_eq!(
+        diagnostics[0].1["message"],
+        "NOTIFIED_SESSION_FAILURE:AUTH_SESSION_EXPIRED"
+    );
+    drop(diagnostics);
+    let _ = std::fs::remove_file(risk_path);
 }
 
 #[tokio::test]

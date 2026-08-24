@@ -8,8 +8,6 @@ import PositionsTab from '../../src/components/trading/order-center/PositionsTab
 import TradeFillsTab from '../../src/components/trading/order-center/TradeFillsTab.vue'
 import ClosedPnlTab from '../../src/components/trading/order-center/ClosedPnlTab.vue'
 import OrderCenter from '../../src/components/trading/OrderCenter.vue'
-import OrderTable from '../../src/components/trading/OrderTable.vue'
-import PositionTable from '../../src/components/trading/PositionTable.vue'
 import { installMessageApi } from '../../src/services/errorService'
 import { useConnectionStore } from '../../src/stores/connection'
 import { useLogStore } from '../../src/stores/log'
@@ -113,13 +111,9 @@ describe('order center activation', () => {
     expect(tauriInvoke).toHaveBeenCalledWith('fetch_closed_pnl', expect.any(Object))
   })
 
-  it('keeps every current query path as one-log one-Toast ordinary-error owner', async () => {
+  it('keeps direct query paths as one-log one-Toast ordinary-error owners', async () => {
     useConnectionStore().setStatus('connected')
 
-    const positions = mount(PositionsTab, {
-      props: { active: false },
-      global: { plugins: [pinia], stubs: { TanstackDataTable: true } },
-    })
     const fills = mount(TradeFillsTab, {
       props: { active: false },
       global: { plugins: [pinia], stubs: { TanstackDataTable: true } },
@@ -128,14 +122,6 @@ describe('order center activation', () => {
       props: { active: false },
       global: { plugins: [pinia], stubs: { TanstackDataTable: true } },
     })
-    const legacy = mount(PositionTable, {
-      props: { active: false },
-      global: { plugins: [pinia], stubs: { NButton: true, NDataTable: true } },
-    })
-    const legacyOrders = mount(OrderTable, {
-      props: { active: false },
-      global: { plugins: [pinia], stubs: { NButton: true, NDataTable: true } },
-    })
     await flushPromises()
 
     const cases: Array<{
@@ -143,28 +129,12 @@ describe('order center activation', () => {
       reject: () => void
     }> = [
       {
-        invoke: () => (positions.vm as unknown as { refresh: () => Promise<void> }).refresh(),
-        reject: () => vi.mocked(refreshSyncTask).mockRejectedValueOnce(new Error('positions query failed')),
-      },
-      {
         invoke: () => (fills.vm as unknown as { refresh: () => Promise<void> }).refresh(),
         reject: () => vi.mocked(tauriInvoke).mockRejectedValueOnce(new Error('fills query failed')),
       },
       {
         invoke: () => (pnl.vm as unknown as { refresh: () => Promise<void> }).refresh(),
         reject: () => vi.mocked(tauriInvoke).mockRejectedValueOnce(new Error('pnl query failed')),
-      },
-      {
-        invoke: () => (legacy.vm as unknown as {
-          refreshPanels: () => Promise<void>
-        }).refreshPanels(),
-        reject: () => vi.mocked(refreshSyncTask).mockRejectedValueOnce(new Error('legacy query failed')),
-      },
-      {
-        invoke: () => (legacyOrders.vm as unknown as {
-          refreshPanels: () => Promise<void>
-        }).refreshPanels(),
-        reject: () => vi.mocked(refreshSyncTask).mockRejectedValueOnce(new Error('legacy orders failed')),
       },
     ]
 

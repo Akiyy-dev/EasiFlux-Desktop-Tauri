@@ -642,6 +642,39 @@ describe('post-switch reconciliation', () => {
     })
   })
 
+  it('does not republish an owned session marker returned by reconciliation bootstrap', async () => {
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
+      }
+      if (command === 'get_config') return Promise.resolve(backupConfig)
+      if (command === 'list_account_profiles') return Promise.resolve([backupProfile])
+      if (command === 'get_connection_status' || command === 'get_websocket_status') {
+        return Promise.resolve('connected')
+      }
+      if (command === 'scheduler_run_task') {
+        return Promise.reject({
+          message: 'bootstrap failed',
+          cause: {
+            code: 'AUTH_SESSION_EXPIRED',
+            message: '账户会话已失效',
+            notificationId: 'committed-session-id',
+          },
+        })
+      }
+      return Promise.resolve(undefined)
+    })
+
+    const store = useAccountProfilesStore()
+    await store.switchAccount('backup')
+
+    expect(store.reconciliationFailedSteps).toEqual([])
+    expect(store.reconciliationError).toBeNull()
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'create_client_notification')).toHaveLength(0)
+    expect(errorServiceMocks.reportError).not.toHaveBeenCalled()
+  })
+
   it('keeps a backend recovery marker blocked across refreshes, retries, and events', async () => {
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'switch_account') {

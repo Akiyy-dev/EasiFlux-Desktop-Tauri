@@ -310,13 +310,53 @@ fn emit_bootstrap_failure_diagnostics(
     }
 }
 
-fn bootstrap_failure_error(failed: &[TaskId]) -> AppError {
+fn aggregate_bootstrap_failure_error(failed: &[TaskId]) -> AppError {
     let labels = failed
         .iter()
         .map(|task| task.bootstrap_label())
         .collect::<Vec<_>>()
         .join("、");
     AppError::Connection(format!("连接初始化未完成: {labels}"))
+}
+
+fn bootstrap_failure_error(failed: &[(TaskId, AppError)]) -> AppError {
+    let generic_tasks = failed
+        .iter()
+        .filter_map(|(task, error)| bootstrap_failure_needs_generic_error(error).then_some(*task))
+        .collect::<Vec<_>>();
+    if !generic_tasks.is_empty() {
+        return aggregate_bootstrap_failure_error(&generic_tasks);
+    }
+    if let Some((
+        _,
+        error @ AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            notification_id,
+            ..
+        },
+    )) = failed.iter().find(|(_, error)| {
+        matches!(
+            error,
+            AppError::Notified {
+                code: "AUTH_SESSION_EXPIRED",
+                notification_id,
+                ..
+            } if !notification_id.trim().is_empty()
+        )
+    }) {
+        debug_assert!(!notification_id.trim().is_empty());
+        return error.clone();
+    }
+    aggregate_bootstrap_failure_error(&failed.iter().map(|(task, _)| *task).collect::<Vec<_>>())
+}
+
+fn deliver_detached_bootstrap_failure<F>(error: &AppError, deliver: F)
+where
+    F: FnOnce(String),
+{
+    if bootstrap_failure_needs_generic_error(error) {
+        deliver(error.user_message());
+    }
 }
 
 fn time_sync_task_result(snapshot: &TimeSnapshot) -> AppResult<()> {
@@ -3307,10 +3347,12 @@ impl SchedulerService {
             })
             .await;
             if let Err(error) = result {
-                tracing::warn!(
-                    message = %error.user_message(),
-                    "connection bootstrap did not complete"
-                );
+                deliver_detached_bootstrap_failure(&error, |message| {
+                    tracing::warn!(
+                        message = %message,
+                        "connection bootstrap did not complete"
+                    );
+                });
             }
         });
         Ok(())
@@ -3339,8 +3381,7 @@ impl SchedulerService {
         if failed.is_empty() {
             Ok(())
         } else {
-            let failed_tasks = failed.into_iter().map(|(task, _)| task).collect::<Vec<_>>();
-            Err(bootstrap_failure_error(&failed_tasks))
+            Err(bootstrap_failure_error(&failed))
         }
     }
 

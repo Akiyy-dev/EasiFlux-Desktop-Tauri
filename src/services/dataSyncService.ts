@@ -1,5 +1,6 @@
 import { tauriInvoke } from '../composables/useTauriCommand'
-import { useLogStore } from '../stores/log'
+import { reportError } from './errorService'
+import { decodeCommandError } from './notificationService'
 
 export type SyncTaskName =
   | 'market'
@@ -18,12 +19,6 @@ const TASK_LABELS: Record<SyncTaskName, string> = {
 
 const inFlight = new Set<SyncTaskName>()
 
-function formatError(error: unknown): string {
-  if (typeof error === 'string') return error
-  if (error instanceof Error) return error.message
-  return '同步失败'
-}
-
 export function syncRunning(): boolean {
   return false
 }
@@ -40,7 +35,9 @@ export async function refreshSyncTask(
   try {
     await tauriInvoke('scheduler_run_task', { task: name, force })
   } catch (error) {
-    useLogStore().setError(`${TASK_LABELS[name]}刷新失败: ${formatError(error)}`)
+    if (!decodeCommandError(error).notificationId) {
+      reportError(error, `${TASK_LABELS[name]}刷新失败`)
+    }
     if (rethrow) throw error
   } finally {
     inFlight.delete(name)

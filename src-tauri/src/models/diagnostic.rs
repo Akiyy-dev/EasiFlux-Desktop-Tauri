@@ -13,6 +13,7 @@ pub struct ProbeEndpointResult {
     pub parsed_count: u32,
     pub first_item_keys: Vec<String>,
     pub error: Option<String>,
+    pub notification_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

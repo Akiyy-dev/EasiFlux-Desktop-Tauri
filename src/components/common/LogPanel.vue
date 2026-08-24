@@ -26,6 +26,9 @@ async function runProbe(): Promise<void> {
   probing.value = true
   try {
     const result = await tauriInvoke<ProbePrivateEndpointsResult>('probe_private_endpoints')
+    if (result.endpoints.some((endpoint) => endpoint.notificationId)) {
+      return
+    }
     logStore.addEntry({
       level: 'info',
       message: `接口诊断: 余额=${result.balanceCount} (${result.balancesOk ? 'ok' : 'fail'})`,

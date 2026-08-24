@@ -1,3 +1,5 @@
+import { decodeCommandError } from './notificationService'
+
 export type AccountReconciliationStep =
   | 'config'
   | 'profiles'
@@ -35,7 +37,9 @@ export async function collectReconciliationFailures(
 ): Promise<AccountReconciliationStep[]> {
   const results = await Promise.allSettled(tasks.map(({ run }) => run()))
   return normalizeReconciliationSteps(results.flatMap((result, index) =>
-    result.status === 'rejected' ? [tasks[index].step] : [],
+    result.status === 'rejected' && !decodeCommandError(result.reason).notificationId
+      ? [tasks[index].step]
+      : [],
   ))
 }
 

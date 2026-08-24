@@ -450,8 +450,15 @@ impl TradingService {
 }
 
 fn deliver_notified_placement<T>(emitter: &EventEmitter, result: AppResult<T>) -> AppResult<T> {
-    if let Err(AppError::Notified { code, .. }) = &result {
-        emitter.emit_diagnostic(&format!("NOTIFIED_PLACEMENT_FAILURE:{code}"), false);
+    if let Err(AppError::Notified {
+        code,
+        notification_id,
+        ..
+    }) = &result
+    {
+        if *code != "AUTH_SESSION_EXPIRED" || notification_id.trim().is_empty() {
+            emitter.emit_diagnostic(&format!("NOTIFIED_PLACEMENT_FAILURE:{code}"), false);
+        }
     }
     result
 }

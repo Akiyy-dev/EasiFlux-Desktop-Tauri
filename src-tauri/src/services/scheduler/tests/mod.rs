@@ -197,7 +197,7 @@ async fn bootstrap_runs_every_applicable_task_and_collects_failures() {
     assert_eq!(*visited.lock().unwrap(), tasks);
     assert_eq!(failed, vec![TaskId::TimeSync, TaskId::Environment]);
 
-    let visible = bootstrap_failure_error(&failed).to_string();
+    let visible = aggregate_bootstrap_failure_error(&failed).to_string();
     assert!(visible.contains("时间同步"));
     assert!(visible.contains("环境检测"));
     assert!(!visible.contains("raw-key"));
@@ -279,6 +279,75 @@ fn reconciliation_bootstrap_suppresses_child_delivery_while_background_keeps_it(
     assert_eq!(events[1].0, "error:occurred");
     assert_eq!(events[0].1["eventId"], events[1].1["eventId"]);
     assert!(!events[0].1.to_string().contains("raw-secret"));
+}
+
+#[test]
+fn direct_bootstrap_preserves_session_ownership_and_excludes_it_from_mixed_failures() {
+    let session = AppError::Notified {
+        code: "AUTH_SESSION_EXPIRED",
+        message: "账户会话已失效",
+        notification_id: "committed-session-id".into(),
+        cause: Some(crate::error::NotificationCause::AuthFailure(
+            crate::api::response::AuthFailureKind::SessionExpired,
+        )),
+    };
+    let session_only = vec![(TaskId::Balances, session.clone())];
+    let sink = Arc::new(StdMutex::new(Vec::new()));
+    let emitter = EventEmitter::new_test(Arc::clone(&sink));
+
+    emit_bootstrap_failure_diagnostics(
+        &emitter,
+        BootstrapDeliveryOwnership::Background,
+        &session_only,
+    );
+    assert!(sink.lock().unwrap().is_empty());
+    assert!(matches!(
+        bootstrap_failure_error(&session_only),
+        AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            notification_id,
+            ..
+        } if notification_id == "committed-session-id"
+    ));
+
+    let mixed = vec![
+        (TaskId::Balances, session),
+        (
+            TaskId::Environment,
+            AppError::Connection("ordinary environment failure".into()),
+        ),
+    ];
+    let mixed_error = bootstrap_failure_error(&mixed);
+    let visible = mixed_error.user_message();
+    assert!(matches!(mixed_error, AppError::Connection(_)));
+    assert!(visible.contains("环境检测"));
+    assert!(!visible.contains("账户资产"));
+    assert!(!visible.contains("AUTH_SESSION_EXPIRED"));
+}
+
+#[test]
+fn detached_bootstrap_does_not_log_an_owned_session_failure_again() {
+    let delivered = Arc::new(StdMutex::new(Vec::new()));
+    let session = AppError::Notified {
+        code: "AUTH_SESSION_EXPIRED",
+        message: "账户会话已失效",
+        notification_id: "committed-session-id".into(),
+        cause: Some(crate::error::NotificationCause::AuthFailure(
+            crate::api::response::AuthFailureKind::SessionExpired,
+        )),
+    };
+
+    deliver_detached_bootstrap_failure(&session, {
+        let delivered = Arc::clone(&delivered);
+        move |message| delivered.lock().unwrap().push(message)
+    });
+    assert!(delivered.lock().unwrap().is_empty());
+
+    deliver_detached_bootstrap_failure(&AppError::Connection("ordinary".into()), {
+        let delivered = Arc::clone(&delivered);
+        move |message| delivered.lock().unwrap().push(message)
+    });
+    assert_eq!(delivered.lock().unwrap().as_slice(), ["连接错误: ordinary"]);
 }
 
 #[tokio::test]
@@ -392,7 +461,7 @@ async fn bootstrap_collects_failures_from_status_semantics() {
     .await;
 
     assert_eq!(failed, vec![TaskId::TimeSync, TaskId::Environment]);
-    let visible = bootstrap_failure_error(&failed).to_string();
+    let visible = aggregate_bootstrap_failure_error(&failed).to_string();
     assert!(!visible.contains("raw time failure"));
     assert!(!visible.contains("raw environment failure"));
 }

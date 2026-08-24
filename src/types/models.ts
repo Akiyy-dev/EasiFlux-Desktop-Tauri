@@ -347,6 +347,7 @@ export interface ProbeEndpointResult {
   parsedCount: number
   firstItemKeys: string[]
   error?: string
+  notificationId?: string
 }
 
 export interface ProbePrivateEndpointsResult {
