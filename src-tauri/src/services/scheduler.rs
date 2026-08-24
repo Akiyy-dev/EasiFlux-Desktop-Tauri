@@ -19,7 +19,7 @@ use crate::models::config::{
     DEFAULT_BASE_URL, MAX_TICKER_POLL_INTERVAL_SECS, MIN_TICKER_POLL_INTERVAL_SECS,
 };
 use crate::models::time::{TimeSnapshot, TimeSyncStatus};
-use crate::models::trading::PrivatePanelsSnapshot;
+use crate::models::trading::{OrderStreamContext, PrivatePanelsSnapshot};
 #[cfg(test)]
 use crate::services::market::run_generation_owned_kline_storage;
 use crate::services::notification::NotificationRuntime;
@@ -3334,8 +3334,23 @@ impl SchedulerService {
             || async {
                 let symbol = self.market.active_symbol().await;
                 let sym = Some(symbol.as_str());
-                let open_orders = self.trading.fetch_open_orders(sym).await?;
-                let order_history = self.trading.fetch_order_history(sym, Some(50)).await?;
+                let context = OrderStreamContext {
+                    account_id: normalize_account_id(&self.config.read().await.active_account_id),
+                    session_epoch: self.account_lifecycle.current_session_epoch(),
+                };
+                let open_orders = self.trading.fetch_open_orders_unobserved(sym).await?;
+                let order_history = self
+                    .trading
+                    .fetch_order_history_unobserved(sym, Some(50))
+                    .await?;
+                let order_snapshots = open_orders
+                    .iter()
+                    .chain(&order_history)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.ws
+                    .seed_order_snapshots_and_mark(&context, &order_snapshots)
+                    .await;
                 let params = build_order_query_params(
                     sym, None, None, None, None, None, None, None, None, None,
                 );
@@ -3514,8 +3529,23 @@ impl SchedulerRefs {
             || async {
                 let symbol = self.market.active_symbol().await;
                 let sym = Some(symbol.as_str());
-                let open_orders = self.trading.fetch_open_orders(sym).await?;
-                let order_history = self.trading.fetch_order_history(sym, Some(50)).await?;
+                let context = OrderStreamContext {
+                    account_id: normalize_account_id(&self.config.read().await.active_account_id),
+                    session_epoch: self.account_lifecycle.current_session_epoch(),
+                };
+                let open_orders = self.trading.fetch_open_orders_unobserved(sym).await?;
+                let order_history = self
+                    .trading
+                    .fetch_order_history_unobserved(sym, Some(50))
+                    .await?;
+                let order_snapshots = open_orders
+                    .iter()
+                    .chain(&order_history)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.ws
+                    .seed_order_snapshots_and_mark(&context, &order_snapshots)
+                    .await;
                 let params = build_order_query_params(
                     sym, None, None, None, None, None, None, None, None, None,
                 );

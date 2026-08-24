@@ -12,6 +12,7 @@ use crate::auth::{Signer, TimeSync};
 use crate::error::{AppError, AppResult};
 use crate::models::config::{ApiCredential, DEFAULT_BASE_URL, RECV_WINDOW_MS};
 
+use super::endpoints;
 use super::response::{error_message, is_sign_error, is_success_response, is_timestamp_error};
 
 /// Ordered query pairs for private GET signing (SDK insertion order).
@@ -109,7 +110,7 @@ impl ApiClient {
     ) -> AppResult<Value> {
         let url = format!("{}{}", self.base_url().await, path);
         let response = self.http.get(&url).query(&params).send().await?;
-        self.parse_response(response).await
+        self.parse_response(response, None).await
     }
 
     pub async fn private_get(&self, path: &str, params: QueryParams) -> AppResult<Value> {
@@ -138,7 +139,7 @@ impl ApiClient {
             req = req.header(k, v);
         }
         let response = req.send().await?;
-        self.parse_response(response).await
+        self.parse_response(response, None).await
     }
 
     pub async fn private_post(&self, path: &str, body: Value) -> AppResult<Value> {
@@ -166,7 +167,7 @@ impl ApiClient {
             req = req.header(k, v);
         }
         let response = req.body(body_text).send().await?;
-        self.parse_response(response).await
+        self.parse_response(response, Some(path)).await
     }
 
     async fn ensure_time_sync(&self) -> AppResult<()> {
@@ -191,7 +192,11 @@ impl ApiClient {
         Ok(signer.prepare_headers(self.time_sync.timestamp_ms(), RECV_WINDOW_MS, payload))
     }
 
-    async fn parse_response(&self, response: reqwest::Response) -> AppResult<Value> {
+    async fn parse_response(
+        &self,
+        response: reqwest::Response,
+        path: Option<&str>,
+    ) -> AppResult<Value> {
         let status = response.status();
         let text = response.text().await?;
         if text.is_empty() {
@@ -200,25 +205,30 @@ impl ApiClient {
             }
             return Err(AppError::Connection(format!("HTTP {}", status)));
         }
-        let payload: Value =
-            serde_json::from_str(&text).map_err(|e| AppError::Connection(e.to_string()))?;
-        if !status.is_success() {
-            return Err(AppError::Connection(
-                error_message(&payload).unwrap_or_else(|| format!("HTTP {}", status)),
+        let payload: Value = serde_json::from_str(&text)
+            .map_err(|_| AppError::Connection("API 响应格式无效".into()))?;
+        if status.is_success()
+            && path == Some(endpoints::CREATE_ORDER)
+            && super::response::classify_create_order_failure(&payload).is_some()
+        {
+            return Err(AppError::TradingFailure(
+                crate::models::trading::TradingFailure::rejected(),
             ));
+        }
+        if !status.is_success() {
+            return Err(AppError::Connection(format!("HTTP {}", status)));
         }
         if !is_success_response(&payload) {
             let msg = error_message(&payload).unwrap_or_else(|| "API 返回错误".into());
             if is_timestamp_error(&payload) {
-                return Err(AppError::Trading(format!("timestamp: {}", msg)));
+                return Err(AppError::Trading("timestamp: 请求时间校验失败".into()));
             }
             if is_sign_error(&payload) || is_sign_error_message(&msg) {
-                return Err(AppError::Trading(format!(
-                    "sign: {}（请重新保存 API Secret）",
-                    msg
-                )));
+                return Err(AppError::Trading(
+                    "sign: 签名校验失败（请重新保存 API Secret）".into(),
+                ));
             }
-            return Err(AppError::Trading(msg));
+            return Err(AppError::Trading("API 返回错误".into()));
         }
         Ok(payload)
     }
@@ -233,6 +243,7 @@ fn should_retry_private_request(error: &AppError) -> bool {
                 || msg.contains("error sign")
         }
         AppError::Connection(msg) => msg.contains("timestamp") || msg.contains("recv_window"),
+        AppError::TradingFailure(_) => false,
         _ => false,
     }
 }
@@ -262,6 +273,72 @@ mod tests {
     use super::*;
     use crate::auth::Signer;
     use crate::models::config::RECV_WINDOW_MS;
+
+    async fn public_get_from_raw_response(response: String) -> AppError {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept test request");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).expect("read test request");
+            socket
+                .write_all(response.as_bytes())
+                .expect("write test response");
+        });
+        let client = ApiClient::new();
+        client.set_base_url(&format!("http://{address}")).await;
+
+        let error = client
+            .public_get("/test", HashMap::new())
+            .await
+            .expect_err("response must fail");
+        server.join().expect("test server should exit");
+        error
+    }
+
+    fn raw_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn provider_and_transport_details_are_not_exposed_to_command_callers() {
+        const PRIVATE: &str = "provider-secret-quantity=999";
+        let cases = [
+            raw_response(
+                "200 OK",
+                &format!(r#"{{"code":7001,"message":"{PRIVATE}"}}"#),
+            ),
+            raw_response("400 Bad Request", &format!(r#"{{"message":"{PRIVATE}"}}"#)),
+            raw_response(
+                "200 OK",
+                &format!(r#"{{"code":7002,"message":"timestamp {PRIVATE}"}}"#),
+            ),
+            raw_response(
+                "200 OK",
+                &format!(r#"{{"code":7003,"message":"invalid signature {PRIVATE}"}}"#),
+            ),
+            raw_response("200 OK", PRIVATE),
+        ];
+
+        for response in cases {
+            let error = public_get_from_raw_response(response).await;
+            for rendered in [error.to_string(), serde_json::to_string(&error).unwrap()] {
+                assert!(
+                    !rendered.contains(PRIVATE),
+                    "leaked provider detail: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("127.0.0.1"),
+                    "leaked request URL: {rendered}"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn set_base_url_normalizes_public_request_target() {

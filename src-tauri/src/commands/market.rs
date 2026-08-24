@@ -4,8 +4,9 @@ use tauri::State;
 use crate::api::PublicApi;
 use crate::error::{AppError, AppResult};
 use crate::models::chart_workspace::ChartWorkspaceKey;
-use crate::models::config::ConnectionStatus;
+use crate::models::config::{normalize_account_id, ConnectionStatus};
 use crate::models::market::{Depth, Kline, Ticker};
+use crate::models::trading::OrderStreamContext;
 use crate::services::account_profiles::run_account_public_operation;
 use crate::state::AppState;
 
@@ -143,6 +144,7 @@ async fn schedule_chart_context_refresh(
             let account = state.account.clone();
             let emitter = state.emitter.clone();
             let account_lifecycle = state.account_lifecycle.clone();
+            let config = state.config.clone();
             tauri::async_runtime::spawn(async move {
                 run_account_public_operation(account_lifecycle.as_ref(), || async {
                     if let Err(error) = market.backfill_gaps(&key.symbol, &key.interval).await {
@@ -154,7 +156,11 @@ async fn schedule_chart_context_refresh(
                     if let Err(error) = market.refresh_snapshot(&key.symbol).await {
                         emitter.emit_error(&format!("行情快照失败: {error}"));
                     }
-                    if let Err(error) = trading.refresh_orders(None).await {
+                    let context = OrderStreamContext {
+                        account_id: normalize_account_id(&config.read().await.active_account_id),
+                        session_epoch: account_lifecycle.current_session_epoch(),
+                    };
+                    if let Err(error) = trading.refresh_orders(&context, None).await {
                         emitter.emit_error(&format!("订单刷新失败: {error}"));
                     }
                     if let Err(error) = account.refresh_positions(None).await {

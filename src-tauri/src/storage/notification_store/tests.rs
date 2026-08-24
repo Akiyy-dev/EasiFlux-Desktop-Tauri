@@ -11,8 +11,9 @@ use super::{
 };
 use crate::error::AppError;
 use crate::models::notification::{
-    NotificationCategory, NotificationContent, NotificationKind, NotificationRecord,
-    NotificationScalar, NotificationScope, NotificationSeverity, MAX_JAVASCRIPT_SAFE_INTEGER,
+    NotificationAction, NotificationCategory, NotificationContent, NotificationEntity,
+    NotificationEntityType, NotificationKind, NotificationRecord, NotificationScalar,
+    NotificationScope, NotificationSeverity, MAX_JAVASCRIPT_SAFE_INTEGER,
 };
 
 static TEST_ROOT_ID: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +36,30 @@ fn cleanup(root: &Path) {
 }
 
 fn sample_record(id: &str, scope: NotificationScope, created_at_ms: u64) -> NotificationRecord {
+    if scope == NotificationScope::Global {
+        return NotificationRecord {
+            id: id.into(),
+            scope,
+            category: NotificationCategory::ConnectionSystem,
+            kind: NotificationKind::ConnectionUnavailable,
+            severity: NotificationSeverity::Warning,
+            content: NotificationContent::new(
+                "connection.unavailable",
+                [("channel", NotificationScalar::String("api".into()))],
+                "连接不可用",
+                "交易连接暂时不可用，请检查网络或稍后重试。",
+            )
+            .unwrap(),
+            entity: None,
+            action: Some(NotificationAction::OpenGeneralSettings),
+            source_event_id: Some(format!("event-{created_at_ms}")),
+            dedupe_key: format!("connection-unavailable-{created_at_ms}"),
+            occurrence_count: 1,
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+            read_at_ms: None,
+        };
+    }
     NotificationRecord {
         id: id.into(),
         scope,
@@ -48,8 +73,13 @@ fn sample_record(id: &str, scope: NotificationScope, created_at_ms: u64) -> Noti
             "订单已完全成交，请前往交易页查看。",
         )
         .unwrap(),
-        entity: None,
-        action: None,
+        entity: Some(NotificationEntity {
+            entity_type: NotificationEntityType::Order,
+            id: "order-42".into(),
+        }),
+        action: Some(NotificationAction::OpenTrading {
+            order_id: Some("order-42".into()),
+        }),
         source_event_id: Some(format!("event-{created_at_ms}")),
         dedupe_key: format!("order-filled-{created_at_ms}"),
         occurrence_count: 1,
@@ -466,7 +496,13 @@ fn invalid_timestamps_scalars_and_enums_are_rejected() {
     invalid_scalar.partitions[0].items[0].kind = NotificationKind::RiskOrderBlocked;
     invalid_scalar.partitions[0].items[0].content = NotificationContent::new(
         "risk.orderBlocked",
-        [("limit", NotificationScalar::Number(1.0))],
+        [
+            (
+                "violationCode",
+                NotificationScalar::String("maxOrderQty".into()),
+            ),
+            ("limit", NotificationScalar::Number(1.0)),
+        ],
         "订单被风控拦截",
         "请检查风控设置",
     )
@@ -693,10 +729,8 @@ fn content_map_round_trip_is_not_reordered_or_dropped() {
     let root = test_root("content-map");
     let store = NotificationStore::with_path(store_path(&root));
     let mut file = sample_file(5);
-    file.partitions[0].items[0].content.params = BTreeMap::from([(
-        "orderId".into(),
-        NotificationScalar::String("order-42".into()),
-    )]);
+    file.partitions[0].items[0].content.params =
+        BTreeMap::from([("channel".into(), NotificationScalar::String("api".into()))]);
 
     store.save(&file).unwrap();
 

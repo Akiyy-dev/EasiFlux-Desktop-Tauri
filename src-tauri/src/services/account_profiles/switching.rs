@@ -45,6 +45,7 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
     target_config.accounts = accounts;
     if let Err(primary) = port.persist_config(&target_config) {
         return Err(rollback_switch(
+            coordinator,
             port,
             &former_config,
             former_status,
@@ -57,8 +58,17 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
 
     if former_status == ConnectionStatus::Connected {
         let realtime = start_realtime.unwrap_or(former_config.use_websocket);
-        if let Err(primary) = port.connect(&target_id, realtime, target_credential).await {
+        if let Err(primary) = port
+            .connect(
+                &target_id,
+                realtime,
+                target_credential,
+                coordinator.next_session_epoch(),
+            )
+            .await
+        {
             return Err(rollback_switch(
+                coordinator,
                 port,
                 &former_config,
                 former_status,
@@ -80,6 +90,7 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
 }
 
 async fn rollback_switch<P: AccountLifecyclePort>(
+    coordinator: &AccountLifecycleCoordinator,
     port: &P,
     former_config: &AppConfig,
     former_status: ConnectionStatus,
@@ -98,6 +109,7 @@ async fn rollback_switch<P: AccountLifecyclePort>(
                     &normalize_account_id(&former_config.active_account_id),
                     former_config.use_websocket,
                     credential,
+                    coordinator.current_session_epoch(),
                 )
                 .await
             {

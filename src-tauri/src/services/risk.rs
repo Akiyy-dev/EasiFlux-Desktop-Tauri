@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use crate::error::{AppError, AppResult};
 use crate::models::config::RiskConfig;
+use crate::models::risk::{RiskViolation, RiskViolationCode};
 use crate::models::trading::PlaceOrderRequest;
 use crate::services::time::{resolve_trading_day_timezone, trading_day_key};
 use crate::storage::{RiskUsage, RiskUsageStore};
@@ -95,7 +96,7 @@ impl RiskService {
         request: &PlaceOrderRequest,
         reference_price: Option<&str>,
         now_ms: u64,
-    ) -> AppResult<RiskReservation> {
+    ) -> Result<RiskReservation, RiskViolation> {
         if !self.config.enabled {
             return Ok(RiskReservation::not_counted());
         }
@@ -107,9 +108,9 @@ impl RiskService {
         let mut state = self
             .usage
             .lock()
-            .map_err(|_| AppError::Storage("风控用量锁已损坏".into()))?;
+            .map_err(|_| RiskViolation::new(RiskViolationCode::LedgerUnavailable))?;
         if state.load_error.is_some() {
-            return Err(AppError::Storage(LEDGER_UNAVAILABLE_MESSAGE.into()));
+            return Err(RiskViolation::new(RiskViolationCode::LedgerUnavailable));
         }
 
         let mut next = match state.usage.as_ref() {
@@ -126,15 +127,17 @@ impl RiskService {
         };
 
         if next.occupied_orders >= self.config.max_daily_orders {
-            return Err(AppError::Risk(format!(
-                "今日下单次数已达上限 {}",
-                self.config.max_daily_orders
-            )));
+            return Err(RiskViolation::with_limit(
+                RiskViolationCode::DailyOrderLimit,
+                f64::from(self.config.max_daily_orders),
+            ));
         }
 
         next.occupied_orders += 1;
         next.updated_at_ms = now_ms;
-        self.store.save(&next)?;
+        self.store
+            .save(&next)
+            .map_err(|_| RiskViolation::new(RiskViolationCode::LedgerUnavailable))?;
         state.usage = Some(next);
 
         Ok(RiskReservation::counted(trading_day, timezone))

@@ -119,9 +119,11 @@ fn enabling_after_disabled_reloads_and_keeps_fail_closed_behavior() {
     let error = service
         .reserve_order(&market_order("1"), None, SHANGHAI_NOON)
         .unwrap_err();
-    let AppError::Storage(message) = error else {
-        panic!("expected fail-closed storage error")
-    };
+    assert_eq!(
+        error.code,
+        crate::models::risk::RiskViolationCode::LedgerUnavailable
+    );
+    let message = AppError::from(error).user_message();
     assert!(!message.contains(path.to_string_lossy().as_ref()));
     assert!(!message.contains("toml"));
     cleanup_test_files(&path);

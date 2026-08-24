@@ -13,7 +13,11 @@ use crate::auth::Signer;
 use crate::auth::TimeSync;
 use crate::error::AppResult;
 use crate::events::EventEmitter;
-use crate::services::MarketService;
+use crate::models::config::normalize_account_id;
+use crate::models::config::AppConfig;
+use crate::models::trading::{Order, OrderStreamContext};
+use crate::services::trading::OrderNotificationObserver;
+use crate::services::{AccountLifecycleCoordinator, MarketService};
 
 use super::messages::{
     build_auth_message, build_ping_message, build_subscribe_message, default_auth_expires_ms,
@@ -156,6 +160,41 @@ struct Subscription {
     private: bool,
 }
 
+#[derive(Default)]
+struct OrderObservationBuffer {
+    context: Option<OrderStreamContext>,
+    snapshot_seeded: bool,
+    pending: Vec<Order>,
+}
+
+impl OrderObservationBuffer {
+    fn reset(&mut self, context: OrderStreamContext) {
+        self.context = Some(context);
+        self.snapshot_seeded = false;
+        self.pending.clear();
+    }
+
+    fn matches(&self, context: &OrderStreamContext) -> bool {
+        self.context.as_ref() == Some(context)
+    }
+
+    fn defer(&mut self, context: &OrderStreamContext, orders: Vec<Order>) -> bool {
+        if !self.matches(context) || self.snapshot_seeded {
+            return false;
+        }
+        self.pending.extend(orders);
+        true
+    }
+
+    fn mark_seeded(&mut self, context: &OrderStreamContext) -> Option<Vec<Order>> {
+        if !self.matches(context) {
+            return None;
+        }
+        self.snapshot_seeded = true;
+        Some(std::mem::take(&mut self.pending))
+    }
+}
+
 pub struct WsManager {
     ws_public_url: Arc<RwLock<String>>,
     ws_private_url: Arc<RwLock<String>>,
@@ -171,10 +210,21 @@ pub struct WsManager {
     public_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     private_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     freshness: Arc<WsFreshness>,
+    notification_observer: OrderNotificationObserver,
+    config: Arc<RwLock<AppConfig>>,
+    account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    order_observation_buffer: Arc<Mutex<OrderObservationBuffer>>,
+    order_snapshot_seeded: Arc<AtomicBool>,
 }
 
 impl WsManager {
-    pub fn new(emitter: EventEmitter, time_sync: Arc<TimeSync>) -> Self {
+    pub fn new(
+        emitter: EventEmitter,
+        time_sync: Arc<TimeSync>,
+        notification_observer: OrderNotificationObserver,
+        config: Arc<RwLock<AppConfig>>,
+        account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    ) -> Self {
         Self {
             ws_public_url: Arc::new(RwLock::new(WS_PUBLIC.to_string())),
             ws_private_url: Arc::new(RwLock::new(WS_PRIVATE.to_string())),
@@ -190,6 +240,11 @@ impl WsManager {
             public_task: Arc::new(Mutex::new(None)),
             private_task: Arc::new(Mutex::new(None)),
             freshness: Arc::new(WsFreshness::default()),
+            notification_observer,
+            config,
+            account_lifecycle,
+            order_observation_buffer: Arc::new(Mutex::new(OrderObservationBuffer::default())),
+            order_snapshot_seeded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -233,7 +288,8 @@ impl WsManager {
     }
 
     pub fn is_private_panels_healthy(&self, stale_ms: u64) -> bool {
-        self.is_private_connected()
+        self.order_snapshot_seeded.load(Ordering::Acquire)
+            && self.is_private_connected()
             && self
                 .freshness
                 .is_private_panels_fresh_at(self.time_sync.local_timestamp_ms(), stale_ms)
@@ -262,8 +318,13 @@ impl WsManager {
         }
     }
 
-    pub async fn start(&self, symbol: &str) -> AppResult<()> {
+    pub async fn start(&self, symbol: &str, context: OrderStreamContext) -> AppResult<()> {
         self.stop().await;
+        self.order_observation_buffer
+            .lock()
+            .await
+            .reset(context.clone());
+        self.order_snapshot_seeded.store(false, Ordering::Release);
         *self.active_symbol.write().await = symbol.to_string();
         self.running.store(true, Ordering::Relaxed);
         self.emitter.emit_websocket("connecting");
@@ -283,6 +344,10 @@ impl WsManager {
         let private_connected = self.private_connected.clone();
         let subscriptions = self.subscriptions.clone();
         let freshness = self.freshness.clone();
+        let notification_observer = self.notification_observer.clone();
+        let config = self.config.clone();
+        let account_lifecycle = self.account_lifecycle.clone();
+        let order_observation_buffer = self.order_observation_buffer.clone();
 
         if !public_topics.is_empty() {
             let emitter_p = emitter.clone();
@@ -317,6 +382,11 @@ impl WsManager {
                 let sym = symbol_owned.clone();
                 let subs = subscriptions.clone();
                 let session_freshness = freshness.clone();
+                let observer = notification_observer.clone();
+                let session_config = config.clone();
+                let lifecycle = account_lifecycle.clone();
+                let observation_buffer = order_observation_buffer.clone();
+                let stream_context = context.clone();
                 let handle = tauri::async_runtime::spawn(async move {
                     run_private_loop(
                         ws_private,
@@ -329,6 +399,11 @@ impl WsManager {
                         running_pr,
                         prc,
                         session_freshness,
+                        observer,
+                        session_config,
+                        lifecycle,
+                        stream_context,
+                        observation_buffer,
                     )
                     .await;
                 });
@@ -337,6 +412,29 @@ impl WsManager {
         }
 
         Ok(())
+    }
+
+    /// Opens the live-order gate after the caller has seeded REST snapshots
+    /// while holding the account lifecycle read guard.
+    pub(crate) async fn seed_order_snapshots_and_mark(
+        &self,
+        context: &OrderStreamContext,
+        snapshots: &[Order],
+    ) {
+        let active_account_id = normalize_account_id(&self.config.read().await.active_account_id);
+        if self.account_lifecycle.current_session_epoch() != context.session_epoch
+            || active_account_id != context.account_id
+        {
+            return;
+        }
+        let mut buffer = self.order_observation_buffer.lock().await;
+        let Some(pending) = buffer.mark_seeded(context) else {
+            return;
+        };
+        self.notification_observer
+            .seed_snapshot_then_replay(context, snapshots, pending, local_timestamp_ms())
+            .await;
+        self.order_snapshot_seeded.store(true, Ordering::Release);
     }
 
     pub async fn stop(&self) {
@@ -410,6 +508,11 @@ async fn run_private_loop(
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     freshness: Arc<WsFreshness>,
+    notification_observer: OrderNotificationObserver,
+    config: Arc<RwLock<AppConfig>>,
+    account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    context: OrderStreamContext,
+    order_observation_buffer: Arc<Mutex<OrderObservationBuffer>>,
 ) {
     while running.load(Ordering::Relaxed) {
         let topics = topic_snapshot(&subscriptions, true).await;
@@ -428,6 +531,11 @@ async fn run_private_loop(
             &running,
             &connected,
             &freshness,
+            &notification_observer,
+            &config,
+            &account_lifecycle,
+            &context,
+            &order_observation_buffer,
         )
         .await
         {
@@ -618,6 +726,11 @@ async fn run_private_session(
     running: &Arc<AtomicBool>,
     connected: &Arc<AtomicBool>,
     freshness: &Arc<WsFreshness>,
+    notification_observer: &OrderNotificationObserver,
+    config: &Arc<RwLock<AppConfig>>,
+    account_lifecycle: &Arc<AccountLifecycleCoordinator>,
+    context: &OrderStreamContext,
+    order_observation_buffer: &Arc<Mutex<OrderObservationBuffer>>,
 ) -> Result<(), String> {
     let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
     let (mut write, mut read) = stream.split();
@@ -649,6 +762,15 @@ async fn run_private_session(
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
                             handle_message(&value, symbol, emitter, market, Some(freshness));
+                            observe_private_orders(
+                                &value,
+                                notification_observer,
+                                config,
+                                account_lifecycle,
+                                context,
+                                order_observation_buffer,
+                            )
+                            .await;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return Err("连接已关闭".into()),
@@ -657,6 +779,66 @@ async fn run_private_session(
                 }
             }
         }
+    }
+}
+
+async fn observe_private_orders(
+    message: &Value,
+    observer: &OrderNotificationObserver,
+    config: &Arc<RwLock<AppConfig>>,
+    account_lifecycle: &Arc<AccountLifecycleCoordinator>,
+    context: &OrderStreamContext,
+    order_observation_buffer: &Arc<Mutex<OrderObservationBuffer>>,
+) {
+    let topic = message
+        .get("topic")
+        .or_else(|| message.get("channel"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if super::topics::event_name_for_topic(topic) != "order" {
+        return;
+    }
+    let data = message.get("data").unwrap_or(message);
+    let orders = if let Some(items) = data.as_array() {
+        items.iter().map(parse_order).collect::<Vec<_>>()
+    } else if data.is_object() {
+        vec![parse_order(data)]
+    } else {
+        Vec::new()
+    };
+    if orders.is_empty() {
+        return;
+    }
+
+    // Lock order is lifecycle -> config -> live buffer -> notification. The
+    // scheduler holds the same lifecycle read guard while seeding and opening
+    // the buffer, so a pending account switch cannot invert these locks.
+    let _lifecycle_guard = account_lifecycle.read_guard().await;
+    let active_account_id = normalize_account_id(&config.read().await.active_account_id);
+    if account_lifecycle.current_session_epoch() != context.session_epoch
+        || active_account_id != context.account_id
+    {
+        return;
+    }
+    let mut buffer = order_observation_buffer.lock().await;
+    if !buffer.matches(context) {
+        return;
+    }
+    if !buffer.snapshot_seeded {
+        let _ = buffer.defer(context, orders);
+        return;
+    }
+    for order in orders {
+        observer
+            .observe(
+                &context.account_id,
+                context.session_epoch,
+                &order,
+                crate::services::notification::OrderObservationOrigin::Realtime,
+                None,
+                local_timestamp_ms(),
+            )
+            .await;
     }
 }
 
@@ -805,8 +987,65 @@ mod tests {
     use super::{
         abort_and_wait_for_tasks, abort_wait_and_reset_freshness, authenticate_and_subscribe,
         await_private_auth_response, record_message_freshness, validate_private_auth_ack,
-        FreshnessDomain, WsFreshness, PRIVATE_AUTH_ERROR, PRIVATE_SUBSCRIPTION_ERROR,
+        FreshnessDomain, OrderObservationBuffer, WsFreshness, PRIVATE_AUTH_ERROR,
+        PRIVATE_SUBSCRIPTION_ERROR,
     };
+    use crate::models::trading::{Order, OrderStatus, OrderStreamContext};
+
+    fn buffered_order(id: &str, status: OrderStatus) -> Order {
+        Order {
+            order_id: id.into(),
+            symbol: "BTCUSDT".into(),
+            side: "Buy".into(),
+            order_type: "Limit".into(),
+            price: "100".into(),
+            qty: "1".into(),
+            status,
+            order_link_id: None,
+            filled_qty: "0".into(),
+            avg_price: "0".into(),
+        }
+    }
+
+    #[test]
+    fn live_order_buffer_preserves_frame_order_until_matching_snapshot_is_seeded() {
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let wrong = OrderStreamContext {
+            account_id: "beta".into(),
+            session_epoch: 7,
+        };
+        let mut buffer = OrderObservationBuffer::default();
+        buffer.reset(context.clone());
+        assert!(buffer.defer(
+            &context,
+            vec![
+                buffered_order("order-buffer-1", OrderStatus::New),
+                buffered_order("order-buffer-1", OrderStatus::PartiallyFilled),
+                buffered_order("order-buffer-1", OrderStatus::Filled),
+            ],
+        ));
+        assert!(buffer.mark_seeded(&wrong).is_none());
+
+        let pending = buffer.mark_seeded(&context).unwrap();
+        assert_eq!(
+            pending
+                .into_iter()
+                .map(|order| order.status)
+                .collect::<Vec<_>>(),
+            vec![
+                OrderStatus::New,
+                OrderStatus::PartiallyFilled,
+                OrderStatus::Filled,
+            ]
+        );
+        assert!(!buffer.defer(
+            &context,
+            vec![buffered_order("order-buffer-2", OrderStatus::New)]
+        ));
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 

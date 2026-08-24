@@ -7,6 +7,8 @@ use tauri::State;
 
 use crate::api::PrivateApi;
 use crate::error::AppResult;
+use crate::models::config::normalize_account_id;
+use crate::models::trading::OrderStreamContext;
 use crate::models::trading::{Order, PrivatePanelsSnapshot};
 use crate::services::account_profiles::run_account_private_operation;
 use crate::state::AppState;
@@ -16,8 +18,15 @@ pub async fn refresh_orders(
     state: State<'_, AppState>,
     symbol: Option<String>,
 ) -> AppResult<Vec<Order>> {
-    run_account_private_operation(state.account_lifecycle.as_ref(), || {
-        state.trading.refresh_orders(symbol.as_deref())
+    run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        let context = OrderStreamContext {
+            account_id: normalize_account_id(&state.config.read().await.active_account_id),
+            session_epoch: state.account_lifecycle.current_session_epoch(),
+        };
+        state
+            .trading
+            .refresh_orders(&context, symbol.as_deref())
+            .await
     })
     .await
 }
@@ -29,9 +38,13 @@ pub async fn refresh_order_history(
     limit: Option<u32>,
 ) -> AppResult<Vec<Order>> {
     run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        let context = OrderStreamContext {
+            account_id: normalize_account_id(&state.config.read().await.active_account_id),
+            session_epoch: state.account_lifecycle.current_session_epoch(),
+        };
         let orders = state
             .trading
-            .refresh_order_history(symbol.as_deref(), limit)
+            .refresh_order_history(&context, symbol.as_deref(), limit)
             .await?;
         for order in &orders {
             state.analytics.record_order(order.clone()).await;
@@ -47,9 +60,16 @@ pub async fn refresh_private_panels(
     symbol: Option<String>,
 ) -> AppResult<PrivatePanelsSnapshot> {
     run_account_private_operation(state.account_lifecycle.as_ref(), || async {
+        let context = OrderStreamContext {
+            account_id: normalize_account_id(&state.config.read().await.active_account_id),
+            session_epoch: state.account_lifecycle.current_session_epoch(),
+        };
         let sym = symbol.as_deref();
-        let open_orders = state.trading.refresh_orders(sym).await?;
-        let order_history = state.trading.refresh_order_history(sym, Some(50)).await?;
+        let open_orders = state.trading.refresh_orders(&context, sym).await?;
+        let order_history = state
+            .trading
+            .refresh_order_history(&context, sym, Some(50))
+            .await?;
         let positions = state.account.refresh_positions(sym).await?;
         for order in &order_history {
             state.analytics.record_order(order.clone()).await;

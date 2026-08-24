@@ -29,6 +29,7 @@ pub(crate) trait AccountLifecyclePort: Send + Sync {
         account_id: &str,
         realtime: bool,
         credential: ApiCredential,
+        session_epoch: u64,
     ) -> AppResult<()>;
     async fn activate_public_environment(&self, credential: &ApiCredential);
     async fn clear_account_data(&self);
@@ -59,6 +60,10 @@ impl AccountLifecycleCoordinator {
 
     pub fn current_session_epoch(&self) -> u64 {
         self.session_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn next_session_epoch(&self) -> u64 {
+        self.current_session_epoch().saturating_add(1)
     }
 
     pub(crate) fn advance_session_epoch(&self) -> u64 {

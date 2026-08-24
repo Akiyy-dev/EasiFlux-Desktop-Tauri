@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{AppError, AppResult};
 use crate::models::notification::{
-    NotificationAction, NotificationCategory, NotificationContent, NotificationInput,
-    NotificationKind, NotificationRecord, NotificationScalar, NotificationScope,
-    NotificationSeverity,
+    NotificationAction, NotificationCategory, NotificationContent, NotificationEntity,
+    NotificationEntityType, NotificationInput, NotificationKind, NotificationRecord,
+    NotificationScalar, NotificationScope, NotificationSeverity,
 };
 use crate::services::notification::{NotificationEmitter, NotificationService};
 use crate::storage::notification_store::{NotificationFileV1, NotificationPersistence};
@@ -77,6 +77,26 @@ pub(super) fn input(
     source_event_id: &str,
     dedupe_key: &str,
 ) -> NotificationInput {
+    if scope == NotificationScope::Global {
+        return NotificationInput {
+            scope,
+            category: NotificationCategory::ConnectionSystem,
+            kind: NotificationKind::ConnectionUnavailable,
+            severity: NotificationSeverity::Warning,
+            content: NotificationContent::new(
+                "connection.unavailable",
+                [("channel", NotificationScalar::String("api".into()))],
+                "连接不可用",
+                "交易连接暂时不可用，请检查网络或稍后重试。",
+            )
+            .unwrap(),
+            entity: None,
+            action: Some(NotificationAction::OpenGeneralSettings),
+            source_event_id: Some(source_event_id.into()),
+            dedupe_key: dedupe_key.into(),
+            session_epoch: Some(7),
+        };
+    }
     NotificationInput {
         scope,
         category: NotificationCategory::Trading,
@@ -89,7 +109,10 @@ pub(super) fn input(
             "订单已完全成交，请前往交易页查看。",
         )
         .unwrap(),
-        entity: None,
+        entity: Some(NotificationEntity {
+            entity_type: NotificationEntityType::Order,
+            id: "order-1".into(),
+        }),
         action: Some(NotificationAction::OpenTrading {
             order_id: Some("order-1".into()),
         }),

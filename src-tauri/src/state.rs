@@ -10,6 +10,7 @@ use crate::plugin::PluginRegistry;
 use crate::services::notification::{
     NotificationEmitter, NotificationRuntime, NotificationService,
 };
+use crate::services::trading::OrderNotificationObserver;
 use crate::services::{
     AccountLifecycleCoordinator, AccountService, AnalyticsService, ChartWorkspaceService,
     ConnectionService, DailyPnlService, MarketService, RiskService, SchedulerService, TimeService,
@@ -94,7 +95,13 @@ impl AppState {
         );
 
         let time_sync = api.time_sync();
-        let ws = Arc::new(WsManager::new(emitter.clone(), time_sync.clone()));
+        let ws = Arc::new(WsManager::new(
+            emitter.clone(),
+            time_sync.clone(),
+            OrderNotificationObserver::new(notification.clone()),
+            config.clone(),
+            account_lifecycle.clone(),
+        ));
         let time = Arc::new(TimeService::new(time_sync, api.clone(), emitter.clone()));
         let chart_state_store = Arc::new(ChartStateStore::new());
         let chart_workspace = Arc::new(ChartWorkspaceService::new(
@@ -123,6 +130,7 @@ impl AppState {
             config.clone(),
             emitter.clone(),
             time.clone(),
+            account_lifecycle.clone(),
         ));
         let risk = Arc::new(RwLock::new(RiskService::new(risk_config)));
         let trading = Arc::new(TradingService::new(
@@ -133,6 +141,7 @@ impl AppState {
             emitter.clone(),
             time.clone(),
             analytics.clone(),
+            notification.clone(),
         ));
         let account = Arc::new(AccountService::new(
             api.clone(),

@@ -79,11 +79,18 @@ impl AccountLifecyclePort for StateLifecyclePort<'_> {
         account_id: &str,
         realtime: bool,
         credential: ApiCredential,
+        session_epoch: u64,
     ) -> AppResult<()> {
         let symbol = self.state.config.read().await.active_symbol.clone();
         self.state
             .connection
-            .connect(account_id, realtime, &symbol, Some(credential))
+            .connect_for_session(
+                account_id,
+                realtime,
+                &symbol,
+                Some(credential),
+                session_epoch,
+            )
             .await
     }
 

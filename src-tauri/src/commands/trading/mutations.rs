@@ -8,7 +8,10 @@ use crate::models::api_requests::{
     ApiCreateTpslRequest, ApiReplaceOrderRequest, ApiReplaceTpslRequest, ApiSetLeverageRequest,
     ApiSwitchMarginModeRequest, ApiSwitchSeparatePositionModeRequest,
 };
-use crate::models::trading::{CancelOrderRequest, Order, PlaceOrderRequest};
+use crate::models::config::normalize_account_id;
+use crate::models::trading::{
+    CancelOrderRequest, Order, OrderStreamContext, PlaceOrderRequest, SubmissionContext,
+};
 use crate::services::account_profiles::run_account_private_mutation;
 use crate::state::AppState;
 
@@ -20,15 +23,33 @@ where
     run_account_private_mutation(state.account_lifecycle.as_ref(), mutation).await
 }
 
+fn new_submission_context(
+    submission_id: String,
+    account_id: String,
+    session_epoch: u64,
+) -> SubmissionContext {
+    SubmissionContext {
+        submission_id,
+        account_id,
+        session_epoch,
+    }
+}
+
 #[tauri::command]
 pub async fn place_order(
     state: State<'_, AppState>,
     request: PlaceOrderRequest,
 ) -> AppResult<Order> {
-    state
-        .trading
-        .place_order(state.account_lifecycle.as_ref(), request)
-        .await
+    let submission_id = uuid::Uuid::new_v4().to_string();
+    run_account_private_mutation(state.account_lifecycle.as_ref(), || async {
+        let context = new_submission_context(
+            submission_id,
+            normalize_account_id(&state.config.read().await.active_account_id),
+            state.account_lifecycle.current_session_epoch(),
+        );
+        state.trading.place_order(context, request).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -36,10 +57,31 @@ pub async fn cancel_order(
     state: State<'_, AppState>,
     request: CancelOrderRequest,
 ) -> AppResult<Order> {
-    state
-        .trading
-        .cancel_order(state.account_lifecycle.as_ref(), request)
-        .await
+    run_account_private_mutation(state.account_lifecycle.as_ref(), || async {
+        let context = OrderStreamContext {
+            account_id: normalize_account_id(&state.config.read().await.active_account_id),
+            session_epoch: state.account_lifecycle.current_session_epoch(),
+        };
+        state.trading.cancel_order(context, request).await
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submission_context_is_a_single_v4_identity_with_bound_session() {
+        let submission_id = uuid::Uuid::new_v4().to_string();
+        let context = new_submission_context(submission_id.clone(), "alpha".into(), 17);
+        let parsed = uuid::Uuid::parse_str(&context.submission_id).unwrap();
+
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+        assert_eq!(context.submission_id, submission_id);
+        assert_eq!(context.account_id, "alpha");
+        assert_eq!(context.session_epoch, 17);
+    }
 }
 
 #[tauri::command]

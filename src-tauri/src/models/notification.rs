@@ -5,6 +5,8 @@ use std::fmt::{Display, Formatter};
 use serde::{Deserialize, Serialize};
 use uuid::{Uuid, Version};
 
+pub use crate::models::risk::RiskViolationCode;
+
 pub const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const DEFAULT_NOTIFICATION_PAGE_LIMIT: u32 = 50;
 pub const MAX_NOTIFICATION_PAGE_LIMIT: u32 = 100;
@@ -127,37 +129,6 @@ impl NotificationScalar {
             ));
         }
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RiskViolationCode {
-    InvalidQuantity,
-    NonPositiveQuantity,
-    MaxOrderQty,
-    MissingLimitPrice,
-    InvalidLimitPrice,
-    NonPositiveLimitPrice,
-    MaxPriceDeviation,
-    DailyOrderLimit,
-    LedgerUnavailable,
-}
-
-impl RiskViolationCode {
-    fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "invalidQuantity" => Self::InvalidQuantity,
-            "nonPositiveQuantity" => Self::NonPositiveQuantity,
-            "maxOrderQty" => Self::MaxOrderQty,
-            "missingLimitPrice" => Self::MissingLimitPrice,
-            "invalidLimitPrice" => Self::InvalidLimitPrice,
-            "nonPositiveLimitPrice" => Self::NonPositiveLimitPrice,
-            "maxPriceDeviation" => Self::MaxPriceDeviation,
-            "dailyOrderLimit" => Self::DailyOrderLimit,
-            "ledgerUnavailable" => Self::LedgerUnavailable,
-            _ => return None,
-        })
     }
 }
 
@@ -441,7 +412,48 @@ impl NotificationContent {
                 ));
             }
         }
+        self.validate_exact_task5_params(template)?;
         Ok(())
+    }
+
+    fn validate_exact_task5_params(
+        &self,
+        template: NotificationMessageTemplate,
+    ) -> Result<(), NotificationValidationError> {
+        let valid = match template {
+            NotificationMessageTemplate::OrderFilled
+            | NotificationMessageTemplate::OrderCanceled => {
+                self.params.len() == 1 && self.params.contains_key("orderId")
+            }
+            NotificationMessageTemplate::OrderRejected => {
+                self.params.len() == 1
+                    && (self.params.contains_key("orderId")
+                        ^ self.params.contains_key("submissionId"))
+            }
+            NotificationMessageTemplate::RiskOrderBlocked => {
+                let Some(NotificationScalar::String(code)) = self.params.get("violationCode")
+                else {
+                    return Err(invalid_content());
+                };
+                let requires_limit = matches!(
+                    RiskViolationCode::parse(code),
+                    Some(
+                        RiskViolationCode::MaxOrderQty
+                            | RiskViolationCode::MaxPriceDeviation
+                            | RiskViolationCode::DailyOrderLimit
+                    )
+                );
+                self.params.len() == usize::from(requires_limit) + 1
+                    && self.params.contains_key("violationCode")
+                    && self.params.contains_key("limit") == requires_limit
+            }
+            _ => true,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(invalid_content())
+        }
     }
 }
 
@@ -567,6 +579,21 @@ impl NotificationRecord {
         {
             return Err(invalid_record());
         }
+        let shape = NotificationInput {
+            scope: self.scope.clone(),
+            category: self.category,
+            kind: self.kind,
+            severity: self.severity,
+            content: self.content.clone(),
+            entity: self.entity.clone(),
+            action: self.action.clone(),
+            source_event_id: None,
+            dedupe_key: "record-shape".into(),
+            session_epoch: Some(0),
+        };
+        shape
+            .validate_exact_task5_shape()
+            .map_err(|_| invalid_record())?;
         Ok(())
     }
 }
@@ -610,7 +637,104 @@ impl NotificationInput {
         {
             return Err(invalid_content());
         }
+        self.validate_exact_task5_shape()?;
         Ok(())
+    }
+
+    pub(crate) fn validate_exact_task5_shape(&self) -> Result<(), NotificationValidationError> {
+        let task5_kind = matches!(
+            self.kind,
+            NotificationKind::OrderFilled
+                | NotificationKind::OrderCanceled
+                | NotificationKind::OrderRejected
+                | NotificationKind::RiskOrderBlocked
+        );
+        let task5_message = matches!(
+            self.content.message_key.as_str(),
+            "order.filled" | "order.canceled" | "order.rejected" | "risk.orderBlocked"
+        );
+        let order_identity = self.content.params.get("orderId").and_then(|value| {
+            if let NotificationScalar::String(value) = value {
+                Some(value.as_str())
+            } else {
+                None
+            }
+        });
+        let order_shape = |expected_kind, expected_severity, expected_key: &str| {
+            let Some(order_id) = order_identity else {
+                return false;
+            };
+            self.category == NotificationCategory::Trading
+                && self.kind == expected_kind
+                && self.severity == expected_severity
+                && self.content.message_key == expected_key
+                && matches!(
+                    self.entity.as_ref(),
+                    Some(NotificationEntity {
+                        entity_type: NotificationEntityType::Order,
+                        id,
+                    }) if id == order_id
+                )
+                && matches!(
+                    self.action.as_ref(),
+                    Some(NotificationAction::OpenTrading { order_id: Some(id) }) if id == order_id
+                )
+                && self.session_epoch.is_some()
+        };
+        let valid = task5_kind == task5_message
+            && (!task5_kind || matches!(self.scope, NotificationScope::Account { .. }))
+            && match self.kind {
+                NotificationKind::OrderFilled => order_shape(
+                    NotificationKind::OrderFilled,
+                    NotificationSeverity::Success,
+                    "order.filled",
+                ),
+                NotificationKind::OrderCanceled => order_shape(
+                    NotificationKind::OrderCanceled,
+                    NotificationSeverity::Info,
+                    "order.canceled",
+                ),
+                NotificationKind::OrderRejected => {
+                    let common = self.category == NotificationCategory::Trading
+                        && self.severity == NotificationSeverity::Error
+                        && self.content.message_key == "order.rejected"
+                        && self.session_epoch.is_some();
+                    common
+                        && if let Some(order_id) = order_identity {
+                            matches!(
+                                self.entity.as_ref(),
+                                Some(NotificationEntity {
+                                    entity_type: NotificationEntityType::Order,
+                                    id,
+                                }) if id == order_id
+                            ) && matches!(
+                                self.action.as_ref(),
+                                Some(NotificationAction::OpenTrading { order_id: Some(id) }) if id == order_id
+                            )
+                        } else {
+                            self.entity.is_none()
+                                && matches!(
+                                    self.action.as_ref(),
+                                    Some(NotificationAction::OpenTrading { order_id: None })
+                                )
+                        }
+                }
+                NotificationKind::RiskOrderBlocked => {
+                    self.category == NotificationCategory::RiskAccount
+                        && self.severity == NotificationSeverity::Warning
+                        && self.content.message_key == "risk.orderBlocked"
+                        && self.entity.is_none()
+                        && matches!(
+                            self.action.as_ref(),
+                            Some(NotificationAction::OpenAccountSettings {
+                                account_section: AccountNotificationSection::Risk,
+                            })
+                        )
+                        && self.session_epoch.is_some()
+                }
+                _ => true,
+            };
+        valid.then_some(()).ok_or_else(invalid_content)
     }
 }
 
@@ -936,6 +1060,144 @@ mod tests {
     }
 
     #[test]
+    fn task5_risk_templates_require_code_specific_exact_params() {
+        for (code, limit_is_required) in [
+            ("invalidQuantity", false),
+            ("nonPositiveQuantity", false),
+            ("maxOrderQty", true),
+            ("missingLimitPrice", false),
+            ("invalidLimitPrice", false),
+            ("nonPositiveLimitPrice", false),
+            ("maxPriceDeviation", true),
+            ("dailyOrderLimit", true),
+            ("ledgerUnavailable", false),
+        ] {
+            let mut params = vec![("violationCode", NotificationScalar::String(code.into()))];
+            if limit_is_required {
+                params.push(("limit", NotificationScalar::Number(1.0)));
+            }
+            NotificationContent::new(
+                "risk.orderBlocked",
+                params,
+                "订单被风控拦截",
+                "请检查风控设置",
+            )
+            .unwrap();
+        }
+
+        assert_invalid_content(NotificationContent::new(
+            "risk.orderBlocked",
+            [(
+                "violationCode",
+                NotificationScalar::String("maxOrderQty".into()),
+            )],
+            "订单被风控拦截",
+            "请检查风控设置",
+        ));
+        assert_invalid_content(NotificationContent::new(
+            "risk.orderBlocked",
+            [
+                (
+                    "violationCode",
+                    NotificationScalar::String("invalidQuantity".into()),
+                ),
+                ("limit", NotificationScalar::Number(1.0)),
+            ],
+            "订单被风控拦截",
+            "请检查风控设置",
+        ));
+        assert_invalid_content(NotificationContent::new::<String, _>(
+            "risk.orderBlocked",
+            [],
+            "订单被风控拦截",
+            "请检查风控设置",
+        ));
+    }
+
+    #[test]
+    fn task5_rejected_order_template_requires_exactly_one_canonical_identity() {
+        let submission_id = uuid::Uuid::new_v4().to_string();
+        NotificationContent::new(
+            "order.rejected",
+            [("orderId", NotificationScalar::String("order-1".into()))],
+            "订单被拒绝",
+            "订单请求被交易端拒绝，请检查订单参数。",
+        )
+        .unwrap();
+        NotificationContent::new(
+            "order.rejected",
+            [(
+                "submissionId",
+                NotificationScalar::String(submission_id.clone()),
+            )],
+            "订单被拒绝",
+            "订单请求被交易端拒绝，请检查订单参数。",
+        )
+        .unwrap();
+
+        assert_invalid_content(NotificationContent::new::<String, _>(
+            "order.rejected",
+            [],
+            "订单被拒绝",
+            "订单请求被交易端拒绝，请检查订单参数。",
+        ));
+        assert_invalid_content(NotificationContent::new(
+            "order.rejected",
+            [
+                ("orderId", NotificationScalar::String("order-1".into())),
+                ("submissionId", NotificationScalar::String(submission_id)),
+            ],
+            "订单被拒绝",
+            "订单请求被交易端拒绝，请检查订单参数。",
+        ));
+
+        let mut record = valid_record();
+        record.action = Some(NotificationAction::OpenTrading { order_id: None });
+        assert_eq!(
+            record.validate().unwrap_err().code(),
+            "INVALID_NOTIFICATION_RECORD"
+        );
+    }
+
+    #[test]
+    fn task5_template_cannot_hide_behind_a_non_task5_kind() {
+        let mut record = valid_record();
+        record.kind = NotificationKind::ConnectionUnavailable;
+
+        assert_eq!(
+            record.validate().unwrap_err().code(),
+            "INVALID_NOTIFICATION_RECORD"
+        );
+    }
+
+    #[test]
+    fn task5_inputs_and_records_reject_global_scope() {
+        let mut record = valid_record();
+        record.scope = NotificationScope::Global;
+        assert_eq!(
+            record.validate().unwrap_err().code(),
+            "INVALID_NOTIFICATION_RECORD"
+        );
+
+        let input = NotificationInput {
+            scope: NotificationScope::Global,
+            category: record.category,
+            kind: record.kind,
+            severity: record.severity,
+            content: record.content,
+            entity: record.entity,
+            action: record.action,
+            source_event_id: record.source_event_id,
+            dedupe_key: record.dedupe_key,
+            session_epoch: Some(1),
+        };
+        assert_eq!(
+            input.validate().unwrap_err().code(),
+            "INVALID_NOTIFICATION_CONTENT"
+        );
+    }
+
+    #[test]
     fn content_validation_rejects_unapproved_templates_params_and_raw_fallback_text() {
         let unknown_param = NotificationContent::new(
             "risk.orderBlocked",
@@ -1080,10 +1342,13 @@ mod tests {
     fn content_validation_accepts_only_controlled_semantic_parameter_values() {
         assert!(NotificationContent::new(
             "risk.orderBlocked",
-            [(
-                "violationCode",
-                NotificationScalar::String("maxOrderQty".into())
-            )],
+            [
+                (
+                    "violationCode",
+                    NotificationScalar::String("maxOrderQty".into()),
+                ),
+                ("limit", NotificationScalar::Number(100.0)),
+            ],
             "订单被风控拦截",
             "请检查风控设置",
         )
@@ -1469,7 +1734,13 @@ mod tests {
             severity: NotificationSeverity::Warning,
             content: NotificationContent::new(
                 "risk.orderBlocked",
-                [("limit", NotificationScalar::Number(100.0))],
+                [
+                    (
+                        "violationCode",
+                        NotificationScalar::String("maxOrderQty".into()),
+                    ),
+                    ("limit", NotificationScalar::Number(100.0)),
+                ],
                 "订单被风控拦截",
                 "请检查风控设置",
             )
@@ -1491,7 +1762,13 @@ mod tests {
             severity: NotificationSeverity::Warning,
             content: NotificationContent::new(
                 "risk.orderBlocked",
-                [("limit", NotificationScalar::Number(100.0))],
+                [
+                    (
+                        "violationCode",
+                        NotificationScalar::String("maxOrderQty".into()),
+                    ),
+                    ("limit", NotificationScalar::Number(100.0)),
+                ],
                 "订单被风控拦截",
                 "请检查风控设置",
             )

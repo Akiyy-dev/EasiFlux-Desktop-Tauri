@@ -2,6 +2,8 @@ use serde::Serialize;
 use std::fmt::Display;
 use thiserror::Error;
 
+use crate::models::trading::TradingFailure;
+
 #[derive(Debug, Clone, Error)]
 pub enum AppError {
     #[error("认证失败: {0}")]
@@ -10,6 +12,8 @@ pub enum AppError {
     Connection(String),
     #[error("交易错误: {0}")]
     Trading(String),
+    #[error("交易错误: {0}")]
+    TradingFailure(TradingFailure),
     #[error("风控拒绝: {0}")]
     Risk(String),
     #[error("配置错误: {0}")]
@@ -20,6 +24,12 @@ pub enum AppError {
     NotConnected,
     #[error("内部错误: {0}")]
     Internal(String),
+    #[error("{message}")]
+    Notified {
+        code: &'static str,
+        message: &'static str,
+        notification_id: String,
+    },
 }
 
 impl Serialize for AppError {
@@ -27,7 +37,21 @@ impl Serialize for AppError {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        match self {
+            Self::Notified {
+                code,
+                message,
+                notification_id,
+            } => {
+                use serde::ser::SerializeStruct;
+                let mut value = serializer.serialize_struct("CommandError", 3)?;
+                value.serialize_field("code", code)?;
+                value.serialize_field("message", message)?;
+                value.serialize_field("notificationId", notification_id)?;
+                value.end()
+            }
+            _ => serializer.serialize_str(&self.to_string()),
+        }
     }
 }
 
@@ -40,8 +64,8 @@ impl AppError {
 }
 
 impl From<reqwest::Error> for AppError {
-    fn from(value: reqwest::Error) -> Self {
-        AppError::Connection(value.to_string())
+    fn from(_value: reqwest::Error) -> Self {
+        AppError::Connection("网络请求失败".into())
     }
 }
 
@@ -129,5 +153,26 @@ mod tests {
         let error = credential_backend_error(PRIVATE_DETAIL);
 
         assert_private_detail_is_hidden(&error, PRIVATE_DETAIL);
+    }
+
+    #[test]
+    fn notified_command_error_has_a_stable_object_shape_while_ordinary_errors_stay_strings() {
+        let notification_id = uuid::Uuid::new_v4().to_string();
+        let notified = AppError::Notified {
+            code: "ORDER_REJECTED",
+            message: "订单请求被交易端拒绝",
+            notification_id: notification_id.clone(),
+        };
+        assert_eq!(
+            serde_json::to_value(notified).unwrap(),
+            serde_json::json!({
+                "code": "ORDER_REJECTED",
+                "message": "订单请求被交易端拒绝",
+                "notificationId": notification_id,
+            })
+        );
+        assert!(serde_json::to_value(AppError::Connection("safe".into()))
+            .unwrap()
+            .is_string());
     }
 }

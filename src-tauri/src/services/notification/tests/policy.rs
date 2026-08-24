@@ -21,7 +21,7 @@ fn first_wave_policy_maps_every_approved_event_to_controlled_account_content() {
         .order_canceled(context("order-canceled"), "order-1")
         .unwrap();
     let rejected = policy
-        .order_rejected(context("order-rejected"), Some("order-1"), "submission-1")
+        .order_rejected(context("order-rejected"), Some("order-1"), None)
         .unwrap();
     let expired = policy.session_expired(context("session-edge")).unwrap();
 
@@ -173,7 +173,7 @@ fn producer_context_rejects_free_text_and_secret_like_source_ids() {
     }
     let policy = NotificationPolicy;
     let error = policy
-        .order_rejected(context("rejected-event"), Some("order-1"), "sk-secret")
+        .order_rejected(context("rejected-event"), None, Some("sk-secret"))
         .unwrap_err();
     assert_eq!(error.code(), "INVALID_NOTIFICATION_CONTENT");
 
@@ -216,8 +216,40 @@ fn policy_rejects_uncontrolled_incident_submission_and_dedupe_components() {
 
     for submission_id in ["submission:1".to_string(), "s".repeat(257)] {
         let error = policy
-            .order_rejected(context("rejected-event"), Some("order-1"), &submission_id)
+            .order_rejected(context("rejected-event"), None, Some(&submission_id))
             .unwrap_err();
         assert_eq!(error.code(), "INVALID_NOTIFICATION_CONTENT");
     }
+}
+
+#[test]
+fn task5_policy_cross_fields_are_exact_for_order_and_risk_templates() {
+    let policy = NotificationPolicy;
+    let mut filled = policy
+        .order_filled(context("order-filled-shape"), "order-1")
+        .unwrap();
+    filled.severity = NotificationSeverity::Error;
+    assert_eq!(
+        filled.validate().unwrap_err().code(),
+        "INVALID_NOTIFICATION_CONTENT"
+    );
+    assert_eq!(
+        filled.validate_exact_task5_shape().unwrap_err().code(),
+        "INVALID_NOTIFICATION_CONTENT"
+    );
+
+    let mut risk = policy
+        .risk_order_blocked(
+            context("risk-shape"),
+            RiskViolationInput {
+                code: RiskViolationCode::DailyOrderLimit,
+                limit: Some(10.0),
+            },
+        )
+        .unwrap();
+    risk.action = Some(NotificationAction::OpenTrading { order_id: None });
+    assert_eq!(
+        risk.validate_exact_task5_shape().unwrap_err().code(),
+        "INVALID_NOTIFICATION_CONTENT"
+    );
 }

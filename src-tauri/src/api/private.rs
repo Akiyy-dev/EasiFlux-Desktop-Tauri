@@ -1,20 +1,19 @@
 use serde_json::Value;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::account::Balance;
 use crate::models::api_requests::{
     ApiAddMarginRequest, ApiCancelAllOrdersRequest, ApiCloseAllPositionsRequest,
-    ApiCreateTpslRequest, ApiReplaceOrderRequest, ApiReplaceTpslRequest,
-    ApiSetLeverageRequest, ApiSwitchMarginModeRequest, ApiSwitchSeparatePositionModeRequest,
-    ApiTransferRequest,
+    ApiCreateTpslRequest, ApiReplaceOrderRequest, ApiReplaceTpslRequest, ApiSetLeverageRequest,
+    ApiSwitchMarginModeRequest, ApiSwitchSeparatePositionModeRequest, ApiTransferRequest,
 };
 use crate::models::trading::{CancelOrderRequest, Order, PlaceOrderRequest, Position};
 
 use super::client::ApiClient;
 use super::endpoints;
 use super::mapper::{
-    build_cancel_order_body, build_order_query_params, build_place_order_body, build_transfer_history_params,
-    parse_balances, parse_order, parse_orders, parse_positions,
+    build_cancel_order_body, build_order_query_params, build_place_order_body,
+    build_transfer_history_params, parse_balances, parse_order, parse_orders, parse_positions,
 };
 use super::response::extract_list;
 
@@ -22,7 +21,8 @@ pub struct PrivateApi;
 
 impl PrivateApi {
     pub async fn open_orders(client: &ApiClient, symbol: Option<&str>) -> AppResult<Vec<Order>> {
-        let params = build_order_query_params(symbol, None, None, None, None, None, None, None, None, None);
+        let params =
+            build_order_query_params(symbol, None, None, None, None, None, None, None, None, None);
         let payload = client.private_get(endpoints::OPEN_ORDERS, params).await?;
         Ok(parse_orders(&payload))
     }
@@ -33,16 +33,7 @@ impl PrivateApi {
         limit: Option<u32>,
     ) -> AppResult<Vec<Order>> {
         let params = build_order_query_params(
-            symbol,
-            None,
-            None,
-            None,
-            None,
-            limit,
-            None,
-            None,
-            None,
-            None,
+            symbol, None, None, None, None, limit, None, None, None, None,
         );
         let payload = client.private_get(endpoints::ORDERS, params).await?;
         Ok(parse_orders(&payload))
@@ -85,16 +76,7 @@ impl PrivateApi {
         cursor: Option<&str>,
     ) -> AppResult<Value> {
         let params = build_order_query_params(
-            symbol,
-            coin,
-            order_id,
-            None,
-            None,
-            limit,
-            cursor,
-            start_time,
-            end_time,
-            exec_type,
+            symbol, coin, order_id, None, None, limit, cursor, start_time, end_time, exec_type,
         );
         client.private_get(endpoints::TRADE_FILLS, params).await
     }
@@ -104,12 +86,14 @@ impl PrivateApi {
         symbol: Option<&str>,
         coin: Option<&str>,
     ) -> AppResult<Value> {
-        let params = build_order_query_params(symbol, coin, None, None, None, None, None, None, None, None);
+        let params =
+            build_order_query_params(symbol, coin, None, None, None, None, None, None, None, None);
         client.private_get(endpoints::FEE_RATE, params).await
     }
 
     pub async fn balances(client: &ApiClient, coin: Option<&str>) -> AppResult<Vec<Balance>> {
-        let params = build_order_query_params(None, coin, None, None, None, None, None, None, None, None);
+        let params =
+            build_order_query_params(None, coin, None, None, None, None, None, None, None, None);
         let payload = client.private_get(endpoints::BALANCES, params).await?;
         Ok(parse_balances(&payload))
     }
@@ -119,7 +103,8 @@ impl PrivateApi {
         symbol: Option<&str>,
         coin: Option<&str>,
     ) -> AppResult<Vec<Position>> {
-        let params = build_order_query_params(symbol, coin, None, None, None, None, None, None, None, None);
+        let params =
+            build_order_query_params(symbol, coin, None, None, None, None, None, None, None, None);
         let payload = client.private_get(endpoints::POSITIONS, params).await?;
         Ok(parse_positions(&payload))
     }
@@ -127,14 +112,25 @@ impl PrivateApi {
     pub async fn create_order(client: &ApiClient, request: &PlaceOrderRequest) -> AppResult<Order> {
         let body = build_place_order_body(request);
         let payload = client.private_post(endpoints::CREATE_ORDER, body).await?;
-        let items = extract_list(&payload);
-        if let Some(first) = items.first() {
-            return Ok(parse_order(first));
-        }
-        Ok(parse_order(super::response::extract_data(&payload)))
+        Self::parse_create_order_payload(&payload)
     }
 
-    pub async fn cancel_order(client: &ApiClient, request: &CancelOrderRequest) -> AppResult<Order> {
+    fn parse_create_order_payload(payload: &Value) -> AppResult<Order> {
+        let items = extract_list(&payload);
+        let order = items
+            .first()
+            .map(|first| parse_order(first))
+            .unwrap_or_else(|| parse_order(super::response::extract_data(&payload)));
+        if order.order_id.trim().is_empty() {
+            return Err(AppError::Internal("订单提交结果不明确".into()));
+        }
+        Ok(order)
+    }
+
+    pub async fn cancel_order(
+        client: &ApiClient,
+        request: &CancelOrderRequest,
+    ) -> AppResult<Order> {
         let body = build_cancel_order_body(request);
         let payload = client.private_post(endpoints::CANCEL_ORDER, body).await?;
         let items = extract_list(&payload);
@@ -201,16 +197,7 @@ impl PrivateApi {
         cursor: Option<&str>,
     ) -> AppResult<Value> {
         let params = build_order_query_params(
-            symbol,
-            coin,
-            None,
-            None,
-            None,
-            limit,
-            cursor,
-            start_time,
-            end_time,
-            None,
+            symbol, coin, None, None, None, limit, cursor, start_time, end_time, None,
         );
         client.private_get(endpoints::CLOSED_PNL, params).await
     }
@@ -247,10 +234,7 @@ impl PrivateApi {
         request: &ApiSwitchSeparatePositionModeRequest,
     ) -> AppResult<Value> {
         client
-            .private_post(
-                endpoints::SWITCH_SEPARATE_POSITION_MODE,
-                request.to_value(),
-            )
+            .private_post(endpoints::SWITCH_SEPARATE_POSITION_MODE, request.to_value())
             .await
     }
 
@@ -270,9 +254,7 @@ impl PrivateApi {
     }
 
     pub async fn user_id(client: &ApiClient) -> AppResult<Value> {
-        client
-            .private_get(endpoints::USER_ID, Vec::new())
-            .await
+        client.private_get(endpoints::USER_ID, Vec::new()).await
     }
 
     pub async fn transfer_history(
@@ -287,5 +269,18 @@ impl PrivateApi {
         client
             .private_get(endpoints::TRANSFER_HISTORY, params)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_create_order_success_body_is_ambiguous_not_a_confirmed_rejection() {
+        let error = PrivateApi::parse_create_order_payload(&serde_json::json!({})).unwrap_err();
+
+        assert!(matches!(error, AppError::Internal(_)));
+        assert!(!matches!(error, AppError::TradingFailure(_)));
     }
 }

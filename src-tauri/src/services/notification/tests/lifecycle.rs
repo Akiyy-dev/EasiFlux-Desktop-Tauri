@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::models::notification::{
-    ListNotificationsRequest, NotificationChange, NotificationChannel, NotificationEntity,
-    NotificationEntityType, NotificationEnvironment, NotificationFilter, NotificationKind,
-    NotificationScope,
+    ListNotificationsRequest, NotificationAction, NotificationCategory, NotificationChange,
+    NotificationChannel, NotificationContent, NotificationEntity, NotificationEntityType,
+    NotificationEnvironment, NotificationFilter, NotificationKind, NotificationScalar,
+    NotificationScope, NotificationSeverity,
 };
 use crate::services::notification::{
     enforce_serialized_file_cap_for_test, AvailabilityState, ConnectionObservation,
@@ -456,6 +457,17 @@ async fn startup_backfill_reserves_reset_revision_digit_growth() {
         account_id: "alpha".into(),
     };
     let mut item = record(1, scope.clone(), "legacy-source", "legacy-dedupe", NOW);
+    item.category = NotificationCategory::ConnectionSystem;
+    item.kind = NotificationKind::ConnectionUnavailable;
+    item.severity = NotificationSeverity::Warning;
+    item.content = NotificationContent::new(
+        "connection.unavailable",
+        [("channel", NotificationScalar::String("api".into()))],
+        "连接不可用",
+        "交易连接暂时不可用，请检查网络或稍后重试。",
+    )
+    .unwrap();
+    item.action = Some(NotificationAction::OpenGeneralSettings);
     item.entity = Some(NotificationEntity {
         entity_type: NotificationEntityType::Order,
         id: "x".into(),
@@ -1359,6 +1371,17 @@ async fn serialized_reservation_returns_domain_capacity_error_without_a_safe_can
         }],
     });
     let mut oversized = input(scope, "oversized-source", "semantic-target");
+    oversized.category = NotificationCategory::ConnectionSystem;
+    oversized.kind = NotificationKind::ConnectionUnavailable;
+    oversized.severity = NotificationSeverity::Warning;
+    oversized.content = NotificationContent::new(
+        "connection.unavailable",
+        [("channel", NotificationScalar::String("api".into()))],
+        "连接不可用",
+        "交易连接暂时不可用，请检查网络或稍后重试。",
+    )
+    .unwrap();
+    oversized.action = Some(NotificationAction::OpenGeneralSettings);
     oversized.entity = Some(NotificationEntity {
         entity_type: NotificationEntityType::Order,
         id: "x".repeat(MAX_NOTIFICATION_FILE_BYTES),

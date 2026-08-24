@@ -218,6 +218,7 @@ impl AccountLifecyclePort for FakeLifecyclePort {
         account_id: &str,
         _realtime: bool,
         credential: ApiCredential,
+        _session_epoch: u64,
     ) -> AppResult<()> {
         self.events
             .lock()

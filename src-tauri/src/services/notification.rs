@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::models::notification::{
     ListNotificationsRequest, NotificationChange, NotificationChangedEvent, NotificationChannel,
     NotificationEnvironment, NotificationFilter, NotificationInput, NotificationKind,
-    NotificationMutationResult, NotificationPage, NotificationRecord, NotificationScope,
-    NotificationSummary, NotificationToastCandidate, MAX_JAVASCRIPT_SAFE_INTEGER,
+    NotificationMutationResult, NotificationPage, NotificationRecord, NotificationScalar,
+    NotificationScope, NotificationSummary, NotificationToastCandidate,
+    MAX_JAVASCRIPT_SAFE_INTEGER,
 };
 use crate::storage::notification_store::{
     notification_file_fits_serialized_limit, NotificationFileV1, NotificationLoadStatus,
@@ -268,13 +269,14 @@ impl NotificationService {
         let _ = enforce_serialized_file_cap(&mut file, &mut normalization, false);
         let active_incidents = rebuild_active_incidents(&file);
         let seen_source_events = rebuild_seen_source_events(&file);
+        let order_states = rebuild_order_states(&file);
         Self {
             state: tokio::sync::Mutex::new(ServiceState {
                 file,
                 seen_source_events,
                 last_pruned_at_ms,
                 active_incidents,
-                order_states: HashMap::new(),
+                order_states,
             }),
             persistence,
             emit_changed,
@@ -826,21 +828,32 @@ impl NotificationService {
         now_ms: u64,
     ) -> Result<PublishOutcome, NotificationError> {
         ViewContext::account(&observation.account_id)?;
+        let entity_ids = order_observation_entity_ids(&observation);
         let entity_id = observation
-            .order_id
+            .submission_id
             .as_ref()
-            .or(observation.submission_id.as_ref())
+            .or(observation.order_id.as_ref())
             .filter(|value| !value.trim().is_empty())
             .cloned()
             .ok_or_else(|| {
                 NotificationError::new("INVALID_NOTIFICATION_CONTENT", "订单观察标识无效")
             })?;
-        let key = OrderKey {
-            account_id: observation.account_id.clone(),
-            entity_id: entity_id.clone(),
-        };
+        let keys: Vec<_> = entity_ids
+            .into_iter()
+            .map(|entity_id| OrderKey {
+                account_id: observation.account_id.clone(),
+                entity_id,
+            })
+            .collect();
         let mut guard = self.state.lock().await;
-        let previous = guard.order_states.get(&key).copied();
+        let previous = keys
+            .iter()
+            .filter_map(|key| guard.order_states.get(key).copied())
+            .find(|state| state.status.is_terminal())
+            .or_else(|| {
+                keys.iter()
+                    .find_map(|key| guard.order_states.get(key).copied())
+            });
         if let Some(previous) = previous.filter(|state| state.status.is_terminal()) {
             if !observation.status.is_terminal() || previous.status != observation.status {
                 tracing::warn!(
@@ -863,13 +876,15 @@ impl NotificationService {
             };
         if !should_publish {
             let mut next = guard.clone();
-            next.order_states.insert(
-                key,
-                ObservedOrderState {
-                    status: observation.status,
-                    terminal_notified: already_notified,
-                },
-            );
+            for key in keys {
+                next.order_states.insert(
+                    key,
+                    ObservedOrderState {
+                        status: observation.status,
+                        terminal_notified: already_notified,
+                    },
+                );
+            }
             *guard = next;
             return Ok(no_publish_outcome(&guard));
         }
@@ -877,7 +892,7 @@ impl NotificationService {
         let context = policy::PolicyContext::new(
             observation.account_id,
             observation.session_epoch,
-            format!("order:{entity_id}:{}", observation.status.name()),
+            format!("order:{entity_id}:terminal"),
         )?;
         let policy = NotificationPolicy;
         let input = match observation.status {
@@ -896,7 +911,7 @@ impl NotificationService {
             ObservedOrderStatus::Rejected => policy.order_rejected(
                 context,
                 observation.order_id.as_deref(),
-                observation.submission_id.as_deref().unwrap_or(&entity_id),
+                observation.submission_id.as_deref(),
             )?,
             ObservedOrderStatus::New | ObservedOrderStatus::PartiallyFilled => unreachable!(),
         };
@@ -904,13 +919,15 @@ impl NotificationService {
             return Ok(no_publish_outcome(&guard));
         };
         let mut next = guard.clone();
-        next.order_states.insert(
-            key,
-            ObservedOrderState {
-                status: observation.status,
-                terminal_notified: true,
-            },
-        );
+        for key in keys {
+            next.order_states.insert(
+                key,
+                ObservedOrderState {
+                    status: observation.status,
+                    terminal_notified: true,
+                },
+            );
+        }
         let mutation = apply_prepared_publish(&mut next, prepared)?;
         self.commit_publish(&mut guard, next, mutation)
     }
@@ -1182,6 +1199,60 @@ fn no_publish_outcome(state: &ServiceState) -> PublishOutcome {
         notification: None,
         revision: state.file.revision.to_string(),
     }
+}
+
+fn order_observation_entity_ids(observation: &OrderObservation) -> Vec<String> {
+    let mut ids = Vec::with_capacity(2);
+    for candidate in [
+        observation.order_id.as_ref(),
+        observation.submission_id.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| !value.trim().is_empty())
+    {
+        if !ids.contains(candidate) {
+            ids.push(candidate.clone());
+        }
+    }
+    ids
+}
+
+fn rebuild_order_states(file: &NotificationFileV1) -> HashMap<OrderKey, ObservedOrderState> {
+    let mut states = HashMap::new();
+    for partition in &file.partitions {
+        let NotificationScope::Account { account_id } = &partition.scope else {
+            continue;
+        };
+        for record in &partition.items {
+            let status = match record.kind {
+                NotificationKind::OrderFilled => ObservedOrderStatus::Filled,
+                NotificationKind::OrderCanceled => ObservedOrderStatus::Canceled,
+                NotificationKind::OrderRejected => ObservedOrderStatus::Rejected,
+                _ => continue,
+            };
+            let Some(entity_id) = ["orderId", "submissionId"].into_iter().find_map(|name| {
+                match record.content.params.get(name) {
+                    Some(NotificationScalar::String(value)) if !value.trim().is_empty() => {
+                        Some(value.clone())
+                    }
+                    _ => None,
+                }
+            }) else {
+                continue;
+            };
+            states
+                .entry(OrderKey {
+                    account_id: account_id.clone(),
+                    entity_id,
+                })
+                .or_insert(ObservedOrderState {
+                    status,
+                    terminal_notified: true,
+                });
+        }
+    }
+    states
 }
 
 #[derive(Default)]

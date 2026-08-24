@@ -132,16 +132,25 @@ impl NotificationPolicy {
         &self,
         context: PolicyContext,
         order_id: Option<&str>,
-        submission_id: &str,
+        submission_id: Option<&str>,
     ) -> Result<NotificationInput, NotificationError> {
-        validate_policy_identifier(submission_id, "订单提交标识无效")?;
-        let params = if let Some(order_id) = order_id {
-            vec![("orderId", NotificationScalar::String(order_id.into()))]
+        let (params, identity) = if let Some(order_id) = order_id {
+            (
+                vec![("orderId", NotificationScalar::String(order_id.into()))],
+                order_id,
+            )
         } else {
-            vec![(
-                "submissionId",
-                NotificationScalar::String(submission_id.into()),
-            )]
+            let submission_id = submission_id.ok_or_else(|| {
+                NotificationError::new("INVALID_NOTIFICATION_CONTENT", "订单提交标识无效")
+            })?;
+            validate_policy_identifier(submission_id, "订单提交标识无效")?;
+            (
+                vec![(
+                    "submissionId",
+                    NotificationScalar::String(submission_id.into()),
+                )],
+                submission_id,
+            )
         };
         controlled_input(
             &context,
@@ -161,7 +170,7 @@ impl NotificationPolicy {
             Some(NotificationAction::OpenTrading {
                 order_id: order_id.map(str::to_owned),
             }),
-            format!("{}:{submission_id}:rejected", context.account_id),
+            format!("{}:{identity}:rejected", context.account_id),
         )
     }
 

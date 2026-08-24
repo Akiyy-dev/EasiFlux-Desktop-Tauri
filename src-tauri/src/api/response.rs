@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::models::trading::{OrderStatus, TradingFailureKind};
+
 const SUCCESS_CODES: &[&str] = &["0", "200", "SUCCESS", "success"];
 
 const LIST_KEYS: &[&str] = &[
@@ -127,7 +129,10 @@ fn collect_object_arrays<'a>(
         }
         Value::Object(map) => {
             for (key, child) in map {
-                if matches!(key.as_str(), "symbol" | "interval" | "coin" | "cursor" | "total") {
+                if matches!(
+                    key.as_str(),
+                    "symbol" | "interval" | "coin" | "cursor" | "total"
+                ) {
                     continue;
                 }
                 collect_object_arrays(child, &format!("{path}.{key}"), best);
@@ -237,7 +242,10 @@ pub fn is_timestamp_error(payload: &Value) -> bool {
 
 pub fn is_sign_error(payload: &Value) -> bool {
     if let Some(code) = response_code(payload) {
-        if matches!(code.as_str(), "26200003" | "26200004" | "26200005" | "20011005") {
+        if matches!(
+            code.as_str(),
+            "26200003" | "26200004" | "26200005" | "20011005"
+        ) {
             return true;
         }
     }
@@ -254,6 +262,36 @@ pub fn error_message(payload: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// Classifies only an explicit order-status field in the create-order result.
+/// Provider codes and localized messages are intentionally not interpreted.
+pub fn classify_create_order_failure(payload: &Value) -> Option<TradingFailureKind> {
+    let response_code = response_code(payload);
+    let recognized_envelope = response_code
+        .as_deref()
+        .is_some_and(|code| SUCCESS_CODES.contains(&code));
+    let infrastructure_code = response_code.as_deref().is_some_and(|code| {
+        code == "429"
+            || code
+                .parse::<u16>()
+                .is_ok_and(|value| (500..=599).contains(&value))
+    });
+    if !recognized_envelope
+        || infrastructure_code
+        || is_auth_error(payload)
+        || is_rate_limit_error(payload)
+        || is_timestamp_error(payload)
+        || is_sign_error(payload)
+    {
+        return None;
+    }
+    let data = extract_data(payload);
+    let candidate = ["orderStatus", "order_status", "status"]
+        .into_iter()
+        .find_map(|key| data.get(key).and_then(Value::as_str))?;
+    (OrderStatus::from_raw(candidate) == OrderStatus::Rejected)
+        .then_some(TradingFailureKind::Rejected)
 }
 
 pub fn describe_data_shape(payload: &Value) -> (String, Vec<String>) {
@@ -285,7 +323,9 @@ mod tests {
 
     #[test]
     fn timestamp_error_detection() {
-        assert!(is_timestamp_error(&json!({"code": 26200002, "msg": "timestamp"})));
+        assert!(is_timestamp_error(
+            &json!({"code": 26200002, "msg": "timestamp"})
+        ));
     }
 
     #[test]
