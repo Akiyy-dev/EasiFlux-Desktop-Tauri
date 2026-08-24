@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NConfigProvider, NMessageProvider, darkTheme } from 'naive-ui'
 import AppShell from './components/layout/AppShell.vue'
 import ErrorToastBridge from './components/common/ErrorToastBridge.vue'
@@ -17,7 +17,8 @@ import { useOrderStore } from './stores/order'
 import { usePositionStore } from './stores/position'
 import { useAccountStore } from './stores/account'
 import { useLogStore } from './stores/log'
-import { useTimeStore } from './stores/time'
+import { useTimeStore } from './stores/time'
+import { useNotificationStore } from './stores/notification'
 import { reportError as reportGlobalError, showBackendError } from './services/errorService'
 import { onConnectionStatusChanged, onWebsocketStatusChanged } from './services/realtimeService'
 import { onTimeUpdated } from './services/timeService'
@@ -49,9 +50,23 @@ const orderStore = useOrderStore()
 const positionStore = usePositionStore()
 const accountStore = useAccountStore()
 const logStore = useLogStore()
-const timeStore = useTimeStore()
+const timeStore = useTimeStore()
+const notificationStore = useNotificationStore()
 
 const showQuickSetup = ref(false)
+let appLifecycleActive = true
+let notificationAccountReady = false
+
+watch(() => accountProfilesStore.activeAccountId, (nextAccountId) => {
+  if (!appLifecycleActive || !notificationAccountReady) return
+  void notificationStore.setAccount(nextAccountId)
+})
+
+onBeforeUnmount(() => {
+  appLifecycleActive = false
+  notificationAccountReady = false
+  notificationStore.stop()
+})
 
 useChartWorkspaceCloseGuard()
 
@@ -128,15 +143,19 @@ useTauriEvent<LogEntry>('log:entry', (entry) => {
   logStore.addEntry(entry)
 })
 
-onMounted(async () => {
-  await whenTauriListenersReady()
-  timeStore.start()
+onMounted(async () => {
+  await whenTauriListenersReady()
+  if (!appLifecycleActive) return
+  await notificationStore.start()
+  if (!appLifecycleActive) return
+  timeStore.start()
 
   try {
-    await appStore.initVersion()
-  } catch (error) {
-    reportError('启动检查失败', error)
-  }
+    await appStore.initVersion()
+  } catch (error) {
+    reportError('启动检查失败', error)
+  }
+  if (!appLifecycleActive) return
 
   let config
   try {
@@ -145,6 +164,7 @@ onMounted(async () => {
     reportError('加载配置失败', error)
     return
   }
+  if (!appLifecycleActive) return
 
   const profilesPromise = accountProfilesStore.refreshProfiles()
   marketStore.activeSymbol = config.activeSymbol
@@ -161,6 +181,7 @@ onMounted(async () => {
     reportError('加载账户配置失败', error)
     return
   }
+  if (!appLifecycleActive) return
 
   const activeProfile = profiles.find(
     (profile) => profile.accountId === accountProfilesStore.activeAccountId,
@@ -168,6 +189,12 @@ onMounted(async () => {
   if (!activeProfile) {
     reportError('加载活动账户失败', new Error('活动账户不在账户列表中'))
     return
+  }
+  await notificationStore.setAccount(activeProfile.accountId)
+  if (!appLifecycleActive) return
+  notificationAccountReady = true
+  if (accountProfilesStore.activeAccountId !== activeProfile.accountId) {
+    void notificationStore.setAccount(accountProfilesStore.activeAccountId)
   }
   if (activeProfile.credentialState === 'missing') {
     showQuickSetup.value = true
