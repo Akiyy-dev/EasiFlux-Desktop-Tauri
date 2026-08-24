@@ -1,0 +1,26 @@
+.notification-popover {
+  display: flex;
+  width: min(400px, calc(100vw - 24px));
+  max-height: calc(100vh - 88px);
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+
+.notification-popover__header,
+.notification-popover__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ef-space-2);
+  padding: var(--ef-space-3);
+  flex-shrink: 0;
+}
+
+.notification-popover__header { border-bottom: 1px solid var(--border); }
+.notification-popover__header h2 { margin: 0; font-size: var(--ef-text-title-size); }
+.notification-popover__footer { border-top: 1px solid var(--border); color: var(--text-secondary); font-size: var(--ef-text-caption-size); }
+.notification-popover__footer button { border: 0; padding: 0; background: transparent; color: var(--accent); cursor: pointer; }

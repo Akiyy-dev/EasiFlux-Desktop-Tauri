@@ -41,6 +41,10 @@ export type NotificationAction =
   | { type: 'openAccountSettings'; accountSection: AccountNotificationSection }
   | { type: 'openGeneralSettings' }
 
+export type NotificationUiAction =
+  | NotificationAction
+  | { type: 'openNotificationSettings' }
+
 export interface NotificationRecord {
   id: string
   scope: NotificationScope
