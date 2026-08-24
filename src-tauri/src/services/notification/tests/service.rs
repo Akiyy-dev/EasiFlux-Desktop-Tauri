@@ -1,14 +1,55 @@
 use std::sync::Arc;
 
 use crate::models::notification::{
-    ListNotificationsRequest, NotificationChange, NotificationFilter, NotificationScope,
+    ClientNotificationFailedStep, ClientNotificationKind, CreateClientNotificationRequest,
+    ListNotificationsRequest, NotificationChange, NotificationFilter, NotificationRecord,
+    NotificationScope,
 };
-use crate::services::notification::{NotificationEmitter, NotificationService, ViewContext};
-use crate::storage::notification_store::NotificationFileV1;
+use crate::services::notification::{
+    NotificationEmitter, NotificationPolicy, NotificationService, ViewContext,
+};
+use crate::storage::notification_store::{
+    NotificationFileV1, NotificationPartition, NotificationSourceEventIndexEntry,
+    NOTIFICATION_SCHEMA_VERSION,
+};
 
 use super::support::{harness, input, FakePersistence};
 
 const NOW: u64 = 1_700_000_000_000;
+
+fn client_input(kind: ClientNotificationKind) -> crate::models::notification::NotificationInput {
+    NotificationPolicy
+        .client_account_failure(CreateClientNotificationRequest {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+            attempt_id: "10000000-0000-4000-8000-000000000001".into(),
+            kind,
+            failed_steps: vec![ClientNotificationFailedStep::Config],
+        })
+        .unwrap()
+}
+
+fn record_from_input(
+    input: crate::models::notification::NotificationInput,
+    id: &str,
+) -> NotificationRecord {
+    NotificationRecord {
+        id: id.into(),
+        scope: input.scope,
+        category: input.category,
+        kind: input.kind,
+        severity: input.severity,
+        content: input.content,
+        entity: input.entity,
+        action: input.action,
+        source_event_id: input.source_event_id,
+        dedupe_key: input.dedupe_key,
+        occurrence_count: 1,
+        created_at_ms: NOW - 1,
+        updated_at_ms: NOW - 1,
+        read_at_ms: None,
+    }
+}
 
 fn request(
     account_id: Option<&str>,
@@ -43,6 +84,63 @@ async fn identical_scope_and_source_event_is_an_absolute_no_op() {
     assert_eq!(second.revision, "1");
     assert_eq!(harness.persistence.saves().len(), 1);
     assert_eq!(harness.events.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn client_replay_rejects_an_indexed_opposite_kind_without_any_mutation() {
+    let expected = client_input(ClientNotificationKind::AccountRecoveryFailed);
+    let target = record_from_input(
+        client_input(ClientNotificationKind::AccountReconciliationFailed),
+        "00000000-0000-4000-8000-000000000001",
+    );
+    let scope = expected.scope.clone();
+    let source_event_id = expected.source_event_id.clone().unwrap();
+    let harness = harness(NotificationFileV1 {
+        schema_version: NOTIFICATION_SCHEMA_VERSION,
+        revision: 9,
+        source_event_index: vec![NotificationSourceEventIndexEntry {
+            scope: scope.clone(),
+            source_event_id,
+            notification_id: target.id.clone(),
+        }],
+        partitions: vec![NotificationPartition {
+            scope,
+            items: vec![target],
+        }],
+    });
+    let context = ViewContext::account("alpha").unwrap();
+    let before = harness
+        .service
+        .list(
+            context.clone(),
+            request(Some("alpha"), NotificationFilter::All, None, 20),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+    let error = harness
+        .service
+        .publish_client_account_failure(expected, NOW)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "NOTIFICATION_STATE_CONFLICT");
+    assert_eq!(harness.service.revision().await, "9");
+    assert_eq!(
+        harness
+            .service
+            .list(
+                context,
+                request(Some("alpha"), NotificationFilter::All, None, 20),
+                NOW
+            )
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(harness.persistence.saves().is_empty());
+    assert!(harness.events.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

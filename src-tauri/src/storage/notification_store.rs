@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 use crate::models::config::APP_NAME;
 use crate::models::notification::{
-    is_safe_notification_source_event_id, NotificationRecord, NotificationScope,
+    client_notification_source_parts, is_safe_notification_source_event_id, NotificationRecord,
+    NotificationScope,
 };
 
 pub const NOTIFICATION_SCHEMA_VERSION: u32 = 1;
@@ -559,7 +560,7 @@ fn validate_file(file: &NotificationFileV1) -> AppResult<()> {
             partition
                 .items
                 .iter()
-                .map(|record| (record.id.as_str(), &partition.scope))
+                .map(|record| (record.id.as_str(), (&partition.scope, record)))
         })
         .collect();
     let mut indexed_sources = HashSet::new();
@@ -569,12 +570,25 @@ fn validate_file(file: &NotificationFileV1) -> AppResult<()> {
         let source_key = (entry.scope.clone(), entry.source_event_id.clone());
         let scope_count = indexed_per_scope.entry(entry.scope.clone()).or_default();
         *scope_count += 1;
+        let indexed_record = records_by_id.get(entry.notification_id.as_str());
+        let valid_client_source_target = if entry.source_event_id.starts_with("client:") {
+            client_notification_source_parts(&entry.source_event_id).is_some_and(
+                |(_, expected_kind, _)| {
+                    indexed_record.is_some_and(|(_, record)| {
+                        record.kind == expected_kind
+                            && record.source_event_id.as_deref()
+                                == Some(entry.source_event_id.as_str())
+                    })
+                },
+            )
+        } else {
+            true
+        };
         if *scope_count > MAX_NOTIFICATION_SOURCE_INDEX_PER_SCOPE
             || !is_safe_notification_source_event_id(&entry.source_event_id)
             || !indexed_sources.insert(source_key.clone())
-            || !records_by_id
-                .get(entry.notification_id.as_str())
-                .is_some_and(|scope| *scope == &entry.scope)
+            || !indexed_record.is_some_and(|(scope, _)| *scope == &entry.scope)
+            || !valid_client_source_target
             || creating_sources
                 .get(&source_key)
                 .is_some_and(|record_id| record_id != &entry.notification_id)

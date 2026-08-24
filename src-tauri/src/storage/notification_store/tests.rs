@@ -11,10 +11,12 @@ use super::{
 };
 use crate::error::AppError;
 use crate::models::notification::{
+    ClientNotificationFailedStep, ClientNotificationKind, CreateClientNotificationRequest,
     NotificationAction, NotificationCategory, NotificationContent, NotificationEntity,
-    NotificationEntityType, NotificationKind, NotificationRecord, NotificationScalar,
-    NotificationScope, NotificationSeverity, MAX_JAVASCRIPT_SAFE_INTEGER,
+    NotificationEntityType, NotificationInput, NotificationKind, NotificationRecord,
+    NotificationScalar, NotificationScope, NotificationSeverity, MAX_JAVASCRIPT_SAFE_INTEGER,
 };
+use crate::services::notification::NotificationPolicy;
 
 static TEST_ROOT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -102,6 +104,38 @@ fn sample_file(revision: u64) -> NotificationFileV1 {
                 100,
             )],
         }],
+    }
+}
+
+fn client_record(kind: ClientNotificationKind, id: &str) -> NotificationRecord {
+    let input = NotificationPolicy
+        .client_account_failure(CreateClientNotificationRequest {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+            attempt_id: "10000000-0000-4000-8000-000000000001".into(),
+            kind,
+            failed_steps: vec![ClientNotificationFailedStep::Config],
+        })
+        .unwrap();
+    record_from_input(input, id)
+}
+
+fn record_from_input(input: NotificationInput, id: &str) -> NotificationRecord {
+    NotificationRecord {
+        id: id.into(),
+        scope: input.scope,
+        category: input.category,
+        kind: input.kind,
+        severity: input.severity,
+        content: input.content,
+        entity: input.entity,
+        action: input.action,
+        source_event_id: input.source_event_id,
+        dedupe_key: input.dedupe_key,
+        occurrence_count: 1,
+        created_at_ms: 100,
+        updated_at_ms: 100,
+        read_at_ms: None,
     }
 }
 
@@ -823,6 +857,72 @@ fn records_reject_duplicate_creating_sources_and_misdirected_creation_index_entr
         notification_id: wrong_target,
     }];
     assert!(store.save(&misdirected).is_err());
+    cleanup(&root);
+}
+
+#[test]
+fn forged_client_source_aliases_are_quarantined_instead_of_loading_wrong_targets() {
+    let recovery_source = "client:10000000-0000-4000-8000-000000000001:recovery";
+    for (label, record) in [
+        (
+            "unrelated-kind",
+            sample_record(
+                "00000000-0000-4000-8000-000000000001",
+                NotificationScope::Account {
+                    account_id: "alpha".into(),
+                },
+                100,
+            ),
+        ),
+        (
+            "opposite-client-kind",
+            client_record(
+                ClientNotificationKind::AccountReconciliationFailed,
+                "00000000-0000-4000-8000-000000000002",
+            ),
+        ),
+    ] {
+        let root = test_root(label);
+        let path = store_path(&root);
+        let scope = record.scope.clone();
+        let file = NotificationFileV1 {
+            schema_version: NOTIFICATION_SCHEMA_VERSION,
+            revision: 7,
+            source_event_index: vec![NotificationSourceEventIndexEntry {
+                scope: scope.clone(),
+                source_event_id: recovery_source.into(),
+                notification_id: record.id.clone(),
+            }],
+            partitions: vec![NotificationPartition {
+                scope,
+                items: vec![record],
+            }],
+        };
+        write_json(&path, &file);
+
+        let outcome = NotificationStore::with_path(path.clone()).load().unwrap();
+
+        assert_eq!(outcome.status, NotificationLoadStatus::ResetFromCorruption);
+        assert_eq!(outcome.file, NotificationFileV1::empty());
+        assert!(!path.exists());
+        cleanup(&root);
+    }
+}
+
+#[test]
+fn ordinary_semantic_source_aliases_remain_valid() {
+    let root = test_root("ordinary-source-alias");
+    let store = NotificationStore::with_path(store_path(&root));
+    let mut file = sample_file(3);
+    file.source_event_index = vec![NotificationSourceEventIndexEntry {
+        scope: NotificationScope::Global,
+        source_event_id: "semantic-connection-alias".into(),
+        notification_id: file.partitions[0].items[0].id.clone(),
+    }];
+
+    store.save(&file).unwrap();
+
+    assert_eq!(store.load().unwrap().file, file);
     cleanup(&root);
 }
 

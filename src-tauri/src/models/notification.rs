@@ -798,16 +798,50 @@ fn client_failure_identity_matches(
     let Some(source) = input.source_event_id.as_deref() else {
         return false;
     };
-    let Some((attempt_id, suffix)) = source
-        .strip_prefix("client:")
-        .and_then(|value| value.split_once(':'))
-    else {
+    let Some((attempt_id, source_kind, suffix)) = client_notification_source_parts(source) else {
         return false;
     };
-    suffix == expected_suffix
-        && !suffix.contains(':')
-        && is_generated_uuid(attempt_id)
+    source_kind == input.kind
+        && suffix == expected_suffix
         && input.dedupe_key == format!("{account_id}:{attempt_id}:{expected_suffix}")
+}
+
+pub(crate) fn client_notification_source_parts(
+    source: &str,
+) -> Option<(&str, NotificationKind, &'static str)> {
+    let (attempt_id, suffix) = source.strip_prefix("client:")?.split_once(':')?;
+    if suffix.contains(':') || !is_generated_uuid(attempt_id) {
+        return None;
+    }
+    let (kind, canonical_suffix) = match suffix {
+        "recovery" => (NotificationKind::AccountRecoveryFailed, "recovery"),
+        "reconciliation" => (
+            NotificationKind::AccountReconciliationFailed,
+            "reconciliation",
+        ),
+        _ => return None,
+    };
+    Some((attempt_id, kind, canonical_suffix))
+}
+
+pub(crate) fn client_notification_record_matches_input(
+    record: &NotificationRecord,
+    input: &NotificationInput,
+) -> bool {
+    matches!(
+        input.kind,
+        NotificationKind::AccountRecoveryFailed | NotificationKind::AccountReconciliationFailed
+    ) && record.validate().is_ok()
+        && input.validate().is_ok()
+        && record.scope == input.scope
+        && record.category == input.category
+        && record.kind == input.kind
+        && record.severity == input.severity
+        && record.content == input.content
+        && record.entity == input.entity
+        && record.action == input.action
+        && record.source_event_id == input.source_event_id
+        && record.dedupe_key == input.dedupe_key
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::models::notification::{
-    ListNotificationsRequest, NotificationChange, NotificationChangedEvent, NotificationChannel,
-    NotificationEnvironment, NotificationFilter, NotificationInput, NotificationKind,
-    NotificationMutationResult, NotificationPage, NotificationRecord, NotificationScalar,
-    NotificationScope, NotificationSummary, NotificationToastCandidate,
-    MAX_JAVASCRIPT_SAFE_INTEGER,
+    client_notification_record_matches_input, ListNotificationsRequest, NotificationChange,
+    NotificationChangedEvent, NotificationChannel, NotificationEnvironment, NotificationFilter,
+    NotificationInput, NotificationKind, NotificationMutationResult, NotificationPage,
+    NotificationRecord, NotificationScalar, NotificationScope, NotificationSummary,
+    NotificationToastCandidate, MAX_JAVASCRIPT_SAFE_INTEGER,
 };
 use crate::storage::notification_store::{
     notification_file_fits_serialized_limit, NotificationFileV1, NotificationLoadStatus,
@@ -389,6 +389,12 @@ impl NotificationService {
             let notification = record_for_source(&guard.file, &source).ok_or_else(|| {
                 NotificationError::new("NOTIFICATION_STATE_CONFLICT", "通知状态已发生冲突")
             })?;
+            if !client_notification_record_matches_input(notification, &input) {
+                return Err(NotificationError::new(
+                    "NOTIFICATION_STATE_CONFLICT",
+                    "通知状态已发生冲突",
+                ));
+            }
             return Ok(ClientNotificationPublishResult {
                 notification: notification.clone(),
                 unread_count: visible_unread_count(&guard.file, &context, now_ms),
