@@ -1,12 +1,13 @@
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 
 use super::super::*;
 use crate::api::response::classify_create_order_failure;
-use crate::models::config::{AppConfig, RiskConfig};
+use crate::models::config::{ApiCredential, AppConfig, RiskConfig};
 use crate::models::notification::{ListNotificationsRequest, NotificationFilter, NotificationKind};
 use crate::models::trading::{OrderStatus, SubmissionContext, TradingFailureKind};
 use crate::services::notification::{
@@ -97,6 +98,100 @@ fn order(id: &str, status: OrderStatus) -> Order {
         filled_qty: "0".into(),
         avg_price: "0".into(),
     }
+}
+
+fn market_request(order_link_id: Option<&str>) -> PlaceOrderRequest {
+    PlaceOrderRequest {
+        symbol: "BTCUSDT".into(),
+        side: "Buy".into(),
+        order_type: "Market".into(),
+        qty: "1".into(),
+        position_idx: 0,
+        price: None,
+        time_in_force: None,
+        order_link_id: order_link_id.map(str::to_owned),
+        reduce_only: None,
+    }
+}
+
+fn read_http_request(socket: &mut std::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 2048];
+    loop {
+        let count = socket.read(&mut buffer).expect("read API request");
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end + 4]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .or_else(|| line.strip_prefix("content-length: "))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if bytes.len() >= header_end + 4 + content_length {
+            break;
+        }
+    }
+    String::from_utf8(bytes).expect("test request is UTF-8")
+}
+
+async fn api_client_for_responses(
+    responses_after_initial_time: Vec<serde_json::Value>,
+) -> (
+    Arc<ApiClient>,
+    std::thread::JoinHandle<()>,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let address = listener.local_addr().expect("test server address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        let responses = std::iter::once(serde_json::json!({
+            "code": 0,
+            "data": {"time": "1782850580"}
+        }))
+        .chain(responses_after_initial_time);
+        for payload in responses {
+            let response_body = serde_json::to_string(&payload).unwrap();
+            let (mut socket, _) = listener.accept().expect("accept API request");
+            captured
+                .lock()
+                .unwrap()
+                .push(read_http_request(&mut socket));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write API response");
+        }
+    });
+    let client = Arc::new(ApiClient::new());
+    client
+        .set_credential(ApiCredential {
+            api_key: "test-key".into(),
+            api_secret: "test-secret".into(),
+            base_url: format!("http://{address}"),
+            label: "test".into(),
+        })
+        .await;
+    (client, server, requests)
+}
+
+fn request_json(request: &str) -> serde_json::Value {
+    let (_, body) = request
+        .split_once("\r\n\r\n")
+        .expect("HTTP request contains a body delimiter");
+    serde_json::from_str(body).expect("request body is JSON")
 }
 
 struct FailOncePersistence {
@@ -222,13 +317,16 @@ async fn confirmed_rejection_persists_when_release_save_fails_without_leaking_de
         &harness.observer,
         &reservation,
         &context,
+        &context.submission_id,
         AppError::TradingFailure(crate::models::trading::TradingFailure::rejected()),
         NOW_MS + 1,
     )
     .await;
 
     assert!(matches!(error, AppError::Notified { .. }));
-    assert_eq!(harness.records("alpha").await.len(), 1);
+    let records = harness.records("alpha").await;
+    assert_eq!(records.len(), 1);
+    assert!(records[0].source_event_id.as_ref().unwrap().len() <= 256);
     assert_eq!(
         RiskUsageStore::with_path(risk_path.clone())
             .load()
@@ -243,6 +341,441 @@ async fn confirmed_rejection_persists_when_release_save_fails_without_leaking_de
 
     std::fs::remove_dir(&private_detail).unwrap();
     std::fs::remove_dir_all(&risk_root).unwrap();
+}
+
+#[tokio::test]
+async fn undocumented_list_rejection_is_ambiguous_without_notification_or_success_side_effects() {
+    let harness = ObserverHarness::new("list-rejection-full-boundary");
+    let risk_path = std::env::temp_dir().join(format!(
+        "easiflux-list-rejection-risk-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig {
+            max_daily_orders: 1,
+            ..Default::default()
+        },
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let (api, server, _) = api_client_for_responses(vec![json!({
+        "code": 0,
+        "data": {
+            "items": [{"orderId": "123", "orderStatus": "Rejected"}]
+        }
+    })])
+    .await;
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 1,
+    };
+    let success_effects = Arc::new(AtomicUsize::new(0));
+    let success_effects_for_call = Arc::clone(&success_effects);
+
+    let result = execute_place_order(
+        api.as_ref(),
+        &risk,
+        &harness.observer,
+        &context,
+        PlaceOrderRequest {
+            symbol: "BTCUSDT".into(),
+            side: "Buy".into(),
+            order_type: "Market".into(),
+            qty: "1".into(),
+            position_idx: 0,
+            price: None,
+            time_in_force: None,
+            order_link_id: None,
+            reduce_only: None,
+        },
+        None,
+        NOW_MS,
+        move |_| async move {
+            success_effects_for_call.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await;
+    server.join().expect("test server exits");
+
+    assert!(matches!(result, Err(AppError::Internal(_))));
+    assert_eq!(success_effects.load(Ordering::SeqCst), 0);
+    assert!(harness.records("alpha").await.is_empty());
+    assert!(risk
+        .read()
+        .await
+        .reserve_order(
+            &PlaceOrderRequest {
+                symbol: "BTCUSDT".into(),
+                side: "Buy".into(),
+                order_type: "Market".into(),
+                qty: "1".into(),
+                position_idx: 0,
+                price: None,
+                time_in_force: None,
+                order_link_id: None,
+                reduce_only: None,
+            },
+            None,
+            NOW_MS + 1,
+        )
+        .is_err());
+
+    let _ = std::fs::remove_file(risk_path);
+}
+
+#[tokio::test]
+async fn noncanonical_create_order_codes_are_ambiguous_and_keep_the_reservation() {
+    for (label, payload) in [
+        (
+            "missing",
+            json!({"data": {"order_id": "123", "order_status": "New"}}),
+        ),
+        (
+            "string-zero",
+            json!({"code": "0", "data": {"order_id": "123", "order_status": "New"}}),
+        ),
+        (
+            "numeric-200",
+            json!({"code": 200, "data": {"order_id": "123", "order_status": "New"}}),
+        ),
+        (
+            "success-string",
+            json!({"code": "SUCCESS", "data": {"order_id": "123", "order_status": "New"}}),
+        ),
+        (
+            "boolean",
+            json!({"code": true, "data": {"order_id": "123", "order_status": "New"}}),
+        ),
+        (
+            "object",
+            json!({"code": {"value": 0}, "data": {"order_id": "123", "order_status": "New"}}),
+        ),
+        (
+            "unknown-numeric",
+            json!({"code": 901234, "data": {"order_id": "123", "order_status": "New"}}),
+        ),
+    ] {
+        let harness = ObserverHarness::new(&format!("ambiguous-code-{label}"));
+        let risk_path = std::env::temp_dir().join(format!(
+            "easiflux-ambiguous-code-risk-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+            RiskConfig {
+                max_daily_orders: 1,
+                ..Default::default()
+            },
+            RiskUsageStore::with_path(risk_path.clone()),
+        )));
+        let (api, server, _) = api_client_for_responses(vec![payload]).await;
+        let context = SubmissionContext {
+            submission_id: uuid::Uuid::new_v4().to_string(),
+            account_id: "alpha".into(),
+            session_epoch: 1,
+        };
+        let success_effects = Arc::new(AtomicUsize::new(0));
+        let success_effects_for_call = Arc::clone(&success_effects);
+
+        let result = execute_place_order(
+            api.as_ref(),
+            &risk,
+            &harness.observer,
+            &context,
+            market_request(None),
+            None,
+            NOW_MS,
+            move |_| async move {
+                success_effects_for_call.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        server.join().expect("test server exits");
+
+        assert!(
+            matches!(result, Err(AppError::Internal(_))),
+            "{label} must be ambiguous: {result:?}"
+        );
+        assert_eq!(success_effects.load(Ordering::SeqCst), 0, "{label}");
+        assert!(harness.records("alpha").await.is_empty(), "{label}");
+        assert!(
+            risk.read()
+                .await
+                .reserve_order(&market_request(None), None, NOW_MS + 1)
+                .is_err(),
+            "{label} must keep its reservation"
+        );
+
+        let _ = std::fs::remove_file(risk_path);
+    }
+}
+
+#[tokio::test]
+async fn caller_order_link_is_preserved_outbound_and_returned_while_submission_stays_independent() {
+    let harness = ObserverHarness::new("caller-order-link");
+    let risk_path = std::env::temp_dir().join(format!(
+        "easiflux-caller-link-risk-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig::default(),
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let caller_link = "client-link_2026.08";
+    let (api, server, requests) = api_client_for_responses(vec![json!({
+        "code": 0,
+        "data": {
+            "order_id": "order-caller-link-1",
+            "order_status": "New",
+            "order_link_id": caller_link,
+        }
+    })])
+    .await;
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 1,
+    };
+    let success_effects = Arc::new(AtomicUsize::new(0));
+    let counted_effects = Arc::clone(&success_effects);
+
+    let result = execute_place_order(
+        api.as_ref(),
+        &risk,
+        &harness.observer,
+        &context,
+        market_request(Some(caller_link)),
+        None,
+        NOW_MS,
+        move |_| async move {
+            counted_effects.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await
+    .unwrap();
+    server.join().expect("test server exits");
+
+    let requests = requests.lock().unwrap();
+    let outbound = request_json(
+        requests
+            .iter()
+            .find(|request| request.starts_with("POST "))
+            .expect("create-order request was sent"),
+    );
+    assert_eq!(outbound["order_link_id"], caller_link);
+    assert_ne!(outbound["order_link_id"], context.submission_id);
+    assert_eq!(result.order_link_id.as_deref(), Some(caller_link));
+    assert_eq!(success_effects.load(Ordering::SeqCst), 1);
+
+    let _ = std::fs::remove_file(risk_path);
+}
+
+#[tokio::test]
+async fn omitted_order_link_uses_one_generated_submission_id_across_timestamp_retry() {
+    let harness = ObserverHarness::new("generated-link-retry");
+    let risk_path = std::env::temp_dir().join(format!(
+        "easiflux-generated-link-risk-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig::default(),
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 1,
+    };
+    let (api, server, requests) = api_client_for_responses(vec![
+        json!({"code": 26200002, "message": "timestamp"}),
+        json!({"code": 0, "data": {"time": "1782850580"}}),
+        json!({
+            "code": 0,
+            "data": {
+                "order_id": "order-generated-link-1",
+                "order_status": "New",
+                "order_link_id": context.submission_id,
+            }
+        }),
+    ])
+    .await;
+
+    let result = execute_place_order(
+        api.as_ref(),
+        &risk,
+        &harness.observer,
+        &context,
+        market_request(None),
+        None,
+        NOW_MS,
+        |_| async {},
+    )
+    .await
+    .unwrap();
+    server.join().expect("test server exits");
+
+    let post_bodies = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.starts_with("POST "))
+        .map(|request| request_json(request))
+        .collect::<Vec<_>>();
+    assert_eq!(post_bodies.len(), 2);
+    assert!(post_bodies
+        .iter()
+        .all(|body| body["order_link_id"] == context.submission_id));
+    assert_eq!(
+        result.order_link_id.as_deref(),
+        Some(context.submission_id.as_str())
+    );
+
+    let _ = std::fs::remove_file(risk_path);
+}
+
+#[tokio::test]
+async fn caller_link_rejection_rebuilds_alias_and_absorbs_later_ws_terminal() {
+    let harness = ObserverHarness::new("caller-link-restart-alias");
+    let risk_path = std::env::temp_dir().join(format!(
+        "easiflux-caller-link-rejection-risk-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig::default(),
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let caller_link = "sk-secret:\nclient-1";
+    let (api, server, requests) = api_client_for_responses(vec![json!({
+        "code": 0,
+        "data": {
+            "order_id": "provider-rejected-caller-1",
+            "orderStatus": "Rejected",
+            "order_link_id": caller_link,
+        }
+    })])
+    .await;
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 1,
+    };
+    let success_effects = Arc::new(AtomicUsize::new(0));
+    let counted_effects = Arc::clone(&success_effects);
+
+    let result = execute_place_order(
+        api.as_ref(),
+        &risk,
+        &harness.observer,
+        &context,
+        market_request(Some(caller_link)),
+        None,
+        NOW_MS,
+        move |_| async move {
+            counted_effects.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await;
+    server.join().expect("test server exits");
+    assert!(matches!(result, Err(AppError::Notified { .. })));
+    let post = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| request.starts_with("POST "))
+        .map(|request| request_json(request))
+        .unwrap();
+    assert_eq!(post["order_link_id"], caller_link);
+    assert_eq!(success_effects.load(Ordering::SeqCst), 0);
+    let records = harness.records("alpha").await;
+    assert_eq!(records.len(), 1);
+    assert!(records[0].source_event_id.as_ref().unwrap().len() <= 256);
+    assert!(risk
+        .read()
+        .await
+        .reserve_order(&market_request(None), None, NOW_MS + 1)
+        .is_ok());
+    let persisted = std::fs::read_to_string(&harness.path).unwrap();
+    assert!(!persisted.contains(caller_link));
+    assert!(!persisted.contains("sk-secret"));
+
+    let path = harness.path.clone();
+    std::mem::forget(harness);
+    let restarted = ObserverHarness::load(path);
+    let mut stream_order = order("order-caller-link-restart-1", OrderStatus::New);
+    stream_order.order_link_id = Some(caller_link.into());
+    restarted
+        .observer
+        .observe(
+            "alpha",
+            1,
+            &stream_order,
+            OrderObservationOrigin::Realtime,
+            None,
+            NOW_MS + 1,
+        )
+        .await;
+    stream_order.status = OrderStatus::Filled;
+    assert!(restarted
+        .observer
+        .observe(
+            "alpha",
+            1,
+            &stream_order,
+            OrderObservationOrigin::Realtime,
+            None,
+            NOW_MS + 2,
+        )
+        .await
+        .is_none());
+    assert_eq!(restarted.records("alpha").await.len(), 1);
+
+    let _ = std::fs::remove_file(risk_path);
+}
+
+#[tokio::test]
+async fn oversized_secret_like_order_link_is_rejected_before_reservation_or_network() {
+    let harness = ObserverHarness::new("oversized-link-rejected");
+    let risk_path = std::env::temp_dir().join(format!(
+        "easiflux-unsafe-link-risk-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig::default(),
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let unsafe_link = format!("sk-secret\n{}", "x".repeat(300));
+    let api = Arc::new(ApiClient::new());
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 1,
+    };
+
+    let result = execute_place_order(
+        api.as_ref(),
+        &risk,
+        &harness.observer,
+        &context,
+        market_request(Some(&unsafe_link)),
+        None,
+        NOW_MS,
+        |_| async {},
+    )
+    .await;
+    assert!(matches!(result, Err(AppError::Trading(_))));
+    assert!(!result.unwrap_err().to_string().contains("sk-secret"));
+    assert!(harness.records("alpha").await.is_empty());
+    assert!(
+        !risk_path.exists(),
+        "validation must run before reservation"
+    );
+
+    let _ = std::fs::remove_file(risk_path);
 }
 
 #[tokio::test]
@@ -267,6 +800,61 @@ async fn buffered_new_filled_survives_snapshot_already_filled_and_notifies_once(
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].kind, NotificationKind::OrderFilled);
     assert_eq!(records[0].occurrence_count, 1);
+}
+
+#[tokio::test]
+async fn buffered_nonterminal_without_live_terminal_accepts_snapshot_terminal_baseline() {
+    for (label, pending_status) in [
+        ("new", OrderStatus::New),
+        ("partial", OrderStatus::PartiallyFilled),
+    ] {
+        let harness = ObserverHarness::new(&format!("buffered-{label}-snapshot-terminal"));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 1,
+        };
+        let order_id = format!("order-buffered-{label}-1");
+        harness
+            .observer
+            .seed_snapshot_then_replay(
+                &context,
+                &[order(&order_id, OrderStatus::Filled)],
+                vec![order(&order_id, pending_status)],
+                NOW_MS,
+            )
+            .await;
+
+        assert!(harness.records("alpha").await.is_empty());
+        assert!(harness
+            .observer
+            .observe(
+                "alpha",
+                1,
+                &order(&order_id, OrderStatus::Filled),
+                OrderObservationOrigin::Realtime,
+                None,
+                NOW_MS + 2,
+            )
+            .await
+            .is_none());
+        assert!(harness.records("alpha").await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn standalone_buffered_terminal_does_not_override_snapshot_terminal_baseline() {
+    let harness = ObserverHarness::new("standalone-buffered-terminal");
+    let context = OrderStreamContext {
+        account_id: "alpha".into(),
+        session_epoch: 1,
+    };
+    let terminal = order("order-standalone-terminal-1", OrderStatus::Filled);
+    harness
+        .observer
+        .seed_snapshot_then_replay(&context, &[terminal.clone()], vec![terminal], NOW_MS)
+        .await;
+
+    assert!(harness.records("alpha").await.is_empty());
 }
 
 #[tokio::test]
@@ -499,7 +1087,7 @@ async fn api_rejection_without_order_id_is_idempotent_across_restart_by_submissi
     };
     let first_id = harness
         .observer
-        .observe_rejection(&context, NOW_MS)
+        .observe_rejection(&context, None, NOW_MS)
         .await
         .expect("confirmed rejection should persist");
     let path = harness.path.clone();
@@ -509,7 +1097,7 @@ async fn api_rejection_without_order_id_is_idempotent_across_restart_by_submissi
     let restarted = ObserverHarness::load(path);
     assert!(restarted
         .observer
-        .observe_rejection(&context, NOW_MS + 1)
+        .observe_rejection(&context, None, NOW_MS + 1)
         .await
         .is_none());
     let records = restarted.records("alpha").await;
@@ -568,7 +1156,7 @@ async fn submission_rejection_and_later_order_stream_are_one_absolute_event() {
     };
     assert!(harness
         .observer
-        .observe_rejection(&context, NOW_MS)
+        .observe_rejection(&context, Some(&context.submission_id), NOW_MS)
         .await
         .is_some());
     let path = harness.path.clone();
@@ -625,10 +1213,9 @@ async fn ws_rejection_without_submission_uses_real_order_id_identity() {
         .is_some());
     let records = harness.records("alpha").await;
     assert_eq!(records.len(), 1);
-    assert_eq!(
-        records[0].source_event_id.as_deref(),
-        Some("order:order-real-identity-1:terminal")
-    );
+    let source = records[0].source_event_id.as_deref().unwrap();
+    assert!(source.starts_with("order:terminal:o"));
+    assert!(!source.contains("order-real-identity-1"));
     assert_eq!(
         records[0].dedupe_key,
         "alpha:order-real-identity-1:rejected"
@@ -707,7 +1294,7 @@ fn create_order_rejection_classification_is_structural_and_fail_closed() {
         classify_create_order_failure(&json!({
             "code": 0,
             "message": "multilingual provider text",
-            "data": { "orderStatus": "Rejected" }
+            "data": { "order_status": "Rejected" }
         })),
         Some(TradingFailureKind::Rejected),
     );

@@ -186,12 +186,72 @@ impl OrderObservationBuffer {
         true
     }
 
-    fn mark_seeded(&mut self, context: &OrderStreamContext) -> Option<Vec<Order>> {
-        if !self.matches(context) {
+    fn pending_for_seed(&self, context: &OrderStreamContext) -> Option<Vec<Order>> {
+        if !self.matches(context) || self.snapshot_seeded {
             return None;
         }
+        Some(self.pending.clone())
+    }
+
+    fn finish_seed(&mut self, context: &OrderStreamContext) -> bool {
+        if !self.matches(context) || self.snapshot_seeded {
+            return false;
+        }
+        self.pending.clear();
         self.snapshot_seeded = true;
-        Some(std::mem::take(&mut self.pending))
+        true
+    }
+}
+
+async fn seed_order_gate<F, Fut>(
+    order_observation_buffer: &Arc<Mutex<OrderObservationBuffer>>,
+    order_snapshot_seeded: &AtomicBool,
+    context: &OrderStreamContext,
+    replay: F,
+) where
+    F: FnOnce(Vec<Order>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut buffer = order_observation_buffer.lock().await;
+    let Some(pending) = buffer.pending_for_seed(context) else {
+        return;
+    };
+    replay(pending).await;
+    if buffer.finish_seed(context) {
+        order_snapshot_seeded.store(true, Ordering::Release);
+    }
+}
+
+async fn observe_manual_order_snapshots_for_session(
+    config: &Arc<RwLock<AppConfig>>,
+    account_lifecycle: &Arc<AccountLifecycleCoordinator>,
+    order_observation_buffer: &Arc<Mutex<OrderObservationBuffer>>,
+    observer: &OrderNotificationObserver,
+    context: &OrderStreamContext,
+    snapshots: &[Order],
+    now_ms: u64,
+) {
+    let active_account_id = normalize_account_id(&config.read().await.active_account_id);
+    if account_lifecycle.current_session_epoch() != context.session_epoch
+        || active_account_id != context.account_id
+    {
+        return;
+    }
+    let buffer = order_observation_buffer.lock().await;
+    if !buffer.matches(context) || !buffer.snapshot_seeded {
+        return;
+    }
+    for (offset, snapshot) in snapshots.iter().enumerate() {
+        observer
+            .observe(
+                &context.account_id,
+                context.session_epoch,
+                snapshot,
+                crate::services::notification::OrderObservationOrigin::Snapshot,
+                None,
+                now_ms.saturating_add(offset as u64),
+            )
+            .await;
     }
 }
 
@@ -427,14 +487,40 @@ impl WsManager {
         {
             return;
         }
-        let mut buffer = self.order_observation_buffer.lock().await;
-        let Some(pending) = buffer.mark_seeded(context) else {
-            return;
-        };
-        self.notification_observer
-            .seed_snapshot_then_replay(context, snapshots, pending, local_timestamp_ms())
-            .await;
-        self.order_snapshot_seeded.store(true, Ordering::Release);
+        seed_order_gate(
+            &self.order_observation_buffer,
+            &self.order_snapshot_seeded,
+            context,
+            |pending| {
+                self.notification_observer.seed_snapshot_then_replay(
+                    context,
+                    snapshots,
+                    pending,
+                    local_timestamp_ms(),
+                )
+            },
+        )
+        .await;
+    }
+
+    /// Applies a manual REST snapshot only after the initial scheduler snapshot
+    /// has opened this immutable session's live-order gate. The caller already
+    /// holds the lifecycle read guard.
+    pub(crate) async fn observe_manual_order_snapshots(
+        &self,
+        context: &OrderStreamContext,
+        snapshots: &[Order],
+    ) {
+        observe_manual_order_snapshots_for_session(
+            &self.config,
+            &self.account_lifecycle,
+            &self.order_observation_buffer,
+            &self.notification_observer,
+            context,
+            snapshots,
+            local_timestamp_ms(),
+        )
+        .await;
     }
 
     pub async fn stop(&self) {
@@ -986,11 +1072,19 @@ mod tests {
 
     use super::{
         abort_and_wait_for_tasks, abort_wait_and_reset_freshness, authenticate_and_subscribe,
-        await_private_auth_response, record_message_freshness, validate_private_auth_ack,
-        FreshnessDomain, OrderObservationBuffer, WsFreshness, PRIVATE_AUTH_ERROR,
-        PRIVATE_SUBSCRIPTION_ERROR,
+        await_private_auth_response, observe_manual_order_snapshots_for_session,
+        record_message_freshness, seed_order_gate, validate_private_auth_ack, FreshnessDomain,
+        OrderObservationBuffer, WsFreshness, PRIVATE_AUTH_ERROR, PRIVATE_SUBSCRIPTION_ERROR,
     };
+    use crate::models::config::AppConfig;
+    use crate::models::notification::{ListNotificationsRequest, NotificationFilter};
     use crate::models::trading::{Order, OrderStatus, OrderStreamContext};
+    use crate::services::notification::{
+        NotificationEmitter, NotificationRuntime, NotificationService, ViewContext,
+    };
+    use crate::services::trading::OrderNotificationObserver;
+    use crate::services::AccountLifecycleCoordinator;
+    use crate::storage::NotificationStore;
 
     fn buffered_order(id: &str, status: OrderStatus) -> Order {
         Order {
@@ -1027,9 +1121,9 @@ mod tests {
                 buffered_order("order-buffer-1", OrderStatus::Filled),
             ],
         ));
-        assert!(buffer.mark_seeded(&wrong).is_none());
+        assert!(buffer.pending_for_seed(&wrong).is_none());
 
-        let pending = buffer.mark_seeded(&context).unwrap();
+        let pending = buffer.pending_for_seed(&context).unwrap();
         assert_eq!(
             pending
                 .into_iter()
@@ -1041,10 +1135,223 @@ mod tests {
                 OrderStatus::Filled,
             ]
         );
+        assert!(buffer.finish_seed(&context));
         assert!(!buffer.defer(
             &context,
             vec![buffered_order("order-buffer-2", OrderStatus::New)]
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_seed_retains_pending_and_retries_once() {
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(
+            &context,
+            vec![
+                buffered_order("order-cancel-seed-1", OrderStatus::New),
+                buffered_order("order-cancel-seed-1", OrderStatus::Filled),
+            ],
+        ));
+        let seeded = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task_buffer = Arc::clone(&buffer);
+        let task_seeded = Arc::clone(&seeded);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            seed_order_gate(
+                &task_buffer,
+                &task_seeded,
+                &task_context,
+                |pending| async move {
+                    assert_eq!(pending.len(), 2);
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                },
+            )
+            .await;
+        });
+        started_rx.await.unwrap();
+
+        let drain_buffer = Arc::clone(&buffer);
+        let drain_context = context.clone();
+        let mut drain = tokio::spawn(async move {
+            drain_buffer.lock().await.defer(
+                &drain_context,
+                vec![buffered_order("order-cancel-seed-2", OrderStatus::New)],
+            )
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut drain)
+            .await
+            .is_err());
+        task.abort();
+        let _ = task.await;
+        assert!(drain.await.unwrap());
+
+        let gate = buffer.lock().await;
+        assert!(!gate.snapshot_seeded);
+        assert_eq!(gate.pending.len(), 3);
+        drop(gate);
+        let replayed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replayed_for_seed = Arc::clone(&replayed);
+        seed_order_gate(&buffer, &seeded, &context, move |pending| async move {
+            for order in pending {
+                let identity = (order.order_id, order.status);
+                let mut observed = replayed_for_seed.lock().unwrap();
+                if !observed.contains(&identity) {
+                    observed.push(identity);
+                }
+            }
+        })
+        .await;
+
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
+        assert_eq!(replayed.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn manual_snapshot_cannot_interleave_with_ws_drain_and_stale_context_is_noop() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "easiflux-manual-order-gate-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+            .join("notifications.v1.json");
+        let emitter: NotificationEmitter = Arc::new(|_| Ok(()));
+        let service = Arc::new(
+            NotificationService::load(
+                NotificationStore::with_path(path.clone()),
+                &["alpha".into()],
+                1_784_606_400_000,
+                emitter,
+            )
+            .unwrap(),
+        );
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Available(
+            Arc::clone(&service),
+        )));
+        let lifecycle = Arc::new(AccountLifecycleCoordinator::new());
+        let mut app_config = AppConfig::default();
+        app_config.active_account_id = "alpha".into();
+        let config = Arc::new(tokio::sync::RwLock::new(app_config));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: lifecycle.current_session_epoch(),
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(
+            &context,
+            vec![
+                buffered_order("order-manual-gate-1", OrderStatus::New),
+                buffered_order("order-manual-gate-1", OrderStatus::Filled),
+            ],
+        ));
+        let seeded = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let seed_buffer = Arc::clone(&buffer);
+        let seed_flag = Arc::clone(&seeded);
+        let seed_context = context.clone();
+        let replay_context = context.clone();
+        let seed_observer = observer.clone();
+        let seed_task = tokio::spawn(async move {
+            seed_order_gate(
+                &seed_buffer,
+                &seed_flag,
+                &seed_context,
+                |pending| async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    seed_observer
+                        .seed_snapshot_then_replay(
+                            &replay_context,
+                            &[buffered_order("order-manual-gate-1", OrderStatus::Filled)],
+                            pending,
+                            1_784_606_400_000,
+                        )
+                        .await;
+                },
+            )
+            .await;
+        });
+        started_rx.await.unwrap();
+
+        let manual_config = Arc::clone(&config);
+        let manual_lifecycle = Arc::clone(&lifecycle);
+        let manual_buffer = Arc::clone(&buffer);
+        let manual_observer = observer.clone();
+        let manual_context = context.clone();
+        let mut manual_task = tokio::spawn(async move {
+            observe_manual_order_snapshots_for_session(
+                &manual_config,
+                &manual_lifecycle,
+                &manual_buffer,
+                &manual_observer,
+                &manual_context,
+                &[buffered_order("order-manual-gate-1", OrderStatus::Filled)],
+                1_784_606_400_100,
+            )
+            .await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut manual_task)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        seed_task.await.unwrap();
+        manual_task.await.unwrap();
+
+        let records = service
+            .list(
+                ViewContext::account("alpha").unwrap(),
+                ListNotificationsRequest {
+                    account_id: Some("alpha".into()),
+                    filter: NotificationFilter::All,
+                    cursor: None,
+                    limit: 100,
+                },
+                1_784_606_401_000,
+            )
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(records.len(), 1);
+
+        lifecycle.advance_session_epoch();
+        observe_manual_order_snapshots_for_session(
+            &config,
+            &lifecycle,
+            &buffer,
+            &observer,
+            &context,
+            &[buffered_order("order-stale-manual-1", OrderStatus::New)],
+            1_784_606_402_000,
+        )
+        .await;
+        assert!(observer
+            .observe(
+                "alpha",
+                context.session_epoch,
+                &buffered_order("order-stale-manual-1", OrderStatus::Filled),
+                crate::services::notification::OrderObservationOrigin::Realtime,
+                None,
+                1_784_606_402_001,
+            )
+            .await
+            .is_none());
+        assert_eq!(service.revision().await, "1");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     struct DropFlag(Arc<AtomicBool>);

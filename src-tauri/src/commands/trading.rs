@@ -23,10 +23,15 @@ pub async fn refresh_orders(
             account_id: normalize_account_id(&state.config.read().await.active_account_id),
             session_epoch: state.account_lifecycle.current_session_epoch(),
         };
-        state
+        let orders = state
             .trading
             .refresh_orders(&context, symbol.as_deref())
-            .await
+            .await?;
+        state
+            .ws
+            .observe_manual_order_snapshots(&context, &orders)
+            .await;
+        Ok(orders)
     })
     .await
 }
@@ -46,6 +51,10 @@ pub async fn refresh_order_history(
             .trading
             .refresh_order_history(&context, symbol.as_deref(), limit)
             .await?;
+        state
+            .ws
+            .observe_manual_order_snapshots(&context, &orders)
+            .await;
         for order in &orders {
             state.analytics.record_order(order.clone()).await;
         }
@@ -70,6 +79,15 @@ pub async fn refresh_private_panels(
             .trading
             .refresh_order_history(&context, sym, Some(50))
             .await?;
+        let order_snapshots = open_orders
+            .iter()
+            .chain(&order_history)
+            .cloned()
+            .collect::<Vec<_>>();
+        state
+            .ws
+            .observe_manual_order_snapshots(&context, &order_snapshots)
+            .await;
         let positions = state.account.refresh_positions(sym).await?;
         for order in &order_history {
             state.analytics.record_order(order.clone()).await;

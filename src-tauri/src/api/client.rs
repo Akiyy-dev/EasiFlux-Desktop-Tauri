@@ -207,13 +207,19 @@ impl ApiClient {
         }
         let payload: Value = serde_json::from_str(&text)
             .map_err(|_| AppError::Connection("API 响应格式无效".into()))?;
-        if status.is_success()
-            && path == Some(endpoints::CREATE_ORDER)
-            && super::response::classify_create_order_failure(&payload).is_some()
-        {
-            return Err(AppError::TradingFailure(
-                crate::models::trading::TradingFailure::rejected(),
-            ));
+        if status.is_success() && path == Some(endpoints::CREATE_ORDER) {
+            match super::response::classify_create_order_outcome(&payload) {
+                super::response::CreateOrderOutcome::Rejected => {
+                    return Err(AppError::TradingFailure(
+                        crate::models::trading::TradingFailure::rejected(),
+                    ));
+                }
+                super::response::CreateOrderOutcome::Accepted(_) => {}
+                super::response::CreateOrderOutcome::ProviderFailure => {}
+                super::response::CreateOrderOutcome::Ambiguous => {
+                    return Err(AppError::Internal("订单提交结果不明确".into()));
+                }
+            }
         }
         if !status.is_success() {
             return Err(AppError::Connection(format!("HTTP {}", status)));

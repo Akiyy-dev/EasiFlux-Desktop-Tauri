@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::models::notification::{
     ListNotificationsRequest, NotificationChange, NotificationChangedEvent, NotificationChannel,
@@ -179,6 +180,7 @@ pub struct OrderObservation {
     pub session_epoch: u64,
     pub order_id: Option<String>,
     pub submission_id: Option<String>,
+    pub order_link_id: Option<String>,
     pub status: ObservedOrderStatus,
     pub origin: OrderObservationOrigin,
 }
@@ -828,16 +830,8 @@ impl NotificationService {
         now_ms: u64,
     ) -> Result<PublishOutcome, NotificationError> {
         ViewContext::account(&observation.account_id)?;
-        let entity_ids = order_observation_entity_ids(&observation);
-        let entity_id = observation
-            .submission_id
-            .as_ref()
-            .or(observation.order_id.as_ref())
-            .filter(|value| !value.trim().is_empty())
-            .cloned()
-            .ok_or_else(|| {
-                NotificationError::new("INVALID_NOTIFICATION_CONTENT", "订单观察标识无效")
-            })?;
+        let entity_ids = order_observation_entity_ids(&observation)?;
+        let entity_id = entity_ids.join(":");
         let keys: Vec<_> = entity_ids
             .into_iter()
             .map(|entity_id| OrderKey {
@@ -892,7 +886,7 @@ impl NotificationService {
         let context = policy::PolicyContext::new(
             observation.account_id,
             observation.session_epoch,
-            format!("order:{entity_id}:terminal"),
+            format!("order:terminal:{entity_id}"),
         )?;
         let policy = NotificationPolicy;
         let input = match observation.status {
@@ -1201,21 +1195,91 @@ fn no_publish_outcome(state: &ServiceState) -> PublishOutcome {
     }
 }
 
-fn order_observation_entity_ids(observation: &OrderObservation) -> Vec<String> {
-    let mut ids = Vec::with_capacity(2);
-    for candidate in [
-        observation.order_id.as_ref(),
-        observation.submission_id.as_ref(),
+fn order_observation_entity_ids(
+    observation: &OrderObservation,
+) -> Result<Vec<String>, NotificationError> {
+    let mut ids = Vec::with_capacity(3);
+    if let Some(order_id) = observation.order_id.as_deref().filter(|value| {
+        !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+    }) {
+        ids.push(order_alias_token("order-id", 'o', order_id));
+    }
+    if let Some(submission_id) = observation
+        .submission_id
+        .as_deref()
+        .filter(|value| is_uuid_v4(value))
+    {
+        ids.push(order_alias_token("submission-id", 's', submission_id));
+    }
+    if let Some(order_link_id) = observation
+        .order_link_id
+        .as_deref()
+        .filter(|value| !value.is_empty() && value.chars().count() <= 36)
+    {
+        ids.push(order_alias_token("order-link-id", 'l', order_link_id));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err(NotificationError::new(
+            "INVALID_NOTIFICATION_CONTENT",
+            "订单观察标识无效",
+        ));
+    }
+    Ok(ids)
+}
+
+fn is_uuid_v4(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version_num() == 4)
+}
+
+fn order_alias_token(domain: &str, prefix: char, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"easiflux.notification.order-alias.v1\0");
+    hasher.update(domain.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.as_bytes());
+    format!("{prefix}{}", hex::encode(hasher.finalize()))
+}
+
+fn persisted_order_aliases(record: &NotificationRecord) -> Vec<String> {
+    let from_source = record
+        .source_event_id
+        .as_deref()
+        .map(persisted_order_aliases_from_source)
+        .filter(|aliases| !aliases.is_empty());
+    if let Some(aliases) = from_source {
+        return aliases;
+    }
+
+    [
+        ("orderId", "order-id", 'o'),
+        ("submissionId", "submission-id", 's'),
     ]
     .into_iter()
-    .flatten()
-    .filter(|value| !value.trim().is_empty())
-    {
-        if !ids.contains(candidate) {
-            ids.push(candidate.clone());
-        }
-    }
-    ids
+    .filter_map(
+        |(name, domain, prefix)| match record.content.params.get(name) {
+            Some(NotificationScalar::String(value)) if !value.trim().is_empty() => {
+                Some(order_alias_token(domain, prefix, value))
+            }
+            _ => None,
+        },
+    )
+    .collect()
+}
+
+fn persisted_order_aliases_from_source(source: &str) -> Vec<String> {
+    source
+        .strip_prefix("order:terminal:")
+        .into_iter()
+        .flat_map(|aliases| aliases.split(':'))
+        .filter(|alias| {
+            alias.len() == 65
+                && matches!(alias.as_bytes().first(), Some(b'o' | b's' | b'l'))
+                && alias.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 fn rebuild_order_states(file: &NotificationFileV1) -> HashMap<OrderKey, ObservedOrderState> {
@@ -1231,25 +1295,21 @@ fn rebuild_order_states(file: &NotificationFileV1) -> HashMap<OrderKey, Observed
                 NotificationKind::OrderRejected => ObservedOrderStatus::Rejected,
                 _ => continue,
             };
-            let Some(entity_id) = ["orderId", "submissionId"].into_iter().find_map(|name| {
-                match record.content.params.get(name) {
-                    Some(NotificationScalar::String(value)) if !value.trim().is_empty() => {
-                        Some(value.clone())
-                    }
-                    _ => None,
-                }
-            }) else {
+            let entity_ids = persisted_order_aliases(record);
+            if entity_ids.is_empty() {
                 continue;
-            };
-            states
-                .entry(OrderKey {
-                    account_id: account_id.clone(),
-                    entity_id,
-                })
-                .or_insert(ObservedOrderState {
-                    status,
-                    terminal_notified: true,
-                });
+            }
+            for entity_id in entity_ids {
+                states
+                    .entry(OrderKey {
+                        account_id: account_id.clone(),
+                        entity_id,
+                    })
+                    .or_insert(ObservedOrderState {
+                        status,
+                        terminal_notified: true,
+                    });
+            }
         }
     }
     states

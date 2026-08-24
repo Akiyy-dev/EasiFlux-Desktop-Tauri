@@ -40,6 +40,7 @@ pub struct AppState {
     pub time: Arc<TimeService>,
     pub daily_pnl: Arc<DailyPnlService>,
     pub scheduler: Arc<SchedulerService>,
+    pub ws: Arc<WsManager>,
     pub environment_status: Arc<RwLock<EnvironmentStatus>>,
     pub account_lifecycle: Arc<AccountLifecycleCoordinator>,
 }
@@ -168,7 +169,7 @@ impl AppState {
             trading.clone(),
             daily_pnl.clone(),
             connection.clone(),
-            ws,
+            ws.clone(),
             config.clone(),
             notification.clone(),
             emitter.clone(),
@@ -198,6 +199,7 @@ impl AppState {
             time,
             daily_pnl,
             scheduler,
+            ws,
             environment_status,
             account_lifecycle,
         })

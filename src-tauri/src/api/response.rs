@@ -30,6 +30,14 @@ pub struct ListEnvelopeMeta {
     pub raw_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CreateOrderOutcome<'a> {
+    Accepted(&'a Value),
+    Rejected,
+    ProviderFailure,
+    Ambiguous,
+}
+
 pub fn extract_data(payload: &Value) -> &Value {
     payload.get("data").unwrap_or(payload)
 }
@@ -264,33 +272,54 @@ pub fn error_message(payload: &Value) -> Option<String> {
     None
 }
 
-/// Classifies only an explicit order-status field in the create-order result.
+/// Selects the exact create-order candidate consumed by the parser and
+/// classifies it only beneath an explicit successful response envelope.
 /// Provider codes and localized messages are intentionally not interpreted.
-pub fn classify_create_order_failure(payload: &Value) -> Option<TradingFailureKind> {
-    let response_code = response_code(payload);
-    let recognized_envelope = response_code
-        .as_deref()
-        .is_some_and(|code| SUCCESS_CODES.contains(&code));
-    let infrastructure_code = response_code.as_deref().is_some_and(|code| {
-        code == "429"
-            || code
-                .parse::<u16>()
-                .is_ok_and(|value| (500..=599).contains(&value))
-    });
-    if !recognized_envelope
-        || infrastructure_code
-        || is_auth_error(payload)
-        || is_rate_limit_error(payload)
-        || is_timestamp_error(payload)
-        || is_sign_error(payload)
-    {
-        return None;
+pub fn classify_create_order_outcome(payload: &Value) -> CreateOrderOutcome<'_> {
+    let Some(code) = payload.get("code") else {
+        return CreateOrderOutcome::Ambiguous;
+    };
+    if code.as_i64() != Some(0) {
+        return if code.as_i64().is_some_and(|code| {
+            matches!(
+                code,
+                26200002
+                    | 26200003
+                    | 26200004
+                    | 26200005
+                    | 26200006
+                    | 26200010
+                    | 26200018
+                    | 20011005
+                    | 10200616
+            )
+        }) {
+            CreateOrderOutcome::ProviderFailure
+        } else {
+            CreateOrderOutcome::Ambiguous
+        };
     }
-    let data = extract_data(payload);
-    let candidate = ["orderStatus", "order_status", "status"]
+    let Some(candidate) = payload.get("data").filter(|data| data.is_object()) else {
+        return CreateOrderOutcome::Ambiguous;
+    };
+    let status = ["status", "orderStatus", "order_status"]
         .into_iter()
-        .find_map(|key| data.get(key).and_then(Value::as_str))?;
-    (OrderStatus::from_raw(candidate) == OrderStatus::Rejected)
+        .find_map(|key| candidate.get(key).and_then(Value::as_str));
+    if status.is_some_and(|status| OrderStatus::from_raw(status) == OrderStatus::Rejected) {
+        CreateOrderOutcome::Rejected
+    } else if candidate
+        .get("order_id")
+        .and_then(Value::as_str)
+        .is_some_and(|order_id| !order_id.trim().is_empty())
+    {
+        CreateOrderOutcome::Accepted(candidate)
+    } else {
+        CreateOrderOutcome::Ambiguous
+    }
+}
+
+pub fn classify_create_order_failure(payload: &Value) -> Option<TradingFailureKind> {
+    (classify_create_order_outcome(payload) == CreateOrderOutcome::Rejected)
         .then_some(TradingFailureKind::Rejected)
 }
 

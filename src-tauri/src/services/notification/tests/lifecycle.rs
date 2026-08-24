@@ -1823,6 +1823,7 @@ async fn deleting_account_without_a_partition_clears_seeded_order_state() {
         session_epoch: 1,
         order_id: Some("order-1".into()),
         submission_id: None,
+        order_link_id: None,
         status: ObservedOrderStatus::New,
         origin: OrderObservationOrigin::Snapshot,
     };
@@ -2236,6 +2237,7 @@ async fn order_observer_honors_snapshot_command_and_realtime_terminal_rules() {
         session_epoch: 9,
         order_id: Some("order-10".into()),
         submission_id: None,
+        order_link_id: None,
         status: ObservedOrderStatus::Filled,
         origin: OrderObservationOrigin::Snapshot,
     };
@@ -2252,6 +2254,7 @@ async fn order_observer_honors_snapshot_command_and_realtime_terminal_rules() {
         session_epoch: 9,
         order_id: Some("order-11".into()),
         submission_id: None,
+        order_link_id: None,
         status: ObservedOrderStatus::Canceled,
         origin: OrderObservationOrigin::Command,
     };
@@ -2275,6 +2278,7 @@ async fn order_observer_honors_snapshot_command_and_realtime_terminal_rules() {
         session_epoch: 9,
         order_id: Some("order-12".into()),
         submission_id: None,
+        order_link_id: None,
         status: ObservedOrderStatus::New,
         origin: OrderObservationOrigin::Realtime,
     };
@@ -2304,6 +2308,7 @@ async fn command_terminal_still_publishes_after_same_order_snapshot_seeded_termi
         session_epoch: 9,
         order_id: Some("order-20".into()),
         submission_id: None,
+        order_link_id: None,
         status: ObservedOrderStatus::Filled,
         origin: OrderObservationOrigin::Snapshot,
     };
@@ -2337,6 +2342,7 @@ async fn terminal_order_state_absorbs_late_nonterminal_and_conflicting_terminal_
         session_epoch: 9,
         order_id: Some("order-30".into()),
         submission_id: None,
+        order_link_id: None,
         status: ObservedOrderStatus::Filled,
         origin: OrderObservationOrigin::Snapshot,
     };
@@ -2450,6 +2456,7 @@ async fn observer_memory_transitions_roll_back_when_persistence_fails() {
         session_epoch: 1,
         order_id: Some("order-rollback-1".into()),
         submission_id: None,
+        order_link_id: None,
         status: ObservedOrderStatus::Filled,
         origin: OrderObservationOrigin::Command,
     };
@@ -2522,6 +2529,7 @@ async fn observer_state_does_not_leak_into_a_committed_housekeeping_phase() {
         session_epoch: 1,
         order_id: Some("order-housekeeping-1".into()),
         submission_id: None,
+        order_link_id: None,
         status: ObservedOrderStatus::Filled,
         origin: OrderObservationOrigin::Command,
     };

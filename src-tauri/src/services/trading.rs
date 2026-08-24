@@ -53,13 +53,12 @@ impl OrderNotificationObserver {
             OrderStatus::Unknown => return None,
         };
         let order_id = (!order.order_id.trim().is_empty()).then(|| order.order_id.clone());
-        let submission_id = submission_id.map(str::to_owned).or_else(|| {
-            order
-                .order_link_id
-                .clone()
-                .filter(|value| is_generated_submission_id(value))
-        });
-        if order_id.is_none() && submission_id.is_none() {
+        let submission_id = submission_id.map(str::to_owned);
+        let order_link_id = order
+            .order_link_id
+            .clone()
+            .filter(|value| is_correlatable_order_link(value));
+        if order_id.is_none() && submission_id.is_none() && order_link_id.is_none() {
             return None;
         }
         let service = match self.runtime.service() {
@@ -79,6 +78,7 @@ impl OrderNotificationObserver {
                     session_epoch,
                     order_id,
                     submission_id,
+                    order_link_id,
                     status,
                     origin,
                 },
@@ -102,13 +102,24 @@ impl OrderNotificationObserver {
         now_ms: u64,
     ) {
         let mut offset = 0_u64;
-        for snapshot in snapshots {
-            if buffered.iter().any(|live| {
-                orders_share_identity(snapshot, live)
-                    && matches!(live.status, OrderStatus::New | OrderStatus::PartiallyFilled)
-            }) {
-                continue;
-            }
+        let (deferred, baseline): (Vec<_>, Vec<_>) = snapshots.iter().partition(|snapshot| {
+            let mut saw_live_nonterminal = false;
+            buffered.iter().any(|live| {
+                if !orders_share_identity(snapshot, live) {
+                    return false;
+                }
+                if matches!(live.status, OrderStatus::New | OrderStatus::PartiallyFilled) {
+                    saw_live_nonterminal = true;
+                    return false;
+                }
+                saw_live_nonterminal
+                    && matches!(
+                        live.status,
+                        OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+                    )
+            })
+        });
+        for snapshot in baseline {
             self.observe(
                 &context.account_id,
                 context.session_epoch,
@@ -119,6 +130,7 @@ impl OrderNotificationObserver {
             )
             .await;
             offset = offset.saturating_add(1);
+            tokio::task::yield_now().await;
         }
         for live in buffered {
             self.observe(
@@ -131,12 +143,27 @@ impl OrderNotificationObserver {
             )
             .await;
             offset = offset.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
+        for snapshot in deferred {
+            self.observe(
+                &context.account_id,
+                context.session_epoch,
+                snapshot,
+                OrderObservationOrigin::Snapshot,
+                None,
+                now_ms.saturating_add(offset),
+            )
+            .await;
+            offset = offset.saturating_add(1);
+            tokio::task::yield_now().await;
         }
     }
 
     pub(crate) async fn observe_rejection(
         &self,
         context: &SubmissionContext,
+        order_link_id: Option<&str>,
         now_ms: u64,
     ) -> Option<String> {
         let service = self.runtime.service().ok()?;
@@ -147,6 +174,9 @@ impl OrderNotificationObserver {
                     session_epoch: context.session_epoch,
                     order_id: None,
                     submission_id: Some(context.submission_id.clone()),
+                    order_link_id: order_link_id
+                        .filter(|value| is_correlatable_order_link(value))
+                        .map(str::to_owned),
                     status: ObservedOrderStatus::Rejected,
                     origin: OrderObservationOrigin::Command,
                 },
@@ -230,16 +260,14 @@ fn orders_share_identity(left: &Order, right: &Order) -> bool {
         || matches!(
             (left.order_link_id.as_deref(), right.order_link_id.as_deref()),
             (Some(left), Some(right))
-                if is_generated_submission_id(left)
-                    && is_generated_submission_id(right)
+                if is_correlatable_order_link(left)
+                    && is_correlatable_order_link(right)
                     && left == right
         )
 }
 
-fn is_generated_submission_id(value: &str) -> bool {
-    uuid::Uuid::parse_str(value).is_ok_and(|id| {
-        id.get_version() == Some(uuid::Version::Random) && id.hyphenated().to_string() == value
-    })
+fn is_correlatable_order_link(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 36
 }
 
 pub struct TradingService {
@@ -279,67 +307,30 @@ impl TradingService {
     pub async fn place_order(
         &self,
         context: SubmissionContext,
-        mut request: PlaceOrderRequest,
+        request: PlaceOrderRequest,
     ) -> AppResult<Order> {
-        request.order_link_id = Some(context.submission_id.clone());
         let now_ms = self.time.now_ms();
         let reference_price = self
             .cache
             .get_ticker(&request.symbol)
             .map(|ticker| ticker.last_price);
-        let reservation_result = {
-            let risk = self.risk.read().await;
-            risk.reserve_order(&request, reference_price.as_deref(), now_ms)
-        };
-        let reservation = match reservation_result {
-            Ok(reservation) => reservation,
-            Err(violation) => {
-                let notification_id = self
-                    .notification_observer
-                    .observe_risk_block(&context, &violation, now_ms)
-                    .await;
-                return Err(match notification_id {
-                    Some(notification_id) => AppError::Notified {
-                        code: "RISK_ORDER_BLOCKED",
-                        message: "订单被风控拦截",
-                        notification_id,
-                    },
-                    None => violation.into(),
-                });
-            }
-        };
-
-        let order = match PrivateApi::create_order(&self.api, &request).await {
-            Ok(order) => order,
-            Err(submit_error) => {
-                return Err(handle_failed_submission(
-                    &self.risk,
-                    &self.notification_observer,
-                    &reservation,
-                    &context,
-                    submit_error,
-                    now_ms,
-                )
-                .await);
-            }
-        };
-
-        self.notification_observer
-            .observe(
-                &context.account_id,
-                context.session_epoch,
-                &order,
-                OrderObservationOrigin::Command,
-                Some(&context.submission_id),
-                now_ms,
-            )
-            .await;
-        let _ = self.trade_log.append_order(&order);
-        self.emitter.emit_order(order.clone());
-        self.emitter
-            .emit_log("info", &format!("下单成功: {}", order.order_id));
-        self.analytics.record_order(order.clone()).await;
-        Ok(order)
+        execute_place_order(
+            self.api.as_ref(),
+            &self.risk,
+            &self.notification_observer,
+            &context,
+            request,
+            reference_price.as_deref(),
+            now_ms,
+            |order| async move {
+                let _ = self.trade_log.append_order(&order);
+                self.emitter.emit_order(order.clone());
+                self.emitter
+                    .emit_log("info", &format!("下单成功: {}", order.order_id));
+                self.analytics.record_order(order).await;
+            },
+        )
+        .await
     }
 
     pub async fn cancel_order(
@@ -381,23 +372,10 @@ impl TradingService {
 
     pub async fn fetch_open_orders(
         &self,
-        context: &OrderStreamContext,
+        _context: &OrderStreamContext,
         symbol: Option<&str>,
     ) -> AppResult<Vec<Order>> {
-        let orders = self.fetch_open_orders_unobserved(symbol).await?;
-        for order in &orders {
-            self.notification_observer
-                .observe(
-                    &context.account_id,
-                    context.session_epoch,
-                    order,
-                    OrderObservationOrigin::Snapshot,
-                    None,
-                    self.time.now_ms(),
-                )
-                .await;
-        }
-        Ok(orders)
+        self.fetch_open_orders_unobserved(symbol).await
     }
 
     pub(crate) async fn fetch_open_orders_unobserved(
@@ -425,24 +403,11 @@ impl TradingService {
 
     pub async fn fetch_order_history(
         &self,
-        context: &OrderStreamContext,
+        _context: &OrderStreamContext,
         symbol: Option<&str>,
         limit: Option<u32>,
     ) -> AppResult<Vec<Order>> {
-        let orders = self.fetch_order_history_unobserved(symbol, limit).await?;
-        for order in &orders {
-            self.notification_observer
-                .observe(
-                    &context.account_id,
-                    context.session_epoch,
-                    order,
-                    OrderObservationOrigin::Snapshot,
-                    None,
-                    self.time.now_ms(),
-                )
-                .await;
-        }
-        Ok(orders)
+        self.fetch_order_history_unobserved(symbol, limit).await
     }
 
     pub(crate) async fn fetch_order_history_unobserved(
@@ -452,6 +417,85 @@ impl TradingService {
     ) -> AppResult<Vec<Order>> {
         PrivateApi::order_history(&self.api, symbol, limit).await
     }
+}
+
+async fn execute_place_order<S, SFut>(
+    api: &ApiClient,
+    risk: &Arc<tokio::sync::RwLock<RiskService>>,
+    observer: &OrderNotificationObserver,
+    context: &SubmissionContext,
+    mut request: PlaceOrderRequest,
+    reference_price: Option<&str>,
+    now_ms: u64,
+    success_side_effects: S,
+) -> AppResult<Order>
+where
+    S: FnOnce(Order) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let transmitted_order_link_id = match request.order_link_id.as_deref() {
+        Some(value) if is_correlatable_order_link(value) => value.to_owned(),
+        Some(_) => {
+            return Err(AppError::Trading(
+                "订单关联标识必须为 1 到 36 个字符".into(),
+            ))
+        }
+        None => context.submission_id.clone(),
+    };
+    request.order_link_id = Some(transmitted_order_link_id.clone());
+    let reservation_result = {
+        let risk = risk.read().await;
+        risk.reserve_order(&request, reference_price, now_ms)
+    };
+    let reservation = match reservation_result {
+        Ok(reservation) => reservation,
+        Err(violation) => {
+            let notification_id = observer
+                .observe_risk_block(context, &violation, now_ms)
+                .await;
+            return Err(match notification_id {
+                Some(notification_id) => AppError::Notified {
+                    code: "RISK_ORDER_BLOCKED",
+                    message: "订单被风控拦截",
+                    notification_id,
+                },
+                None => violation.into(),
+            });
+        }
+    };
+
+    let order = match PrivateApi::create_order(api, &request).await {
+        Ok(order) => order,
+        Err(submit_error) => {
+            return Err(handle_failed_submission(
+                risk,
+                observer,
+                &reservation,
+                context,
+                &transmitted_order_link_id,
+                submit_error,
+                now_ms,
+            )
+            .await);
+        }
+    };
+
+    let mut observed_order = order.clone();
+    if observed_order.order_link_id.is_none() {
+        observed_order.order_link_id = Some(transmitted_order_link_id);
+    }
+    observer
+        .observe(
+            &context.account_id,
+            context.session_epoch,
+            &observed_order,
+            OrderObservationOrigin::Command,
+            Some(&context.submission_id),
+            now_ms,
+        )
+        .await;
+    success_side_effects(order.clone()).await;
+    Ok(order)
 }
 
 pub(crate) async fn execute_coordinated_reserved_order<P, N, F, Fut, S, SFut>(
@@ -549,6 +593,7 @@ async fn handle_failed_submission(
     observer: &OrderNotificationObserver,
     reservation: &RiskReservation,
     context: &SubmissionContext,
+    transmitted_order_link_id: &str,
     submit_error: AppError,
     now_ms: u64,
 ) -> AppError {
@@ -565,7 +610,9 @@ async fn handle_failed_submission(
         );
     }
     let notification_id = if matches!(submit_error, AppError::TradingFailure(_)) {
-        observer.observe_rejection(context, now_ms).await
+        observer
+            .observe_rejection(context, Some(transmitted_order_link_id), now_ms)
+            .await
     } else {
         None
     };

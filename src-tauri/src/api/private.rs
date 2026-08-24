@@ -15,7 +15,7 @@ use super::mapper::{
     build_cancel_order_body, build_order_query_params, build_place_order_body,
     build_transfer_history_params, parse_balances, parse_order, parse_orders, parse_positions,
 };
-use super::response::extract_list;
+use super::response::{extract_list, CreateOrderOutcome};
 
 pub struct PrivateApi;
 
@@ -116,11 +116,17 @@ impl PrivateApi {
     }
 
     fn parse_create_order_payload(payload: &Value) -> AppResult<Order> {
-        let items = extract_list(&payload);
-        let order = items
-            .first()
-            .map(|first| parse_order(first))
-            .unwrap_or_else(|| parse_order(super::response::extract_data(&payload)));
+        let order = match super::response::classify_create_order_outcome(payload) {
+            CreateOrderOutcome::Accepted(candidate) => parse_order(candidate),
+            CreateOrderOutcome::Rejected => {
+                return Err(AppError::TradingFailure(
+                    crate::models::trading::TradingFailure::rejected(),
+                ));
+            }
+            CreateOrderOutcome::ProviderFailure | CreateOrderOutcome::Ambiguous => {
+                return Err(AppError::Internal("订单提交结果不明确".into()));
+            }
+        };
         if order.order_id.trim().is_empty() {
             return Err(AppError::Internal("订单提交结果不明确".into()));
         }
@@ -274,7 +280,60 @@ impl PrivateApi {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+
     use super::*;
+    use crate::models::config::ApiCredential;
+
+    fn place_order_request(order_link_id: Option<&str>) -> PlaceOrderRequest {
+        PlaceOrderRequest {
+            symbol: "BTCUSDT".into(),
+            side: "Buy".into(),
+            order_type: "Market".into(),
+            qty: "1".into(),
+            position_idx: 0,
+            price: None,
+            time_in_force: None,
+            order_link_id: order_link_id.map(str::to_owned),
+            reduce_only: None,
+        }
+    }
+
+    async fn create_order_from_response(payload: serde_json::Value) -> AppResult<Order> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let response_body = serde_json::to_string(&payload).unwrap();
+        let server = std::thread::spawn(move || {
+            for body in [
+                r#"{"code":0,"data":{"time":"1782850580"}}"#.to_string(),
+                response_body,
+            ] {
+                let (mut socket, _) = listener.accept().expect("accept API request");
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).expect("read API request");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write API response");
+            }
+        });
+        let client = ApiClient::new();
+        client
+            .set_credential(ApiCredential {
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                base_url: format!("http://{address}"),
+                label: "test".into(),
+            })
+            .await;
+
+        let result = PrivateApi::create_order(&client, &place_order_request(None)).await;
+        server.join().expect("test server exits");
+        result
+    }
 
     #[test]
     fn empty_create_order_success_body_is_ambiguous_not_a_confirmed_rejection() {
@@ -282,5 +341,36 @@ mod tests {
 
         assert!(matches!(error, AppError::Internal(_)));
         assert!(!matches!(error, AppError::TradingFailure(_)));
+    }
+
+    #[tokio::test]
+    async fn undocumented_create_order_lists_are_ambiguous_while_direct_rejection_is_confirmed() {
+        for data in [
+            serde_json::json!({
+                "items": [{"order_id": "123", "order_status": "Rejected"}]
+            }),
+            serde_json::json!({
+                "rows": [{"order_id": "123", "order_status": "Rejected"}]
+            }),
+            serde_json::json!({
+                "list": [{"order_id": "123", "order_status": "Rejected"}]
+            }),
+        ] {
+            let error = create_order_from_response(serde_json::json!({
+                "code": 0,
+                "data": data,
+            }))
+            .await
+            .expect_err("an undocumented create-order list is ambiguous");
+            assert!(matches!(error, AppError::Internal(_)));
+        }
+
+        let error = create_order_from_response(serde_json::json!({
+            "code": 0,
+            "data": {"order_id": "direct-rejected-1", "orderStatus": "Rejected"},
+        }))
+        .await
+        .expect_err("a documented direct rejection is confirmed");
+        assert!(matches!(error, AppError::TradingFailure(_)));
     }
 }
