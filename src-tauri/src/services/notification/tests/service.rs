@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::Arc;
 
 use crate::models::notification::{
@@ -10,13 +11,117 @@ use crate::services::notification::{
     NotificationStorageFailureReporter, ViewContext,
 };
 use crate::storage::notification_store::{
-    NotificationFileV1, NotificationPartition, NotificationSourceEventIndexEntry,
-    NOTIFICATION_SCHEMA_VERSION,
+    FailurePoint, NotificationFileV1, NotificationPartition, NotificationSourceEventIndexEntry,
+    NotificationStore, NOTIFICATION_SCHEMA_VERSION,
 };
 
 use super::support::{harness, input, FakePersistence};
 
 const NOW: u64 = 1_700_000_000_000;
+
+fn recovery_test_path(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!(
+            "easiflux-notification-recovery-report-{}-{}-{label}",
+            std::process::id(),
+            uuid::Uuid::new_v4(),
+        ))
+        .join("notifications.v1.json")
+}
+
+#[tokio::test]
+async fn startup_recovery_write_failures_share_diagnostic_throttle_and_preserve_semantics() {
+    let diagnostic_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reporter = NotificationStorageFailureReporter::new(crate::events::EventEmitter::new_test(
+        Arc::clone(&diagnostic_events),
+    ));
+    let changed_emitter: NotificationEmitter = Arc::new(|_| Ok(()));
+
+    for (source, now_ms, revision, expected_logs) in [("temp", 0, 10, 1), ("backup", 1, 11, 2)] {
+        let recovered_path = recovery_test_path(source);
+        fs::create_dir_all(recovered_path.parent().unwrap()).unwrap();
+        let mut recovered_file = NotificationFileV1::empty();
+        recovered_file.revision = revision;
+        let source_path = match source {
+            "temp" => NotificationStore::temp_path_for_test(&recovered_path),
+            "backup" => NotificationStore::backup_path_for_test(&recovered_path),
+            _ => unreachable!(),
+        };
+        fs::write(source_path, serde_json::to_vec(&recovered_file).unwrap()).unwrap();
+        let recovered = NotificationService::load_with_reporter(
+            NotificationStore::with_path_and_failures(
+                recovered_path.clone(),
+                vec![FailurePoint::PromoteTemp],
+            ),
+            &[],
+            now_ms,
+            Arc::clone(&changed_emitter),
+            reporter.clone(),
+        )
+        .expect("normalization write failure still returns recovered data");
+        assert_eq!(recovered.revision().await, revision.to_string());
+        let events = diagnostic_events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "log:entry")
+                .count(),
+            expected_logs
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "error:occurred")
+                .count(),
+            1
+        );
+        drop(events);
+        fs::remove_dir_all(recovered_path.parent().unwrap()).unwrap();
+    }
+
+    for (now_ms, expected_logs, expected_toasts) in [(59_999, 3, 1), (60_000, 4, 2)] {
+        let corrupt_path = recovery_test_path("fatal");
+        fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        let corrupt_bytes = b"corrupt-evidence-must-remain";
+        fs::write(&corrupt_path, corrupt_bytes).unwrap();
+        let result = NotificationService::load_with_reporter(
+            NotificationStore::with_path_and_failures(
+                corrupt_path.clone(),
+                vec![FailurePoint::PreserveCorrupt],
+            ),
+            &[],
+            now_ms,
+            Arc::clone(&changed_emitter),
+            reporter.clone(),
+        );
+        let error = match result {
+            Ok(_) => panic!("evidence preservation write failure must be fatal"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "NOTIFICATION_STORAGE_UNAVAILABLE");
+        assert_eq!(fs::read(&corrupt_path).unwrap(), corrupt_bytes);
+        let events = diagnostic_events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "log:entry")
+                .count(),
+            expected_logs
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "error:occurred")
+                .count(),
+            expected_toasts
+        );
+        assert!(events.iter().all(|(_, payload)| payload
+            .to_string()
+            .contains("NOTIFICATION_STORAGE_UNAVAILABLE")));
+        drop(events);
+        fs::remove_dir_all(corrupt_path.parent().unwrap()).unwrap();
+    }
+}
 
 #[tokio::test]
 async fn storage_failures_always_log_throttle_toast_and_reset_after_durable_write() {

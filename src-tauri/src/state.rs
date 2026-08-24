@@ -115,6 +115,7 @@ impl AppState {
             notification.clone(),
             config.clone(),
             account_lifecycle.clone(),
+            emitter.clone(),
         );
         let auth_observer: crate::api::client::AuthFailureObserver = Arc::new({
             let observer = session_notification_observer.clone();

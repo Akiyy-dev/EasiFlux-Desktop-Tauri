@@ -12,6 +12,7 @@ import { refreshSyncTask } from '../../../services/dataSyncService'
 import type { Order } from '../../../types/models'
 import { filterOpenOrders, type OpenOrderScope } from '../../../utils/orderFilters'
 import { notifyWarning, reportError } from '../../../services/errorService'
+import { decodeCommandError } from '../../../services/notificationService'
 
 const props = defineProps<{
   active: boolean
@@ -48,7 +49,7 @@ async function cancelOne(row: Order): Promise<void> {
     await refreshSyncTask('privatePanels')
     tableRef.value?.clearSelection()
   } catch (error) {
-    reportError(error)
+    if (!decodeCommandError(error).notificationId) reportError(error)
   } finally {
     actionLoading.value = false
   }
@@ -70,7 +71,7 @@ async function batchCancel(rows: Order[]): Promise<void> {
     await refreshSyncTask('privatePanels')
     tableRef.value?.clearSelection()
   } catch (error) {
-    reportError(error)
+    if (!decodeCommandError(error).notificationId) reportError(error)
   } finally {
     actionLoading.value = false
   }
@@ -87,7 +88,7 @@ async function cancelAll(): Promise<void> {
     await refreshSyncTask('privatePanels')
     tableRef.value?.clearSelection()
   } catch (error) {
-    reportError(error)
+    if (!decodeCommandError(error).notificationId) reportError(error)
   } finally {
     actionLoading.value = false
   }

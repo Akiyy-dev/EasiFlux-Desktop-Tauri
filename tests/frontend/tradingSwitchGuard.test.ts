@@ -24,6 +24,16 @@ const order: Order = {
   price: '60000', qty: '0.1', status: 'New', filledQty: '0', avgPrice: '0',
 }
 
+function notifiedSessionError(): Error {
+  return Object.assign(new Error('private mutation failed'), {
+    cause: {
+      code: 'AUTH_SESSION_EXPIRED',
+      message: '账户会话已失效',
+      notificationId: 'notification-session-cancel',
+    },
+  })
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>((done) => { resolve = done })
@@ -238,12 +248,17 @@ describe('account-switch trading mutation guard', () => {
       ?.attributes('disabled')).toBeUndefined()
   })
 
-  it('keeps current and legacy cancellation failures frontend-owned exactly once', async () => {
+  it.each([
+    'current single cancel',
+    'current batch cancel',
+    'current cancel all',
+    'legacy single cancel',
+  ])('keeps ordinary %s frontend-owned exactly once', async (owner) => {
     const toastError = vi.fn()
     installMessageApi({ error: toastError } as unknown as MessageApi)
     useOrderStore().setOpenOrders([order])
     vi.mocked(tauriInvoke).mockImplementation((command) => (
-      command === 'cancel_order'
+      command === (owner === 'current cancel all' ? 'cancel_all_orders' : 'cancel_order')
         ? Promise.reject(new Error('ordinary cancellation failure'))
         : Promise.resolve(undefined)
     ))
@@ -255,19 +270,71 @@ describe('account-switch trading mutation guard', () => {
     })
     await flushPromises()
 
-    useLogStore().clear()
-    useLogStore().clearError()
-    await (current.vm as unknown as { cancelOne: (row: Order) => Promise<void> })
-      .cancelOne(order)
-    expect(toastError).toHaveBeenCalledTimes(1)
-    expect(useLogStore().entries).toHaveLength(1)
+    const currentVm = current.vm as unknown as {
+      cancelOne: (row: Order) => Promise<void>
+      batchCancel: (rows: Order[]) => Promise<void>
+      cancelAll: () => Promise<void>
+    }
+    const cancel = owner === 'current single cancel'
+      ? () => currentVm.cancelOne(order)
+      : owner === 'current batch cancel'
+        ? () => currentVm.batchCancel([order])
+        : owner === 'current cancel all'
+          ? () => currentVm.cancelAll()
+          : () => (legacy.vm as unknown as {
+              cancel: (row: Order) => Promise<void>
+            }).cancel(order)
 
-    toastError.mockClear()
     useLogStore().clear()
     useLogStore().clearError()
-    await (legacy.vm as unknown as { cancel: (row: Order) => Promise<void> }).cancel(order)
+    await cancel()
     expect(toastError).toHaveBeenCalledTimes(1)
     expect(useLogStore().entries).toHaveLength(1)
+  })
+
+  it.each([
+    'current single cancel',
+    'current batch cancel',
+    'current cancel all',
+    'legacy single cancel',
+  ])('keeps notified session expiry out of generic delivery for %s', async (owner) => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useOrderStore().setOpenOrders([order])
+    vi.mocked(tauriInvoke).mockImplementation((command) => (
+      command === (owner === 'current cancel all' ? 'cancel_all_orders' : 'cancel_order')
+        ? Promise.reject(notifiedSessionError())
+        : Promise.resolve(undefined)
+    ))
+    const current = mount(OpenOrdersTab, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+    const legacy = mount(OrderTable, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+    await flushPromises()
+
+    const currentVm = current.vm as unknown as {
+      cancelOne: (row: Order) => Promise<void>
+      batchCancel: (rows: Order[]) => Promise<void>
+      cancelAll: () => Promise<void>
+    }
+    const cancel = owner === 'current single cancel'
+      ? () => currentVm.cancelOne(order)
+      : owner === 'current batch cancel'
+        ? () => currentVm.batchCancel([order])
+        : owner === 'current cancel all'
+          ? () => currentVm.cancelAll()
+          : () => (legacy.vm as unknown as {
+              cancel: (row: Order) => Promise<void>
+            }).cancel(order)
+
+    useLogStore().clear()
+    useLogStore().clearError()
+    toastError.mockClear()
+    await cancel()
+    expect(toastError).toHaveBeenCalledTimes(0)
+    expect(useLogStore().entries).toHaveLength(0)
   })
 
   it.each([

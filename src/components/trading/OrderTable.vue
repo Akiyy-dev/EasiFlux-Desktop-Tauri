@@ -8,6 +8,7 @@ import { useAccountProfilesStore } from '../../stores/accountProfiles'
 import { refreshSyncTask } from '../../services/dataSyncService'
 import type { Order } from '../../types/models'
 import { notifyWarning, reportError } from '../../services/errorService'
+import { decodeCommandError } from '../../services/notificationService'
 
 const TABLE_MAX_HEIGHT = 168
 
@@ -70,7 +71,7 @@ async function cancel(row: Order): Promise<void> {
     await orderStore.cancelOrder({ symbol: row.symbol, orderId: row.orderId })
     await refreshPanels()
   } catch (e) {
-    reportError(e)
+    if (!decodeCommandError(e).notificationId) reportError(e)
   }
 }
 

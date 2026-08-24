@@ -415,6 +415,145 @@ async fn client_bridge_success_owns_one_record_created_event_and_aggregate_error
 }
 
 #[tokio::test]
+async fn client_bridge_sequential_replay_emits_no_second_aggregate_diagnostic() {
+    use crate::models::notification::{
+        ClientNotificationFailedStep as Step, ClientNotificationKind as ClientKind,
+    };
+
+    let fixture = fixture();
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let emitter = crate::events::EventEmitter::new_test(Arc::clone(&sink));
+    let request = client_request(ClientKind::AccountRecoveryFailed, vec![Step::Config]);
+
+    let first = create_client_notification_with_diagnostic_inner(
+        &fixture.runtime,
+        &fixture.config,
+        &fixture.lifecycle,
+        &emitter,
+        request.clone(),
+        NOW_MS,
+    )
+    .await
+    .unwrap();
+    let replay = create_client_notification_with_diagnostic_inner(
+        &fixture.runtime,
+        &fixture.config,
+        &fixture.lifecycle,
+        &emitter,
+        request,
+        NOW_MS + 1,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(replay.notification.id, first.notification.id);
+    assert_eq!(fixture.persistence.saves.lock().unwrap().len(), 1);
+    assert_eq!(fixture.events.lock().unwrap().len(), 1);
+    assert_eq!(sink.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn client_bridge_concurrent_replay_emits_one_commit_diagnostic_total() {
+    use crate::models::notification::{
+        ClientNotificationFailedStep as Step, ClientNotificationKind as ClientKind,
+    };
+
+    let fixture = fixture();
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let emitter = crate::events::EventEmitter::new_test(Arc::clone(&sink));
+    let request = client_request(ClientKind::AccountRecoveryFailed, vec![Step::Connection]);
+    let (first, second) = tokio::join!(
+        create_client_notification_with_diagnostic_inner(
+            &fixture.runtime,
+            &fixture.config,
+            &fixture.lifecycle,
+            &emitter,
+            request.clone(),
+            NOW_MS,
+        ),
+        create_client_notification_with_diagnostic_inner(
+            &fixture.runtime,
+            &fixture.config,
+            &fixture.lifecycle,
+            &emitter,
+            request,
+            NOW_MS,
+        ),
+    );
+
+    assert_eq!(
+        first.unwrap().notification.id,
+        second.unwrap().notification.id
+    );
+    assert_eq!(fixture.persistence.saves.lock().unwrap().len(), 1);
+    assert_eq!(fixture.events.lock().unwrap().len(), 1);
+    assert_eq!(sink.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn client_bridge_restart_replay_emits_no_second_aggregate_diagnostic() {
+    use crate::models::notification::{
+        ClientNotificationFailedStep as Step, ClientNotificationKind as ClientKind,
+    };
+
+    let fixture = fixture();
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let emitter = crate::events::EventEmitter::new_test(Arc::clone(&sink));
+    let request = client_request(ClientKind::AccountRecoveryFailed, vec![Step::Bootstrap]);
+    let first = create_client_notification_with_diagnostic_inner(
+        &fixture.runtime,
+        &fixture.config,
+        &fixture.lifecycle,
+        &emitter,
+        request.clone(),
+        NOW_MS,
+    )
+    .await
+    .unwrap();
+    let persisted = fixture
+        .persistence
+        .saves
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    let restart_persistence = MemoryPersistence::default();
+    let restart_events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&restart_events);
+    let changed: NotificationEmitter = Arc::new(move |event| {
+        captured.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+    let restart_runtime = Arc::new(NotificationRuntime::Available(Arc::new(
+        NotificationService::from_snapshot(
+            persisted,
+            Arc::new(restart_persistence.clone()),
+            changed,
+            NOW_MS + 1,
+        ),
+    )));
+
+    let replay = create_client_notification_with_diagnostic_inner(
+        &restart_runtime,
+        &fixture.config,
+        &AccountLifecycleCoordinator::new(),
+        &emitter,
+        request,
+        NOW_MS + 1,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(replay.notification.id, first.notification.id);
+    assert_eq!(fixture.persistence.saves.lock().unwrap().len(), 1);
+    assert_eq!(fixture.events.lock().unwrap().len(), 1);
+    assert!(restart_persistence.saves.lock().unwrap().is_empty());
+    assert!(restart_events.lock().unwrap().is_empty());
+    assert_eq!(sink.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn client_bridge_replay_returns_the_existing_committed_id_without_mutation() {
     use crate::models::notification::{
         ClientNotificationFailedStep as Step, ClientNotificationKind as ClientKind,

@@ -1176,6 +1176,7 @@ async fn session_expired_create_order_preserves_typed_notification_provenance_an
             ..Default::default()
         })),
         Arc::new(crate::services::AccountLifecycleCoordinator::new()),
+        crate::events::EventEmitter::new_test(Arc::new(Mutex::new(Vec::new()))),
     );
     api.set_auth_failure_observer(Arc::new(move |context, failure| {
         let observer = session_observer.clone();
@@ -1298,6 +1299,7 @@ async fn committed_session_expiry_survives_risk_release_save_failure_and_replay(
             ..Default::default()
         })),
         Arc::new(crate::services::AccountLifecycleCoordinator::new()),
+        crate::events::EventEmitter::new_test(Arc::new(Mutex::new(Vec::new()))),
     );
     api.set_auth_failure_observer(Arc::new(move |context, failure| {
         let observer = session_observer.clone();

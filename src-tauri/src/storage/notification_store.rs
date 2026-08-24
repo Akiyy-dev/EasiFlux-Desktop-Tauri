@@ -83,6 +83,27 @@ pub struct NotificationLoadOutcome {
     pub status: NotificationLoadStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NotificationStorageWriteFailure {
+    pub operation: &'static str,
+    pub path_kind: &'static str,
+}
+
+pub(crate) struct NotificationLoadReport {
+    pub outcome: NotificationLoadOutcome,
+    pub write_failures: Vec<NotificationStorageWriteFailure>,
+}
+
+pub(crate) struct NotificationLoadFailure {
+    pub error: AppError,
+    pub write_failures: Vec<NotificationStorageWriteFailure>,
+}
+
+struct NotificationPreservationFailure {
+    error: AppError,
+    write_failure: NotificationStorageWriteFailure,
+}
+
 pub(crate) trait NotificationPersistence: Send + Sync {
     fn save(&self, file: &NotificationFileV1) -> AppResult<()>;
 }
@@ -137,7 +158,13 @@ impl NotificationStore {
     }
 
     pub fn load(&self) -> AppResult<NotificationLoadOutcome> {
-        let _guard = self.lock_writes()?;
+        self.load_report()
+            .map(|report| report.outcome)
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn load_report(&self) -> Result<NotificationLoadReport, NotificationLoadFailure> {
+        let _guard = self.lock_writes().map_err(load_failure_without_write)?;
         let paths = NotificationPaths::new(&self.path);
         let candidates = [
             (&paths.main, None, "main"),
@@ -145,13 +172,16 @@ impl NotificationStore {
             (&paths.backup, Some(RecoverySource::Backup), "backup"),
         ];
         let mut corrupt_candidates = Vec::new();
+        let mut write_failures = Vec::new();
 
         for (path, source, path_kind) in candidates {
             match fs::symlink_metadata(path) {
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    return Err(storage_unavailable("inspect", path_kind, error));
+                    return Err(load_failure_without_write(storage_unavailable(
+                        "inspect", path_kind, error,
+                    )));
                 }
             }
 
@@ -161,6 +191,12 @@ impl NotificationStore {
                         None => NotificationLoadStatus::Clean,
                         Some(source) => {
                             if let Err(error) = self.save_validated(&file) {
+                                if storage_error_code(&error) == NOTIFICATION_STORAGE_UNAVAILABLE {
+                                    write_failures.push(NotificationStorageWriteFailure {
+                                        operation: "normalize_recovery",
+                                        path_kind: recovery_source_name(source),
+                                    });
+                                }
                                 tracing::warn!(
                                     source = recovery_source_name(source),
                                     error_code = storage_error_code(&error),
@@ -170,37 +206,59 @@ impl NotificationStore {
                             NotificationLoadStatus::Recovered { source }
                         }
                     };
-                    return Ok(NotificationLoadOutcome { file, status });
+                    return Ok(NotificationLoadReport {
+                        outcome: NotificationLoadOutcome { file, status },
+                        write_failures,
+                    });
                 }
                 Ok(Candidate::Future(found)) => {
-                    return Ok(NotificationLoadOutcome {
-                        file: NotificationFileV1::empty(),
-                        status: NotificationLoadStatus::UnsupportedSchema { found },
+                    return Ok(NotificationLoadReport {
+                        outcome: NotificationLoadOutcome {
+                            file: NotificationFileV1::empty(),
+                            status: NotificationLoadStatus::UnsupportedSchema { found },
+                        },
+                        write_failures,
                     });
                 }
                 Ok(Candidate::Corrupt) => {
                     corrupt_candidates.push((path.to_path_buf(), path_kind));
                 }
                 Ok(Candidate::OversizedUnknown) => {
-                    return Err(storage_unavailable_without_io(
+                    return Err(load_failure_without_write(storage_unavailable_without_io(
                         "oversized_unknown_schema",
                         path_kind,
-                    ));
+                    )));
                 }
-                Err(error) => return Err(storage_unavailable("read", path_kind, error)),
+                Err(error) => {
+                    return Err(load_failure_without_write(storage_unavailable(
+                        "read", path_kind, error,
+                    )));
+                }
             }
         }
 
         if corrupt_candidates.is_empty() {
-            Ok(NotificationLoadOutcome {
-                file: NotificationFileV1::empty(),
-                status: NotificationLoadStatus::Clean,
+            Ok(NotificationLoadReport {
+                outcome: NotificationLoadOutcome {
+                    file: NotificationFileV1::empty(),
+                    status: NotificationLoadStatus::Clean,
+                },
+                write_failures,
             })
         } else {
-            self.preserve_corrupt_candidates(&corrupt_candidates)?;
-            Ok(NotificationLoadOutcome {
-                file: NotificationFileV1::empty(),
-                status: NotificationLoadStatus::ResetFromCorruption,
+            if let Err(failure) = self.preserve_corrupt_candidates(&corrupt_candidates) {
+                write_failures.push(failure.write_failure);
+                return Err(NotificationLoadFailure {
+                    error: failure.error,
+                    write_failures,
+                });
+            }
+            Ok(NotificationLoadReport {
+                outcome: NotificationLoadOutcome {
+                    file: NotificationFileV1::empty(),
+                    status: NotificationLoadStatus::ResetFromCorruption,
+                },
+                write_failures,
             })
         }
     }
@@ -261,7 +319,10 @@ impl NotificationStore {
         rename_and_sync(backup_path, main_path, "restore_backup")
     }
 
-    fn preserve_corrupt_candidates(&self, candidates: &[(PathBuf, &'static str)]) -> AppResult<()> {
+    fn preserve_corrupt_candidates(
+        &self,
+        candidates: &[(PathBuf, &'static str)],
+    ) -> Result<(), NotificationPreservationFailure> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -271,7 +332,14 @@ impl NotificationStore {
                 FailurePointName::PreserveCorrupt,
                 "preserve_corrupt",
                 path_kind,
-            )?;
+            )
+            .map_err(|error| NotificationPreservationFailure {
+                error,
+                write_failure: NotificationStorageWriteFailure {
+                    operation: "preserve_corrupt",
+                    path_kind,
+                },
+            })?;
             let evidence_path = sibling_path(path, &format!(".corrupt-{timestamp}-{index}"));
             match fs::rename(path, &evidence_path) {
                 Ok(()) => {
@@ -292,10 +360,13 @@ impl NotificationStore {
                             copy_error_kind = io_error_kind(&copy_error),
                             "notification corrupt evidence preservation failed"
                         );
-                        return Err(storage_unavailable_without_io(
-                            "preserve_corrupt",
-                            path_kind,
-                        ));
+                        return Err(NotificationPreservationFailure {
+                            error: storage_unavailable_without_io("preserve_corrupt", path_kind),
+                            write_failure: NotificationStorageWriteFailure {
+                                operation: "preserve_corrupt",
+                                path_kind,
+                            },
+                        });
                     }
                 },
             }
@@ -690,6 +761,13 @@ fn sync_parent_directory(_path: &Path) -> AppResult<()> {
 
 fn invalid_file() -> AppError {
     AppError::Storage(INVALID_NOTIFICATION_FILE.into())
+}
+
+fn load_failure_without_write(error: AppError) -> NotificationLoadFailure {
+    NotificationLoadFailure {
+        error,
+        write_failures: Vec::new(),
+    }
 }
 
 fn storage_unavailable(

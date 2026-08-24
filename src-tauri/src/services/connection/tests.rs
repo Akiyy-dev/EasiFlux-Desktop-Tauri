@@ -42,6 +42,7 @@ struct Harness {
     observer: SessionNotificationObserver,
     persistence: Arc<MemoryPersistence>,
     events: Arc<Mutex<Vec<crate::models::notification::NotificationChangedEvent>>>,
+    diagnostics: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     config: Arc<tokio::sync::RwLock<AppConfig>>,
     lifecycle: Arc<crate::services::AccountLifecycleCoordinator>,
 }
@@ -64,18 +65,53 @@ fn harness() -> Harness {
     app_config.active_account_id = "alpha".into();
     let config = Arc::new(tokio::sync::RwLock::new(app_config));
     let lifecycle = Arc::new(crate::services::AccountLifecycleCoordinator::new());
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
     let observer = SessionNotificationObserver::new(
         Arc::new(NotificationRuntime::Available(service)),
         Arc::clone(&config),
         Arc::clone(&lifecycle),
+        crate::events::EventEmitter::new_test(Arc::clone(&diagnostics)),
     );
     Harness {
         observer,
         persistence,
         events,
+        diagnostics,
         config,
         lifecycle,
     }
+}
+
+#[tokio::test]
+async fn durable_session_expiry_commit_owns_one_log_only_diagnostic() {
+    let harness = harness();
+    let notification_id = harness
+        .observer
+        .observe_auth_failure(&context("alpha", 0), AuthFailureKind::SessionExpired, NOW)
+        .await
+        .expect("durable session notification returns its marker");
+
+    assert_eq!(harness.persistence.files.lock().unwrap().len(), 1);
+    assert_eq!(harness.events.lock().unwrap().len(), 1);
+    let diagnostics = harness.diagnostics.lock().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].0, "log:entry");
+    assert_eq!(
+        diagnostics[0].1["message"],
+        "NOTIFIED_SESSION_FAILURE:AUTH_SESSION_EXPIRED"
+    );
+    assert!(diagnostics.iter().all(|(name, _)| name != "error:occurred"));
+    drop(diagnostics);
+
+    let explicit_error = notified_connection_error(
+        crate::error::AppError::AuthFailure(AuthFailureKind::SessionExpired),
+        Some(notification_id),
+    );
+    let _ = deliver_notified_connection_error(
+        &crate::events::EventEmitter::new_test(Arc::clone(&harness.diagnostics)),
+        explicit_error,
+    );
+    assert_eq!(harness.diagnostics.lock().unwrap().len(), 1);
 }
 
 fn context(account_id: &str, session_epoch: u64) -> SessionContext {

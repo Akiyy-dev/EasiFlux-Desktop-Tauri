@@ -89,6 +89,11 @@ pub struct CreateClientNotificationResult {
     pub revision: String,
 }
 
+struct CreateClientNotificationOutcome {
+    response: CreateClientNotificationResult,
+    committed: bool,
+}
+
 fn configured_account_exists(config: &AppConfig, requested: &str) -> bool {
     config
         .accounts
@@ -265,13 +270,13 @@ fn validate_client_notification_envelope(
     Ok(())
 }
 
-async fn create_client_notification_inner(
+async fn create_client_notification_outcome_inner(
     runtime: &Arc<NotificationRuntime>,
     config: &Arc<RwLock<AppConfig>>,
     lifecycle: &AccountLifecycleCoordinator,
     request: CreateClientNotificationRequest,
     now_ms: u64,
-) -> Result<CreateClientNotificationResult, NotificationCommandError> {
+) -> Result<CreateClientNotificationOutcome, NotificationCommandError> {
     request
         .validate()
         .map_err(|error| NotificationCommandError::new(error.code(), "客户端通知请求无效"))?;
@@ -306,11 +311,27 @@ async fn create_client_notification_inner(
         .service()?
         .publish_client_account_failure(input, now_ms)
         .await?;
-    Ok(CreateClientNotificationResult {
-        notification: result.notification,
-        unread_count: result.unread_count,
-        revision: result.revision,
+    Ok(CreateClientNotificationOutcome {
+        response: CreateClientNotificationResult {
+            notification: result.notification,
+            unread_count: result.unread_count,
+            revision: result.revision,
+        },
+        committed: result.committed,
     })
+}
+
+#[cfg(test)]
+async fn create_client_notification_inner(
+    runtime: &Arc<NotificationRuntime>,
+    config: &Arc<RwLock<AppConfig>>,
+    lifecycle: &AccountLifecycleCoordinator,
+    request: CreateClientNotificationRequest,
+    now_ms: u64,
+) -> Result<CreateClientNotificationResult, NotificationCommandError> {
+    create_client_notification_outcome_inner(runtime, config, lifecycle, request, now_ms)
+        .await
+        .map(|outcome| outcome.response)
 }
 
 fn client_failure_diagnostic(request: &CreateClientNotificationRequest) -> String {
@@ -340,10 +361,13 @@ async fn create_client_notification_with_diagnostic_inner(
     now_ms: u64,
 ) -> Result<CreateClientNotificationResult, NotificationCommandError> {
     let diagnostic = client_failure_diagnostic(&request);
-    let result =
-        create_client_notification_inner(runtime, config, lifecycle, request, now_ms).await?;
-    emitter.emit_diagnostic(&diagnostic, false);
-    Ok(result)
+    let outcome =
+        create_client_notification_outcome_inner(runtime, config, lifecycle, request, now_ms)
+            .await?;
+    if outcome.committed {
+        emitter.emit_diagnostic(&diagnostic, false);
+    }
+    Ok(outcome.response)
 }
 
 #[tauri::command]

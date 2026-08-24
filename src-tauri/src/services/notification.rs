@@ -75,6 +75,16 @@ impl NotificationStorageFailureReporter {
             .emit_diagnostic(NOTIFICATION_STORAGE_UNAVAILABLE, include_error_event);
     }
 
+    fn report_recovery_write_failure(
+        &self,
+        failure: crate::storage::notification_store::NotificationStorageWriteFailure,
+        now_ms: u64,
+    ) {
+        debug_assert!(!failure.operation.is_empty());
+        debug_assert!(!failure.path_kind.is_empty());
+        self.report(now_ms);
+    }
+
     fn reset(&self) {
         *self
             .last_toast_at_ms
@@ -164,6 +174,7 @@ pub(crate) struct ClientNotificationPublishResult {
     pub notification: NotificationRecord,
     pub unread_count: u64,
     pub revision: String,
+    pub committed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,7 +416,24 @@ impl NotificationService {
         emit_changed: NotificationEmitter,
         storage_failure_reporter: Option<NotificationStorageFailureReporter>,
     ) -> Result<Self, NotificationError> {
-        let outcome = store.load().map_err(map_persistence_error)?;
+        let outcome = match store.load_report() {
+            Ok(report) => {
+                if let Some(reporter) = &storage_failure_reporter {
+                    for failure in report.write_failures {
+                        reporter.report_recovery_write_failure(failure, now_ms);
+                    }
+                }
+                report.outcome
+            }
+            Err(failure) => {
+                if let Some(reporter) = &storage_failure_reporter {
+                    for write_failure in failure.write_failures {
+                        reporter.report_recovery_write_failure(write_failure, now_ms);
+                    }
+                }
+                return Err(map_persistence_error(failure.error));
+            }
+        };
         if let NotificationLoadStatus::UnsupportedSchema { .. } = outcome.status {
             return Err(NotificationError::new(
                 "UNSUPPORTED_NOTIFICATION_SCHEMA",
@@ -522,6 +550,7 @@ impl NotificationService {
                 notification: notification.clone(),
                 unread_count: visible_unread_count(&guard.file, &context, now_ms),
                 revision: guard.file.revision.to_string(),
+                committed: false,
             });
         }
 
@@ -540,6 +569,7 @@ impl NotificationService {
             notification,
             unread_count: visible_unread_count(&guard.file, &context, now_ms),
             revision: outcome.revision,
+            committed: true,
         })
     }
 

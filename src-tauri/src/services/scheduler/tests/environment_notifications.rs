@@ -187,6 +187,7 @@ impl ProbeHarness {
             Arc::new(runtime),
             Arc::clone(&config),
             Arc::clone(&lifecycle),
+            emitter.clone(),
         );
         let api = Arc::new(ApiClient::new());
         let time = Arc::new(TimeService::new(api.time_sync(), api, emitter.clone()));
@@ -274,6 +275,7 @@ fn harness() -> Harness {
         Arc::new(NotificationRuntime::Available(service)),
         Arc::clone(&config),
         Arc::clone(&lifecycle),
+        EventEmitter::new_test(Arc::new(Mutex::new(Vec::new()))),
     );
     Harness {
         observer,

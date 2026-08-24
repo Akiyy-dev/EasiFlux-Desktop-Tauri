@@ -35,6 +35,7 @@ pub(crate) struct SessionNotificationObserver {
     runtime: Arc<NotificationRuntime>,
     config: Arc<tokio::sync::RwLock<AppConfig>>,
     account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    emitter: EventEmitter,
 }
 
 impl SessionNotificationObserver {
@@ -42,11 +43,13 @@ impl SessionNotificationObserver {
         runtime: Arc<NotificationRuntime>,
         config: Arc<tokio::sync::RwLock<AppConfig>>,
         account_lifecycle: Arc<AccountLifecycleCoordinator>,
+        emitter: EventEmitter,
     ) -> Self {
         Self {
             runtime,
             config,
             account_lifecycle,
+            emitter,
         }
     }
 
@@ -217,7 +220,11 @@ impl SessionNotificationObserver {
             .observe_session_expired(context.account_id.clone(), context.session_epoch, now_ms)
             .await
         {
-            Ok(outcome) => outcome.notification.map(|record| record.id),
+            Ok(outcome) => outcome.notification.map(|record| {
+                self.emitter
+                    .emit_diagnostic("NOTIFIED_SESSION_FAILURE:AUTH_SESSION_EXPIRED", false);
+                record.id
+            }),
             Err(error) => {
                 tracing::warn!(
                     code = error.code(),
@@ -253,7 +260,9 @@ fn notified_connection_error(error: AppError, notification_id: Option<String>) -
 
 fn deliver_notified_connection_error(emitter: &EventEmitter, error: AppError) -> AppError {
     if let AppError::Notified { code, .. } = &error {
-        emitter.emit_diagnostic(&format!("NOTIFIED_CONNECTION_FAILURE:{code}"), false);
+        if *code != "AUTH_SESSION_EXPIRED" {
+            emitter.emit_diagnostic(&format!("NOTIFIED_CONNECTION_FAILURE:{code}"), false);
+        }
     }
     error
 }
