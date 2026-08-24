@@ -62,7 +62,23 @@ describe('post-switch reconciliation', () => {
       }
       if (command === 'create_client_notification') {
         return Promise.resolve({
-          notification: { id: '00000000-0000-4000-8000-000000000001' },
+          notification: {
+            id: '00000000-0000-4000-8000-000000000001',
+            scope: { type: 'account', accountId: 'backup' },
+            category: 'riskAccount',
+            kind: 'accountReconciliationFailed',
+            severity: 'critical',
+            content: {
+              messageKey: 'account.reconciliationFailed',
+              params: { failedSteps: 'config,profiles,connection,bootstrap' },
+              fallbackTitle: '账户对账失败',
+              fallbackBody: '账户状态对账未完成，请检查账户配置。',
+            },
+            dedupeKey: 'backup:attempt:reconciliation',
+            occurrenceCount: 1,
+            createdAtMs: 1,
+            updatedAtMs: 1,
+          },
           unreadCount: 1,
           revision: '1',
         })

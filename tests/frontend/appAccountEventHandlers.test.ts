@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   listeners: new Map<string, (payload: unknown) => void>(),
   closeGuard: vi.fn(),
+  reportError: vi.fn(),
+  showBackendError: vi.fn(),
 }))
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: mocks.invoke }))
@@ -22,6 +24,10 @@ vi.mock('../../src/composables/useTauriEvent', () => ({
 }))
 vi.mock('../../src/composables/useChartWorkspaceCloseGuard', () => ({
   useChartWorkspaceCloseGuard: mocks.closeGuard,
+}))
+vi.mock('../../src/services/errorService', () => ({
+  reportError: mocks.reportError,
+  showBackendError: mocks.showBackendError,
 }))
 vi.mock('../../src/components/layout/AppShell.vue', () => ({
   default: { template: '<div />' },
@@ -48,6 +54,8 @@ describe('App account-bound event handlers', () => {
     setActivePinia(pinia)
     mocks.listeners.clear()
     mocks.closeGuard.mockReset()
+    mocks.reportError.mockReset()
+    mocks.showBackendError.mockReset()
     mocks.invoke.mockReset()
     mocks.invoke.mockImplementation((command: string) => {
       if (command === 'get_config') return Promise.resolve(config)
@@ -114,6 +122,15 @@ describe('App account-bound event handlers', () => {
     })
 
     expect(useAccountStore().balances).toEqual([balance])
+  })
+
+  it('routes the typed backend error envelope to the Toast-only adapter', () => {
+    const event = { eventId: 'backend:event:1', message: '后台任务失败' }
+
+    mocks.listeners.get('error:occurred')?.(event)
+
+    expect(mocks.showBackendError).toHaveBeenCalledWith(event)
+    expect(mocks.reportError).not.toHaveBeenCalledWith(event)
   })
 
   it('rejects a current-epoch event owned by a different account', () => {

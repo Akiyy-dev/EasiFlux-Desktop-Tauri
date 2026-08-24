@@ -18,7 +18,7 @@ import { usePositionStore } from './stores/position'
 import { useAccountStore } from './stores/account'
 import { useLogStore } from './stores/log'
 import { useTimeStore } from './stores/time'
-import { reportError as reportGlobalError } from './services/errorService'
+import { reportError as reportGlobalError, showBackendError } from './services/errorService'
 import { onConnectionStatusChanged, onWebsocketStatusChanged } from './services/realtimeService'
 import { onTimeUpdated } from './services/timeService'
 import { applyPrivatePanelsSnapshot } from './stores/privatePanels'
@@ -31,7 +31,8 @@ import type {
   Depth,
   EnvironmentStatus,
   Kline,
-  LogEntry,
+  BackendErrorEvent,
+  LogEntry,
   Order,
   Position,
   PrivatePanelsSnapshot,
@@ -119,9 +120,9 @@ useTauriEvent<TimeSnapshot>('time:updated', (snapshot) => {
   onTimeUpdated(snapshot)
 })
 
-useTauriEvent<string>('error:occurred', (msg) => {
-  reportGlobalError(msg)
-})
+useTauriEvent<BackendErrorEvent>('error:occurred', (event) => {
+  showBackendError(event)
+})
 
 useTauriEvent<LogEntry>('log:entry', (entry) => {
   logStore.addEntry(entry)

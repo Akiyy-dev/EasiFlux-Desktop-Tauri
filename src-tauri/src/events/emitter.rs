@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tauri::AppHandle;
 #[cfg(not(test))]
 use tauri::Emitter;
+use uuid::Uuid;
 
 use crate::models::account::AccountSummary;
 use crate::models::config::{ConnectionStatus, EnvironmentStatus};
@@ -199,19 +200,31 @@ impl EventEmitter {
     }
 
     pub fn emit_error(&self, message: &str) {
-        let _ = self.emit("error:occurred", message);
-        self.emit_log("error", message);
+        let event_id = Uuid::new_v4().to_string();
+        let _ = self.emit(
+            "error:occurred",
+            &serde_json::json!({
+                "eventId": event_id,
+                "message": message,
+            }),
+        );
+        self.emit_log_entry("error", message, Some(&event_id));
     }
 
     pub fn emit_log(&self, level: &str, message: &str) {
-        let _ = self.emit(
-            "log:entry",
-            &serde_json::json!({
-                "level": level,
-                "message": message,
-                "timestamp": chrono::Utc::now().timestamp_millis(),
-            }),
-        );
+        self.emit_log_entry(level, message, None);
+    }
+
+    fn emit_log_entry(&self, level: &str, message: &str, event_id: Option<&str>) {
+        let mut entry = serde_json::json!({
+            "level": level,
+            "message": message,
+            "timestamp": chrono::Utc::now().timestamp_millis(),
+        });
+        if let Some(event_id) = event_id {
+            entry["eventId"] = serde_json::Value::String(event_id.to_string());
+        }
+        let _ = self.emit("log:entry", &entry);
     }
 }
 
@@ -221,6 +234,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::json;
+    use uuid::{Uuid, Version};
 
     use crate::models::config::ConnectionStatus;
     use crate::models::notification::{
@@ -350,5 +364,39 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(error, "NOTIFICATION_EVENT_EMIT_FAILED");
         assert!(!error.contains("raw-secret"));
+    }
+
+    #[test]
+    fn error_and_log_envelopes_share_one_opaque_event_id() {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitter = super::EventEmitter::new_test(sink.clone());
+
+        emitter.emit_error("后台任务失败");
+
+        let events = sink.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "error:occurred");
+        assert_eq!(events[1].0, "log:entry");
+        let event_id = events[0].1["eventId"].as_str().unwrap();
+        let uuid = Uuid::parse_str(event_id).unwrap();
+        assert_eq!(uuid.get_version(), Some(Version::Random));
+        assert_eq!(events[0].1["message"], "后台任务失败");
+        assert_eq!(events[1].1["eventId"], event_id);
+        assert_eq!(events[1].1["level"], "error");
+        assert_eq!(events[1].1["message"], "后台任务失败");
+        assert!(events[1].1["timestamp"].is_i64());
+    }
+
+    #[test]
+    fn ordinary_log_entries_omit_the_optional_event_id() {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitter = super::EventEmitter::new_test(sink.clone());
+
+        emitter.emit_log("info", "ordinary");
+
+        let events = sink.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "log:entry");
+        assert_eq!(events[0].1.get("eventId"), None);
     }
 }

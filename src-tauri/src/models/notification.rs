@@ -501,6 +501,7 @@ pub enum AccountNotificationSection {
 )]
 pub enum NotificationAction {
     OpenTrading {
+        #[serde(skip_serializing_if = "Option::is_none")]
         order_id: Option<String>,
     },
     OpenAccountSettings {
@@ -1151,6 +1152,14 @@ mod tests {
             })
             .unwrap(),
             json!({ "type": "openTrading", "orderId": "o-1" }),
+        );
+    }
+
+    #[test]
+    fn open_trading_without_order_omits_the_optional_wire_field() {
+        assert_eq!(
+            serde_json::to_value(NotificationAction::OpenTrading { order_id: None }).unwrap(),
+            json!({ "type": "openTrading" }),
         );
     }
 

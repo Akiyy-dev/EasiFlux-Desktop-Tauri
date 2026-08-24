@@ -323,6 +323,12 @@ export interface LogEntry {
   level: string
   message: string
   timestamp: number
+  eventId?: string
+}
+
+export interface BackendErrorEvent {
+  eventId: string
+  message: string
 }
 
 export interface PingResponse {

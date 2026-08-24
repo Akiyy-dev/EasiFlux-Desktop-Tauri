@@ -11,7 +11,23 @@ describe('client notification bridge service', () => {
 
   it('owns the exact one-request invoke envelope', async () => {
     vi.mocked(tauriInvoke).mockResolvedValue({
-      notification: { id: '00000000-0000-4000-8000-000000000001' },
+      notification: {
+        id: '00000000-0000-4000-8000-000000000001',
+        scope: { type: 'account', accountId: 'primary' },
+        category: 'riskAccount',
+        kind: 'accountRecoveryFailed',
+        severity: 'error',
+        content: {
+          messageKey: 'account.recoveryFailed',
+          params: { failedSteps: 'connection' },
+          fallbackTitle: '账户恢复失败',
+          fallbackBody: '账户恢复未完成，请检查账户设置。',
+        },
+        dedupeKey: 'primary:attempt:recovery',
+        occurrenceCount: 1,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      },
       unreadCount: 1,
       revision: '1',
     })
