@@ -154,14 +154,18 @@ describe('NotificationSettingsPanel', () => {
     expect(wrapper.find('[data-testid="notification-clear-dialog"]').exists()).toBe(false)
   })
 
-  it('preserves the immutable dialog and list on false, then closes only after a true clear result', async () => {
+  it('preserves the dialog and list on false, showing only the Store-local clear error before closing on true', async () => {
     const store = useNotificationStore()
     store.settingsDraft = { ...enabled }
     store.accountId = 'acct-1'
     store.items = [{ id: 'visible-item' }] as never
     const clear = vi.spyOn(store, 'clearCurrentAccount')
       .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
       .mockResolvedValueOnce(true)
+    vi.spyOn(store, 'error', 'get')
+      .mockReturnValueOnce('清理失败：后端拒绝')
+      .mockReturnValueOnce(null)
     const wrapper = mountPanel()
 
     await wrapper.get('[data-testid="notification-clear-current-account"]').trigger('click')
@@ -172,10 +176,18 @@ describe('NotificationSettingsPanel', () => {
     expect(wrapper.find('[data-testid="notification-clear-dialog"]').exists()).toBe(true)
     expect((wrapper.get('[data-testid="notification-clear-confirmation-input"]').element as HTMLInputElement).value).toBe('acct-1')
     expect(store.items).toHaveLength(1)
+    expect(wrapper.get('[data-testid="notification-clear-error"]').text()).toBe('清理失败：后端拒绝')
 
     await wrapper.get('[data-testid="notification-clear-confirm"]').trigger('click')
     await flushPromises()
-    expect(clear).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('[data-testid="notification-clear-dialog"]').exists()).toBe(true)
+    expect((wrapper.get('[data-testid="notification-clear-confirmation-input"]').element as HTMLInputElement).value).toBe('acct-1')
+    expect(store.items).toHaveLength(1)
+    expect(wrapper.find('[data-testid="notification-clear-error"]').exists()).toBe(false)
+
+    await wrapper.get('[data-testid="notification-clear-confirm"]').trigger('click')
+    await flushPromises()
+    expect(clear).toHaveBeenCalledTimes(3)
     expect(wrapper.find('[data-testid="notification-clear-dialog"]').exists()).toBe(false)
   })
 
