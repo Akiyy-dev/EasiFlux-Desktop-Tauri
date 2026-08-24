@@ -63,6 +63,10 @@ impl NotificationError {
     pub fn availability(&self) -> NotificationAvailability {
         NotificationAvailability::new(self.code, self.message)
     }
+
+    pub(crate) fn is_retryable_persistence_failure(&self) -> bool {
+        self.code == NOTIFICATION_STORAGE_UNAVAILABLE
+    }
 }
 
 impl Display for NotificationError {

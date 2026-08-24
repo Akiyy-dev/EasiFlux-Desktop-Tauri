@@ -208,18 +208,20 @@ async fn seed_order_gate<F, Fut>(
     order_snapshot_seeded: &AtomicBool,
     context: &OrderStreamContext,
     replay: F,
-) where
+) -> AppResult<()>
+where
     F: FnOnce(Vec<Order>) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = AppResult<()>>,
 {
     let mut buffer = order_observation_buffer.lock().await;
     let Some(pending) = buffer.pending_for_seed(context) else {
-        return;
+        return Ok(());
     };
-    replay(pending).await;
+    replay(pending).await?;
     if buffer.finish_seed(context) {
         order_snapshot_seeded.store(true, Ordering::Release);
     }
+    Ok(())
 }
 
 async fn observe_manual_order_snapshots_for_session(
@@ -480,12 +482,12 @@ impl WsManager {
         &self,
         context: &OrderStreamContext,
         snapshots: &[Order],
-    ) {
+    ) -> AppResult<()> {
         let active_account_id = normalize_account_id(&self.config.read().await.active_account_id);
         if self.account_lifecycle.current_session_epoch() != context.session_epoch
             || active_account_id != context.account_id
         {
-            return;
+            return Ok(());
         }
         seed_order_gate(
             &self.order_observation_buffer,
@@ -500,7 +502,7 @@ impl WsManager {
                 )
             },
         )
-        .await;
+        .await
     }
 
     /// Applies a manual REST snapshot only after the initial scheduler snapshot
@@ -1062,7 +1064,7 @@ async fn topic_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1080,11 +1082,31 @@ mod tests {
     use crate::models::notification::{ListNotificationsRequest, NotificationFilter};
     use crate::models::trading::{Order, OrderStatus, OrderStreamContext};
     use crate::services::notification::{
-        NotificationEmitter, NotificationRuntime, NotificationService, ViewContext,
+        NotificationAvailability, NotificationEmitter, NotificationRuntime, NotificationService,
+        ViewContext,
     };
     use crate::services::trading::OrderNotificationObserver;
     use crate::services::AccountLifecycleCoordinator;
+    use crate::storage::notification_store::{NotificationFileV1, NotificationPersistence};
     use crate::storage::NotificationStore;
+
+    struct FailAtPersistence {
+        attempts: AtomicUsize,
+        fail_at: usize,
+    }
+
+    impl NotificationPersistence for FailAtPersistence {
+        fn save(&self, _file: &NotificationFileV1) -> crate::error::AppResult<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == self.fail_at {
+                Err(crate::error::AppError::Storage(
+                    "private-notification-store-detail".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     fn buffered_order(id: &str, status: OrderStatus) -> Order {
         Order {
@@ -1172,9 +1194,10 @@ mod tests {
                     assert_eq!(pending.len(), 2);
                     let _ = started_tx.send(());
                     let _ = release_rx.await;
+                    Ok(())
                 },
             )
-            .await;
+            .await
         });
         started_rx.await.unwrap();
 
@@ -1207,14 +1230,275 @@ mod tests {
                     observed.push(identity);
                 }
             }
+            Ok(())
         })
-        .await;
+        .await
+        .unwrap();
 
         assert!(seeded.load(Ordering::Acquire));
         let gate = buffer.lock().await;
         assert!(gate.snapshot_seeded);
         assert!(gate.pending.is_empty());
         assert_eq!(replayed.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_gate_replay_retains_full_batch_and_retries_partial_commit_once() {
+        let persistence = Arc::new(FailAtPersistence {
+            attempts: AtomicUsize::new(0),
+            fail_at: 2,
+        });
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_by_callback = Arc::clone(&emitted);
+        let emitter: NotificationEmitter = Arc::new(move |_| {
+            emitted_by_callback.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let service = Arc::new(NotificationService::from_snapshot(
+            NotificationFileV1::empty(),
+            Arc::clone(&persistence),
+            emitter,
+            1_784_606_400_000,
+        ));
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Available(
+            Arc::clone(&service),
+        )));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        let pending = vec![
+            buffered_order("order-gate-persist-1", OrderStatus::New),
+            buffered_order("order-gate-persist-1", OrderStatus::Filled),
+            buffered_order("order-gate-persist-2", OrderStatus::PartiallyFilled),
+            buffered_order("order-gate-persist-2", OrderStatus::Filled),
+        ];
+        assert!(buffer.lock().await.defer(&context, pending.clone()));
+        let seeded = AtomicBool::new(false);
+
+        let first = seed_order_gate(&buffer, &seeded, &context, |buffered| {
+            observer.seed_snapshot_then_replay(&context, &[], buffered, 1_784_606_400_000)
+        })
+        .await;
+
+        assert!(first.is_err());
+        let rendered = first.unwrap_err().to_string();
+        assert!(!rendered.contains("private-notification-store-detail"));
+        assert!(!seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(!gate.snapshot_seeded);
+        assert_eq!(
+            gate.pending
+                .iter()
+                .map(|order| (order.order_id.as_str(), order.status.clone()))
+                .collect::<Vec<_>>(),
+            pending
+                .iter()
+                .map(|order| (order.order_id.as_str(), order.status.clone()))
+                .collect::<Vec<_>>()
+        );
+        drop(gate);
+        assert_eq!(service.revision().await, "1");
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+
+        seed_order_gate(&buffer, &seeded, &context, |buffered| {
+            observer.seed_snapshot_then_replay(&context, &[], buffered, 1_784_606_400_100)
+        })
+        .await
+        .unwrap();
+
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
+        drop(gate);
+        assert_eq!(persistence.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(service.revision().await, "2");
+        assert_eq!(emitted.load(Ordering::SeqCst), 2);
+        let records = service
+            .list(
+                ViewContext::account("alpha").unwrap(),
+                ListNotificationsRequest {
+                    account_id: Some("alpha".into()),
+                    filter: NotificationFilter::All,
+                    cursor: None,
+                    limit: 100,
+                },
+                1_784_606_401_000,
+            )
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fail_once_gate_replay_stays_closed_until_the_batch_commits() {
+        let persistence = Arc::new(FailAtPersistence {
+            attempts: AtomicUsize::new(0),
+            fail_at: 1,
+        });
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_by_callback = Arc::clone(&emitted);
+        let service = Arc::new(NotificationService::from_snapshot(
+            NotificationFileV1::empty(),
+            Arc::clone(&persistence),
+            Arc::new(move |_| {
+                emitted_by_callback.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            1_784_606_400_000,
+        ));
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Available(
+            Arc::clone(&service),
+        )));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(
+            &context,
+            vec![
+                buffered_order("order-gate-fail-once-1", OrderStatus::New),
+                buffered_order("order-gate-fail-once-1", OrderStatus::Filled),
+            ],
+        ));
+        let seeded = AtomicBool::new(false);
+
+        let first = seed_order_gate(&buffer, &seeded, &context, |pending| {
+            observer.seed_snapshot_then_replay(&context, &[], pending, 1_784_606_400_000)
+        })
+        .await;
+
+        assert!(first.is_err());
+        assert!(!first
+            .unwrap_err()
+            .to_string()
+            .contains("private-notification-store-detail"));
+        assert!(!seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(!gate.snapshot_seeded);
+        assert_eq!(gate.pending.len(), 2);
+        drop(gate);
+        assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(service.revision().await, "0");
+        assert_eq!(emitted.load(Ordering::SeqCst), 0);
+
+        seed_order_gate(&buffer, &seeded, &context, |pending| {
+            observer.seed_snapshot_then_replay(&context, &[], pending, 1_784_606_400_100)
+        })
+        .await
+        .unwrap();
+
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
+        drop(gate);
+        assert_eq!(persistence.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(service.revision().await, "1");
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn permanent_invalid_order_content_is_skipped_and_gate_opens_without_retry_loop() {
+        let persistence = Arc::new(FailAtPersistence {
+            attempts: AtomicUsize::new(0),
+            fail_at: usize::MAX,
+        });
+        let service = Arc::new(NotificationService::from_snapshot(
+            NotificationFileV1::empty(),
+            Arc::clone(&persistence),
+            Arc::new(|_| Ok(())),
+            1_784_606_400_000,
+        ));
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Available(
+            Arc::clone(&service),
+        )));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let mut new = buffered_order("", OrderStatus::New);
+        new.order_link_id = Some("private-invalid-order-link".into());
+        let mut filled = new.clone();
+        filled.status = OrderStatus::Filled;
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(&context, vec![new, filled]));
+        let seeded = AtomicBool::new(false);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            seed_order_gate(&buffer, &seeded, &context, |pending| {
+                observer.seed_snapshot_then_replay(&context, &[], pending, 1_784_606_400_000)
+            }),
+        )
+        .await
+        .expect("permanent notification validation must not enter retry backoff");
+
+        assert!(result.is_ok());
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
+        drop(gate);
+        assert_eq!(persistence.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(service.revision().await, "0");
+        let records = service
+            .list(
+                ViewContext::account("alpha").unwrap(),
+                ListNotificationsRequest {
+                    account_id: Some("alpha".into()),
+                    filter: NotificationFilter::All,
+                    cursor: None,
+                    limit: 100,
+                },
+                1_784_606_401_000,
+            )
+            .await
+            .unwrap()
+            .items;
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unavailable_notification_runtime_opens_gate_without_retry_error() {
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Unavailable(
+            NotificationAvailability::new(
+                "NOTIFICATION_FUTURE_SCHEMA",
+                "private-unavailable-detail",
+            ),
+        )));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(
+            &context,
+            vec![
+                buffered_order("order-unavailable-runtime-1", OrderStatus::New),
+                buffered_order("order-unavailable-runtime-1", OrderStatus::Filled),
+            ],
+        ));
+        let seeded = AtomicBool::new(false);
+
+        let result = seed_order_gate(&buffer, &seeded, &context, |pending| {
+            observer.seed_snapshot_then_replay(&context, &[], pending, 1_784_606_400_000)
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
     }
 
     #[tokio::test]
@@ -1279,10 +1563,10 @@ mod tests {
                             pending,
                             1_784_606_400_000,
                         )
-                        .await;
+                        .await
                 },
             )
-            .await;
+            .await
         });
         started_rx.await.unwrap();
 
@@ -1309,7 +1593,7 @@ mod tests {
                 .is_err()
         );
         release_tx.send(()).unwrap();
-        seed_task.await.unwrap();
+        seed_task.await.unwrap().unwrap();
         manual_task.await.unwrap();
 
         let records = service

@@ -273,6 +273,94 @@ async fn observer_save_failure_is_swallowed_and_same_terminal_can_retry() {
 }
 
 #[tokio::test]
+async fn accepted_terminal_order_stays_successful_when_notification_save_fails() {
+    let persistence = Arc::new(FailOncePersistence {
+        fail: AtomicBool::new(true),
+        attempts: AtomicUsize::new(0),
+    });
+    let service = Arc::new(NotificationService::from_snapshot(
+        NotificationFileV1::empty(),
+        Arc::clone(&persistence),
+        Arc::new(|_| Ok(())),
+        NOW_MS,
+    ));
+    let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Available(
+        Arc::clone(&service),
+    )));
+    let risk_path = std::env::temp_dir().join(format!(
+        "easiflux-accepted-terminal-notification-failure-risk-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig {
+            max_daily_orders: 1,
+            ..Default::default()
+        },
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let (api, server, _) = api_client_for_responses(vec![json!({
+        "code": 0,
+        "data": {
+            "order_id": "order-accepted-save-failure-1",
+            "order_status": "Filled"
+        }
+    })])
+    .await;
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 1,
+    };
+    let trade_log_effects = Arc::new(AtomicUsize::new(0));
+    let event_effects = Arc::new(AtomicUsize::new(0));
+    let analytics_effects = Arc::new(AtomicUsize::new(0));
+    let counted_trade_log = Arc::clone(&trade_log_effects);
+    let counted_event = Arc::clone(&event_effects);
+    let counted_analytics = Arc::clone(&analytics_effects);
+
+    let result = execute_place_order(
+        api.as_ref(),
+        &risk,
+        &observer,
+        &context,
+        market_request(None),
+        None,
+        NOW_MS,
+        move |_| async move {
+            counted_trade_log.fetch_add(1, Ordering::SeqCst);
+            counted_event.fetch_add(1, Ordering::SeqCst);
+            counted_analytics.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await;
+    server.join().expect("test server exits");
+
+    assert!(matches!(
+        result,
+        Ok(Order {
+            status: OrderStatus::Filled,
+            ..
+        })
+    ));
+    assert_eq!(trade_log_effects.load(Ordering::SeqCst), 1);
+    assert_eq!(event_effects.load(Ordering::SeqCst), 1);
+    assert_eq!(analytics_effects.load(Ordering::SeqCst), 1);
+    assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(service.revision().await, "0");
+    assert_eq!(
+        RiskUsageStore::with_path(risk_path.clone())
+            .load()
+            .unwrap()
+            .unwrap()
+            .occupied_orders,
+        1
+    );
+
+    let _ = std::fs::remove_file(risk_path);
+}
+
+#[tokio::test]
 async fn confirmed_rejection_persists_when_release_save_fails_without_leaking_detail() {
     let harness = ObserverHarness::new("rejection-with-release-failure");
     let risk_root = std::env::temp_dir().join(format!(
@@ -506,9 +594,163 @@ async fn noncanonical_create_order_codes_are_ambiguous_and_keep_the_reservation(
                 .is_err(),
             "{label} must keep its reservation"
         );
+        assert_eq!(
+            RiskUsageStore::with_path(risk_path.clone())
+                .load()
+                .unwrap()
+                .unwrap()
+                .occupied_orders,
+            1,
+            "{label} must keep its reservation on disk"
+        );
 
         let _ = std::fs::remove_file(risk_path);
     }
+}
+
+#[tokio::test]
+async fn generic_provider_timestamp_and_sign_failures_keep_quota_and_publish_nothing() {
+    let cases = [
+        (
+            "generic-provider",
+            vec![json!({
+                "code": 26200010,
+                "message": "private-provider-detail"
+            })],
+        ),
+        (
+            "timestamp",
+            vec![
+                json!({"code": 26200002, "message": "private-timestamp-detail"}),
+                json!({"code": 0, "data": {"time": "1782850580"}}),
+                json!({"code": 26200002, "message": "private-timestamp-detail"}),
+            ],
+        ),
+        (
+            "sign",
+            vec![
+                json!({"code": 26200003, "message": "private-sign-detail"}),
+                json!({"code": 0, "data": {"time": "1782850580"}}),
+                json!({"code": 26200003, "message": "private-sign-detail"}),
+            ],
+        ),
+    ];
+
+    for (label, responses) in cases {
+        let harness = ObserverHarness::new(&format!("ambiguous-{label}"));
+        let risk_path = std::env::temp_dir().join(format!(
+            "easiflux-ambiguous-{label}-risk-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+            RiskConfig {
+                max_daily_orders: 1,
+                ..Default::default()
+            },
+            RiskUsageStore::with_path(risk_path.clone()),
+        )));
+        let (api, server, _) = api_client_for_responses(responses).await;
+        let context = SubmissionContext {
+            submission_id: uuid::Uuid::new_v4().to_string(),
+            account_id: "alpha".into(),
+            session_epoch: 1,
+        };
+
+        let result = execute_place_order(
+            api.as_ref(),
+            &risk,
+            &harness.observer,
+            &context,
+            market_request(None),
+            None,
+            NOW_MS,
+            |_| async {},
+        )
+        .await;
+        server.join().expect("test server exits");
+
+        assert!(
+            matches!(result, Err(AppError::Trading(_))),
+            "{label}: {result:?}"
+        );
+        let rendered = serde_json::to_string(&result.unwrap_err()).unwrap();
+        assert!(!rendered.contains("private-"), "{label}: {rendered}");
+        assert!(harness.records("alpha").await.is_empty(), "{label}");
+        assert!(
+            risk.read()
+                .await
+                .reserve_order(&market_request(None), None, NOW_MS + 1)
+                .is_err(),
+            "{label} must keep its reservation in memory"
+        );
+        assert_eq!(
+            RiskUsageStore::with_path(risk_path.clone())
+                .load()
+                .unwrap()
+                .unwrap()
+                .occupied_orders,
+            1,
+            "{label} must keep its reservation on disk"
+        );
+
+        let _ = std::fs::remove_file(risk_path);
+    }
+}
+
+#[tokio::test]
+async fn missing_api_credential_keeps_quota_and_publishes_nothing() {
+    let harness = ObserverHarness::new("ambiguous-auth");
+    let risk_path = std::env::temp_dir().join(format!(
+        "easiflux-ambiguous-auth-risk-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+        RiskConfig {
+            max_daily_orders: 1,
+            ..Default::default()
+        },
+        RiskUsageStore::with_path(risk_path.clone()),
+    )));
+    let (api, server, _) = api_client_for_responses(Vec::new()).await;
+    api.clear_credential().await;
+    let context = SubmissionContext {
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        account_id: "alpha".into(),
+        session_epoch: 1,
+    };
+
+    let result = execute_place_order(
+        api.as_ref(),
+        &risk,
+        &harness.observer,
+        &context,
+        market_request(None),
+        None,
+        NOW_MS,
+        |_| async {},
+    )
+    .await;
+    server.join().expect("test server exits");
+
+    assert!(matches!(result, Err(AppError::Auth(_))), "{result:?}");
+    assert!(harness.records("alpha").await.is_empty());
+    assert!(risk
+        .read()
+        .await
+        .reserve_order(&market_request(None), None, NOW_MS + 1)
+        .is_err());
+    assert_eq!(
+        RiskUsageStore::with_path(risk_path.clone())
+            .load()
+            .unwrap()
+            .unwrap()
+            .occupied_orders,
+        1
+    );
+
+    let _ = std::fs::remove_file(risk_path);
 }
 
 #[tokio::test]
@@ -520,7 +762,10 @@ async fn caller_order_link_is_preserved_outbound_and_returned_while_submission_s
         uuid::Uuid::new_v4()
     ));
     let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
-        RiskConfig::default(),
+        RiskConfig {
+            max_daily_orders: 1,
+            ..Default::default()
+        },
         RiskUsageStore::with_path(risk_path.clone()),
     )));
     let caller_link = "client-link_2026.08";
@@ -693,6 +938,14 @@ async fn caller_link_rejection_rebuilds_alias_and_absorbs_later_ws_terminal() {
     let records = harness.records("alpha").await;
     assert_eq!(records.len(), 1);
     assert!(records[0].source_event_id.as_ref().unwrap().len() <= 256);
+    assert_eq!(
+        RiskUsageStore::with_path(risk_path.clone())
+            .load()
+            .unwrap()
+            .unwrap()
+            .occupied_orders,
+        0
+    );
     assert!(risk
         .read()
         .await
@@ -794,7 +1047,8 @@ async fn buffered_new_filled_survives_snapshot_already_filled_and_notifies_once(
     harness
         .observer
         .seed_snapshot_then_replay(&context, &[snapshot], pending, NOW_MS)
-        .await;
+        .await
+        .unwrap();
 
     let records = harness.records("alpha").await;
     assert_eq!(records.len(), 1);
@@ -822,7 +1076,8 @@ async fn buffered_nonterminal_without_live_terminal_accepts_snapshot_terminal_ba
                 vec![order(&order_id, pending_status)],
                 NOW_MS,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert!(harness.records("alpha").await.is_empty());
         assert!(harness
@@ -852,7 +1107,8 @@ async fn standalone_buffered_terminal_does_not_override_snapshot_terminal_baseli
     harness
         .observer
         .seed_snapshot_then_replay(&context, &[terminal.clone()], vec![terminal], NOW_MS)
-        .await;
+        .await
+        .unwrap();
 
     assert!(harness.records("alpha").await.is_empty());
 }
@@ -869,7 +1125,8 @@ async fn buffered_unknown_does_not_shadow_a_usable_snapshot_predecessor() {
     harness
         .observer
         .seed_snapshot_then_replay(&context, &[snapshot], vec![unknown], NOW_MS)
-        .await;
+        .await
+        .unwrap();
 
     assert!(harness
         .observer

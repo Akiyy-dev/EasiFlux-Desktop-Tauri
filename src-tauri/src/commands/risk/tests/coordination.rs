@@ -138,7 +138,9 @@ async fn disabling_risk_waits_for_failed_order_release_and_clears_disk_quota() {
         || NOW_MS,
         || async move {
             wait_for_release.await.unwrap();
-            Err::<Order, AppError>(AppError::Trading("rejected".into()))
+            Err::<Order, AppError>(AppError::TradingFailure(
+                crate::models::trading::TradingFailure::rejected(),
+            ))
         },
         |_| async {},
     );
@@ -171,7 +173,7 @@ async fn disabling_risk_waits_for_failed_order_release_and_clears_disk_quota() {
     let order_result = tokio::time::timeout(std::time::Duration::from_secs(1), order.as_mut())
         .await
         .expect("order lifecycle should finish after submission is released");
-    assert!(matches!(order_result, Err(AppError::Trading(_))));
+    assert!(matches!(order_result, Err(AppError::TradingFailure(_))));
     let status = tokio::time::timeout(std::time::Duration::from_secs(1), update.as_mut())
         .await
         .expect("risk update should acquire the coordinator after order cleanup")

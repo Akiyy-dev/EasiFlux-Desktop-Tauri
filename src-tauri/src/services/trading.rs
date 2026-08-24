@@ -44,13 +44,34 @@ impl OrderNotificationObserver {
         submission_id: Option<&str>,
         now_ms: u64,
     ) -> Option<String> {
+        self.observe_checked(
+            account_id,
+            session_epoch,
+            order,
+            origin,
+            submission_id,
+            now_ms,
+        )
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn observe_checked(
+        &self,
+        account_id: &str,
+        session_epoch: u64,
+        order: &Order,
+        origin: OrderObservationOrigin,
+        submission_id: Option<&str>,
+        now_ms: u64,
+    ) -> AppResult<Option<String>> {
         let status = match order.status {
             OrderStatus::New => ObservedOrderStatus::New,
             OrderStatus::PartiallyFilled => ObservedOrderStatus::PartiallyFilled,
             OrderStatus::Filled => ObservedOrderStatus::Filled,
             OrderStatus::Cancelled => ObservedOrderStatus::Canceled,
             OrderStatus::Rejected => ObservedOrderStatus::Rejected,
-            OrderStatus::Unknown => return None,
+            OrderStatus::Unknown => return Ok(None),
         };
         let order_id = (!order.order_id.trim().is_empty()).then(|| order.order_id.clone());
         let submission_id = submission_id.map(str::to_owned);
@@ -59,7 +80,7 @@ impl OrderNotificationObserver {
             .clone()
             .filter(|value| is_correlatable_order_link(value));
         if order_id.is_none() && submission_id.is_none() && order_link_id.is_none() {
-            return None;
+            return Ok(None);
         }
         let service = match self.runtime.service() {
             Ok(service) => service,
@@ -68,7 +89,7 @@ impl OrderNotificationObserver {
                     code = availability.code(),
                     "order notification observer unavailable"
                 );
-                return None;
+                return Ok(None);
             }
         };
         match service
@@ -86,10 +107,16 @@ impl OrderNotificationObserver {
             )
             .await
         {
-            Ok(outcome) => outcome.notification.map(|record| record.id),
+            Ok(outcome) => Ok(outcome.notification.map(|record| record.id)),
             Err(error) => {
                 tracing::warn!(code = error.code(), "order notification observation failed");
-                None
+                if error.is_retryable_persistence_failure() {
+                    Err(AppError::Internal(
+                        "订单通知同步暂时不可用，请稍后重试".into(),
+                    ))
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
@@ -100,7 +127,7 @@ impl OrderNotificationObserver {
         snapshots: &[Order],
         buffered: Vec<Order>,
         now_ms: u64,
-    ) {
+    ) -> AppResult<()> {
         let mut offset = 0_u64;
         let (deferred, baseline): (Vec<_>, Vec<_>) = snapshots.iter().partition(|snapshot| {
             let mut saw_live_nonterminal = false;
@@ -120,7 +147,7 @@ impl OrderNotificationObserver {
             })
         });
         for snapshot in baseline {
-            self.observe(
+            self.observe_checked(
                 &context.account_id,
                 context.session_epoch,
                 snapshot,
@@ -128,12 +155,12 @@ impl OrderNotificationObserver {
                 None,
                 now_ms.saturating_add(offset),
             )
-            .await;
+            .await?;
             offset = offset.saturating_add(1);
             tokio::task::yield_now().await;
         }
         for live in buffered {
-            self.observe(
+            self.observe_checked(
                 &context.account_id,
                 context.session_epoch,
                 &live,
@@ -141,12 +168,12 @@ impl OrderNotificationObserver {
                 None,
                 now_ms.saturating_add(offset),
             )
-            .await;
+            .await?;
             offset = offset.saturating_add(1);
             tokio::task::yield_now().await;
         }
         for snapshot in deferred {
-            self.observe(
+            self.observe_checked(
                 &context.account_id,
                 context.session_epoch,
                 snapshot,
@@ -154,10 +181,11 @@ impl OrderNotificationObserver {
                 None,
                 now_ms.saturating_add(offset),
             )
-            .await;
+            .await?;
             offset = offset.saturating_add(1);
             tokio::task::yield_now().await;
         }
+        Ok(())
     }
 
     pub(crate) async fn observe_rejection(
@@ -585,7 +613,15 @@ where
 }
 
 fn is_certain_submission_failure(error: &AppError) -> bool {
-    !matches!(error, AppError::Connection(_) | AppError::Internal(_))
+    is_confirmed_submission_rejection(error)
+}
+
+fn is_confirmed_submission_rejection(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::TradingFailure(failure)
+            if failure.kind == crate::models::trading::TradingFailureKind::Rejected
+    )
 }
 
 async fn handle_failed_submission(
@@ -609,7 +645,7 @@ async fn handle_failed_submission(
             "risk reservation rollback failed after order submission"
         );
     }
-    let notification_id = if matches!(submit_error, AppError::TradingFailure(_)) {
+    let notification_id = if is_confirmed_submission_rejection(&submit_error) {
         observer
             .observe_rejection(context, Some(transmitted_order_link_id), now_ms)
             .await
@@ -710,8 +746,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submission_error_releases_reservation() {
-        let path = test_path("release");
+    async fn generic_trading_error_keeps_reservation_in_memory_and_on_disk() {
+        let path = test_path("ambiguous-trading");
         let risk = risk_with_limit(&path, 1);
         let request = market_order();
 
@@ -725,8 +761,72 @@ mod tests {
             .read()
             .await
             .reserve_order(&request, None, NOW_MS)
-            .is_ok());
+            .is_err());
+        assert_eq!(
+            RiskUsageStore::with_path(path.clone())
+                .load()
+                .unwrap()
+                .unwrap()
+                .occupied_orders,
+            1
+        );
         cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn typed_rejection_releases_reservation_in_memory_and_on_disk() {
+        let path = test_path("typed-rejection-release");
+        let risk = risk_with_limit(&path, 1);
+        let request = market_order();
+
+        let result = execute_reserved_order(&risk, &request, None, NOW_MS, || {
+            std::future::ready(Err::<Order, AppError>(AppError::TradingFailure(
+                crate::models::trading::TradingFailure::rejected(),
+            )))
+        })
+        .await;
+
+        assert!(matches!(result, Err(AppError::TradingFailure(_))));
+        assert!(risk
+            .read()
+            .await
+            .reserve_order(&request, None, NOW_MS)
+            .is_ok());
+        assert_eq!(
+            RiskUsageStore::with_path(path.clone())
+                .load()
+                .unwrap()
+                .unwrap()
+                .occupied_orders,
+            1,
+            "the second reservation proves both memory and disk were released"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn only_typed_rejection_is_a_certain_submission_failure() {
+        let ambiguous = [
+            AppError::Auth("safe".into()),
+            AppError::Connection("safe".into()),
+            AppError::Trading("safe".into()),
+            AppError::Risk("safe".into()),
+            AppError::Config("safe".into()),
+            AppError::Storage("safe".into()),
+            AppError::NotConnected,
+            AppError::Internal("safe".into()),
+            AppError::Notified {
+                code: "ORDER_REJECTED",
+                message: "订单请求被交易端拒绝",
+                notification_id: uuid::Uuid::new_v4().to_string(),
+            },
+        ];
+        assert!(ambiguous
+            .iter()
+            .all(|error| !is_certain_submission_failure(error)));
+        assert!(is_certain_submission_failure(&AppError::TradingFailure(
+            crate::models::trading::TradingFailure::rejected(),
+        )));
     }
 
     #[tokio::test]

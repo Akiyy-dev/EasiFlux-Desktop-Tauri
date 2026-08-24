@@ -3350,7 +3350,7 @@ impl SchedulerService {
                     .collect::<Vec<_>>();
                 self.ws
                     .seed_order_snapshots_and_mark(&context, &order_snapshots)
-                    .await;
+                    .await?;
                 let params = build_order_query_params(
                     sym, None, None, None, None, None, None, None, None, None,
                 );
@@ -3545,7 +3545,7 @@ impl SchedulerRefs {
                     .collect::<Vec<_>>();
                 self.ws
                     .seed_order_snapshots_and_mark(&context, &order_snapshots)
-                    .await;
+                    .await?;
                 let params = build_order_query_params(
                     sym, None, None, None, None, None, None, None, None, None,
                 );
