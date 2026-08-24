@@ -7,6 +7,7 @@ import { useAccountProfilesStore } from '../../stores/accountProfiles'
 import { useConfigStore } from '../../stores/config'
 import { useConnectionStore } from '../../stores/connection'
 import { reportError } from '../../services/errorService'
+import { decodeCommandError } from '../../services/notificationService'
 
 const props = defineProps<{ show: boolean }>()
 const emit = defineEmits<{ 'update:show': [value: boolean] }>()
@@ -103,7 +104,10 @@ async function connectStoredCredentials(session = flowSession): Promise<void> {
     if (session === flowSession && props.show) emit('update:show', false)
   } catch (error) {
     if (session === flowSession && props.show) {
-      connectionError.value = reportError(error, '凭据已保存，连接失败')
+      const decoded = decodeCommandError(error)
+      connectionError.value = decoded.notificationId
+        ? decoded.message
+        : reportError(error, '凭据已保存，连接失败')
     }
   } finally {
     if (session === flowSession) connecting.value = false

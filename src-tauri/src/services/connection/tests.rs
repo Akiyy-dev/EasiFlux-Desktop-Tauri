@@ -13,7 +13,10 @@ use crate::services::notification::{
 };
 use crate::storage::notification_store::{NotificationFileV1, NotificationPersistence};
 
-use super::{notified_connection_error, ConnectionObservationSource, SessionNotificationObserver};
+use super::{
+    deliver_notified_connection_error, notified_connection_error, ConnectionObservationSource,
+    SessionNotificationObserver,
+};
 
 const NOW: u64 = 1_700_000_000_000;
 
@@ -682,4 +685,28 @@ fn committed_incident_returns_a_controlled_error_with_only_the_committed_id() {
             "notificationId": notification_id,
         }),
     );
+}
+
+#[test]
+fn committed_connection_marker_owns_one_error_log_without_generic_event() {
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let emitter = crate::events::EventEmitter::new_test(Arc::clone(&sink));
+    let notified = notified_connection_error(
+        crate::error::AppError::Connection("apiKey=raw-secret".into()),
+        Some("notification-connection-1".into()),
+    );
+
+    let result = deliver_notified_connection_error(&emitter, notified);
+
+    assert!(matches!(result, crate::error::AppError::Notified { .. }));
+    let events = sink.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "log:entry");
+    assert_eq!(events[0].1["level"], "error");
+    assert_eq!(
+        events[0].1["message"],
+        "NOTIFIED_CONNECTION_FAILURE:CONNECTION_UNAVAILABLE"
+    );
+    assert!(events.iter().all(|(name, _)| name != "error:occurred"));
+    assert!(!events[0].1.to_string().contains("raw-secret"));
 }

@@ -289,6 +289,27 @@ fn bootstrap_failure_needs_generic_error(error: &AppError) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootstrapDeliveryOwnership {
+    Background,
+    Reconciliation,
+}
+
+fn emit_bootstrap_failure_diagnostics(
+    emitter: &EventEmitter,
+    ownership: BootstrapDeliveryOwnership,
+    failed: &[(TaskId, AppError)],
+) {
+    if ownership == BootstrapDeliveryOwnership::Reconciliation {
+        return;
+    }
+    for (task, error) in failed {
+        if bootstrap_failure_needs_generic_error(error) {
+            emitter.emit_error(&format!("连接后{}同步失败", task.bootstrap_label()));
+        }
+    }
+}
+
 fn bootstrap_failure_error(failed: &[TaskId]) -> AppError {
     let labels = failed
         .iter()
@@ -3261,7 +3282,16 @@ impl SchedulerService {
 
     pub async fn bootstrap_connection(&self) -> AppResult<()> {
         run_generation_activity(&self.lifecycle, || async {
-            self.bootstrap_connection_inner().await
+            self.bootstrap_connection_inner(BootstrapDeliveryOwnership::Background)
+                .await
+        })
+        .await
+    }
+
+    pub async fn bootstrap_reconciliation(&self) -> AppResult<()> {
+        run_generation_activity(&self.lifecycle, || async {
+            self.bootstrap_connection_inner(BootstrapDeliveryOwnership::Reconciliation)
+                .await
         })
         .await
     }
@@ -3271,7 +3301,9 @@ impl SchedulerService {
         let scheduler = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
             let result = run_claimed_generation_activity(activity, || async {
-                scheduler.bootstrap_connection_inner().await
+                scheduler
+                    .bootstrap_connection_inner(BootstrapDeliveryOwnership::Background)
+                    .await
             })
             .await;
             if let Err(error) = result {
@@ -3284,7 +3316,10 @@ impl SchedulerService {
         Ok(())
     }
 
-    async fn bootstrap_connection_inner(&self) -> AppResult<()> {
+    async fn bootstrap_connection_inner(
+        &self,
+        ownership: BootstrapDeliveryOwnership,
+    ) -> AppResult<()> {
         let (tasks, mut failed) = run_bootstrap_account_phase(
             self.account_lifecycle.as_ref(),
             || async { self.connection.status().await == ConnectionStatus::Connected },
@@ -3300,12 +3335,7 @@ impl SchedulerService {
                 .position(|task| task == failed_task)
                 .unwrap_or(usize::MAX)
         });
-        for (task, error) in &failed {
-            if bootstrap_failure_needs_generic_error(error) {
-                self.emitter
-                    .emit_error(&format!("连接后{}同步失败", task.bootstrap_label()));
-            }
-        }
+        emit_bootstrap_failure_diagnostics(&self.emitter, ownership, &failed);
         if failed.is_empty() {
             Ok(())
         } else {

@@ -4,10 +4,12 @@ use serde::Serialize;
 use tauri::State;
 use tokio::sync::RwLock;
 
+use crate::events::EventEmitter;
 use crate::models::config::AppConfig;
 use crate::models::notification::{
-    CreateClientNotificationRequest, ListNotificationsRequest, NotificationPage,
-    NotificationRecord, NotificationScope, NotificationSummary,
+    ClientNotificationFailedStep, ClientNotificationKind, CreateClientNotificationRequest,
+    ListNotificationsRequest, NotificationPage, NotificationRecord, NotificationScope,
+    NotificationSummary,
 };
 use crate::services::notification::{
     NotificationAvailability, NotificationError, NotificationPolicy, NotificationRuntime,
@@ -311,6 +313,39 @@ async fn create_client_notification_inner(
     })
 }
 
+fn client_failure_diagnostic(request: &CreateClientNotificationRequest) -> String {
+    let kind = match request.kind {
+        ClientNotificationKind::AccountRecoveryFailed => "accountRecoveryFailed",
+        ClientNotificationKind::AccountReconciliationFailed => "accountReconciliationFailed",
+    };
+    let steps = [
+        (ClientNotificationFailedStep::Config, "config"),
+        (ClientNotificationFailedStep::Profiles, "profiles"),
+        (ClientNotificationFailedStep::Connection, "connection"),
+        (ClientNotificationFailedStep::Bootstrap, "bootstrap"),
+    ]
+    .into_iter()
+    .filter_map(|(step, label)| request.failed_steps.contains(&step).then_some(label))
+    .collect::<Vec<_>>()
+    .join(",");
+    format!("CLIENT_ACCOUNT_FAILURE:{kind}:{steps}")
+}
+
+async fn create_client_notification_with_diagnostic_inner(
+    runtime: &Arc<NotificationRuntime>,
+    config: &Arc<RwLock<AppConfig>>,
+    lifecycle: &AccountLifecycleCoordinator,
+    emitter: &EventEmitter,
+    request: CreateClientNotificationRequest,
+    now_ms: u64,
+) -> Result<CreateClientNotificationResult, NotificationCommandError> {
+    let diagnostic = client_failure_diagnostic(&request);
+    let result =
+        create_client_notification_inner(runtime, config, lifecycle, request, now_ms).await?;
+    emitter.emit_diagnostic(&diagnostic, false);
+    Ok(result)
+}
+
 #[tauri::command]
 pub async fn list_notifications(
     state: State<'_, AppState>,
@@ -412,10 +447,11 @@ pub async fn create_client_notification(
     request: CreateClientNotificationRequest,
 ) -> Result<CreateClientNotificationResult, NotificationCommandError> {
     validate_client_notification_envelope(raw_request.body())?;
-    create_client_notification_inner(
+    create_client_notification_with_diagnostic_inner(
         &state.notification,
         &state.config,
         state.account_lifecycle.as_ref(),
+        &state.emitter,
         request,
         state.time.local_now_ms(),
     )

@@ -279,9 +279,31 @@ export function decodeCommandError(error: unknown): DecodedCommandError {
   if (typeof error === 'string') return { message: error }
   if (!isObject(error) || typeof error.message !== 'string') return { message: '未知错误' }
 
-  const decoded: DecodedCommandError = { message: error.message }
-  if (typeof error.code === 'string') decoded.code = error.code
-  if (typeof error.eventId === 'string') decoded.eventId = error.eventId
-  if (typeof error.notificationId === 'string') decoded.notificationId = error.notificationId
-  return decoded
+  const fallback: DecodedCommandError = { message: error.message }
+  const seen = new Set<object>()
+  let structured: DecodedCommandError | undefined
+  let current: Record<string, unknown> | undefined = error
+
+  for (let depth = 0; current && depth < 8; depth += 1) {
+    if (seen.has(current)) break
+    seen.add(current)
+
+    if (typeof current.message === 'string') {
+      const decoded: DecodedCommandError = { message: current.message }
+      if (typeof current.code === 'string') decoded.code = current.code
+      if (typeof current.eventId === 'string') decoded.eventId = current.eventId
+      if (
+        typeof current.notificationId === 'string'
+        && current.notificationId.trim().length > 0
+      ) {
+        decoded.notificationId = current.notificationId
+      }
+      if (decoded.notificationId) return decoded
+      if ((decoded.code || decoded.eventId) && !structured) structured = decoded
+    }
+
+    current = isObject(current.cause) ? current.cause : undefined
+  }
+
+  return structured ?? fallback
 }

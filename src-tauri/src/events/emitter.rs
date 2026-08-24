@@ -39,9 +39,17 @@ impl ErrorDeliveryFailure {
     }
 }
 
-fn emit_error_with<F, E>(
+fn emit_error_with<F, E>(message: &str, timestamp: i64, emit: F) -> Result<(), ErrorDeliveryFailure>
+where
+    F: FnMut(&str, &serde_json::Value) -> Result<(), E>,
+{
+    emit_diagnostic_with(message, timestamp, true, emit)
+}
+
+fn emit_diagnostic_with<F, E>(
     message: &str,
     timestamp: i64,
+    include_error_event: bool,
     mut emit: F,
 ) -> Result<(), ErrorDeliveryFailure>
 where
@@ -55,6 +63,10 @@ where
         "timestamp": timestamp,
     });
     emit(LOG_ENTRY_EVENT, &log_entry).map_err(|_| ErrorDeliveryFailure::LogEntry)?;
+
+    if !include_error_event {
+        return Ok(());
+    }
 
     let error_event = serde_json::json!({
         "eventId": event_id,
@@ -248,9 +260,14 @@ impl EventEmitter {
     }
 
     pub fn emit_error(&self, message: &str) {
-        let result = emit_error_with(
+        self.emit_diagnostic(message, true);
+    }
+
+    pub fn emit_diagnostic(&self, message: &str, include_error_event: bool) {
+        let result = emit_diagnostic_with(
             message,
             chrono::Utc::now().timestamp_millis(),
+            include_error_event,
             |name, payload| self.emit(name, payload),
         );
         if let Err(failure) = result {
@@ -512,5 +529,26 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "log:entry");
         assert_eq!(events[0].1.get("eventId"), None);
+    }
+
+    #[test]
+    fn diagnostic_delivery_is_log_only_or_one_paired_toast_with_the_same_event_id() {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitter = super::EventEmitter::new_test(sink.clone());
+
+        emitter.emit_diagnostic("committed notified failure", false);
+        emitter.emit_diagnostic("storage unavailable", true);
+
+        let events = sink.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].0, "log:entry");
+        assert_eq!(events[0].1["level"], "error");
+        assert_eq!(events[0].1["message"], "committed notified failure");
+        assert!(events[0].1["eventId"].is_string());
+        assert_eq!(events[1].0, "log:entry");
+        assert_eq!(events[2].0, "error:occurred");
+        assert_eq!(events[1].1["eventId"], events[2].1["eventId"]);
+        assert_eq!(events[1].1["message"], "storage unavailable");
+        assert_eq!(events[2].1["message"], "storage unavailable");
     }
 }

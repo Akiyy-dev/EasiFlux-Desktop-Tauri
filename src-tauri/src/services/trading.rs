@@ -343,7 +343,7 @@ impl TradingService {
             .cache
             .get_ticker(&request.symbol)
             .map(|ticker| ticker.last_price);
-        execute_place_order(
+        let result = execute_place_order(
             self.api.as_ref(),
             &self.risk,
             &self.notification_observer,
@@ -359,7 +359,8 @@ impl TradingService {
                 self.analytics.record_order(order).await;
             },
         )
-        .await
+        .await;
+        deliver_notified_placement(&self.emitter, result)
     }
 
     pub async fn cancel_order(
@@ -446,6 +447,13 @@ impl TradingService {
     ) -> AppResult<Vec<Order>> {
         PrivateApi::order_history(&self.api, symbol, limit).await
     }
+}
+
+fn deliver_notified_placement<T>(emitter: &EventEmitter, result: AppResult<T>) -> AppResult<T> {
+    if let Err(AppError::Notified { code, .. }) = &result {
+        emitter.emit_diagnostic(&format!("NOTIFIED_PLACEMENT_FAILURE:{code}"), false);
+    }
+    result
 }
 
 async fn execute_place_order<S, SFut>(

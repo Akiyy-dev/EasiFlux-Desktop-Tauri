@@ -256,6 +256,31 @@ fn bootstrap_observer_owned_failures_never_emit_a_second_generic_error() {
     ));
 }
 
+#[test]
+fn reconciliation_bootstrap_suppresses_child_delivery_while_background_keeps_it() {
+    let sink = Arc::new(StdMutex::new(Vec::new()));
+    let emitter = EventEmitter::new_test(Arc::clone(&sink));
+    let failures = vec![(
+        TaskId::TimeSync,
+        AppError::Internal("apiKey=raw-secret".into()),
+    )];
+
+    emit_bootstrap_failure_diagnostics(
+        &emitter,
+        BootstrapDeliveryOwnership::Reconciliation,
+        &failures,
+    );
+    assert!(sink.lock().unwrap().is_empty());
+
+    emit_bootstrap_failure_diagnostics(&emitter, BootstrapDeliveryOwnership::Background, &failures);
+    let events = sink.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, "log:entry");
+    assert_eq!(events[1].0, "error:occurred");
+    assert_eq!(events[0].1["eventId"], events[1].1["eventId"]);
+    assert!(!events[0].1.to_string().contains("raw-secret"));
+}
+
 #[tokio::test]
 async fn environment_probe_client_uses_reported_base_url() {
     let client = environment_probe_client("https://sandbox.example.test/").await;

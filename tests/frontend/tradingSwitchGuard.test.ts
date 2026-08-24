@@ -2,15 +2,18 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { nextTick } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { MessageApi } from 'naive-ui'
 import OpenOrdersTab from '../../src/components/trading/order-center/OpenOrdersTab.vue'
 import OrderPanel from '../../src/components/trading/OrderPanel.vue'
 import OrderTable from '../../src/components/trading/OrderTable.vue'
 import { useOrderPanel } from '../../src/composables/useOrderPanel'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { refreshSyncTask } from '../../src/services/dataSyncService'
+import { installMessageApi } from '../../src/services/errorService'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConnectionStore } from '../../src/stores/connection'
 import { useOrderStore } from '../../src/stores/order'
+import { useLogStore } from '../../src/stores/log'
 import type { AccountSwitchResult, AppConfig, Order } from '../../src/types/models'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
@@ -233,5 +236,91 @@ describe('account-switch trading mutation guard', () => {
       ?.attributes('disabled')).toBeUndefined()
     expect(legacy.findAll('button').find((item) => item.text() === '撤单')
       ?.attributes('disabled')).toBeUndefined()
+  })
+
+  it('keeps current and legacy cancellation failures frontend-owned exactly once', async () => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useOrderStore().setOpenOrders([order])
+    vi.mocked(tauriInvoke).mockImplementation((command) => (
+      command === 'cancel_order'
+        ? Promise.reject(new Error('ordinary cancellation failure'))
+        : Promise.resolve(undefined)
+    ))
+    const current = mount(OpenOrdersTab, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+    const legacy = mount(OrderTable, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+    await flushPromises()
+
+    useLogStore().clear()
+    useLogStore().clearError()
+    await (current.vm as unknown as { cancelOne: (row: Order) => Promise<void> })
+      .cancelOne(order)
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(useLogStore().entries).toHaveLength(1)
+
+    toastError.mockClear()
+    useLogStore().clear()
+    useLogStore().clearError()
+    await (legacy.vm as unknown as { cancel: (row: Order) => Promise<void> }).cancel(order)
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(useLogStore().entries).toHaveLength(1)
+  })
+
+  it.each([
+    ['RISK_ORDER_BLOCKED', '订单触发风险限制'],
+    ['ORDER_REJECTED', '订单已被交易所拒绝'],
+    ['ACCOUNT_SESSION_EXPIRED', '账户会话已失效'],
+  ])('keeps notified placement %s inline without generic delivery', async (code, message) => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'place_order') {
+        return Promise.reject({
+          code,
+          message,
+          notificationId: `notification-${code.toLowerCase()}`,
+        })
+      }
+      return Promise.resolve(undefined)
+    })
+    const panel = useOrderPanel()
+    panel.qty.value = '0.1'
+    panel.price.value = '60000'
+    await nextTick()
+
+    await panel.submit()
+
+    expect(panel.validationMessage.value).toBe(message)
+    expect(toastError).toHaveBeenCalledTimes(0)
+    expect(useLogStore().entries).toHaveLength(0)
+    expect(useLogStore().lastError).toBeNull()
+  })
+
+  it('keeps an ordinary placement failure frontend-owned exactly once', async () => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
+    vi.mocked(tauriInvoke).mockImplementation((command) => (
+      command === 'place_order'
+        ? Promise.reject(new Error('ordinary placement failure'))
+        : Promise.resolve(undefined)
+    ))
+    const panel = useOrderPanel()
+    panel.qty.value = '0.1'
+    panel.price.value = '60000'
+    await nextTick()
+
+    await panel.submit()
+
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(useLogStore().entries).toHaveLength(1)
+    expect(useLogStore().lastError).toContain('ordinary placement failure')
   })
 })

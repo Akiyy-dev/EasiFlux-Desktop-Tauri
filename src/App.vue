@@ -20,6 +20,7 @@ import { useLogStore } from './stores/log'
 import { useTimeStore } from './stores/time'
 import { useNotificationStore } from './stores/notification'
 import { reportError as reportGlobalError, showBackendError } from './services/errorService'
+import { decodeCommandError } from './services/notificationService'
 import { onConnectionStatusChanged, onWebsocketStatusChanged } from './services/realtimeService'
 import { onTimeUpdated } from './services/timeService'
 import { applyPrivatePanelsSnapshot } from './stores/privatePanels'
@@ -208,6 +209,7 @@ onMounted(async () => {
   try {
     await connectionStore.connect(config.useWebsocket)
   } catch (error) {
+    if (decodeCommandError(error).notificationId) return
     reportError('自动连接失败', error)
   }
 })

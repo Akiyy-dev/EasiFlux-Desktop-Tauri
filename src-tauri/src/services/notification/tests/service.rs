@@ -6,7 +6,8 @@ use crate::models::notification::{
     NotificationScope,
 };
 use crate::services::notification::{
-    NotificationEmitter, NotificationPolicy, NotificationService, ViewContext,
+    NotificationEmitter, NotificationPolicy, NotificationService,
+    NotificationStorageFailureReporter, ViewContext,
 };
 use crate::storage::notification_store::{
     NotificationFileV1, NotificationPartition, NotificationSourceEventIndexEntry,
@@ -16,6 +17,94 @@ use crate::storage::notification_store::{
 use super::support::{harness, input, FakePersistence};
 
 const NOW: u64 = 1_700_000_000_000;
+
+#[tokio::test]
+async fn storage_failures_always_log_throttle_toast_and_reset_after_durable_write() {
+    let persistence = Arc::new(FakePersistence::default());
+    let changed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let changed_sink = Arc::clone(&changed);
+    let changed_emitter: NotificationEmitter = Arc::new(move |event| {
+        changed_sink.lock().unwrap().push(event.clone());
+        Ok(())
+    });
+    let diagnostic_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let event_emitter = crate::events::EventEmitter::new_test(Arc::clone(&diagnostic_events));
+    let reporter = NotificationStorageFailureReporter::new(event_emitter);
+    let service = NotificationService::from_snapshot_with_reporter(
+        NotificationFileV1::empty(),
+        Arc::clone(&persistence),
+        changed_emitter,
+        reporter,
+        0,
+    );
+    let first = input(
+        NotificationScope::Account {
+            account_id: "alpha".into(),
+        },
+        "storage-source-1",
+        "storage-dedupe-1",
+    );
+
+    for (now_ms, expected_logs, expected_toasts) in [(0, 1, 1), (59_999, 2, 1), (60_000, 3, 2)] {
+        persistence.fail_next();
+        let error = service.publish(first.clone(), now_ms).await.unwrap_err();
+        assert_eq!(error.code(), "NOTIFICATION_STORAGE_UNAVAILABLE");
+        let events = diagnostic_events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "log:entry")
+                .count(),
+            expected_logs
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "error:occurred")
+                .count(),
+            expected_toasts
+        );
+        assert!(events.iter().all(|(_, payload)| {
+            payload
+                .to_string()
+                .contains("NOTIFICATION_STORAGE_UNAVAILABLE")
+        }));
+        drop(events);
+        assert_eq!(service.revision().await, "0");
+        assert!(changed.lock().unwrap().is_empty());
+    }
+
+    service.publish(first, 60_001).await.unwrap();
+    assert_eq!(service.revision().await, "1");
+    assert_eq!(changed.lock().unwrap().len(), 1);
+
+    persistence.fail_next();
+    let second = input(
+        NotificationScope::Account {
+            account_id: "alpha".into(),
+        },
+        "storage-source-2",
+        "storage-dedupe-2",
+    );
+    service.publish(second, 60_002).await.unwrap_err();
+    let events = diagnostic_events.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(name, _)| name == "log:entry")
+            .count(),
+        4
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(name, _)| name == "error:occurred")
+            .count(),
+        3
+    );
+    assert_eq!(service.revision().await, "1");
+    assert_eq!(changed.lock().unwrap().len(), 1);
+}
 
 fn client_input(kind: ClientNotificationKind) -> crate::models::notification::NotificationInput {
     NotificationPolicy

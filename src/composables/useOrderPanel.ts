@@ -8,6 +8,7 @@ import { useOrderStore } from '../stores/order'
 import { usePositionStore } from '../stores/position'
 import { refreshSyncTask } from '../services/dataSyncService'
 import { notifySuccess, notifyWarning, reportError } from '../services/errorService'
+import { decodeCommandError } from '../services/notificationService'
 import {
   calculateQuickQty,
   findClosablePosition,
@@ -159,7 +160,12 @@ export function useOrderPanel() {
       sizePct.value = 0
       notifySuccess(orderSuccessMessage(actionLabel.value))
     } catch (error) {
-      reportError(error, orderFailureMessage(actionLabel.value))
+      const decoded = decodeCommandError(error)
+      if (decoded.notificationId) {
+        validationMessage.value = decoded.message
+      } else {
+        reportError(error, orderFailureMessage(actionLabel.value))
+      }
     } finally {
       submitting.value = false
     }

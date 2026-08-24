@@ -252,4 +252,43 @@ describe('decodeCommandError', () => {
       notificationId: 'notification-1',
     })
   })
+
+  it('follows wrapped causes to the first structured notification marker', () => {
+    const notificationFailure = {
+      code: 'CONNECTION_UNAVAILABLE',
+      message: '连接服务暂时不可用',
+      notificationId: 'notification-connection-1',
+    }
+    const middle = new Error('middle wrapper') as Error & { cause?: unknown }
+    middle.cause = notificationFailure
+    const outer = new Error('outer wrapper') as Error & { cause?: unknown }
+    outer.cause = middle
+
+    expect(decodeCommandError(outer)).toEqual(notificationFailure)
+  })
+
+  it('does not let an outer non-notification code hide a notified cause', () => {
+    const notificationFailure = {
+      code: 'CONNECTION_UNAVAILABLE',
+      message: '连接服务暂时不可用',
+      notificationId: 'notification-connection-2',
+    }
+    const outer = Object.assign(new Error('outer wrapper'), {
+      code: 'WRAPPED_CONNECTION_FAILURE',
+      cause: notificationFailure,
+    })
+
+    expect(decodeCommandError(outer)).toEqual(notificationFailure)
+  })
+
+  it('keeps cyclic and unstructured cause chains ordinary', () => {
+    const cyclic = new Error('ordinary connection failure') as Error & { cause?: unknown }
+    cyclic.cause = { message: 'nested ordinary failure', cause: cyclic }
+
+    expect(decodeCommandError(cyclic)).toEqual({ message: 'ordinary connection failure' })
+    expect(decodeCommandError({
+      message: 'invalid marker',
+      notificationId: '',
+    })).toEqual({ message: 'invalid marker' })
+  })
 })

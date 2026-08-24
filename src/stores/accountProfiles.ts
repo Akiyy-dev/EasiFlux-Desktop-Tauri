@@ -302,7 +302,10 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
     ]
     tasks.push({
       step: 'bootstrap',
-      run: () => tauriInvoke('scheduler_run_task', { task: 'bootstrap', force: true }),
+      run: () => tauriInvoke('scheduler_run_task', {
+        task: 'reconciliationBootstrap',
+        force: true,
+      }),
     })
     reconciliationLoading.value = true
     reconciliationFailedSteps.value = []

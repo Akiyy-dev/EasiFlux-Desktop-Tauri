@@ -10,6 +10,7 @@ use crate::plugin::PluginRegistry;
 use crate::services::connection::SessionNotificationObserver;
 use crate::services::notification::{
     NotificationEmitter, NotificationRuntime, NotificationService,
+    NotificationStorageFailureReporter,
 };
 use crate::services::trading::OrderNotificationObserver;
 use crate::services::{
@@ -51,9 +52,16 @@ fn initialize_notification_runtime(
     configured_accounts: &[String],
     now_ms: u64,
     emit_changed: NotificationEmitter,
+    storage_failure_reporter: NotificationStorageFailureReporter,
 ) -> Arc<NotificationRuntime> {
     Arc::new(
-        match NotificationService::load(store, configured_accounts, now_ms, emit_changed) {
+        match NotificationService::load_with_reporter(
+            store,
+            configured_accounts,
+            now_ms,
+            emit_changed,
+            storage_failure_reporter,
+        ) {
             Ok(service) => NotificationRuntime::Available(Arc::new(service)),
             Err(error) => {
                 tracing::warn!(
@@ -101,6 +109,7 @@ impl AppState {
             &configured_accounts,
             chrono::Utc::now().timestamp_millis().max(0) as u64,
             notification_emitter,
+            NotificationStorageFailureReporter::new(emitter.clone()),
         );
         let session_notification_observer = SessionNotificationObserver::new(
             notification.clone(),
@@ -243,12 +252,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
+    use crate::events::EventEmitter;
     use crate::models::notification::{
         NotificationAction, NotificationCategory, NotificationChangedEvent, NotificationContent,
         NotificationEntity, NotificationEntityType, NotificationKind, NotificationRecord,
         NotificationScalar, NotificationScope, NotificationSeverity,
     };
-    use crate::services::notification::{NotificationEmitter, NotificationRuntime};
+    use crate::services::notification::{
+        NotificationEmitter, NotificationRuntime, NotificationStorageFailureReporter,
+    };
     use crate::storage::notification_store::{
         NotificationFileV1, NotificationPartition, NotificationSourceEventIndexEntry,
         NotificationStore,
@@ -279,6 +291,12 @@ mod tests {
             }),
             events,
         )
+    }
+
+    fn storage_failure_reporter() -> NotificationStorageFailureReporter {
+        NotificationStorageFailureReporter::new(EventEmitter::new_test(Arc::new(Mutex::new(
+            Vec::new(),
+        ))))
     }
 
     fn startup_record(
@@ -405,6 +423,7 @@ mod tests {
             &configured_accounts,
             1_700_000_000_100,
             emitter,
+            storage_failure_reporter(),
         );
 
         let NotificationRuntime::Available(service) = runtime.as_ref() else {
@@ -442,6 +461,7 @@ mod tests {
             &configured_accounts,
             1_700_000_000_200,
             restart_emitter,
+            storage_failure_reporter(),
         );
         let NotificationRuntime::Available(restarted_service) = restarted.as_ref() else {
             panic!("cleaned history must remain available on restart");
@@ -468,6 +488,7 @@ mod tests {
             &["primary".into()],
             1_700_000_000_000,
             emitter,
+            storage_failure_reporter(),
         );
 
         match runtime.as_ref() {
@@ -495,6 +516,7 @@ mod tests {
             &["primary".into()],
             1_700_000_000_000,
             emitter,
+            storage_failure_reporter(),
         );
 
         let NotificationRuntime::Available(service) = runtime.as_ref() else {
@@ -551,6 +573,7 @@ mod tests {
             &["primary".into()],
             1_700_000_000_100,
             emitter,
+            storage_failure_reporter(),
         );
 
         let NotificationRuntime::Available(service) = runtime.as_ref() else {

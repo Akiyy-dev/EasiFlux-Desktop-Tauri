@@ -251,6 +251,13 @@ fn notified_connection_error(error: AppError, notification_id: Option<String>) -
     }
 }
 
+fn deliver_notified_connection_error(emitter: &EventEmitter, error: AppError) -> AppError {
+    if let AppError::Notified { code, .. } = &error {
+        emitter.emit_diagnostic(&format!("NOTIFIED_CONNECTION_FAILURE:{code}"), false);
+    }
+    error
+}
+
 pub struct ConnectionService {
     api: Arc<ApiClient>,
 
@@ -374,7 +381,8 @@ impl ConnectionService {
                     }
                     _ => None,
                 };
-                Err(notified_connection_error(e, notification_id))
+                let error = notified_connection_error(e, notification_id);
+                Err(deliver_notified_connection_error(&self.emitter, error))
             }
         }
     }

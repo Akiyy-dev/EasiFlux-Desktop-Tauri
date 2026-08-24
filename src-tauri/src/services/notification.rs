@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::events::EventEmitter;
 use crate::models::notification::{
     client_notification_record_matches_input, ListNotificationsRequest, NotificationChange,
     NotificationChangedEvent, NotificationChannel, NotificationEnvironment, NotificationFilter,
@@ -32,6 +33,7 @@ const NOTIFICATION_SOURCE_INDEX_CAPACITY_EXCEEDED: &str =
 const NOTIFICATION_FILE_CAPACITY_EXCEEDED: &str = "NOTIFICATION_FILE_CAPACITY_EXCEEDED";
 const INVALID_NOTIFICATION_CURSOR: &str = "INVALID_NOTIFICATION_CURSOR";
 const MAINTENANCE_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
+const STORAGE_FAILURE_TOAST_INTERVAL_MS: u64 = 60_000;
 
 /// Synchronous, non-reentrant commit callback.
 ///
@@ -40,6 +42,46 @@ const MAINTENANCE_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Its error is diagnostic-only and never rolls back the committed mutation.
 pub type NotificationEmitter =
     Arc<dyn Fn(&NotificationChangedEvent) -> Result<(), String> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct NotificationStorageFailureReporter {
+    emitter: EventEmitter,
+    last_toast_at_ms: Arc<StdMutex<Option<u64>>>,
+}
+
+impl NotificationStorageFailureReporter {
+    pub fn new(emitter: EventEmitter) -> Self {
+        Self {
+            emitter,
+            last_toast_at_ms: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    fn report(&self, now_ms: u64) {
+        let include_error_event = {
+            let mut last_toast_at_ms = self
+                .last_toast_at_ms
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let allowed = last_toast_at_ms.is_none_or(|last| {
+                now_ms.saturating_sub(last) >= STORAGE_FAILURE_TOAST_INTERVAL_MS
+            });
+            if allowed {
+                *last_toast_at_ms = Some(now_ms);
+            }
+            allowed
+        };
+        self.emitter
+            .emit_diagnostic(NOTIFICATION_STORAGE_UNAVAILABLE, include_error_event);
+    }
+
+    fn reset(&self) {
+        *self
+            .last_toast_at_ms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotificationError {
@@ -265,13 +307,46 @@ pub struct NotificationService {
     state: tokio::sync::Mutex<ServiceState>,
     persistence: Arc<dyn NotificationPersistence>,
     emit_changed: NotificationEmitter,
+    storage_failure_reporter: Option<NotificationStorageFailureReporter>,
 }
 
 impl NotificationService {
     pub(crate) fn from_snapshot<P>(
+        file: NotificationFileV1,
+        persistence: Arc<P>,
+        emit_changed: NotificationEmitter,
+        last_pruned_at_ms: u64,
+    ) -> Self
+    where
+        P: NotificationPersistence + 'static,
+    {
+        Self::from_snapshot_internal(file, persistence, emit_changed, None, last_pruned_at_ms)
+    }
+
+    pub(crate) fn from_snapshot_with_reporter<P>(
+        file: NotificationFileV1,
+        persistence: Arc<P>,
+        emit_changed: NotificationEmitter,
+        storage_failure_reporter: NotificationStorageFailureReporter,
+        last_pruned_at_ms: u64,
+    ) -> Self
+    where
+        P: NotificationPersistence + 'static,
+    {
+        Self::from_snapshot_internal(
+            file,
+            persistence,
+            emit_changed,
+            Some(storage_failure_reporter),
+            last_pruned_at_ms,
+        )
+    }
+
+    fn from_snapshot_internal<P>(
         mut file: NotificationFileV1,
         persistence: Arc<P>,
         emit_changed: NotificationEmitter,
+        storage_failure_reporter: Option<NotificationStorageFailureReporter>,
         last_pruned_at_ms: u64,
     ) -> Self
     where
@@ -294,6 +369,7 @@ impl NotificationService {
             }),
             persistence,
             emit_changed,
+            storage_failure_reporter,
         }
     }
 
@@ -302,6 +378,32 @@ impl NotificationService {
         configured_accounts: &[String],
         now_ms: u64,
         emit_changed: NotificationEmitter,
+    ) -> Result<Self, NotificationError> {
+        Self::load_internal(store, configured_accounts, now_ms, emit_changed, None)
+    }
+
+    pub fn load_with_reporter(
+        store: NotificationStore,
+        configured_accounts: &[String],
+        now_ms: u64,
+        emit_changed: NotificationEmitter,
+        storage_failure_reporter: NotificationStorageFailureReporter,
+    ) -> Result<Self, NotificationError> {
+        Self::load_internal(
+            store,
+            configured_accounts,
+            now_ms,
+            emit_changed,
+            Some(storage_failure_reporter),
+        )
+    }
+
+    fn load_internal(
+        store: NotificationStore,
+        configured_accounts: &[String],
+        now_ms: u64,
+        emit_changed: NotificationEmitter,
+        storage_failure_reporter: Option<NotificationStorageFailureReporter>,
     ) -> Result<Self, NotificationError> {
         let outcome = store.load().map_err(map_persistence_error)?;
         if let NotificationLoadStatus::UnsupportedSchema { .. } = outcome.status {
@@ -321,9 +423,30 @@ impl NotificationService {
             file.revision = file.revision.checked_add(1).ok_or_else(|| {
                 NotificationError::new("NOTIFICATION_REVISION_EXHAUSTED", "通知修订号已达上限")
             })?;
-            store.save(&file).map_err(map_persistence_error)?;
+            match store.save(&file) {
+                Ok(()) => {
+                    if let Some(reporter) = &storage_failure_reporter {
+                        reporter.reset();
+                    }
+                }
+                Err(error) => {
+                    let error = map_persistence_error(error);
+                    if error.is_retryable_persistence_failure() {
+                        if let Some(reporter) = &storage_failure_reporter {
+                            reporter.report(now_ms);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
         }
-        let service = Self::from_snapshot(file, Arc::new(store), emit_changed, now_ms);
+        let service = Self::from_snapshot_internal(
+            file,
+            Arc::new(store),
+            emit_changed,
+            storage_failure_reporter,
+            now_ms,
+        );
         if pruning.changed {
             let event = NotificationChangedEvent {
                 previous_revision: previous_revision.to_string(),
@@ -353,7 +476,7 @@ impl NotificationService {
         };
         let mut next = guard.clone();
         let mutation = apply_prepared_publish(&mut next, prepared)?;
-        self.commit_publish(&mut guard, next, mutation)
+        self.commit_publish(&mut guard, next, mutation, now_ms)
     }
 
     pub(crate) async fn publish_client_account_failure(
@@ -409,7 +532,7 @@ impl NotificationService {
             })?;
         let mut next = guard.clone();
         let mutation = apply_prepared_publish(&mut next, prepared)?;
-        let outcome = self.commit_publish(&mut guard, next, mutation)?;
+        let outcome = self.commit_publish(&mut guard, next, mutation, now_ms)?;
         let notification = outcome.notification.ok_or_else(|| {
             NotificationError::new("NOTIFICATION_STATE_CONFLICT", "通知状态已发生冲突")
         })?;
@@ -524,7 +647,7 @@ impl NotificationService {
         record.read_at_ms = Some(now_ms.max(record.created_at_ms));
         record.updated_at_ms = record.updated_at_ms.max(now_ms);
         let changed = record.clone();
-        let previous_revision = commit_file(&self.persistence, &mut guard, next)?;
+        let previous_revision = self.commit_file(&mut guard, next, now_ms)?;
         let event = NotificationChangedEvent {
             previous_revision: previous_revision.to_string(),
             revision: guard.file.revision.to_string(),
@@ -578,7 +701,7 @@ impl NotificationService {
                 revision: guard.file.revision.to_string(),
             });
         }
-        let previous_revision = commit_file(&self.persistence, &mut guard, next)?;
+        let previous_revision = self.commit_file(&mut guard, next, now_ms)?;
         let event = NotificationChangedEvent {
             previous_revision: previous_revision.to_string(),
             revision: guard.file.revision.to_string(),
@@ -618,7 +741,7 @@ impl NotificationService {
         remove_empty_partitions(&mut next.file);
         let _ = cleanup_source_event_index(&mut next.file);
         next.seen_source_events = rebuild_seen_source_events(&next.file);
-        let previous_revision = commit_file(&self.persistence, &mut guard, next)?;
+        let previous_revision = self.commit_file(&mut guard, next, now_ms)?;
         let event = NotificationChangedEvent {
             previous_revision: previous_revision.to_string(),
             revision: guard.file.revision.to_string(),
@@ -672,7 +795,7 @@ impl NotificationService {
             .retain(|partition| partition.scope != scope);
         let _ = cleanup_source_event_index(&mut next.file);
         next.seen_source_events = rebuild_seen_source_events(&next.file);
-        let previous_revision = commit_file(&self.persistence, &mut guard, next)?;
+        let previous_revision = self.commit_file(&mut guard, next, now_ms)?;
         let event = NotificationChangedEvent {
             previous_revision: previous_revision.to_string(),
             revision: guard.file.revision.to_string(),
@@ -718,7 +841,7 @@ impl NotificationService {
                 revision: guard.file.revision.to_string(),
             });
         }
-        let previous_revision = commit_file(&self.persistence, &mut guard, next)?;
+        let previous_revision = self.commit_file(&mut guard, next, now_ms)?;
         let event = NotificationChangedEvent {
             previous_revision: previous_revision.to_string(),
             revision: guard.file.revision.to_string(),
@@ -738,7 +861,7 @@ impl NotificationService {
     pub async fn delete_account_partition(
         &self,
         account_id: &str,
-        _now_ms: u64,
+        now_ms: u64,
     ) -> Result<(), NotificationError> {
         let scope = ViewContext::account(account_id).map(|_| NotificationScope::Account {
             account_id: account_id.into(),
@@ -766,7 +889,7 @@ impl NotificationService {
             *guard = next;
             return Ok(());
         }
-        let previous_revision = commit_file(&self.persistence, &mut guard, next)?;
+        let previous_revision = self.commit_file(&mut guard, next, now_ms)?;
         let event = NotificationChangedEvent {
             previous_revision: previous_revision.to_string(),
             revision: guard.file.revision.to_string(),
@@ -835,7 +958,7 @@ impl NotificationService {
             next.active_incidents.remove(&key);
         }
         let mutation = apply_prepared_publish(&mut next, prepared)?;
-        self.commit_publish(&mut guard, next, mutation)
+        self.commit_publish(&mut guard, next, mutation, now_ms)
     }
 
     pub async fn observe_environment(
@@ -906,7 +1029,7 @@ impl NotificationService {
             next.active_incidents.remove(&key);
         }
         let mutation = apply_prepared_publish(&mut next, prepared)?;
-        self.commit_publish(&mut guard, next, mutation)
+        self.commit_publish(&mut guard, next, mutation, now_ms)
     }
 
     pub async fn observe_session_expired(
@@ -1024,7 +1147,7 @@ impl NotificationService {
             );
         }
         let mutation = apply_prepared_publish(&mut next, prepared)?;
-        self.commit_publish(&mut guard, next, mutation)
+        self.commit_publish(&mut guard, next, mutation, now_ms)
     }
 
     fn prepare_publish_locked(
@@ -1054,7 +1177,7 @@ impl NotificationService {
         }
         next.seen_source_events = rebuild_seen_source_events(&next.file);
         next.active_incidents = rebuild_active_incidents(&next.file);
-        let previous_revision = commit_file(&self.persistence, guard, next)?;
+        let previous_revision = self.commit_file(guard, next, now_ms)?;
         let event = NotificationChangedEvent {
             previous_revision: previous_revision.to_string(),
             revision: guard.file.revision.to_string(),
@@ -1072,6 +1195,7 @@ impl NotificationService {
         guard: &mut ServiceState,
         mut next: ServiceState,
         mutation: PublishMutation,
+        now_ms: u64,
     ) -> Result<PublishOutcome, NotificationError> {
         let Some(record) = mutation.record else {
             *guard = next;
@@ -1081,9 +1205,7 @@ impl NotificationService {
         next.file.revision = previous_revision.checked_add(1).ok_or_else(|| {
             NotificationError::new("NOTIFICATION_REVISION_EXHAUSTED", "通知修订号已达上限")
         })?;
-        self.persistence
-            .save(&next.file)
-            .map_err(map_persistence_error)?;
+        self.save_file(&next.file, now_ms)?;
         *guard = next;
         let event = NotificationChangedEvent {
             previous_revision: previous_revision.to_string(),
@@ -1098,6 +1220,41 @@ impl NotificationService {
             notification: Some(record),
             revision: guard.file.revision.to_string(),
         })
+    }
+
+    fn commit_file(
+        &self,
+        guard: &mut ServiceState,
+        mut next: ServiceState,
+        now_ms: u64,
+    ) -> Result<u64, NotificationError> {
+        let previous_revision = next.file.revision;
+        next.file.revision = next.file.revision.checked_add(1).ok_or_else(|| {
+            NotificationError::new("NOTIFICATION_REVISION_EXHAUSTED", "通知修订号已达上限")
+        })?;
+        self.save_file(&next.file, now_ms)?;
+        *guard = next;
+        Ok(previous_revision)
+    }
+
+    fn save_file(&self, file: &NotificationFileV1, now_ms: u64) -> Result<(), NotificationError> {
+        match self.persistence.save(file) {
+            Ok(()) => {
+                if let Some(reporter) = &self.storage_failure_reporter {
+                    reporter.reset();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let error = map_persistence_error(error);
+                if error.is_retryable_persistence_failure() {
+                    if let Some(reporter) = &self.storage_failure_reporter {
+                        reporter.report(now_ms);
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     fn emit_diagnostic_only(&self, event: &NotificationChangedEvent) {
@@ -2452,22 +2609,6 @@ fn visible_unread_count(file: &NotificationFileV1, context: &ViewContext, now_ms
         .flat_map(|partition| &partition.items)
         .filter(|record| record.read_at_ms.is_none() && !is_expired(record, now_ms))
         .count() as u64
-}
-
-fn commit_file(
-    persistence: &Arc<dyn NotificationPersistence>,
-    guard: &mut ServiceState,
-    mut next: ServiceState,
-) -> Result<u64, NotificationError> {
-    let previous_revision = next.file.revision;
-    next.file.revision = next.file.revision.checked_add(1).ok_or_else(|| {
-        NotificationError::new("NOTIFICATION_REVISION_EXHAUSTED", "通知修订号已达上限")
-    })?;
-    persistence
-        .save(&next.file)
-        .map_err(map_persistence_error)?;
-    *guard = next;
-    Ok(previous_revision)
 }
 
 fn find_record_index(file: &NotificationFileV1, id: &str) -> Option<(usize, usize)> {

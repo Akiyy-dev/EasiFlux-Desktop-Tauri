@@ -62,6 +62,9 @@ pub async fn scheduler_run_task(
     if task == "bootstrap" {
         return state.scheduler.bootstrap_connection().await;
     }
+    if task == "reconciliationBootstrap" {
+        return state.scheduler.bootstrap_reconciliation().await;
+    }
     let task_id = crate::services::scheduler::TaskId::from_name(&task)
         .ok_or_else(|| crate::error::AppError::Internal(format!("未知调度任务: {task}")))?;
     state

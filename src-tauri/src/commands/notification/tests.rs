@@ -374,6 +374,47 @@ async fn client_bridge_allowed_kinds_derive_closed_policy_and_deterministic_step
 }
 
 #[tokio::test]
+async fn client_bridge_success_owns_one_record_created_event_and_aggregate_error_log() {
+    use crate::models::notification::{
+        ClientNotificationFailedStep as Step, ClientNotificationKind as ClientKind,
+    };
+
+    let fixture = fixture();
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let emitter = crate::events::EventEmitter::new_test(Arc::clone(&sink));
+
+    let result = create_client_notification_with_diagnostic_inner(
+        &fixture.runtime,
+        &fixture.config,
+        &fixture.lifecycle,
+        &emitter,
+        client_request(
+            ClientKind::AccountReconciliationFailed,
+            vec![Step::Bootstrap, Step::Config],
+        ),
+        NOW_MS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fixture.persistence.saves.lock().unwrap().len(), 1);
+    assert_eq!(fixture.events.lock().unwrap().len(), 1);
+    assert_eq!(
+        result.notification.kind,
+        NotificationKind::AccountReconciliationFailed
+    );
+    let diagnostics = sink.lock().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].0, "log:entry");
+    assert_eq!(diagnostics[0].1["level"], "error");
+    assert_eq!(
+        diagnostics[0].1["message"],
+        "CLIENT_ACCOUNT_FAILURE:accountReconciliationFailed:config,bootstrap"
+    );
+    assert!(diagnostics.iter().all(|(name, _)| name != "error:occurred"));
+}
+
+#[tokio::test]
 async fn client_bridge_replay_returns_the_existing_committed_id_without_mutation() {
     use crate::models::notification::{
         ClientNotificationFailedStep as Step, ClientNotificationKind as ClientKind,

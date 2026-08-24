@@ -21,6 +21,39 @@ use crate::storage::{NotificationStore, RiskUsageStore};
 
 const NOW_MS: u64 = 1_784_606_400_000;
 
+#[test]
+fn notified_placement_result_owns_one_log_only_diagnostic() {
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let emitter = EventEmitter::new_test(Arc::clone(&sink));
+    let notified = AppError::Notified {
+        code: "ORDER_REJECTED",
+        message: "订单已被拒绝",
+        notification_id: "notification-order-1".into(),
+        cause: None,
+    };
+
+    let result = deliver_notified_placement(&emitter, Err::<(), _>(notified));
+
+    assert!(matches!(result, Err(AppError::Notified { .. })));
+    let events = sink.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "log:entry");
+    assert_eq!(events[0].1["level"], "error");
+    assert_eq!(
+        events[0].1["message"],
+        "NOTIFIED_PLACEMENT_FAILURE:ORDER_REJECTED"
+    );
+    assert!(events.iter().all(|(name, _)| name != "error:occurred"));
+    drop(events);
+
+    let ordinary = deliver_notified_placement(
+        &emitter,
+        Err::<(), _>(AppError::Trading("apiKey=raw-secret".into())),
+    );
+    assert!(matches!(ordinary, Err(AppError::Trading(_))));
+    assert_eq!(sink.lock().unwrap().len(), 1);
+}
+
 struct CountingNotificationPersistence {
     inner: NotificationStore,
     attempts: Arc<AtomicUsize>,

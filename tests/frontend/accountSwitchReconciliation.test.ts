@@ -620,7 +620,7 @@ describe('post-switch reconciliation', () => {
     ])
   })
 
-  it('runs strict bootstrap after switching to a disconnected account', async () => {
+  it('uses the closed reconciliation bootstrap after switching to a disconnected account', async () => {
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'switch_account') {
         return Promise.resolve({ activeAccountId: 'backup', connected: false, sessionEpoch: 1 })
@@ -638,7 +638,7 @@ describe('post-switch reconciliation', () => {
       'get_connection_status', 'get_websocket_status', 'scheduler_run_task',
     ])
     expect(tauriInvoke).toHaveBeenLastCalledWith('scheduler_run_task', {
-      task: 'bootstrap', force: true,
+      task: 'reconciliationBootstrap', force: true,
     })
   })
 
