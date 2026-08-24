@@ -249,20 +249,23 @@ impl NotificationPolicy {
         request
             .validate()
             .map_err(|error| NotificationError::new(error.code(), "客户端通知请求无效"))?;
+        let suffix = match request.kind {
+            ClientNotificationKind::AccountRecoveryFailed => "recovery",
+            ClientNotificationKind::AccountReconciliationFailed => "reconciliation",
+        };
         let context = PolicyContext::new(
             request.account_id.clone(),
             request.session_epoch,
-            request.attempt_id.clone(),
+            format!("client:{}:{suffix}", request.attempt_id),
         )?;
         let failed_steps = normalize_steps(&request.failed_steps);
-        let (kind, severity, key, title, body, suffix) = match request.kind {
+        let (kind, severity, key, title, body) = match request.kind {
             ClientNotificationKind::AccountRecoveryFailed => (
                 NotificationKind::AccountRecoveryFailed,
                 NotificationSeverity::Error,
                 "account.recoveryFailed",
                 "账户恢复失败",
                 "请检查账户设置后重试。",
-                "recovery",
             ),
             ClientNotificationKind::AccountReconciliationFailed => (
                 NotificationKind::AccountReconciliationFailed,
@@ -270,7 +273,6 @@ impl NotificationPolicy {
                 "account.reconciliationFailed",
                 "账户对账失败",
                 "请检查账户数据后重试。",
-                "reconciliation",
             ),
         };
         controlled_input(

@@ -342,7 +342,8 @@ async fn simultaneous_switch_and_delete_are_serialized() {
             "connect:backup",
             "activate:backup:1",
             "delete:spare",
-            "persist:backup"
+            "persist:backup",
+            "notification-cleanup:spare"
         ]
     );
 }

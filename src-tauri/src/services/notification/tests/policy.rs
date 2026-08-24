@@ -95,6 +95,14 @@ fn client_bridge_is_closed_and_maps_only_controlled_fields() {
     assert_eq!(recovery.kind, NotificationKind::AccountRecoveryFailed);
     assert_eq!(recovery.severity, NotificationSeverity::Error);
     assert_eq!(
+        recovery.source_event_id.as_deref(),
+        Some("client:0b102d04-848c-4c84-a644-033383850c71:recovery")
+    );
+    assert_eq!(
+        recovery.dedupe_key,
+        "alpha:0b102d04-848c-4c84-a644-033383850c71:recovery"
+    );
+    assert_eq!(
         recovery.action,
         Some(NotificationAction::OpenAccountSettings {
             account_section: AccountNotificationSection::Api,
@@ -115,6 +123,14 @@ fn client_bridge_is_closed_and_maps_only_controlled_fields() {
         NotificationKind::AccountReconciliationFailed
     );
     assert_eq!(reconciliation.severity, NotificationSeverity::Critical);
+    assert_eq!(
+        reconciliation.source_event_id.as_deref(),
+        Some("client:5f99306a-385a-44e2-a830-e062b1bb4f54:reconciliation")
+    );
+    assert_eq!(
+        reconciliation.dedupe_key,
+        "alpha:5f99306a-385a-44e2-a830-e062b1bb4f54:reconciliation"
+    );
     let wire = serde_json::to_value(recovery).unwrap();
     assert!(wire.get("fallbackTitle").is_none());
     assert!(wire.get("rawError").is_none());

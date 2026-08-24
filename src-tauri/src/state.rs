@@ -66,11 +66,18 @@ fn initialize_notification_runtime(
     )
 }
 
+fn configured_notification_accounts(config: &AppConfig) -> Vec<String> {
+    crate::services::account_profiles::normalize_account_ids(
+        &config.accounts,
+        &config.active_account_id,
+    )
+}
+
 impl AppState {
     pub fn new(app: tauri::AppHandle) -> crate::error::AppResult<Self> {
         let config_store = ConfigStore::new();
         let loaded = config_store.load()?;
-        let configured_accounts = loaded.accounts.clone();
+        let configured_accounts = configured_notification_accounts(&loaded);
         let risk_config = crate::models::config::RiskConfig::from(&loaded);
         let initial_chart_context =
             ChartWorkspaceKey::parse(&loaded.active_symbol, &loaded.kline_interval)
@@ -237,15 +244,17 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::models::notification::{
-        NotificationCategory, NotificationChangedEvent, NotificationContent, NotificationKind,
-        NotificationRecord, NotificationScope, NotificationSeverity,
+        NotificationAction, NotificationCategory, NotificationChangedEvent, NotificationContent,
+        NotificationEntity, NotificationEntityType, NotificationKind, NotificationRecord,
+        NotificationScalar, NotificationScope, NotificationSeverity,
     };
     use crate::services::notification::{NotificationEmitter, NotificationRuntime};
     use crate::storage::notification_store::{
-        NotificationFileV1, NotificationPartition, NotificationStore,
+        NotificationFileV1, NotificationPartition, NotificationSourceEventIndexEntry,
+        NotificationStore,
     };
 
-    use super::initialize_notification_runtime;
+    use super::{configured_notification_accounts, initialize_notification_runtime};
 
     fn test_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir()
@@ -270,6 +279,176 @@ mod tests {
             }),
             events,
         )
+    }
+
+    fn startup_record(
+        number: u128,
+        scope: NotificationScope,
+        source_event_id: &str,
+    ) -> NotificationRecord {
+        let (category, kind, severity, content, entity, action) = match &scope {
+            NotificationScope::Global => (
+                NotificationCategory::ConnectionSystem,
+                NotificationKind::ConnectionUnavailable,
+                NotificationSeverity::Warning,
+                NotificationContent::new(
+                    "connection.unavailable",
+                    [("channel", NotificationScalar::String("api".into()))],
+                    "连接不可用",
+                    "交易连接暂时不可用，请检查网络或稍后重试。",
+                )
+                .unwrap(),
+                None,
+                Some(NotificationAction::OpenGeneralSettings),
+            ),
+            NotificationScope::Account { .. } => (
+                NotificationCategory::Trading,
+                NotificationKind::OrderFilled,
+                NotificationSeverity::Success,
+                NotificationContent::new(
+                    "order.filled",
+                    [("orderId", NotificationScalar::String("order-1".into()))],
+                    "订单已成交",
+                    "订单已完全成交，请前往交易页查看。",
+                )
+                .unwrap(),
+                Some(NotificationEntity {
+                    entity_type: NotificationEntityType::Order,
+                    id: "order-1".into(),
+                }),
+                Some(NotificationAction::OpenTrading {
+                    order_id: Some("order-1".into()),
+                }),
+            ),
+        };
+        NotificationRecord {
+            id: format!("00000000-0000-4000-8000-{number:012x}"),
+            scope,
+            category,
+            kind,
+            severity,
+            content,
+            entity,
+            action,
+            source_event_id: Some(source_event_id.into()),
+            dedupe_key: format!("{source_event_id}-dedupe"),
+            occurrence_count: 1,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            read_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_normalizes_configured_and_active_accounts_before_orphan_prune() {
+        let path = test_path("normalized-configured-accounts");
+        let global = NotificationScope::Global;
+        let listed = NotificationScope::Account {
+            account_id: "listed".into(),
+        };
+        let active = NotificationScope::Account {
+            account_id: "live-active".into(),
+        };
+        let orphan = NotificationScope::Account {
+            account_id: "orphan".into(),
+        };
+        let records = vec![
+            startup_record(1, global.clone(), "global-source"),
+            startup_record(2, listed.clone(), "listed-source"),
+            startup_record(3, active.clone(), "active-source"),
+            startup_record(4, orphan.clone(), "orphan-source"),
+        ];
+        let source_event_index = records
+            .iter()
+            .map(|record| NotificationSourceEventIndexEntry {
+                scope: record.scope.clone(),
+                source_event_id: record.source_event_id.clone().unwrap(),
+                notification_id: record.id.clone(),
+            })
+            .collect();
+        NotificationStore::with_path(path.clone())
+            .save(&NotificationFileV1 {
+                schema_version: 1,
+                revision: 12,
+                source_event_index,
+                partitions: vec![
+                    NotificationPartition {
+                        scope: global.clone(),
+                        items: vec![records[0].clone()],
+                    },
+                    NotificationPartition {
+                        scope: listed.clone(),
+                        items: vec![records[1].clone()],
+                    },
+                    NotificationPartition {
+                        scope: active.clone(),
+                        items: vec![records[2].clone()],
+                    },
+                    NotificationPartition {
+                        scope: orphan,
+                        items: vec![records[3].clone()],
+                    },
+                ],
+            })
+            .unwrap();
+        let config = crate::models::config::AppConfig {
+            accounts: vec![" listed ".into(), "listed".into(), " ".into()],
+            active_account_id: " live-active ".into(),
+            ..Default::default()
+        };
+        let configured_accounts = configured_notification_accounts(&config);
+        assert_eq!(configured_accounts, vec!["live-active", "listed"]);
+        let (emitter, events) = capture_emitter();
+
+        let runtime = initialize_notification_runtime(
+            NotificationStore::with_path(path.clone()),
+            &configured_accounts,
+            1_700_000_000_100,
+            emitter,
+        );
+
+        let NotificationRuntime::Available(service) = runtime.as_ref() else {
+            panic!("valid normalized startup history must remain available");
+        };
+        assert_eq!(service.revision().await, "13");
+        assert_eq!(events.lock().unwrap().len(), 1);
+        let persisted = NotificationStore::with_path(path.clone())
+            .load()
+            .unwrap()
+            .file;
+        assert_eq!(persisted.partitions.len(), 3);
+        assert!(persisted
+            .partitions
+            .iter()
+            .any(|partition| partition.scope == global));
+        assert!(persisted
+            .partitions
+            .iter()
+            .any(|partition| partition.scope == listed));
+        assert!(persisted
+            .partitions
+            .iter()
+            .any(|partition| partition.scope == active));
+        assert_eq!(persisted.source_event_index.len(), 3);
+        assert!(persisted
+            .source_event_index
+            .iter()
+            .all(|entry| entry.source_event_id != "orphan-source"));
+        drop(runtime);
+
+        let (restart_emitter, restart_events) = capture_emitter();
+        let restarted = initialize_notification_runtime(
+            NotificationStore::with_path(path.clone()),
+            &configured_accounts,
+            1_700_000_000_200,
+            restart_emitter,
+        );
+        let NotificationRuntime::Available(restarted_service) = restarted.as_ref() else {
+            panic!("cleaned history must remain available on restart");
+        };
+        assert_eq!(restarted_service.revision().await, "13");
+        assert!(restart_events.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]

@@ -7,6 +7,11 @@ import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import type { AccountProfile } from '../../src/types/models'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
+const errorServiceMocks = vi.hoisted(() => ({
+  notifyWarning: vi.fn(),
+  reportError: vi.fn((error: unknown) => error instanceof Error ? error.message : String(error)),
+}))
+vi.mock('../../src/services/errorService', () => errorServiceMocks)
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -38,6 +43,8 @@ describe('AccountProfilesPanel mutation failures', () => {
     pinia = createPinia()
     setActivePinia(pinia)
     vi.mocked(tauriInvoke).mockReset()
+    errorServiceMocks.notifyWarning.mockClear()
+    errorServiceMocks.reportError.mockClear()
   })
 
   function mountPanel() {
@@ -112,7 +119,9 @@ describe('AccountProfilesPanel mutation failures', () => {
         if (listCall === 2) return pendingRefresh.promise
         return Promise.resolve(profiles)
       }
-      if (command === 'delete_account') return Promise.resolve(undefined)
+      if (command === 'delete_account') {
+        return Promise.resolve({ notificationCleanupPending: false })
+      }
       return Promise.resolve(undefined)
     })
     const wrapper = mountPanel()
@@ -142,5 +151,56 @@ describe('AccountProfilesPanel mutation failures', () => {
     expect(wrapper.find('[data-testid="profile-list-retry"]').exists()).toBe(false)
     expect(wrapper.findAll('.actions button')
       .some((button) => button.attributes('disabled') === undefined)).toBe(true)
+  })
+
+  it('closes a committed delete and shows exactly one controlled cleanup warning', async () => {
+    let listCall = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') {
+        listCall += 1
+        return Promise.resolve(listCall === 1 ? profiles : [profiles[0]])
+      }
+      if (command === 'delete_account') {
+        return Promise.resolve({
+          notificationCleanupPending: true,
+          warningCode: 'NOTIFICATION_CLEANUP_PENDING',
+        })
+      }
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    await wrapper.get('[data-testid="delete-backup"]').trigger('click')
+    await wrapper.get('[data-testid="confirm-delete"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="dialog"]').exists()).toBe(false)
+    expect(useAccountProfilesStore().deleteError).toBeNull()
+    expect(errorServiceMocks.reportError).not.toHaveBeenCalled()
+    expect(errorServiceMocks.notifyWarning).toHaveBeenCalledTimes(1)
+    expect(errorServiceMocks.notifyWarning).toHaveBeenCalledWith(
+      '账户已删除，通知清理将在稍后重试。',
+    )
+  })
+
+  it('treats malformed or absent cleanup warning fields as no warning', async () => {
+    for (const result of [
+      { notificationCleanupPending: false },
+      { notificationCleanupPending: true },
+      { notificationCleanupPending: true, warningCode: 'RAW_PATH_DETAIL' },
+    ]) {
+      const store = useAccountProfilesStore()
+      vi.mocked(tauriInvoke).mockImplementation((command) => {
+        if (command === 'delete_account') return Promise.resolve(result)
+        if (command === 'list_account_profiles') return Promise.resolve(profiles)
+        return Promise.resolve(undefined)
+      })
+      await store.deleteAccount('backup')
+      await flushPromises()
+    }
+
+    expect(errorServiceMocks.notifyWarning).not.toHaveBeenCalled()
+    expect(errorServiceMocks.reportError).not.toHaveBeenCalled()
   })
 })

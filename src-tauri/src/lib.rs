@@ -71,6 +71,7 @@ pub fn run() {
             mark_visible_notifications_read,
             delete_notification,
             clear_account_notifications,
+            create_client_notification,
             get_risk_status,
             update_risk_config,
             save_credentials,

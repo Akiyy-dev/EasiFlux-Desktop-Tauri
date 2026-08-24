@@ -42,6 +42,27 @@ export const useConfigStore = defineStore('config', () => {
     }
   }
 
+  async function fetchConfigForCompletion(
+    isCompletionValid: () => boolean,
+  ): Promise<boolean> {
+    const requestId = ++latestFetchRequest
+    loading.value = true
+    try {
+      let result: AppConfig
+      try {
+        result = withAuthoritativeAccount(await tauriInvoke<AppConfig>('get_config'))
+      } catch (error) {
+        if (requestId !== latestFetchRequest || !isCompletionValid()) return false
+        throw error
+      }
+      if (requestId !== latestFetchRequest || !isCompletionValid()) return false
+      config.value = result
+      return true
+    } finally {
+      if (requestId === latestFetchRequest) loading.value = false
+    }
+  }
+
   async function saveConfig(next: AppConfig): Promise<void> {
     const requestId = ++latestFetchRequest
     const result = withAuthoritativeAccount(
@@ -98,6 +119,7 @@ export const useConfigStore = defineStore('config', () => {
     config,
     loading,
     fetchConfig,
+    fetchConfigForCompletion,
     saveConfig,
     adoptActiveAccountId,
     adoptRiskConfig,

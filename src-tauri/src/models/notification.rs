@@ -587,8 +587,8 @@ impl NotificationRecord {
             content: self.content.clone(),
             entity: self.entity.clone(),
             action: self.action.clone(),
-            source_event_id: None,
-            dedupe_key: "record-shape".into(),
+            source_event_id: self.source_event_id.clone(),
+            dedupe_key: self.dedupe_key.clone(),
             session_epoch: Some(0),
         };
         shape
@@ -681,7 +681,47 @@ impl NotificationInput {
                 )
                 && self.session_epoch.is_some()
         };
+        let client_kind = matches!(
+            self.kind,
+            NotificationKind::AccountRecoveryFailed | NotificationKind::AccountReconciliationFailed
+        );
+        let client_message = matches!(
+            self.content.message_key.as_str(),
+            "account.recoveryFailed" | "account.reconciliationFailed"
+        );
+        let account_id = match &self.scope {
+            NotificationScope::Account { account_id } => Some(account_id.as_str()),
+            NotificationScope::Global => None,
+        };
+        let client_shape =
+            |expected_kind, expected_severity, expected_key: &str, expected_suffix: &str| {
+                let Some(account_id) = account_id else {
+                    return false;
+                };
+                self.kind == expected_kind
+                    && self.category == NotificationCategory::RiskAccount
+                    && self.severity == expected_severity
+                    && self.content.message_key == expected_key
+                    && self.content.params.len() == 1
+                    && self.content.params.contains_key("failedSteps")
+                    && matches!(
+                        self.entity.as_ref(),
+                        Some(NotificationEntity {
+                            entity_type: NotificationEntityType::Account,
+                            id,
+                        }) if id == account_id
+                    )
+                    && matches!(
+                        self.action.as_ref(),
+                        Some(NotificationAction::OpenAccountSettings {
+                            account_section: AccountNotificationSection::Api,
+                        })
+                    )
+                    && self.session_epoch.is_some()
+                    && client_failure_identity_matches(self, account_id, expected_suffix)
+            };
         let valid = task5_kind == task5_message
+            && client_kind == client_message
             && (!task5_kind || matches!(self.scope, NotificationScope::Account { .. }))
             && match self.kind {
                 NotificationKind::OrderFilled => order_shape(
@@ -732,10 +772,42 @@ impl NotificationInput {
                         )
                         && self.session_epoch.is_some()
                 }
+                NotificationKind::AccountRecoveryFailed => client_shape(
+                    NotificationKind::AccountRecoveryFailed,
+                    NotificationSeverity::Error,
+                    "account.recoveryFailed",
+                    "recovery",
+                ),
+                NotificationKind::AccountReconciliationFailed => client_shape(
+                    NotificationKind::AccountReconciliationFailed,
+                    NotificationSeverity::Critical,
+                    "account.reconciliationFailed",
+                    "reconciliation",
+                ),
                 _ => true,
             };
         valid.then_some(()).ok_or_else(invalid_content)
     }
+}
+
+fn client_failure_identity_matches(
+    input: &NotificationInput,
+    account_id: &str,
+    expected_suffix: &str,
+) -> bool {
+    let Some(source) = input.source_event_id.as_deref() else {
+        return false;
+    };
+    let Some((attempt_id, suffix)) = source
+        .strip_prefix("client:")
+        .and_then(|value| value.split_once(':'))
+    else {
+        return false;
+    };
+    suffix == expected_suffix
+        && !suffix.contains(':')
+        && is_generated_uuid(attempt_id)
+        && input.dedupe_key == format!("{account_id}:{attempt_id}:{expected_suffix}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -916,7 +988,7 @@ impl ClientNotificationFailedStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateClientNotificationRequest {
     pub account_id: String,
     pub session_epoch: u64,
@@ -1195,6 +1267,120 @@ mod tests {
             input.validate().unwrap_err().code(),
             "INVALID_NOTIFICATION_CONTENT"
         );
+    }
+
+    #[test]
+    fn client_failure_inputs_require_the_exact_closed_shape() {
+        for kind in [
+            NotificationKind::AccountRecoveryFailed,
+            NotificationKind::AccountReconciliationFailed,
+        ] {
+            valid_client_failure_input(kind).validate().unwrap();
+        }
+
+        let base = valid_client_failure_input(NotificationKind::AccountRecoveryFailed);
+        let mut invalid = Vec::new();
+
+        let mut value = base.clone();
+        value.scope = NotificationScope::Global;
+        invalid.push(value);
+        let mut value = base.clone();
+        value.category = NotificationCategory::Trading;
+        invalid.push(value);
+        let mut value = base.clone();
+        value.severity = NotificationSeverity::Warning;
+        invalid.push(value);
+        let mut value = base.clone();
+        value.content =
+            valid_client_failure_input(NotificationKind::AccountReconciliationFailed).content;
+        invalid.push(value);
+        let mut value = base.clone();
+        value.content.params.insert(
+            "attemptId".into(),
+            NotificationScalar::String("10000000-0000-4000-8000-000000000001".into()),
+        );
+        invalid.push(value);
+        let mut value = base.clone();
+        value.entity = None;
+        invalid.push(value);
+        let mut value = base.clone();
+        value.entity = Some(NotificationEntity {
+            entity_type: NotificationEntityType::Account,
+            id: "other".into(),
+        });
+        invalid.push(value);
+        let mut value = base.clone();
+        value.action = Some(NotificationAction::OpenAccountSettings {
+            account_section: AccountNotificationSection::Risk,
+        });
+        invalid.push(value);
+        let mut value = base.clone();
+        value.source_event_id = Some("client:10000000-0000-4000-8000-000000000002:recovery".into());
+        invalid.push(value);
+        let mut value = base.clone();
+        value.dedupe_key = "other:10000000-0000-4000-8000-000000000001:recovery".into();
+        invalid.push(value);
+        let mut value = base;
+        value.session_epoch = None;
+        invalid.push(value);
+
+        for value in invalid {
+            assert_eq!(
+                value.validate().unwrap_err().code(),
+                "INVALID_NOTIFICATION_CONTENT"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_client_failure_records_reject_forged_policy_shapes() {
+        for kind in [
+            NotificationKind::AccountRecoveryFailed,
+            NotificationKind::AccountReconciliationFailed,
+        ] {
+            valid_client_failure_record(kind).validate().unwrap();
+        }
+
+        let base = valid_client_failure_record(NotificationKind::AccountRecoveryFailed);
+        let mut invalid = Vec::new();
+        let mut value = base.clone();
+        value.scope = NotificationScope::Global;
+        invalid.push(value);
+        let mut value = base.clone();
+        value.category = NotificationCategory::ConnectionSystem;
+        invalid.push(value);
+        let mut value = base.clone();
+        value.severity = NotificationSeverity::Critical;
+        invalid.push(value);
+        let mut value = base.clone();
+        value.kind = NotificationKind::AccountReconciliationFailed;
+        invalid.push(value);
+        let mut value = base.clone();
+        value.content.params.clear();
+        invalid.push(value);
+        let mut value = base.clone();
+        value.entity = Some(NotificationEntity {
+            entity_type: NotificationEntityType::Account,
+            id: "other".into(),
+        });
+        invalid.push(value);
+        let mut value = base.clone();
+        value.source_event_id =
+            Some("client:10000000-0000-4000-8000-000000000001:reconciliation".into());
+        invalid.push(value);
+        let mut value = base.clone();
+        value.dedupe_key = "alpha:10000000-0000-4000-8000-000000000002:recovery".into();
+        invalid.push(value);
+        let mut value = base;
+        value.action = None;
+        invalid.push(value);
+
+        for value in invalid {
+            assert_eq!(
+                value.validate().unwrap_err().code(),
+                "INVALID_NOTIFICATION_RECORD"
+            );
+        }
     }
 
     #[test]
@@ -1779,6 +1965,76 @@ mod tests {
             }),
             source_event_id: Some("submission-1".into()),
             dedupe_key: "alpha:submission-1:risk".into(),
+            occurrence_count: 1,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            read_at_ms: None,
+        }
+    }
+
+    fn valid_client_failure_input(kind: NotificationKind) -> NotificationInput {
+        let (severity, key, title, body, suffix) = match kind {
+            NotificationKind::AccountRecoveryFailed => (
+                NotificationSeverity::Error,
+                "account.recoveryFailed",
+                "账户恢复失败",
+                "请检查账户设置后重试。",
+                "recovery",
+            ),
+            NotificationKind::AccountReconciliationFailed => (
+                NotificationSeverity::Critical,
+                "account.reconciliationFailed",
+                "账户对账失败",
+                "请检查账户数据后重试。",
+                "reconciliation",
+            ),
+            _ => panic!("client failure helper requires a client kind"),
+        };
+        NotificationInput {
+            scope: NotificationScope::Account {
+                account_id: "alpha".into(),
+            },
+            category: NotificationCategory::RiskAccount,
+            kind,
+            severity,
+            content: NotificationContent::new(
+                key,
+                [(
+                    "failedSteps",
+                    NotificationScalar::String("config,connection".into()),
+                )],
+                title,
+                body,
+            )
+            .unwrap(),
+            entity: Some(NotificationEntity {
+                entity_type: NotificationEntityType::Account,
+                id: "alpha".into(),
+            }),
+            action: Some(NotificationAction::OpenAccountSettings {
+                account_section: AccountNotificationSection::Api,
+            }),
+            source_event_id: Some(format!(
+                "client:10000000-0000-4000-8000-000000000001:{suffix}"
+            )),
+            dedupe_key: format!("alpha:10000000-0000-4000-8000-000000000001:{suffix}"),
+            session_epoch: Some(4),
+        }
+    }
+
+    fn valid_client_failure_record(kind: NotificationKind) -> NotificationRecord {
+        let input = valid_client_failure_input(kind);
+        NotificationRecord {
+            id: "0b102d04-848c-4c84-a644-033383850c71".into(),
+            scope: input.scope,
+            category: input.category,
+            kind: input.kind,
+            severity: input.severity,
+            content: input.content,
+            entity: input.entity,
+            action: input.action,
+            source_event_id: input.source_event_id,
+            dedupe_key: input.dedupe_key,
             occurrence_count: 1,
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_000_000,

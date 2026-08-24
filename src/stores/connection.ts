@@ -255,8 +255,20 @@ export const useConnectionStore = defineStore('connection', () => {
     isCompletionValid?: ConnectionCompletionValidity,
   ): Promise<{ status: ConnectionStatus; applied: boolean }> {
     const requestId = ++latestStatusRequest
-    const next = await tauriInvoke<ConnectionStatus>('get_connection_status')
+    let next: ConnectionStatus
+    try {
+      next = await tauriInvoke<ConnectionStatus>('get_connection_status')
+    } catch (error) {
+      if (
+        connectionRequest === undefined
+        && (requestId !== latestStatusRequest || !completionRemainsValid(isCompletionValid))
+      ) {
+        return { status: status.value, applied: false }
+      }
+      throw error
+    }
     const applied = requestId === latestStatusRequest
+      && completionRemainsValid(isCompletionValid)
       && (connectionRequest === undefined || (
         connectionCompletionRemainsCurrent(connectionRequest, isCompletionValid)
       ))
@@ -264,14 +276,28 @@ export const useConnectionStore = defineStore('connection', () => {
     return { status: next, applied }
   }
 
-  async function refreshStatus(): Promise<ConnectionStatus> {
-    return (await refreshStatusForConnection()).status
+  async function refreshStatus(
+    isCompletionValid?: ConnectionCompletionValidity,
+  ): Promise<ConnectionStatus> {
+    return (await refreshStatusForConnection(undefined, isCompletionValid)).status
   }
 
-  async function refreshWsStatus(): Promise<ConnectionStatus> {
+  async function refreshWsStatus(
+    isCompletionValid?: ConnectionCompletionValidity,
+  ): Promise<ConnectionStatus> {
     const requestId = ++latestWsStatusRequest
-    const next = await tauriInvoke<ConnectionStatus>('get_websocket_status')
-    if (requestId === latestWsStatusRequest) wsStatus.value = next
+    let next: ConnectionStatus
+    try {
+      next = await tauriInvoke<ConnectionStatus>('get_websocket_status')
+    } catch (error) {
+      if (requestId !== latestWsStatusRequest || !completionRemainsValid(isCompletionValid)) {
+        return wsStatus.value
+      }
+      throw error
+    }
+    if (requestId === latestWsStatusRequest && completionRemainsValid(isCompletionValid)) {
+      wsStatus.value = next
+    }
     return next
   }
 

@@ -86,6 +86,13 @@ export interface AccountSessionEvent<T> {
   payload: T
 }
 
+export type DeleteAccountWarningCode = 'NOTIFICATION_CLEANUP_PENDING'
+
+export interface DeleteAccountResult {
+  notificationCleanupPending: boolean
+  warningCode?: DeleteAccountWarningCode
+}
+
 export interface SaveCredentialRequest {
   accountId: string
   apiKey: string

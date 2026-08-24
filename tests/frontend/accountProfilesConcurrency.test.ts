@@ -149,4 +149,23 @@ describe('account profile refresh concurrency', () => {
     expect(store.profiles).toEqual([freshProfile])
     expect(store.listError).toBeNull()
   })
+
+  it('keeps a normal profile refresh owned when the same account advances epoch', async () => {
+    const pending = deferred<AccountProfile[]>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return pending.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useAccountProfilesStore()
+    const refresh = store.refreshProfiles()
+    expect(store.loading).toBe(true)
+
+    store.adoptSessionEpoch(1)
+    pending.resolve([freshProfile])
+    await refresh
+
+    expect(store.profiles).toEqual([freshProfile])
+    expect(store.loading).toBe(false)
+    expect(store.listError).toBeNull()
+  })
 })

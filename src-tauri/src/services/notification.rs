@@ -117,6 +117,13 @@ pub struct PublishOutcome {
     pub revision: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClientNotificationPublishResult {
+    pub notification: NotificationRecord,
+    pub unread_count: u64,
+    pub revision: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PruneOutcome {
     pub affected_count: u64,
@@ -347,6 +354,64 @@ impl NotificationService {
         let mut next = guard.clone();
         let mutation = apply_prepared_publish(&mut next, prepared)?;
         self.commit_publish(&mut guard, next, mutation)
+    }
+
+    pub(crate) async fn publish_client_account_failure(
+        &self,
+        input: NotificationInput,
+        now_ms: u64,
+    ) -> Result<ClientNotificationPublishResult, NotificationError> {
+        validate_publish_input(&input)?;
+        if !matches!(
+            input.kind,
+            NotificationKind::AccountRecoveryFailed | NotificationKind::AccountReconciliationFailed
+        ) {
+            return Err(NotificationError::new(
+                "INVALID_NOTIFICATION_CONTENT",
+                "客户端通知输入无效",
+            ));
+        }
+        let account_id = match &input.scope {
+            NotificationScope::Account { account_id } => account_id.clone(),
+            NotificationScope::Global => {
+                return Err(NotificationError::new(
+                    "INVALID_NOTIFICATION_CONTENT",
+                    "客户端通知输入无效",
+                ));
+            }
+        };
+        let context = ViewContext::account(account_id)?;
+        let source = source_key(&input).ok_or_else(|| {
+            NotificationError::new("INVALID_NOTIFICATION_CONTENT", "客户端通知来源无效")
+        })?;
+        let mut guard = self.state.lock().await;
+        if guard.seen_source_events.contains(&source) {
+            let notification = record_for_source(&guard.file, &source).ok_or_else(|| {
+                NotificationError::new("NOTIFICATION_STATE_CONFLICT", "通知状态已发生冲突")
+            })?;
+            return Ok(ClientNotificationPublishResult {
+                notification: notification.clone(),
+                unread_count: visible_unread_count(&guard.file, &context, now_ms),
+                revision: guard.file.revision.to_string(),
+            });
+        }
+
+        let prepared = self
+            .prepare_publish_locked(&mut guard, &input, now_ms)?
+            .ok_or_else(|| {
+                NotificationError::new("NOTIFICATION_STATE_CONFLICT", "通知状态已发生冲突")
+            })?;
+        let mut next = guard.clone();
+        let mutation = apply_prepared_publish(&mut next, prepared)?;
+        let outcome = self.commit_publish(&mut guard, next, mutation)?;
+        let notification = outcome.notification.ok_or_else(|| {
+            NotificationError::new("NOTIFICATION_STATE_CONFLICT", "通知状态已发生冲突")
+        })?;
+        Ok(ClientNotificationPublishResult {
+            notification,
+            unread_count: visible_unread_count(&guard.file, &context, now_ms),
+            revision: outcome.revision,
+        })
     }
 
     pub async fn list(
@@ -1216,6 +1281,24 @@ fn source_key(input: &NotificationInput) -> Option<(NotificationScope, String)> 
         .source_event_id
         .as_ref()
         .map(|source| (input.scope.clone(), source.clone()))
+}
+
+fn record_for_source<'a>(
+    file: &'a NotificationFileV1,
+    source: &(NotificationScope, String),
+) -> Option<&'a NotificationRecord> {
+    let notification_id = file
+        .source_event_index
+        .iter()
+        .find(|entry| entry.scope == source.0 && entry.source_event_id == source.1)?
+        .notification_id
+        .as_str();
+    file.partitions
+        .iter()
+        .find(|partition| partition.scope == source.0)?
+        .items
+        .iter()
+        .find(|record| record.id == notification_id)
 }
 
 fn no_publish_outcome(state: &ServiceState) -> PublishOutcome {

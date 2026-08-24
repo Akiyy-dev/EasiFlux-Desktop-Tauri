@@ -6,11 +6,12 @@ use tokio::sync::RwLock;
 
 use crate::models::config::AppConfig;
 use crate::models::notification::{
-    ListNotificationsRequest, NotificationPage, NotificationRecord, NotificationScope,
-    NotificationSummary,
+    CreateClientNotificationRequest, ListNotificationsRequest, NotificationPage,
+    NotificationRecord, NotificationScope, NotificationSummary,
 };
 use crate::services::notification::{
-    NotificationAvailability, NotificationError, NotificationRuntime, ViewContext,
+    NotificationAvailability, NotificationError, NotificationPolicy, NotificationRuntime,
+    ViewContext,
 };
 use crate::services::AccountLifecycleCoordinator;
 use crate::state::AppState;
@@ -74,6 +75,14 @@ pub struct DeleteNotificationResult {
 #[serde(rename_all = "camelCase")]
 pub struct ClearAccountNotificationsResult {
     pub affected_count: u64,
+    pub unread_count: u64,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateClientNotificationResult {
+    pub notification: NotificationRecord,
     pub unread_count: u64,
     pub revision: String,
 }
@@ -236,6 +245,72 @@ async fn clear_account_notifications_inner(
     })
 }
 
+fn validate_client_notification_envelope(
+    body: &tauri::ipc::InvokeBody,
+) -> Result<(), NotificationCommandError> {
+    let tauri::ipc::InvokeBody::Json(serde_json::Value::Object(args)) = body else {
+        return Err(NotificationCommandError::new(
+            "INVALID_NOTIFICATION_REQUEST",
+            "客户端通知请求无效",
+        ));
+    };
+    if args.len() != 1 || !args.contains_key("request") {
+        return Err(NotificationCommandError::new(
+            "INVALID_NOTIFICATION_REQUEST",
+            "客户端通知请求无效",
+        ));
+    }
+    Ok(())
+}
+
+async fn create_client_notification_inner(
+    runtime: &Arc<NotificationRuntime>,
+    config: &Arc<RwLock<AppConfig>>,
+    lifecycle: &AccountLifecycleCoordinator,
+    request: CreateClientNotificationRequest,
+    now_ms: u64,
+) -> Result<CreateClientNotificationResult, NotificationCommandError> {
+    request
+        .validate()
+        .map_err(|error| NotificationCommandError::new(error.code(), "客户端通知请求无效"))?;
+    let canonical_request = crate::models::config::normalize_account_id(&request.account_id);
+    if canonical_request != request.account_id {
+        return Err(NotificationCommandError::new(
+            "INVALID_NOTIFICATION_REQUEST",
+            "客户端通知请求无效",
+        ));
+    }
+
+    let _guard = lifecycle.read_guard().await;
+    let active_account_id = {
+        let config = config.read().await;
+        crate::models::config::normalize_account_id(&config.active_account_id)
+    };
+    if request.account_id != active_account_id {
+        return Err(NotificationCommandError::new(
+            "NOTIFICATION_SCOPE_MISMATCH",
+            "通知账户范围不匹配",
+        ));
+    }
+    if request.session_epoch != lifecycle.current_session_epoch() {
+        return Err(NotificationCommandError::new(
+            "NOTIFICATION_SESSION_MISMATCH",
+            "通知会话代次不匹配",
+        ));
+    }
+
+    let input = NotificationPolicy::default().client_account_failure(request)?;
+    let result = runtime
+        .service()?
+        .publish_client_account_failure(input, now_ms)
+        .await?;
+    Ok(CreateClientNotificationResult {
+        notification: result.notification,
+        unread_count: result.unread_count,
+        revision: result.revision,
+    })
+}
+
 #[tauri::command]
 pub async fn list_notifications(
     state: State<'_, AppState>,
@@ -325,6 +400,23 @@ pub async fn clear_account_notifications(
         &state.config,
         state.account_lifecycle.as_ref(),
         account_id,
+        state.time.local_now_ms(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn create_client_notification(
+    raw_request: tauri::ipc::Request<'_>,
+    state: State<'_, AppState>,
+    request: CreateClientNotificationRequest,
+) -> Result<CreateClientNotificationResult, NotificationCommandError> {
+    validate_client_notification_envelope(raw_request.body())?;
+    create_client_notification_inner(
+        &state.notification,
+        &state.config,
+        state.account_lifecycle.as_ref(),
+        request,
         state.time.local_now_ms(),
     )
     .await

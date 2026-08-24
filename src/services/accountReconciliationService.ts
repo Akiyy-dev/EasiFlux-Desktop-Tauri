@@ -9,6 +9,20 @@ export interface AccountReconciliationTask {
   run: () => Promise<unknown>
 }
 
+const RECONCILIATION_STEP_ORDER: readonly AccountReconciliationStep[] = [
+  'config',
+  'profiles',
+  'connection',
+  'bootstrap',
+]
+
+export function normalizeReconciliationSteps(
+  steps: readonly AccountReconciliationStep[],
+): AccountReconciliationStep[] {
+  const included = new Set(steps)
+  return RECONCILIATION_STEP_ORDER.filter((step) => included.has(step))
+}
+
 const FAILURE_LABELS: Record<AccountReconciliationStep, string> = {
   config: '配置刷新失败',
   profiles: '账户配置刷新失败',
@@ -20,9 +34,9 @@ export async function collectReconciliationFailures(
   tasks: AccountReconciliationTask[],
 ): Promise<AccountReconciliationStep[]> {
   const results = await Promise.allSettled(tasks.map(({ run }) => run()))
-  return results.flatMap((result, index) =>
+  return normalizeReconciliationSteps(results.flatMap((result, index) =>
     result.status === 'rejected' ? [tasks[index].step] : [],
-  )
+  ))
 }
 
 export function formatReconciliationError(
