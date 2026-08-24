@@ -121,12 +121,15 @@ export const useNotificationStore = defineStore('notification', () => {
     if (canAdoptRevision(capturedRevision, revision)) observedRevision.value = revision
   }
 
-  function clearPage(clearUnread: boolean): void {
+  function clearPage(clearUnread: boolean, retainFailedFirstPage = false): void {
+    const retainedError = retainFailedFirstPage && firstPageNeedsRetry
+      ? dataError.value
+      : null
     items.value = []
     nextCursor.value = undefined
-    firstPageNeedsRetry = false
+    firstPageNeedsRetry = retainedError !== null
     pageError.value = null
-    dataError.value = null
+    dataError.value = retainedError
     if (clearUnread) unreadCount.value = null
   }
 
@@ -606,11 +609,15 @@ export const useNotificationStore = defineStore('notification', () => {
     }
   }
 
-  async function refreshAfterMutation(hard: boolean, clearUnread = false): Promise<void> {
+  async function refreshAfterMutation(
+    hard: boolean,
+    clearUnread = false,
+    retainFailedFirstPage = false,
+  ): Promise<void> {
     const owner = lifecycleId
     const generation = loadGeneration.value
     invalidateLoadMore()
-    if (hard) clearPage(clearUnread)
+    if (hard) clearPage(clearUnread, retainFailedFirstPage)
     if (pageInitialized) await queryFirstPage(owner, generation)
     else await refreshSummary(owner, generation)
   }
@@ -623,7 +630,7 @@ export const useNotificationStore = defineStore('notification', () => {
     const capturedFilter = filter.value
     const capturedRevision = observedRevision.value
     const pendingOwner = ++mutationOwnerSequence
-    dataError.value = null
+    if (!firstPageNeedsRetry) dataError.value = null
     markAllReadOwner = pendingOwner
     markAllReadPending.value = true
     try {
@@ -650,7 +657,7 @@ export const useNotificationStore = defineStore('notification', () => {
   async function clearCurrentAccount(): Promise<boolean> {
     if (clearCurrentAccountPending.value) return false
     const capturedAccountId = accountId.value
-    dataError.value = null
+    if (!firstPageNeedsRetry) dataError.value = null
     if (capturedAccountId === null) {
       dataError.value = '当前没有可清空通知的账户'
       return false
@@ -668,7 +675,7 @@ export const useNotificationStore = defineStore('notification', () => {
       invalidateReadAuthority()
       unreadCount.value = result.unreadCount
       adoptRevision(capturedRevision, result.revision)
-      await refreshAfterMutation(true, false)
+      await refreshAfterMutation(true, false, firstPageNeedsRetry)
       return true
     } catch (mutationError) {
       if (ownsContext(owner, generation, capturedAccountId, capturedFilter)) {

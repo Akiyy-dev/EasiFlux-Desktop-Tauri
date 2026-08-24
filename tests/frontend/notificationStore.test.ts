@@ -1082,6 +1082,92 @@ describe('notification authoritative mutations and settings', () => {
     expect(store.error).toBeNull()
   })
 
+  it('keeps a failed soft page error visible through deferred mark-all and its repair', async () => {
+    const itemA = record('mark-all-dirty-a')
+    const itemB = record('mark-all-dirty-b')
+    const store = await openedStore(itemA)
+    mocks.list.mockRejectedValueOnce(new Error('soft mark-all refresh failed'))
+
+    emit(changed('revision-1', 'revision-2', [itemB.scope], {
+      change: 'created',
+      notificationId: itemB.id,
+      toastCandidate: candidate(itemB.id, itemB.scope),
+    }))
+    await tick()
+    expect(store.error).toBe('soft mark-all refresh failed')
+
+    const response = deferred<{
+      affectedCount: number; affectedScopes: NotificationRecord['scope'][]
+      unreadCount: number; revision: string
+    }>()
+    const repairPage = deferred<NotificationPage>()
+    mocks.markAllRead.mockReturnValueOnce(response.promise)
+    mocks.list.mockReturnValueOnce(repairPage.promise)
+    const marking = store.markAllRead()
+
+    expect(store.markAllReadPending).toBe(true)
+    expect(store.error).toBe('soft mark-all refresh failed')
+
+    const readA = { ...itemA, readAtMs: itemA.createdAtMs + 1 }
+    const readB = { ...itemB, readAtMs: itemB.createdAtMs + 1 }
+    response.resolve({
+      affectedCount: 2,
+      affectedScopes: [{ type: 'account', accountId: 'primary' }],
+      unreadCount: 0,
+      revision: 'revision-3',
+    })
+    await tick()
+
+    expect(store.markAllReadPending).toBe(true)
+    expect(store.error).toBe('soft mark-all refresh failed')
+
+    repairPage.resolve(page([readA, readB], 'revision-3', undefined, 0))
+    await expect(marking).resolves.toBe(true)
+
+    expect(store.markAllReadPending).toBe(false)
+    expect(store.items).toEqual([readA, readB])
+    expect(store.error).toBeNull()
+  })
+
+  it('keeps a failed soft page error visible through deferred account clear and its reload', async () => {
+    const itemA = record('clear-dirty-a')
+    const itemB = record('clear-dirty-b')
+    const store = await openedStore(itemA)
+    mocks.list.mockRejectedValueOnce(new Error('soft clear refresh failed'))
+
+    emit(changed('revision-1', 'revision-2', [itemB.scope], {
+      change: 'created',
+      notificationId: itemB.id,
+      toastCandidate: candidate(itemB.id, itemB.scope),
+    }))
+    await tick()
+    expect(store.error).toBe('soft clear refresh failed')
+
+    const response = deferred<{ affectedCount: number; unreadCount: number; revision: string }>()
+    const reloadPage = deferred<NotificationPage>()
+    mocks.clear.mockReturnValueOnce(response.promise)
+    mocks.list.mockReturnValueOnce(reloadPage.promise)
+    const clearing = store.clearCurrentAccount()
+
+    expect(store.clearCurrentAccountPending).toBe(true)
+    expect(store.error).toBe('soft clear refresh failed')
+
+    const global = record('clear-dirty-global', { type: 'global' })
+    response.resolve({ affectedCount: 2, unreadCount: 1, revision: 'revision-3' })
+    await tick()
+
+    expect(store.clearCurrentAccountPending).toBe(true)
+    expect(store.items).toEqual([])
+    expect(store.error).toBe('soft clear refresh failed')
+
+    reloadPage.resolve(page([global], 'revision-3', undefined, 1))
+    await expect(clearing).resolves.toBe(true)
+
+    expect(store.clearCurrentAccountPending).toBe(false)
+    expect(store.items).toEqual([global])
+    expect(store.error).toBeNull()
+  })
+
   it('does not query after an ordinary remove without active or failed first-page work', async () => {
     const item = record('remove-without-page-repair')
     const store = await openedStore(item)
