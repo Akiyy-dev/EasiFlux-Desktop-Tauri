@@ -569,6 +569,35 @@ describe('notification store context, paging, revisions, and Toasts', () => {
     expect(store.observedRevision).toBe('revision-page-newer')
   })
 
+  it('preserves a failed account page retry after its concurrent summary succeeds', async () => {
+    const store = useNotificationStore()
+    mocks.list.mockResolvedValueOnce(page([record('primary-before-failure')], 'revision-1'))
+    await store.start()
+    await store.setAccount('primary')
+    await store.open()
+    const backupSummary = deferred<{ unreadCount: number; revision: string }>()
+    mocks.summary.mockReturnValueOnce(backupSummary.promise)
+    mocks.list.mockRejectedValueOnce(new Error('backup page failed'))
+
+    const switching = store.setAccount('backup')
+    await tick()
+    expect(store.error).toBe('backup page failed')
+
+    backupSummary.resolve({ unreadCount: 4, revision: 'revision-summary' })
+    await switching
+    expect(store.error).toBe('backup page failed')
+
+    const backup = record('backup-after-retry', { type: 'account', accountId: 'backup' })
+    mocks.list.mockResolvedValueOnce(page([backup], 'revision-page', undefined, 4))
+    await store.open()
+
+    expect(mocks.list).toHaveBeenCalledTimes(3)
+    expect(store.items).toEqual([backup])
+    expect(store.unreadCount).toBe(4)
+    expect(store.observedRevision).toBe('revision-page')
+    expect(store.error).toBeNull()
+  })
+
   it('keeps an opened page authoritative when the older startup summary resolves later', async () => {
     const olderSummary = deferred<{ unreadCount: number; revision: string }>()
     const newerPage = deferred<NotificationPage>()
@@ -967,6 +996,106 @@ describe('notification authoritative mutations and settings', () => {
     expect(store.items).toEqual([itemB])
     expect(store.unreadCount).toBe(1)
     expect(store.observedRevision).toBe('revision-3')
+    expect(store.error).toBeNull()
+  })
+
+  it('repairs a failed soft event page after an accepted mark-read without hiding its retry error', async () => {
+    const itemA = record('mark-read-dirty-a')
+    const itemB = record('mark-read-dirty-b')
+    const store = await openedStore(itemA)
+    mocks.list.mockRejectedValueOnce(new Error('soft mark-read refresh failed'))
+    const toastB = candidate(itemB.id, itemB.scope)
+
+    emit(changed('revision-1', 'revision-2', [itemB.scope], {
+      change: 'created',
+      notificationId: itemB.id,
+      toastCandidate: toastB,
+    }))
+    await tick()
+    expect(store.items).toEqual([itemA])
+    expect(store.error).toBe('soft mark-read refresh failed')
+
+    const repairPage = deferred<NotificationPage>()
+    mocks.list.mockReturnValueOnce(repairPage.promise)
+    const markedA = { ...itemA, readAtMs: itemA.createdAtMs + 1 }
+    mocks.markRead.mockResolvedValueOnce({
+      notification: markedA,
+      unreadCount: 1,
+      revision: 'revision-3',
+    })
+
+    await expect(store.markRead(itemA.id)).resolves.toBe(true)
+    const errorWhileRepairPending = store.error
+    emit(changed('revision-2', 'revision-3', [itemA.scope]))
+    await tick()
+
+    expect(errorWhileRepairPending).toBe('soft mark-read refresh failed')
+    expect(mocks.list).toHaveBeenCalledTimes(3)
+    expect(store.items).toEqual([markedA])
+    expect(store.observedRevision).toBe('revision-3')
+
+    repairPage.resolve(page([markedA, itemB], 'revision-3', undefined, 1))
+    await tick()
+
+    expect(store.items).toEqual([markedA, itemB])
+    expect(store.unreadCount).toBe(1)
+    expect(store.observedRevision).toBe('revision-3')
+    expect(store.error).toBeNull()
+  })
+
+  it('repairs a failed soft event page after an accepted remove without hiding its retry error', async () => {
+    const itemA = record('remove-dirty-a')
+    const itemB = record('remove-dirty-b')
+    const store = await openedStore(itemA)
+    mocks.list.mockRejectedValueOnce(new Error('soft remove refresh failed'))
+    const toastB = candidate(itemB.id, itemB.scope)
+
+    emit(changed('revision-1', 'revision-2', [itemB.scope], {
+      change: 'created',
+      notificationId: itemB.id,
+      toastCandidate: toastB,
+    }))
+    await tick()
+    expect(store.items).toEqual([itemA])
+    expect(store.error).toBe('soft remove refresh failed')
+
+    const repairPage = deferred<NotificationPage>()
+    mocks.list.mockReturnValueOnce(repairPage.promise)
+    mocks.remove.mockResolvedValueOnce({ unreadCount: 1, revision: 'revision-3' })
+
+    await expect(store.remove(itemA.id)).resolves.toBe(true)
+    const errorWhileRepairPending = store.error
+    emit(changed('revision-2', 'revision-3', [itemA.scope]))
+    await tick()
+
+    expect(errorWhileRepairPending).toBe('soft remove refresh failed')
+    expect(mocks.list).toHaveBeenCalledTimes(3)
+    expect(store.items).toEqual([])
+    expect(store.observedRevision).toBe('revision-3')
+
+    repairPage.resolve(page([itemB], 'revision-3', undefined, 1))
+    await tick()
+
+    expect(store.items).toEqual([itemB])
+    expect(store.unreadCount).toBe(1)
+    expect(store.observedRevision).toBe('revision-3')
+    expect(store.error).toBeNull()
+  })
+
+  it('does not query after an ordinary remove without active or failed first-page work', async () => {
+    const item = record('remove-without-page-repair')
+    const store = await openedStore(item)
+    mocks.list.mockClear()
+    mocks.remove.mockResolvedValueOnce({ unreadCount: 0, revision: 'revision-2' })
+
+    await expect(store.remove(item.id)).resolves.toBe(true)
+    emit(changed('revision-1', 'revision-2', [item.scope]))
+    await tick()
+
+    expect(mocks.list).not.toHaveBeenCalled()
+    expect(store.items).toEqual([])
+    expect(store.unreadCount).toBe(0)
+    expect(store.observedRevision).toBe('revision-2')
     expect(store.error).toBeNull()
   })
 

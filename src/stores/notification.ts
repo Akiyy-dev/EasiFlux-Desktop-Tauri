@@ -68,6 +68,7 @@ export const useNotificationStore = defineStore('notification', () => {
   let pageRequestId = 0
   let moreRequestId = 0
   let readAuthorityEpoch = 0
+  let firstPageNeedsRetry = false
   let activePageRequest: {
     requestId: number
     authorityEpoch: number
@@ -123,6 +124,7 @@ export const useNotificationStore = defineStore('notification', () => {
   function clearPage(clearUnread: boolean): void {
     items.value = []
     nextCursor.value = undefined
+    firstPageNeedsRetry = false
     pageError.value = null
     dataError.value = null
     if (clearUnread) unreadCount.value = null
@@ -186,7 +188,7 @@ export const useNotificationStore = defineStore('notification', () => {
       ) return
       unreadCount.value = summary.unreadCount
       adoptRevision(capturedRevision, summary.revision)
-      dataError.value = null
+      if (!firstPageNeedsRetry) dataError.value = null
     } catch (summaryError) {
       if (
         requestId === summaryRequestId
@@ -230,6 +232,7 @@ export const useNotificationStore = defineStore('notification', () => {
         || !ownsContext(owner, generation, capturedAccountId, capturedFilter)
       ) return
       pageAuthorityGeneration = generation
+      firstPageNeedsRetry = false
       items.value = result.items
       nextCursor.value = result.nextCursor
       unreadCount.value = result.unreadCount
@@ -242,6 +245,7 @@ export const useNotificationStore = defineStore('notification', () => {
         && authorityEpoch === readAuthorityEpoch
         && ownsContext(owner, generation, capturedAccountId, capturedFilter)
       ) {
+        firstPageNeedsRetry = true
         dataError.value = localErrorMessage(pageLoadError)
       }
     } finally {
@@ -436,6 +440,7 @@ export const useNotificationStore = defineStore('notification', () => {
     settingsSaveStatus.value = 'idle'
     settingsError.value = null
     pageAuthorityGeneration = -1
+    firstPageNeedsRetry = false
     activePageRequest = null
     invalidateMutationOwnership()
     const installedUnlisten = unlisten
@@ -537,7 +542,7 @@ export const useNotificationStore = defineStore('notification', () => {
     const capturedFilter = filter.value
     const capturedRevision = observedRevision.value
     const pendingOwner = ++mutationOwnerSequence
-    dataError.value = null
+    if (!firstPageNeedsRetry) dataError.value = null
     markReadOwners.set(id, pendingOwner)
     replacePendingId(markReadPendingIds, id, true)
     try {
@@ -552,7 +557,8 @@ export const useNotificationStore = defineStore('notification', () => {
       }
       unreadCount.value = result.unreadCount
       adoptRevision(capturedRevision, result.revision)
-      if (invalidateReadAuthority()) scheduleEventRefresh()
+      const canceledFirstPage = invalidateReadAuthority()
+      if (canceledFirstPage || firstPageNeedsRetry) scheduleEventRefresh()
       return true
     } catch (mutationError) {
       if (ownsContext(owner, generation, capturedAccountId, capturedFilter)) {
@@ -575,7 +581,7 @@ export const useNotificationStore = defineStore('notification', () => {
     const capturedFilter = filter.value
     const capturedRevision = observedRevision.value
     const pendingOwner = ++mutationOwnerSequence
-    dataError.value = null
+    if (!firstPageNeedsRetry) dataError.value = null
     removeOwners.set(id, pendingOwner)
     replacePendingId(removePendingIds, id, true)
     try {
@@ -584,7 +590,8 @@ export const useNotificationStore = defineStore('notification', () => {
       items.value = items.value.filter((item) => item.id !== id)
       unreadCount.value = result.unreadCount
       adoptRevision(capturedRevision, result.revision)
-      if (invalidateReadAuthority()) scheduleEventRefresh()
+      const canceledFirstPage = invalidateReadAuthority()
+      if (canceledFirstPage || firstPageNeedsRetry) scheduleEventRefresh()
       return true
     } catch (mutationError) {
       if (ownsContext(owner, generation, capturedAccountId, capturedFilter)) {
