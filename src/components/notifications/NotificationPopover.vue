@@ -59,6 +59,7 @@ watch(() => props.show, async (isOpen, wasOpen) => {
     if (wasOpen) removeDocumentListeners()
     return
   }
+  notificationSettingsPending = false
   addDocumentListeners()
   void notificationStore.open()
   await nextTick()

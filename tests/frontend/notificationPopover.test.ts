@@ -170,6 +170,25 @@ describe('NotificationPopover', () => {
     expect(wrapper.emitted('action')).toEqual([[{ type: 'openNotificationSettings' }]])
   })
 
+  it('drops a canceled settings intent before a later ordinary leave', async () => {
+    setActivePinia(createPinia())
+    const wrapper = mount(NotificationPopover, { props: { show: true } })
+
+    await wrapper.get('[data-testid="notification-settings"]').trigger('click')
+    await wrapper.setProps({ show: false })
+    await wrapper.setProps({ show: true })
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushPromises()
+    await wrapper.setProps({ show: false })
+
+    const afterLeave = wrapper.getComponent({ name: 'NPopover' }).props('internalOnAfterLeave')
+    expect(afterLeave).toBeTypeOf('function')
+    ;(afterLeave as () => void)()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.emitted('action')).toBeUndefined()
+  })
+
   it('requests close on Escape and removes its document listener when closed', async () => {
     setActivePinia(createPinia())
     const wrapper = mount(NotificationPopover, { props: { show: true } })
