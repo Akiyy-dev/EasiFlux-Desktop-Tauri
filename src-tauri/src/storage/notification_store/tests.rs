@@ -107,6 +107,53 @@ fn sample_file(revision: u64) -> NotificationFileV1 {
     }
 }
 
+#[test]
+fn store_roundtrips_every_canonical_account_id_shape() {
+    let root = test_root("canonical-account-domain");
+    let store = NotificationStore::with_path(store_path(&root));
+    let mut file = NotificationFileV1::empty();
+    file.revision = 5;
+
+    for (index, account_id) in [
+        "trader.name@example.com".to_string(),
+        "desk.alpha".to_string(),
+        "账户-甲".to_string(),
+        "a".repeat(96),
+        "token-secret".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let scope = NotificationScope::Account {
+            account_id: account_id.clone(),
+        };
+        let input = NotificationPolicy
+            .client_account_failure(CreateClientNotificationRequest {
+                account_id,
+                session_epoch: 7,
+                attempt_id: format!("10000000-0000-4000-8000-{index:012}"),
+                kind: ClientNotificationKind::AccountRecoveryFailed,
+                failed_steps: vec![ClientNotificationFailedStep::Config],
+            })
+            .unwrap();
+        let record = record_from_input(input, &format!("20000000-0000-4000-8000-{index:012}"));
+        file.source_event_index
+            .push(NotificationSourceEventIndexEntry {
+                scope: scope.clone(),
+                source_event_id: record.source_event_id.clone().unwrap(),
+                notification_id: record.id.clone(),
+            });
+        file.partitions.push(NotificationPartition {
+            scope,
+            items: vec![record],
+        });
+    }
+
+    store.save(&file).unwrap();
+    assert_eq!(store.load().unwrap().file, file);
+    cleanup(&root);
+}
+
 fn client_record(kind: ClientNotificationKind, id: &str) -> NotificationRecord {
     let input = NotificationPolicy
         .client_account_failure(CreateClientNotificationRequest {

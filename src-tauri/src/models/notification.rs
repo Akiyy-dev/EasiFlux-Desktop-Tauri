@@ -308,13 +308,7 @@ struct AccountId;
 
 impl AccountId {
     fn parse(value: &str) -> Option<()> {
-        (!value.is_empty()
-            && value.len() <= 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            && !looks_like_secret(value))
-        .then_some(())
+        (!value.is_empty() && value.trim() == value).then_some(())
     }
 }
 
@@ -476,7 +470,11 @@ pub struct NotificationEntity {
 
 impl NotificationEntity {
     fn validate(&self) -> Result<(), NotificationValidationError> {
-        if self.id.trim().is_empty() {
+        let valid = match self.entity_type {
+            NotificationEntityType::Account => AccountId::parse(&self.id).is_some(),
+            _ => !self.id.trim().is_empty(),
+        };
+        if !valid {
             return Err(NotificationValidationError::new(
                 "INVALID_NOTIFICATION_RECORD",
                 "通知实体标识不能为空",
@@ -719,7 +717,7 @@ impl NotificationInput {
                         })
                     )
                     && self.session_epoch.is_some()
-                    && client_failure_identity_matches(self, account_id, expected_suffix)
+                    && client_failure_identity_matches(self, expected_suffix)
             };
         let valid = task5_kind == task5_message
             && client_kind == client_message
@@ -791,11 +789,7 @@ impl NotificationInput {
     }
 }
 
-fn client_failure_identity_matches(
-    input: &NotificationInput,
-    account_id: &str,
-    expected_suffix: &str,
-) -> bool {
+fn client_failure_identity_matches(input: &NotificationInput, expected_suffix: &str) -> bool {
     let Some(source) = input.source_event_id.as_deref() else {
         return false;
     };
@@ -804,7 +798,7 @@ fn client_failure_identity_matches(
     };
     source_kind == input.kind
         && suffix == expected_suffix
-        && input.dedupe_key == format!("{account_id}:{attempt_id}:{expected_suffix}")
+        && input.dedupe_key == format!("client:{attempt_id}:{expected_suffix}")
 }
 
 pub(crate) fn client_notification_source_parts(
@@ -1106,7 +1100,7 @@ fn looks_like_secret(value: &str) -> bool {
         || value.starts_with("eyJ")
 }
 
-fn is_generated_uuid(value: &str) -> bool {
+pub(crate) fn is_generated_uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|parsed| {
         parsed.get_version() == Some(Version::Random) && parsed.hyphenated().to_string() == value
     })
@@ -1153,6 +1147,61 @@ mod tests {
             .unwrap(),
             json!({ "type": "openTrading", "orderId": "o-1" }),
         );
+    }
+
+    #[test]
+    fn canonical_account_domain_accepts_email_unicode_long_and_secret_looking_ids() {
+        let account_ids = [
+            "trader.name@example.com".to_string(),
+            "desk.alpha".to_string(),
+            "账户-甲".to_string(),
+            "a".repeat(96),
+            "token-secret".to_string(),
+        ];
+
+        for account_id in account_ids {
+            NotificationScope::Account {
+                account_id: account_id.clone(),
+            }
+            .validate()
+            .unwrap();
+            NotificationContent::new(
+                "account.sessionExpired",
+                [("accountId", NotificationScalar::String(account_id.clone()))],
+                "账户会话已失效",
+                "请检查账户 API 设置。",
+            )
+            .unwrap();
+            NotificationEntity {
+                entity_type: NotificationEntityType::Account,
+                id: account_id.clone(),
+            }
+            .validate()
+            .unwrap();
+            CreateClientNotificationRequest {
+                account_id,
+                session_epoch: 1,
+                attempt_id: "10000000-0000-4000-8000-000000000001".into(),
+                kind: ClientNotificationKind::AccountRecoveryFailed,
+                failed_steps: vec![ClientNotificationFailedStep::Config],
+            }
+            .validate()
+            .unwrap();
+        }
+
+        for account_id in ["", "   ", " leading", "trailing "] {
+            assert!(NotificationScope::Account {
+                account_id: account_id.into(),
+            }
+            .validate()
+            .is_err());
+            assert!(NotificationEntity {
+                entity_type: NotificationEntityType::Account,
+                id: account_id.into(),
+            }
+            .validate()
+            .is_err());
+        }
     }
 
     #[test]
@@ -1412,7 +1461,7 @@ mod tests {
             Some("client:10000000-0000-4000-8000-000000000001:reconciliation".into());
         invalid.push(value);
         let mut value = base.clone();
-        value.dedupe_key = "alpha:10000000-0000-4000-8000-000000000002:recovery".into();
+        value.dedupe_key = "client:10000000-0000-4000-8000-000000000002:recovery".into();
         invalid.push(value);
         let mut value = base;
         value.action = None;
@@ -1551,7 +1600,7 @@ mod tests {
             "account.sessionExpired",
             [(
                 "accountId",
-                NotificationScalar::String("sk_live_account".into()),
+                NotificationScalar::String(" trailing-account ".into()),
             )],
             "账户会话已失效",
             "请检查账户 API 设置。",
@@ -2060,7 +2109,7 @@ mod tests {
             source_event_id: Some(format!(
                 "client:10000000-0000-4000-8000-000000000001:{suffix}"
             )),
-            dedupe_key: format!("alpha:10000000-0000-4000-8000-000000000001:{suffix}"),
+            dedupe_key: format!("client:10000000-0000-4000-8000-000000000001:{suffix}"),
             session_epoch: Some(4),
         }
     }

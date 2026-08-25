@@ -23,6 +23,7 @@ const {
   markReadPendingIds, nextCursor, pageError, removePendingIds, unreadCount,
 } = storeToRefs(notificationStore)
 const panel = ref<{ focus: () => void; contains: (target: unknown) => boolean } | null>(null)
+let showGeneration = 0
 
 function close(): void {
   if (props.show) emit('update:show', false)
@@ -52,17 +53,22 @@ function removeDocumentListeners(): void {
 }
 
 watch(() => props.show, async (isOpen, wasOpen) => {
+  const generation = ++showGeneration
   if (!isOpen) {
     if (wasOpen) removeDocumentListeners()
     return
   }
   addDocumentListeners()
-  await notificationStore.open()
+  void notificationStore.open()
   await nextTick()
+  if (generation !== showGeneration || !props.show) return
   panel.value?.focus()
 }, { immediate: true })
 
-onBeforeUnmount(removeDocumentListeners)
+onBeforeUnmount(() => {
+  showGeneration += 1
+  removeDocumentListeners()
+})
 
 async function activate(record: NotificationRecord): Promise<void> {
   await notificationStore.markRead(record.id)
@@ -70,7 +76,6 @@ async function activate(record: NotificationRecord): Promise<void> {
 }
 
 function openNotificationSettings(): void {
-  emit('update:show', false)
   emit('action', { type: 'openNotificationSettings' })
 }
 </script>

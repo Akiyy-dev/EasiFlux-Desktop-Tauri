@@ -123,7 +123,7 @@ impl AppState {
                 let observer = observer.clone();
                 Box::pin(async move {
                     observer
-                        .observe_auth_failure_guarded(
+                        .observe_api_auth_failure_guarded(
                             &context,
                             failure,
                             chrono::Utc::now().timestamp_millis().max(0) as u64,

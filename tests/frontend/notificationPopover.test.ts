@@ -19,6 +19,12 @@ const today: NotificationRecord = {
 }
 const earlier = { ...today, id: 'earlier', createdAtMs: now - 86_400_000, updatedAtMs: now - 86_400_000 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
 function mountList(overrides: Record<string, unknown> = {}) {
   return mount(NotificationList, {
     props: {
@@ -81,6 +87,51 @@ describe('NotificationList', () => {
 })
 
 describe('NotificationPopover', () => {
+  it('focuses the rendered panel without waiting for a deferred store open', async () => {
+    setActivePinia(createPinia())
+    const pendingOpen = deferred<void>()
+    vi.spyOn(useNotificationStore(), 'open').mockReturnValue(pendingOpen.promise)
+    const before = document.createElement('button')
+    document.body.append(before)
+    before.focus()
+    const wrapper = mount(NotificationPopover, {
+      props: { show: false },
+      attachTo: document.body,
+    })
+
+    await wrapper.setProps({ show: true })
+    await wrapper.vm.$nextTick()
+
+    expect(document.activeElement).toBe(wrapper.get('#notification-popover-dialog').element)
+    pendingOpen.resolve()
+    await flushPromises()
+    wrapper.unmount()
+    before.remove()
+  })
+
+  it('does not focus a closed panel when a deferred store open resolves', async () => {
+    setActivePinia(createPinia())
+    const pendingOpen = deferred<void>()
+    vi.spyOn(useNotificationStore(), 'open').mockReturnValue(pendingOpen.promise)
+    const outside = document.createElement('button')
+    document.body.append(outside)
+    const wrapper = mount(NotificationPopover, {
+      props: { show: false },
+      attachTo: document.body,
+    })
+
+    await wrapper.setProps({ show: true })
+    await wrapper.setProps({ show: false })
+    outside.focus()
+    pendingOpen.resolve()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(document.activeElement).toBe(outside)
+    wrapper.unmount()
+    outside.remove()
+  })
+
   it('opens by loading the store only and forwards activation after a false mark-read result', async () => {
     setActivePinia(createPinia())
     const store = useNotificationStore()
@@ -99,11 +150,11 @@ describe('NotificationPopover', () => {
     expect(wrapper.emitted('update:show')).toBeUndefined()
   })
 
-  it('closes before emitting the UI-only notification settings action', async () => {
+  it('emits the UI-only notification settings action without claiming close focus ownership', async () => {
     setActivePinia(createPinia())
     const wrapper = mount(NotificationPopover, { props: { show: true } })
     await wrapper.get('[data-testid="notification-settings"]').trigger('click')
-    expect(wrapper.emitted('update:show')).toEqual([[false]])
+    expect(wrapper.emitted('update:show')).toBeUndefined()
     expect(wrapper.emitted('action')).toEqual([[{ type: 'openNotificationSettings' }]])
   })
 

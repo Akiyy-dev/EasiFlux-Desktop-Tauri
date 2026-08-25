@@ -464,7 +464,11 @@ async fn private_api_session_expiry_commits_once_and_returns_only_the_real_recor
     let observer = harness.observer.clone();
     client.set_auth_failure_observer(Arc::new(move |context, failure| {
         let observer = observer.clone();
-        Box::pin(async move { observer.observe_auth_failure(&context, failure, NOW).await })
+        Box::pin(async move {
+            observer
+                .observe_api_auth_failure(&context, failure, NOW)
+                .await
+        })
     }));
 
     let first = client
@@ -543,6 +547,147 @@ async fn concurrent_and_restart_session_replay_keep_one_commit_and_one_diagnosti
     assert!(restarted.persistence.files.lock().unwrap().is_empty());
     assert!(restarted.events.lock().unwrap().is_empty());
     assert!(restarted.diagnostics.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn api_notification_session_identity_survives_failed_retry_and_rearms_on_real_boundaries() {
+    let harness = harness();
+    let client = ApiClient::new();
+    let session = context("alpha", 0);
+    let credential = ApiCredential {
+        label: "Alpha".into(),
+        api_key: "key-one".into(),
+        api_secret: "secret-one".into(),
+        base_url: "https://api.example.test".into(),
+    };
+
+    client
+        .set_credential_for_session(credential.clone(), session.clone())
+        .await;
+    let first = client
+        .notification_session_context_for_test()
+        .await
+        .expect("first effective auth session");
+    let first_id = harness
+        .observer
+        .observe_api_auth_failure(&first, AuthFailureKind::SessionExpired, NOW)
+        .await
+        .unwrap();
+
+    client
+        .set_credential_for_session(credential.clone(), session.clone())
+        .await;
+    let failed_retry = client
+        .notification_session_context_for_test()
+        .await
+        .expect("failed retry keeps its session");
+    assert_eq!(
+        failed_retry.notification_session_token,
+        first.notification_session_token
+    );
+    let retry_id = harness
+        .observer
+        .observe_api_auth_failure(&failed_retry, AuthFailureKind::SessionExpired, NOW + 1)
+        .await
+        .unwrap();
+    assert_eq!(retry_id, first_id);
+
+    client.confirm_connected_session(&session).await;
+    let recovered = client
+        .notification_session_context_for_test()
+        .await
+        .expect("confirmed recovery rearms notifications");
+    assert_ne!(
+        recovered.notification_session_token,
+        first.notification_session_token
+    );
+    let recovered_id = harness
+        .observer
+        .observe_api_auth_failure(&recovered, AuthFailureKind::SessionExpired, NOW + 2)
+        .await
+        .unwrap();
+    assert_ne!(recovered_id, first_id);
+
+    let replaced_credential = ApiCredential {
+        api_key: "key-two".into(),
+        api_secret: "secret-two".into(),
+        ..credential.clone()
+    };
+    client
+        .set_credential_for_session(replaced_credential.clone(), session.clone())
+        .await;
+    let replaced = client
+        .notification_session_context_for_test()
+        .await
+        .expect("credential replacement rearms notifications");
+    assert_ne!(
+        replaced.notification_session_token,
+        recovered.notification_session_token
+    );
+    let replaced_id = harness
+        .observer
+        .observe_api_auth_failure(&replaced, AuthFailureKind::SessionExpired, NOW + 3)
+        .await
+        .unwrap();
+    assert_ne!(replaced_id, recovered_id);
+
+    let environment_credential = ApiCredential {
+        base_url: "https://sandbox.example.test".into(),
+        ..replaced_credential
+    };
+    client
+        .set_credential_for_session(environment_credential.clone(), session.clone())
+        .await;
+    let environment = client
+        .notification_session_context_for_test()
+        .await
+        .expect("environment replacement rearms notifications");
+    assert_ne!(
+        environment.notification_session_token,
+        replaced.notification_session_token
+    );
+    let environment_id = harness
+        .observer
+        .observe_api_auth_failure(&environment, AuthFailureKind::SessionExpired, NOW + 4)
+        .await
+        .unwrap();
+    assert_ne!(environment_id, replaced_id);
+
+    client
+        .set_credential_for_session(environment_credential, context("beta", 0))
+        .await;
+    let replacement_account = client
+        .notification_session_context_for_test()
+        .await
+        .expect("account replacement rearms notifications");
+    assert_ne!(
+        replacement_account.notification_session_token,
+        environment.notification_session_token
+    );
+
+    let restarted_client = ApiClient::new();
+    restarted_client
+        .set_credential_for_session(credential, session)
+        .await;
+    let restarted = restarted_client
+        .notification_session_context_for_test()
+        .await
+        .expect("new process client creates a fresh session");
+    assert_ne!(
+        restarted.notification_session_token,
+        first.notification_session_token
+    );
+    let restarted_id = harness
+        .observer
+        .observe_api_auth_failure(&restarted, AuthFailureKind::SessionExpired, NOW + 5)
+        .await
+        .unwrap();
+    assert_ne!(restarted_id, first_id);
+
+    assert_eq!(records(&harness).len(), 5);
+    assert_eq!(harness.persistence.files.lock().unwrap().len(), 5);
+    assert_eq!(harness.events.lock().unwrap().len(), 5);
+    assert_eq!(harness.diagnostics.lock().unwrap().len(), 5);
 }
 
 #[tokio::test]

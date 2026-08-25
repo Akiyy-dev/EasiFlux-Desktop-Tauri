@@ -100,7 +100,7 @@ fn client_bridge_is_closed_and_maps_only_controlled_fields() {
     );
     assert_eq!(
         recovery.dedupe_key,
-        "alpha:0b102d04-848c-4c84-a644-033383850c71:recovery"
+        "client:0b102d04-848c-4c84-a644-033383850c71:recovery"
     );
     assert_eq!(
         recovery.action,
@@ -129,7 +129,7 @@ fn client_bridge_is_closed_and_maps_only_controlled_fields() {
     );
     assert_eq!(
         reconciliation.dedupe_key,
-        "alpha:5f99306a-385a-44e2-a830-e062b1bb4f54:reconciliation"
+        "client:5f99306a-385a-44e2-a830-e062b1bb4f54:reconciliation"
     );
     let wire = serde_json::to_value(recovery).unwrap();
     assert!(wire.get("fallbackTitle").is_none());
@@ -174,6 +174,47 @@ fn connection_and_environment_policy_keep_incidents_independent() {
 fn producer_context_requires_an_explicit_valid_account_scope() {
     let error = PolicyContext::new("", 4, "event-1").unwrap_err();
     assert_eq!(error.code(), "INVALID_NOTIFICATION_SCOPE");
+}
+
+#[test]
+fn policy_preserves_canonical_account_ids_without_putting_them_in_safe_identifiers() {
+    let policy = NotificationPolicy;
+    for (index, account_id) in [
+        "trader.name@example.com".to_string(),
+        "desk.alpha".to_string(),
+        "账户-甲".to_string(),
+        "a".repeat(96),
+        "token-secret".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!("session:10000000-0000-4000-8000-{index:012}:expired");
+        let input = policy
+            .session_expired(PolicyContext::new(&account_id, 4, &source).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            input.scope,
+            NotificationScope::Account {
+                account_id: account_id.clone(),
+            }
+        );
+        assert_eq!(
+            input.content.params.get("accountId"),
+            Some(&NotificationScalar::String(account_id.clone()))
+        );
+        assert_eq!(
+            input.entity,
+            Some(crate::models::notification::NotificationEntity {
+                entity_type: crate::models::notification::NotificationEntityType::Account,
+                id: account_id.clone(),
+            })
+        );
+        assert_eq!(input.source_event_id.as_deref(), Some(source.as_str()));
+        assert!(!input.dedupe_key.contains(&account_id));
+        input.validate().unwrap();
+    }
 }
 
 #[test]

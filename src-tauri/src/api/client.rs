@@ -23,10 +23,33 @@ use super::response::{classify_auth_failure, is_success_response, AuthFailureKin
 /// Ordered query pairs for private GET signing (SDK insertion order).
 pub type QueryParams = Vec<(String, String)>;
 pub(crate) type AuthFailureObserver = Arc<
-    dyn Fn(SessionContext, AuthFailureKind) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
+    dyn Fn(
+            ApiSessionContext,
+            AuthFailureKind,
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
         + Send
         + Sync,
 >;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApiSessionContext {
+    pub session: SessionContext,
+    pub notification_session_token: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ApiSessionIdentity {
+    account_id: String,
+    api_key: String,
+    api_secret: String,
+    base_url: String,
+}
+
+#[derive(Clone)]
+struct InstalledApiSession {
+    context: ApiSessionContext,
+    identity: ApiSessionIdentity,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct HttpTimeoutPolicy {
@@ -54,7 +77,8 @@ pub struct ApiClient {
     credential: Arc<RwLock<Option<ApiCredential>>>,
     signer: Arc<RwLock<Option<Signer>>>,
     time_sync: Arc<TimeSync>,
-    session_context: Arc<RwLock<Option<SessionContext>>>,
+    session_context: Arc<RwLock<Option<InstalledApiSession>>>,
+    session_install_lock: Arc<tokio::sync::Mutex<()>>,
     auth_failure_observer: Arc<std::sync::RwLock<Option<AuthFailureObserver>>>,
 }
 
@@ -76,6 +100,7 @@ impl ApiClient {
             signer: Arc::new(RwLock::new(None)),
             time_sync: Arc::new(TimeSync::new()),
             session_context: Arc::new(RwLock::new(None)),
+            session_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auth_failure_observer: Arc::new(std::sync::RwLock::new(None)),
         }
     }
@@ -107,8 +132,54 @@ impl ApiClient {
         credential: ApiCredential,
         context: SessionContext,
     ) {
+        let _install = self.session_install_lock.lock().await;
+        let credential = credential.normalize();
+        if !credential.is_valid() {
+            self.set_credential(credential).await;
+            return;
+        }
+        let identity = ApiSessionIdentity {
+            account_id: context.account_id.clone(),
+            api_key: credential.api_key.clone(),
+            api_secret: credential.api_secret.clone(),
+            base_url: credential.base_url.clone(),
+        };
+        let notification_session_token = self
+            .session_context
+            .read()
+            .await
+            .as_ref()
+            .filter(|installed| installed.identity == identity)
+            .map(|installed| installed.context.notification_session_token.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.set_credential(credential).await;
-        *self.session_context.write().await = Some(context);
+        *self.session_context.write().await = Some(InstalledApiSession {
+            context: ApiSessionContext {
+                session: context,
+                notification_session_token,
+            },
+            identity,
+        });
+    }
+
+    pub(crate) async fn confirm_connected_session(&self, context: &SessionContext) {
+        let _install = self.session_install_lock.lock().await;
+        let mut installed = self.session_context.write().await;
+        if let Some(installed) = installed
+            .as_mut()
+            .filter(|installed| installed.context.session == *context)
+        {
+            installed.context.notification_session_token = uuid::Uuid::new_v4().to_string();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn notification_session_context_for_test(&self) -> Option<ApiSessionContext> {
+        self.session_context
+            .read()
+            .await
+            .as_ref()
+            .map(|installed| installed.context.clone())
     }
 
     pub(crate) fn set_auth_failure_observer(&self, observer: AuthFailureObserver) {
@@ -118,6 +189,7 @@ impl ApiClient {
     }
 
     pub async fn clear_credential(&self) {
+        let _install = self.session_install_lock.lock().await;
         *self.credential.write().await = None;
         *self.signer.write().await = None;
         *self.session_context.write().await = None;
@@ -158,7 +230,12 @@ impl ApiClient {
     }
 
     async fn private_get_once(&self, path: &str, params: &QueryParams) -> AppResult<Value> {
-        let context = self.session_context.read().await.clone();
+        let context = self
+            .session_context
+            .read()
+            .await
+            .as_ref()
+            .map(|installed| installed.context.clone());
         let query = encode_query(params);
         let headers = self.sign_headers(&query, "").await?;
         let base = format!("{}{}", self.base_url().await, path);
@@ -188,7 +265,12 @@ impl ApiClient {
     }
 
     async fn private_post_once(&self, path: &str, body: Value) -> AppResult<Value> {
-        let context = self.session_context.read().await.clone();
+        let context = self
+            .session_context
+            .read()
+            .await
+            .as_ref()
+            .map(|installed| installed.context.clone());
         let url = format!("{}{}", self.base_url().await, path);
         let body_text =
             serde_json::to_string(&body).map_err(|e| AppError::Internal(e.to_string()))?;
@@ -230,7 +312,7 @@ impl ApiClient {
         &self,
         response: reqwest::Response,
         path: Option<&str>,
-        context: Option<SessionContext>,
+        context: Option<ApiSessionContext>,
     ) -> AppResult<Value> {
         let status = response.status();
         let status_auth_failure =
@@ -395,8 +477,11 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let captured_calls = Arc::clone(&calls);
         client.set_auth_failure_observer(Arc::new(move |context, failure| {
-            assert_eq!(context.account_id, "alpha");
-            assert_eq!(context.session_epoch, 4);
+            assert_eq!(context.session.account_id, "alpha");
+            assert_eq!(context.session.session_epoch, 4);
+            assert!(crate::models::notification::is_generated_uuid(
+                &context.notification_session_token
+            ));
             assert_eq!(failure, AuthFailureKind::SessionExpired);
             captured_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Some("committed-notification-id".to_string()) })

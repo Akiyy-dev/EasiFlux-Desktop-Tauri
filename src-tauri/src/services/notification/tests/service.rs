@@ -323,6 +323,160 @@ async fn concurrent_and_restart_source_replay_return_the_stable_live_record() {
 }
 
 #[tokio::test]
+async fn effective_session_token_dedupes_one_edge_and_rearms_after_recovery_or_restart() {
+    let first_run = harness(NotificationFileV1::empty());
+    let token_one = "10000000-0000-4000-8000-000000000001";
+    let (left, right) = tokio::join!(
+        first_run
+            .service
+            .observe_session_expired("alpha".into(), 7, token_one, NOW),
+        first_run
+            .service
+            .observe_session_expired("alpha".into(), 7, token_one, NOW),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_eq!(
+        left.notification.as_ref().unwrap().id,
+        right.notification.as_ref().unwrap().id
+    );
+    assert_eq!(
+        first_run
+            .service
+            .summary(ViewContext::account("alpha").unwrap(), NOW)
+            .await
+            .unwrap()
+            .unread_count,
+        1
+    );
+    assert_eq!(first_run.persistence.saves().len(), 1);
+    {
+        let events = first_run.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].change, NotificationChange::Created);
+        assert!(events[0].toast_candidate.is_some());
+    }
+
+    let replay = first_run
+        .service
+        .observe_session_expired("alpha".into(), 7, token_one, NOW + 1)
+        .await
+        .unwrap();
+    assert!(!replay.committed);
+    assert_eq!(first_run.persistence.saves().len(), 1);
+    assert_eq!(first_run.events.lock().unwrap().len(), 1);
+
+    let recovered_session = first_run
+        .service
+        .observe_session_expired(
+            "alpha".into(),
+            7,
+            "20000000-0000-4000-8000-000000000002",
+            NOW + 2,
+        )
+        .await
+        .unwrap();
+    assert!(recovered_session.committed);
+    assert_eq!(
+        first_run
+            .service
+            .summary(ViewContext::account("alpha").unwrap(), NOW + 2)
+            .await
+            .unwrap()
+            .unread_count,
+        2
+    );
+    assert_eq!(first_run.persistence.saves().len(), 2);
+    {
+        let events = first_run.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].change, NotificationChange::Created);
+        assert!(events[1].toast_candidate.is_some());
+    }
+
+    let persisted = first_run.persistence.saves().last().unwrap().clone();
+    let restarted = harness(persisted);
+    let restarted_session = restarted
+        .service
+        .observe_session_expired(
+            "alpha".into(),
+            7,
+            "30000000-0000-4000-8000-000000000003",
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+    assert!(restarted_session.committed);
+    assert_eq!(
+        restarted
+            .service
+            .summary(ViewContext::account("alpha").unwrap(), NOW + 3)
+            .await
+            .unwrap()
+            .unread_count,
+        3
+    );
+    assert_eq!(restarted.persistence.saves().len(), 1);
+    {
+        let events = restarted.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].change, NotificationChange::Created);
+        assert!(events[0].toast_candidate.is_some());
+    }
+}
+
+#[tokio::test]
+async fn service_roundtrips_every_canonical_account_id_shape() {
+    let harness = harness(NotificationFileV1::empty());
+    for (index, account_id) in [
+        "trader.name@example.com".to_string(),
+        "desk.alpha".to_string(),
+        "账户-甲".to_string(),
+        "a".repeat(96),
+        "token-secret".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let outcome = harness
+            .service
+            .observe_session_expired(
+                account_id.clone(),
+                7,
+                &format!("10000000-0000-4000-8000-{index:012}"),
+                NOW + index as u64,
+            )
+            .await
+            .unwrap();
+        let notification = outcome.notification.unwrap();
+        let page = harness
+            .service
+            .list(
+                ViewContext::account(&account_id).unwrap(),
+                ListNotificationsRequest {
+                    account_id: Some(account_id.clone()),
+                    filter: NotificationFilter::All,
+                    cursor: None,
+                    limit: 100,
+                },
+                NOW + index as u64,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.items[0].id, notification.id);
+        assert_eq!(
+            page.items[0].scope,
+            NotificationScope::Account {
+                account_id: account_id.clone(),
+            }
+        );
+        assert!(!page.items[0].dedupe_key.contains(&account_id));
+    }
+    assert_eq!(harness.persistence.saves().len(), 5);
+}
+
+#[tokio::test]
 async fn source_publish_persistence_failure_returns_no_replay_marker_or_state() {
     let harness = harness(NotificationFileV1::empty());
     harness.persistence.fail_next();

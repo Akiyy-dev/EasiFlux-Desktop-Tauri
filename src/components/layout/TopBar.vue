@@ -16,15 +16,28 @@ const appStore = useAppStore()
 const { version } = storeToRefs(appStore)
 const showNotifications = ref(false)
 const bell = ref<{ focus: () => void; contains: (target: unknown) => boolean } | null>(null)
+let suppressBellFocusOnce = false
 
 const emit = defineEmits<{ action: [action: NotificationUiAction] }>()
 
 watch(showNotifications, async (isOpen, wasOpen) => {
   if (!isOpen && wasOpen) {
+    if (suppressBellFocusOnce) {
+      suppressBellFocusOnce = false
+      return
+    }
     await nextTick()
     bell.value?.focus()
   }
 })
+
+function handleNotificationAction(action: NotificationUiAction): void {
+  if (action.type === 'openNotificationSettings' && showNotifications.value) {
+    suppressBellFocusOnce = true
+    showNotifications.value = false
+  }
+  emit('action', action)
+}
 
 function notificationLabel(unreadCount: number | null): string {
   if (unreadCount === null) return '通知，未读数量未知'
@@ -60,7 +73,7 @@ function badgeLabel(unreadCount: number | null): string | null {
       <NotificationPopover
         v-model:show="showNotifications"
         :trigger-element="bell"
-        @action="emit('action', $event)"
+        @action="handleNotificationAction"
       >
         <template #trigger="{ unreadCount }">
           <button

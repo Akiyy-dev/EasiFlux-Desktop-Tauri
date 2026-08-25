@@ -1079,13 +1079,20 @@ impl NotificationService {
         &self,
         account_id: String,
         session_epoch: u64,
+        notification_session_token: &str,
         now_ms: u64,
     ) -> Result<PublishOutcome, NotificationError> {
         ViewContext::account(&account_id)?;
+        if !crate::models::notification::is_generated_uuid(notification_session_token) {
+            return Err(NotificationError::new(
+                "INVALID_NOTIFICATION_CONTENT",
+                "通知会话标识无效",
+            ));
+        }
         let context = policy::PolicyContext::new(
             account_id,
             session_epoch,
-            format!("session:{session_epoch}:expired"),
+            format!("session:{notification_session_token}:expired"),
         )?;
         let input = NotificationPolicy.session_expired(context)?;
         self.publish(input, now_ms).await

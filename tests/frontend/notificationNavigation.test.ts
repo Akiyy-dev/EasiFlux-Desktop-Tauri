@@ -13,10 +13,12 @@ vi.mock('../../src/components/market/KlineChart.vue', () => ({
 }))
 
 function mountShell() {
+  const pinia = createPinia()
+  setActivePinia(pinia)
   return mount(AppShell, {
     attachTo: document.body,
     global: {
-      plugins: [createPinia()],
+      plugins: [pinia],
       stubs: {
         TradingLayout: { template: '<div />' },
         ChartWorkspacePage: { template: '<div />' },
@@ -96,6 +98,35 @@ describe('notification action navigation', () => {
     expect(document.activeElement).toBe(heading.element)
     pendingFlush.resolve()
     await flushPromises()
+    wrapper.unmount()
+  })
+
+  it('hands focus from the real notification footer sequence to the settings heading', async () => {
+    const wrapper = mountShell()
+
+    await wrapper.get('[data-testid="notification-bell"]').trigger('click')
+    await flushPromises()
+    const settings = document.querySelector('[data-testid="notification-settings"]')
+    expect(settings).toBeInstanceOf(HTMLButtonElement)
+    ;(settings as HTMLButtonElement).click()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(document.activeElement).toBe(wrapper.get('#notification-settings-title').element)
+    wrapper.unmount()
+  })
+
+  it('restores focus to the bell for an ordinary popover close', async () => {
+    const wrapper = mountShell()
+    const bell = wrapper.get('[data-testid="notification-bell"]')
+
+    await bell.trigger('click')
+    await flushPromises()
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(document.activeElement).toBe(bell.element)
     wrapper.unmount()
   })
 })

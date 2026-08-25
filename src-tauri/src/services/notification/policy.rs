@@ -124,7 +124,7 @@ impl NotificationPolicy {
             Some(NotificationAction::OpenTrading {
                 order_id: Some(order_id.into()),
             }),
-            format!("{}:{order_id}:{suffix}", context.account_id),
+            format!("order:{order_id}:{suffix}"),
         )
     }
 
@@ -170,7 +170,7 @@ impl NotificationPolicy {
             Some(NotificationAction::OpenTrading {
                 order_id: order_id.map(str::to_owned),
             }),
-            format!("{}:{identity}:rejected", context.account_id),
+            format!("order:{identity}:rejected"),
         )
     }
 
@@ -202,8 +202,7 @@ impl NotificationPolicy {
                 account_section: AccountNotificationSection::Risk,
             }),
             format!(
-                "{}:{}:{}",
-                context.account_id,
+                "risk:{}:{}",
                 context.source_event_id,
                 risk_code(violation.code)
             ),
@@ -235,10 +234,7 @@ impl NotificationPolicy {
             Some(NotificationAction::OpenAccountSettings {
                 account_section: AccountNotificationSection::Api,
             }),
-            format!(
-                "{}:{}:session-expired",
-                context.account_id, context.session_epoch
-            ),
+            context.source_event_id.clone(),
         )
     }
 
@@ -293,7 +289,7 @@ impl NotificationPolicy {
             Some(NotificationAction::OpenAccountSettings {
                 account_section: AccountNotificationSection::Api,
             }),
-            format!("{}:{}:{suffix}", context.account_id, request.attempt_id),
+            context.source_event_id.clone(),
         )
     }
 
@@ -362,8 +358,7 @@ impl NotificationPolicy {
             }),
             None,
             format!(
-                "{}:{}:{incident_id}:{suffix}",
-                context.account_id,
+                "connection:{}:{incident_id}:{suffix}",
                 channel_name(channel)
             ),
         )
@@ -437,10 +432,7 @@ impl NotificationPolicy {
                 id: environment_key.into(),
             }),
             None,
-            format!(
-                "{}:{}:{incident_id}:{suffix}",
-                context.account_id, environment_key
-            ),
+            format!("environment:{environment_key}:{incident_id}:{suffix}"),
         )
     }
 }

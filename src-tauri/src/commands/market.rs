@@ -518,7 +518,7 @@ mod tests {
             let observer = session_observer.clone();
             Box::pin(async move {
                 observer
-                    .observe_auth_failure(&context, failure, 1_784_606_400_000)
+                    .observe_api_auth_failure(&context, failure, 1_784_606_400_000)
                     .await
             })
         }));

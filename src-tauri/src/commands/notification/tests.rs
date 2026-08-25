@@ -362,14 +362,89 @@ async fn client_bridge_allowed_kinds_derive_closed_policy_and_deterministic_step
             result.notification.source_event_id.as_deref(),
             Some(expected_source.as_str())
         );
-        assert_eq!(
-            result.notification.dedupe_key,
-            format!("primary:10000000-0000-4000-8000-000000000001:{suffix}")
-        );
+        assert_eq!(result.notification.dedupe_key, expected_source);
         assert_eq!(result.unread_count, 3);
         assert_eq!(result.revision, "8");
         assert_eq!(fixture.persistence.saves.lock().unwrap().len(), 1);
         assert_eq!(fixture.events.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn client_command_roundtrips_every_canonical_account_id_shape() {
+    use crate::models::notification::{
+        ClientNotificationFailedStep as Step, ClientNotificationKind as ClientKind,
+    };
+
+    for (index, account_id) in [
+        "trader.name@example.com".to_string(),
+        "desk.alpha".to_string(),
+        "账户-甲".to_string(),
+        "a".repeat(96),
+        "token-secret".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = fixture();
+        {
+            let mut config = fixture.config.write().await;
+            config.active_account_id = account_id.clone();
+            config.accounts = vec![account_id.clone()];
+        }
+        let created = create_client_notification_inner(
+            &fixture.runtime,
+            &fixture.config,
+            &fixture.lifecycle,
+            crate::models::notification::CreateClientNotificationRequest {
+                account_id: account_id.clone(),
+                session_epoch: 0,
+                attempt_id: format!("10000000-0000-4000-8000-{index:012}"),
+                kind: ClientKind::AccountRecoveryFailed,
+                failed_steps: vec![Step::Config],
+            },
+            NOW_MS,
+        )
+        .await
+        .unwrap();
+
+        let page = list_notifications_inner(
+            &fixture.runtime,
+            &fixture.config,
+            &fixture.lifecycle,
+            ListNotificationsRequest {
+                account_id: Some(account_id.clone()),
+                filter: NotificationFilter::All,
+                cursor: None,
+                limit: DEFAULT_NOTIFICATION_PAGE_LIMIT,
+            },
+            NOW_MS,
+        )
+        .await
+        .unwrap();
+        let listed = page
+            .items
+            .iter()
+            .find(|item| item.id == created.notification.id)
+            .unwrap();
+        assert_eq!(
+            listed.scope,
+            NotificationScope::Account {
+                account_id: account_id.clone(),
+            }
+        );
+        assert!(!listed.dedupe_key.contains(&account_id));
+
+        let cleared = clear_account_notifications_inner(
+            &fixture.runtime,
+            &fixture.config,
+            &fixture.lifecycle,
+            account_id,
+            NOW_MS + 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.affected_count, 1);
     }
 }
 
@@ -1187,6 +1262,25 @@ async fn clear_requires_a_configured_current_account() {
     .await
     .unwrap_err();
     assert_eq!(missing.code, "NOTIFICATION_ACCOUNT_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn clear_accepts_a_normalized_migrated_active_account_missing_from_accounts() {
+    let fixture = fixture();
+    fixture.config.write().await.accounts.clear();
+
+    let cleared = clear_account_notifications_inner(
+        &fixture.runtime,
+        &fixture.config,
+        &fixture.lifecycle,
+        "primary".into(),
+        NOW_MS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(cleared.affected_count, 1);
+    assert_eq!(cleared.unread_count, 1);
 }
 
 #[tokio::test]

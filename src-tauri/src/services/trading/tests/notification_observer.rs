@@ -1221,7 +1221,7 @@ async fn place_order_session_expiry_has_one_durable_diagnostic_owner() {
         let observer = session_observer.clone();
         Box::pin(async move {
             observer
-                .observe_auth_failure(&context, failure, NOW_MS)
+                .observe_api_auth_failure(&context, failure, NOW_MS)
                 .await
         })
     }));
@@ -1336,7 +1336,7 @@ async fn session_expired_create_order_preserves_typed_notification_provenance_an
         let observer = session_observer.clone();
         Box::pin(async move {
             observer
-                .observe_auth_failure(&context, failure, NOW_MS)
+                .observe_api_auth_failure(&context, failure, NOW_MS)
                 .await
         })
     }));
@@ -1466,7 +1466,7 @@ async fn committed_session_expiry_survives_risk_release_save_failure_and_replay(
         let observer = session_observer.clone();
         Box::pin(async move {
             observer
-                .observe_auth_failure(&context, failure, NOW_MS)
+                .observe_api_auth_failure(&context, failure, NOW_MS)
                 .await
         })
     }));
@@ -2392,7 +2392,7 @@ async fn ws_rejection_without_submission_uses_real_order_id_identity() {
     assert!(!source.contains("order-real-identity-1"));
     assert_eq!(
         records[0].dedupe_key,
-        "alpha:order-real-identity-1:rejected"
+        "order:order-real-identity-1:rejected"
     );
 }
 

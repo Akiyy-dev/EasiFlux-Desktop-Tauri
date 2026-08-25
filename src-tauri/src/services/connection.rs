@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::api::client::ApiSessionContext;
 use crate::api::response::AuthFailureKind;
 use crate::api::{ApiClient, PublicApi};
 
@@ -186,24 +187,26 @@ impl SessionNotificationObserver {
         }
     }
 
-    pub(crate) async fn observe_auth_failure(
+    pub(crate) async fn observe_api_auth_failure(
         &self,
-        context: &SessionContext,
+        context: &ApiSessionContext,
         failure: AuthFailureKind,
         now_ms: u64,
     ) -> Option<String> {
         let _guard = self.account_lifecycle.read_guard().await;
-        self.observe_auth_failure_guarded(context, failure, now_ms)
+        self.observe_api_auth_failure_guarded(context, failure, now_ms)
             .await
     }
 
-    pub(crate) async fn observe_auth_failure_guarded(
+    pub(crate) async fn observe_api_auth_failure_guarded(
         &self,
-        context: &SessionContext,
+        context: &ApiSessionContext,
         failure: AuthFailureKind,
         now_ms: u64,
     ) -> Option<String> {
-        if failure != AuthFailureKind::SessionExpired || !self.is_current_guarded(context).await {
+        if failure != AuthFailureKind::SessionExpired
+            || !self.is_current_guarded(&context.session).await
+        {
             return None;
         }
         let service = match self.runtime.service() {
@@ -217,7 +220,12 @@ impl SessionNotificationObserver {
             }
         };
         match service
-            .observe_session_expired(context.account_id.clone(), context.session_epoch, now_ms)
+            .observe_session_expired(
+                context.session.account_id.clone(),
+                context.session.session_epoch,
+                &context.notification_session_token,
+                now_ms,
+            )
             .await
         {
             Ok(outcome) => {
@@ -235,6 +243,42 @@ impl SessionNotificationObserver {
                 None
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_auth_failure(
+        &self,
+        context: &SessionContext,
+        failure: AuthFailureKind,
+        now_ms: u64,
+    ) -> Option<String> {
+        self.observe_api_auth_failure(
+            &ApiSessionContext {
+                session: context.clone(),
+                notification_session_token: "00000000-0000-4000-8000-000000000001".into(),
+            },
+            failure,
+            now_ms,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_auth_failure_guarded(
+        &self,
+        context: &SessionContext,
+        failure: AuthFailureKind,
+        now_ms: u64,
+    ) -> Option<String> {
+        self.observe_api_auth_failure_guarded(
+            &ApiSessionContext {
+                session: context.clone(),
+                notification_session_token: "00000000-0000-4000-8000-000000000001".into(),
+            },
+            failure,
+            now_ms,
+        )
+        .await
     }
 }
 
@@ -491,6 +535,7 @@ impl ConnectionService {
             }
         }
 
+        self.api.confirm_connected_session(context).await;
         self.set_status(context, ConnectionStatus::Connected).await;
         self.notification_observer
             .observe_connection_status_guarded(

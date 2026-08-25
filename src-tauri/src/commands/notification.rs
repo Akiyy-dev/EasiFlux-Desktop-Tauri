@@ -95,11 +95,12 @@ struct CreateClientNotificationOutcome {
 }
 
 fn configured_account_exists(config: &AppConfig, requested: &str) -> bool {
-    config
-        .accounts
-        .iter()
-        .map(|account_id| account_id.trim())
-        .any(|account_id| account_id == requested)
+    crate::services::account_profiles::normalize_account_ids(
+        &config.accounts,
+        &config.active_account_id,
+    )
+    .iter()
+    .any(|account_id| account_id == requested)
 }
 
 fn resolve_context(
