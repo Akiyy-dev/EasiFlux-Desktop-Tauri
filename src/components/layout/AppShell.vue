@@ -128,9 +128,7 @@ function selectSection(section: SidebarSectionKey): void {
 
 function focusNotificationSettingsHeading(): void {
   void nextTick(() => {
-    const heading = globalThis.document.querySelector(
-      '#notification-settings-title, .main h1, .main h2, .main h3',
-    )
+    const heading = globalThis.document.getElementById('notification-settings-title')
     if (!(heading instanceof globalThis.HTMLElement)) return
     heading.tabIndex = -1
     heading.focus()

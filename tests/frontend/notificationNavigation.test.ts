@@ -2,6 +2,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import AppShell from '../../src/components/layout/AppShell.vue'
+import NotificationPopover from '../../src/components/notifications/NotificationPopover.vue'
 import TopBar from '../../src/components/layout/TopBar.vue'
 import { flushActiveChartWorkspace } from '../../src/services/chartWorkspaceFlushRegistry'
 
@@ -25,7 +26,7 @@ function mountShell() {
         DashboardPage: { template: '<div />' },
         SettingsCenterPage: {
           props: ['initialSection', 'initialAccountSection'],
-          template: '<section data-testid="settings-content" :data-account-section="initialAccountSection"><h2 v-if="initialSection === \'notifications\'" id="notification-settings-title">通知设置</h2><h1 v-else>{{ initialSection }}</h1></section>',
+          template: '<section data-testid="settings-content" :data-account-section="initialAccountSection"><h1>设置</h1><h2 v-if="initialSection === \'notifications\'" id="notification-settings-title">通知设置</h2><h2 v-else>{{ initialSection }}</h2></section>',
         },
       },
     },
@@ -110,6 +111,14 @@ describe('notification action navigation', () => {
     expect(settings).toBeInstanceOf(HTMLButtonElement)
     ;(settings as HTMLButtonElement).click()
     await flushPromises()
+
+    const afterLeave = wrapper
+      .getComponent(NotificationPopover)
+      .getComponent({ name: 'Popover' })
+      .props('internalOnAfterLeave')
+    expect(afterLeave).toBeTypeOf('function')
+    ;(afterLeave as () => void)()
+    await flushPromises()
     await wrapper.vm.$nextTick()
 
     expect(document.activeElement).toBe(wrapper.get('#notification-settings-title').element)
@@ -128,5 +137,26 @@ describe('notification action navigation', () => {
 
     expect(document.activeElement).toBe(bell.element)
     wrapper.unmount()
+  })
+
+  it('restores focus after the full outside-pointer click sequence completes', async () => {
+    const wrapper = mountShell()
+    const bell = wrapper.get('[data-testid="notification-bell"]')
+    const outside = document.createElement('button')
+    document.body.append(outside)
+
+    await bell.trigger('click')
+    await flushPromises()
+    outside.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    await flushPromises()
+    outside.focus()
+    outside.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+    outside.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(document.activeElement).toBe(bell.element)
+    wrapper.unmount()
+    outside.remove()
   })
 })

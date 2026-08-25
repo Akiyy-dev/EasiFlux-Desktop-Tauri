@@ -24,6 +24,7 @@ const {
 } = storeToRefs(notificationStore)
 const panel = ref<{ focus: () => void; contains: (target: unknown) => boolean } | null>(null)
 let showGeneration = 0
+let notificationSettingsPending = false
 
 function close(): void {
   if (props.show) emit('update:show', false)
@@ -36,7 +37,7 @@ function onEscape(event: { key: string; preventDefault: () => void }): void {
   }
 }
 
-function onOutsidePointer(event: { target: unknown }): void {
+function onOutsideClick(event: { target: unknown }): void {
   const target = event.target
   if (!panel.value || panel.value.contains(target) || props.triggerElement?.contains(target)) return
   close()
@@ -44,12 +45,12 @@ function onOutsidePointer(event: { target: unknown }): void {
 
 function addDocumentListeners(): void {
   globalThis.document.addEventListener('keydown', onEscape)
-  globalThis.document.addEventListener('mousedown', onOutsidePointer)
+  globalThis.document.addEventListener('click', onOutsideClick)
 }
 
 function removeDocumentListeners(): void {
   globalThis.document.removeEventListener('keydown', onEscape)
-  globalThis.document.removeEventListener('mousedown', onOutsidePointer)
+  globalThis.document.removeEventListener('click', onOutsideClick)
 }
 
 watch(() => props.show, async (isOpen, wasOpen) => {
@@ -76,6 +77,13 @@ async function activate(record: NotificationRecord): Promise<void> {
 }
 
 function openNotificationSettings(): void {
+  notificationSettingsPending = true
+  close()
+}
+
+function handleAfterLeave(): void {
+  if (!notificationSettingsPending) return
+  notificationSettingsPending = false
   emit('action', { type: 'openNotificationSettings' })
 }
 </script>
@@ -85,6 +93,7 @@ function openNotificationSettings(): void {
     trigger="manual"
     placement="bottom-end"
     :show="show"
+    :internal-on-after-leave="handleAfterLeave"
     @update:show="emit('update:show', $event)"
   >
     <template #trigger>

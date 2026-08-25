@@ -8,7 +8,11 @@ import type { NotificationRecord } from '../../src/types/notification'
 import { useNotificationStore } from '../../src/stores/notification'
 
 vi.mock('naive-ui', () => ({
-  NPopover: { name: 'NPopover', template: '<div><slot name="trigger" /><slot /></div>' },
+  NPopover: {
+    name: 'NPopover',
+    props: ['internalOnAfterLeave'],
+    template: '<div><slot name="trigger" /><slot /></div>',
+  },
 }))
 
 const now = 1_700_000_000_000
@@ -150,11 +154,19 @@ describe('NotificationPopover', () => {
     expect(wrapper.emitted('update:show')).toBeUndefined()
   })
 
-  it('emits the UI-only notification settings action without claiming close focus ownership', async () => {
+  it('waits for the popover to leave before opening notification settings', async () => {
     setActivePinia(createPinia())
     const wrapper = mount(NotificationPopover, { props: { show: true } })
     await wrapper.get('[data-testid="notification-settings"]').trigger('click')
-    expect(wrapper.emitted('update:show')).toBeUndefined()
+
+    expect(wrapper.emitted('update:show')).toEqual([[false]])
+    expect(wrapper.emitted('action')).toBeUndefined()
+
+    const afterLeave = wrapper.getComponent({ name: 'NPopover' }).props('internalOnAfterLeave')
+    expect(afterLeave).toBeTypeOf('function')
+    ;(afterLeave as () => void)()
+    await wrapper.vm.$nextTick()
+
     expect(wrapper.emitted('action')).toEqual([[{ type: 'openNotificationSettings' }]])
   })
 
@@ -176,7 +188,7 @@ describe('NotificationPopover', () => {
     const outside = document.createElement('button')
     document.body.append(outside)
 
-    outside.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    outside.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await flushPromises()
 
     expect(wrapper.emitted('update:show')).toEqual([[false]])
