@@ -535,7 +535,6 @@ impl ConnectionService {
             }
         }
 
-        self.api.confirm_connected_session(context).await;
         self.set_status(context, ConnectionStatus::Connected).await;
         self.notification_observer
             .observe_connection_status_guarded(

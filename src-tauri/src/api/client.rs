@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::api::PublicApi;
@@ -37,18 +38,22 @@ pub(crate) struct ApiSessionContext {
     pub notification_session_token: String,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct ApiSessionIdentity {
-    account_id: String,
-    api_key: String,
-    api_secret: String,
-    base_url: String,
-}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ApiSessionFingerprint([u8; 32]);
 
 #[derive(Clone)]
 struct InstalledApiSession {
     context: ApiSessionContext,
-    identity: ApiSessionIdentity,
+    fingerprint: ApiSessionFingerprint,
+    request_owner: uuid::Uuid,
+    rearm_pending: bool,
+}
+
+#[derive(Clone)]
+struct RememberedApiSession {
+    fingerprint: ApiSessionFingerprint,
+    notification_session_token: String,
+    rearm_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +83,7 @@ pub struct ApiClient {
     signer: Arc<RwLock<Option<Signer>>>,
     time_sync: Arc<TimeSync>,
     session_context: Arc<RwLock<Option<InstalledApiSession>>>,
+    remembered_session: Arc<RwLock<Option<RememberedApiSession>>>,
     session_install_lock: Arc<tokio::sync::Mutex<()>>,
     auth_failure_observer: Arc<std::sync::RwLock<Option<AuthFailureObserver>>>,
 }
@@ -100,6 +106,7 @@ impl ApiClient {
             signer: Arc::new(RwLock::new(None)),
             time_sync: Arc::new(TimeSync::new()),
             session_context: Arc::new(RwLock::new(None)),
+            remembered_session: Arc::new(RwLock::new(None)),
             session_install_lock: Arc::new(tokio::sync::Mutex::new(())),
             auth_failure_observer: Arc::new(std::sync::RwLock::new(None)),
         }
@@ -110,6 +117,7 @@ impl ApiClient {
     }
 
     pub async fn set_credential(&self, credential: ApiCredential) {
+        let _install = self.session_install_lock.lock().await;
         let credential = credential.normalize();
         if !credential.is_valid() {
             *self.base_url.write().await = String::new();
@@ -118,6 +126,11 @@ impl ApiClient {
             *self.session_context.write().await = None;
             return;
         }
+        self.set_credential_material(credential).await;
+        *self.session_context.write().await = None;
+    }
+
+    async fn set_credential_material(&self, credential: ApiCredential) {
         let base = normalize_base_url(&credential.base_url);
         *self.base_url.write().await = base;
         *self.signer.write().await = Some(Signer::new(
@@ -135,42 +148,40 @@ impl ApiClient {
         let _install = self.session_install_lock.lock().await;
         let credential = credential.normalize();
         if !credential.is_valid() {
-            self.set_credential(credential).await;
+            *self.base_url.write().await = String::new();
+            *self.credential.write().await = None;
+            *self.signer.write().await = None;
+            *self.session_context.write().await = None;
             return;
         }
-        let identity = ApiSessionIdentity {
-            account_id: context.account_id.clone(),
-            api_key: credential.api_key.clone(),
-            api_secret: credential.api_secret.clone(),
-            base_url: credential.base_url.clone(),
-        };
-        let notification_session_token = self
-            .session_context
+        let fingerprint = api_session_fingerprint(&context.account_id, &credential);
+        let remembered = self
+            .remembered_session
             .read()
             .await
             .as_ref()
-            .filter(|installed| installed.identity == identity)
-            .map(|installed| installed.context.notification_session_token.clone())
+            .filter(|remembered| remembered.fingerprint == fingerprint)
+            .cloned();
+        let notification_session_token = remembered
+            .as_ref()
+            .map(|remembered| remembered.notification_session_token.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        self.set_credential(credential).await;
+        let rearm_pending = remembered.is_some_and(|remembered| remembered.rearm_pending);
+        self.set_credential_material(credential).await;
         *self.session_context.write().await = Some(InstalledApiSession {
             context: ApiSessionContext {
                 session: context,
-                notification_session_token,
+                notification_session_token: notification_session_token.clone(),
             },
-            identity,
+            fingerprint,
+            request_owner: uuid::Uuid::new_v4(),
+            rearm_pending,
         });
-    }
-
-    pub(crate) async fn confirm_connected_session(&self, context: &SessionContext) {
-        let _install = self.session_install_lock.lock().await;
-        let mut installed = self.session_context.write().await;
-        if let Some(installed) = installed
-            .as_mut()
-            .filter(|installed| installed.context.session == *context)
-        {
-            installed.context.notification_session_token = uuid::Uuid::new_v4().to_string();
-        }
+        *self.remembered_session.write().await = Some(RememberedApiSession {
+            fingerprint,
+            notification_session_token,
+            rearm_pending,
+        });
     }
 
     #[cfg(test)]
@@ -230,12 +241,7 @@ impl ApiClient {
     }
 
     async fn private_get_once(&self, path: &str, params: &QueryParams) -> AppResult<Value> {
-        let context = self
-            .session_context
-            .read()
-            .await
-            .as_ref()
-            .map(|installed| installed.context.clone());
+        let context = self.session_for_request().await;
         let query = encode_query(params);
         let headers = self.sign_headers(&query, "").await?;
         let base = format!("{}{}", self.base_url().await, path);
@@ -265,12 +271,7 @@ impl ApiClient {
     }
 
     async fn private_post_once(&self, path: &str, body: Value) -> AppResult<Value> {
-        let context = self
-            .session_context
-            .read()
-            .await
-            .as_ref()
-            .map(|installed| installed.context.clone());
+        let context = self.session_for_request().await;
         let url = format!("{}{}", self.base_url().await, path);
         let body_text =
             serde_json::to_string(&body).map_err(|e| AppError::Internal(e.to_string()))?;
@@ -308,31 +309,79 @@ impl ApiClient {
         Ok(signer.prepare_headers(self.time_sync.timestamp_ms(), RECV_WINDOW_MS, payload))
     }
 
+    async fn session_for_request(&self) -> Option<InstalledApiSession> {
+        let _install = self.session_install_lock.lock().await;
+        self.session_context.read().await.clone()
+    }
+
+    async fn mark_current_session_expired(
+        &self,
+        request: &InstalledApiSession,
+    ) -> Option<ApiSessionContext> {
+        let _install = self.session_install_lock.lock().await;
+        let context = {
+            let mut installed = self.session_context.write().await;
+            let current = installed
+                .as_mut()
+                .filter(|current| current.owns_response(request))?;
+            current.rearm_pending = true;
+            current.context.clone()
+        };
+        *self.remembered_session.write().await = Some(RememberedApiSession {
+            fingerprint: request.fingerprint,
+            notification_session_token: context.notification_session_token.clone(),
+            rearm_pending: true,
+        });
+        Some(context)
+    }
+
+    async fn confirm_authenticated_private_response(&self, request: &InstalledApiSession) {
+        let _install = self.session_install_lock.lock().await;
+        let remembered = {
+            let mut installed = self.session_context.write().await;
+            let Some(current) = installed
+                .as_mut()
+                .filter(|current| current.owns_response(request) && current.rearm_pending)
+            else {
+                return;
+            };
+            current.context.notification_session_token = uuid::Uuid::new_v4().to_string();
+            current.rearm_pending = false;
+            RememberedApiSession {
+                fingerprint: current.fingerprint,
+                notification_session_token: current.context.notification_session_token.clone(),
+                rearm_pending: false,
+            }
+        };
+        *self.remembered_session.write().await = Some(remembered);
+    }
+
     async fn parse_response(
         &self,
         response: reqwest::Response,
         path: Option<&str>,
-        context: Option<ApiSessionContext>,
+        context: Option<InstalledApiSession>,
     ) -> AppResult<Value> {
         let status = response.status();
         let status_auth_failure =
             classify_auth_failure(Some(status.as_u16()), &serde_json::json!({}));
         let text = response.text().await?;
-        if text.is_empty() {
-            if status.is_success() {
-                return Ok(json!({}));
-            }
+        if text.is_empty() && !status.is_success() {
             if status_auth_failure != AuthFailureKind::Other {
                 return Err(AppError::AuthFailure(status_auth_failure));
             }
             return Err(AppError::Connection(format!("HTTP {}", status)));
         }
-        let payload: Value = match serde_json::from_str(&text) {
-            Ok(payload) => payload,
-            Err(_) if status_auth_failure != AuthFailureKind::Other => {
-                return Err(AppError::AuthFailure(status_auth_failure));
+        let payload: Value = if text.is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_str(&text) {
+                Ok(payload) => payload,
+                Err(_) if status_auth_failure != AuthFailureKind::Other => {
+                    return Err(AppError::AuthFailure(status_auth_failure));
+                }
+                Err(_) => return Err(AppError::Connection("API 响应格式无效".into())),
             }
-            Err(_) => return Err(AppError::Connection("API 响应格式无效".into())),
         };
         let auth_failure = classify_auth_failure(Some(status.as_u16()), &payload);
         if auth_failure == AuthFailureKind::SessionExpired {
@@ -341,7 +390,11 @@ impl ApiClient {
                 .read()
                 .ok()
                 .and_then(|observer| observer.clone());
-            if let (Some(context), Some(observer)) = (context, observer) {
+            let current_context = match context.as_ref() {
+                Some(context) => self.mark_current_session_expired(context).await,
+                None => None,
+            };
+            if let (Some(context), Some(observer)) = (current_context, observer) {
                 if let Some(notification_id) = observer(context, auth_failure).await {
                     return Err(AppError::Notified {
                         code: "AUTH_SESSION_EXPIRED",
@@ -361,6 +414,9 @@ impl ApiClient {
         if path == Some(endpoints::CREATE_ORDER) {
             match super::response::classify_create_order_outcome(&payload) {
                 super::response::CreateOrderOutcome::Rejected => {
+                    if let Some(context) = context.as_ref() {
+                        self.confirm_authenticated_private_response(context).await;
+                    }
                     return Err(AppError::TradingFailure(
                         crate::models::trading::TradingFailure::rejected(),
                     ));
@@ -374,8 +430,34 @@ impl ApiClient {
         if !is_success_response(&payload) {
             return Err(AppError::Trading("API 返回错误".into()));
         }
+        if let Some(context) = context.as_ref() {
+            self.confirm_authenticated_private_response(context).await;
+        }
         Ok(payload)
     }
+}
+
+impl InstalledApiSession {
+    fn owns_response(&self, request: &Self) -> bool {
+        self.request_owner == request.request_owner
+            && self.fingerprint == request.fingerprint
+            && self.context == request.context
+    }
+}
+
+fn api_session_fingerprint(account_id: &str, credential: &ApiCredential) -> ApiSessionFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(b"easiflux.api-notification-session.v1\0");
+    for value in [
+        account_id,
+        credential.api_key.as_str(),
+        credential.api_secret.as_str(),
+        credential.base_url.as_str(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    ApiSessionFingerprint(hasher.finalize().into())
 }
 
 fn should_retry_private_request(error: &AppError) -> bool {
@@ -437,6 +519,49 @@ mod tests {
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    fn accept_raw_request(listener: &std::net::TcpListener) -> (std::net::TcpStream, String) {
+        use std::io::Read;
+
+        let (mut socket, _) = listener.accept().expect("accept test request");
+        let mut request = [0_u8; 2048];
+        let length = socket.read(&mut request).expect("read test request");
+        (
+            socket,
+            String::from_utf8_lossy(&request[..length]).into_owned(),
+        )
+    }
+
+    fn write_json_response(socket: &mut std::net::TcpStream, body: &str) {
+        use std::io::Write;
+
+        socket
+            .write_all(raw_response("200 OK", body).as_bytes())
+            .expect("write test response");
+    }
+
+    async fn install_test_session(client: &ApiClient, address: std::net::SocketAddr) {
+        client
+            .set_credential_for_session(
+                ApiCredential {
+                    label: "Alpha".into(),
+                    api_key: "key".into(),
+                    api_secret: "secret".into(),
+                    base_url: format!("http://{address}"),
+                },
+                SessionContext {
+                    account_id: "alpha".into(),
+                    session_epoch: 4,
+                },
+            )
+            .await;
+        client.time_sync().set_server_time(
+            client
+                .time_sync()
+                .local_timestamp_ms()
+                .saturating_add(1_000),
+        );
     }
 
     #[tokio::test]
@@ -502,6 +627,372 @@ mod tests {
                 "notificationId": "committed-notification-id",
             })
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_private_success_rearms_the_expired_token_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let (both_ready_tx, both_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut expired, _) = accept_raw_request(&listener);
+            write_json_response(&mut expired, r#"{"code":26200003}"#);
+
+            let mut first = None;
+            let mut second = None;
+            for _ in 0..2 {
+                let (socket, request) = accept_raw_request(&listener);
+                if request.contains("GET /private/first ") {
+                    first = Some(socket);
+                } else if request.contains("GET /private/second ") {
+                    second = Some(socket);
+                } else {
+                    panic!("unexpected request: {request}");
+                }
+            }
+            both_ready_tx.send(()).expect("signal concurrent requests");
+            release_first_rx.recv().expect("release first response");
+            write_json_response(
+                first.as_mut().expect("first request socket"),
+                r#"{"code":0,"data":{"ok":true}}"#,
+            );
+            release_second_rx.recv().expect("release second response");
+            write_json_response(
+                second.as_mut().expect("second request socket"),
+                r#"{"code":0,"data":{"ok":true}}"#,
+            );
+        });
+
+        let client = ApiClient::new();
+        install_test_session(&client, address).await;
+        client.set_auth_failure_observer(Arc::new(|_, _| {
+            Box::pin(async { Some("expired-notification".into()) })
+        }));
+        client
+            .private_get("/private/expired", Vec::new())
+            .await
+            .expect_err("expiry arms authenticated recovery");
+        let expired_token = client
+            .notification_session_context_for_test()
+            .await
+            .unwrap()
+            .notification_session_token;
+
+        let first_client = client.clone();
+        let first =
+            tokio::spawn(
+                async move { first_client.private_get("/private/first", Vec::new()).await },
+            );
+        let second_client = client.clone();
+        let second = tokio::spawn(async move {
+            second_client
+                .private_get("/private/second", Vec::new())
+                .await
+        });
+        both_ready_rx.await.expect("both requests reached server");
+
+        release_first_tx.send(()).expect("release first success");
+        first.await.unwrap().unwrap();
+        let recovered_token = client
+            .notification_session_context_for_test()
+            .await
+            .unwrap()
+            .notification_session_token;
+        assert_ne!(recovered_token, expired_token);
+
+        release_second_tx.send(()).expect("release second success");
+        second.await.unwrap().unwrap();
+        assert_eq!(
+            client
+                .notification_session_context_for_test()
+                .await
+                .unwrap()
+                .notification_session_token,
+            recovered_token
+        );
+        server.join().expect("test server exits");
+    }
+
+    #[tokio::test]
+    async fn stale_expiry_after_authenticated_recovery_cannot_notify() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let (stale_ready_tx, stale_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_stale_tx, release_stale_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut expired, _) = accept_raw_request(&listener);
+            write_json_response(&mut expired, r#"{"code":26200003}"#);
+
+            let (mut stale, request) = accept_raw_request(&listener);
+            assert!(request.contains("GET /private/stale-expiry "));
+            stale_ready_tx.send(()).expect("signal stale request");
+
+            let (mut recovered, request) = accept_raw_request(&listener);
+            assert!(request.contains("GET /private/recovered "));
+            write_json_response(
+                &mut recovered,
+                r#"{"code":0,"data":{"authenticated":true}}"#,
+            );
+
+            release_stale_rx.recv().expect("release stale expiry");
+            write_json_response(&mut stale, r#"{"code":26200003}"#);
+        });
+
+        let client = ApiClient::new();
+        install_test_session(&client, address).await;
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let captured_notifications = Arc::clone(&notifications);
+        client.set_auth_failure_observer(Arc::new(move |_, _| {
+            captured_notifications.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some("expired-notification".into()) })
+        }));
+        client
+            .private_get("/private/expired", Vec::new())
+            .await
+            .expect_err("initial expiry must notify");
+        let expired_token = client
+            .notification_session_context_for_test()
+            .await
+            .unwrap()
+            .notification_session_token;
+
+        let stale_client = client.clone();
+        let stale = tokio::spawn(async move {
+            stale_client
+                .private_get("/private/stale-expiry", Vec::new())
+                .await
+        });
+        stale_ready_rx.await.expect("stale request reached server");
+        client
+            .private_get("/private/recovered", Vec::new())
+            .await
+            .expect("newer private success confirms recovery");
+        assert_ne!(
+            client
+                .notification_session_context_for_test()
+                .await
+                .unwrap()
+                .notification_session_token,
+            expired_token
+        );
+
+        release_stale_tx.send(()).expect("release stale failure");
+        let stale_error = stale.await.unwrap().expect_err("stale expiry still fails");
+        assert!(matches!(
+            stale_error,
+            AppError::AuthFailure(AuthFailureKind::SessionExpired)
+        ));
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        server.join().expect("test server exits");
+    }
+
+    #[tokio::test]
+    async fn stale_private_success_cannot_rotate_a_replaced_identity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let (stale_ready_tx, stale_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_stale_tx, release_stale_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for body in [
+                r#"{"code":26200003}"#,
+                r#"{"code":0,"data":{"authenticated":true}}"#,
+                r#"{"code":26200003}"#,
+            ] {
+                let (mut socket, _) = accept_raw_request(&listener);
+                write_json_response(&mut socket, body);
+            }
+            let (mut stale, request) = accept_raw_request(&listener);
+            assert!(request.contains("GET /private/stale-success "));
+            stale_ready_tx.send(()).expect("signal stale request");
+            release_stale_rx.recv().expect("release stale success");
+            write_json_response(&mut stale, r#"{"code":0,"data":{"authenticated":true}}"#);
+        });
+
+        let client = ApiClient::new();
+        install_test_session(&client, address).await;
+        client.set_auth_failure_observer(Arc::new(|_, _| {
+            Box::pin(async { Some("expired-notification".into()) })
+        }));
+        client
+            .private_get("/private/expired", Vec::new())
+            .await
+            .expect_err("initial expiry must fail");
+        client
+            .private_get("/private/recovered", Vec::new())
+            .await
+            .expect("current private success confirms recovery");
+        client
+            .private_get("/private/expired-again", Vec::new())
+            .await
+            .expect_err("second expiry arms another recovery");
+
+        let stale_client = client.clone();
+        let stale = tokio::spawn(async move {
+            stale_client
+                .private_get("/private/stale-success", Vec::new())
+                .await
+        });
+        stale_ready_rx.await.expect("stale success reached server");
+        client
+            .set_credential_for_session(
+                ApiCredential {
+                    label: "Replacement".into(),
+                    api_key: "key-two".into(),
+                    api_secret: "secret-two".into(),
+                    base_url: format!("http://{address}"),
+                },
+                SessionContext {
+                    account_id: "alpha".into(),
+                    session_epoch: 4,
+                },
+            )
+            .await;
+        let replacement_token = client
+            .notification_session_context_for_test()
+            .await
+            .unwrap()
+            .notification_session_token;
+
+        release_stale_tx.send(()).expect("release stale success");
+        stale.await.unwrap().unwrap();
+        assert_eq!(
+            client
+                .notification_session_context_for_test()
+                .await
+                .unwrap()
+                .notification_session_token,
+            replacement_token
+        );
+        server.join().expect("test server exits");
+    }
+
+    #[tokio::test]
+    async fn empty_private_get_and_post_success_rearm_expired_tokens() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = std::thread::spawn(move || {
+            for (expected_request, body) in [
+                ("GET /private/expired ", r#"{"code":26200003}"#),
+                ("GET /private/empty ", ""),
+                ("GET /private/expired-again ", r#"{"code":26200003}"#),
+                ("POST /private/empty ", ""),
+            ] {
+                let (mut socket, request) = accept_raw_request(&listener);
+                assert!(request.contains(expected_request), "{request}");
+                write_json_response(&mut socket, body);
+            }
+        });
+
+        let client = ApiClient::new();
+        install_test_session(&client, address).await;
+        client.set_auth_failure_observer(Arc::new(|_, _| {
+            Box::pin(async { Some("expired-notification".into()) })
+        }));
+        client
+            .private_get("/private/expired", Vec::new())
+            .await
+            .expect_err("initial expiry must fail");
+        let first_expired_token = client
+            .notification_session_context_for_test()
+            .await
+            .unwrap()
+            .notification_session_token;
+
+        assert_eq!(
+            client
+                .private_get("/private/empty", Vec::new())
+                .await
+                .unwrap(),
+            json!({})
+        );
+        let get_recovered_token = client
+            .notification_session_context_for_test()
+            .await
+            .unwrap()
+            .notification_session_token;
+        assert_ne!(get_recovered_token, first_expired_token);
+
+        client
+            .private_get("/private/expired-again", Vec::new())
+            .await
+            .expect_err("second expiry must fail");
+        assert_eq!(
+            client
+                .private_post("/private/empty", json!({"request": true}))
+                .await
+                .unwrap(),
+            json!({})
+        );
+        assert_ne!(
+            client
+                .notification_session_context_for_test()
+                .await
+                .unwrap()
+                .notification_session_token,
+            get_recovered_token
+        );
+        server.join().expect("test server exits");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_order_cannot_rearm_before_special_validation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = std::thread::spawn(move || {
+            for body in [
+                r#"{"code":26200003}"#,
+                r#"{"code":0,"data":{}}"#,
+                r#"{"code":0,"data":{"order_id":"order-1"}}"#,
+            ] {
+                let (mut socket, _) = accept_raw_request(&listener);
+                write_json_response(&mut socket, body);
+            }
+        });
+
+        let client = ApiClient::new();
+        install_test_session(&client, address).await;
+        client.set_auth_failure_observer(Arc::new(|_, _| {
+            Box::pin(async { Some("expired-notification".into()) })
+        }));
+        client
+            .private_get("/private/expired", Vec::new())
+            .await
+            .expect_err("initial expiry must fail");
+        let expired_token = client
+            .notification_session_context_for_test()
+            .await
+            .unwrap()
+            .notification_session_token;
+
+        let ambiguous = client
+            .private_post(endpoints::CREATE_ORDER, json!({"symbol": "BTCUSDT"}))
+            .await
+            .expect_err("ambiguous order response must fail closed");
+        assert!(matches!(ambiguous, AppError::Internal(_)));
+        assert_eq!(
+            client
+                .notification_session_context_for_test()
+                .await
+                .unwrap()
+                .notification_session_token,
+            expired_token
+        );
+
+        client
+            .private_post(endpoints::CREATE_ORDER, json!({"symbol": "BTCUSDT"}))
+            .await
+            .expect("structurally accepted order confirms private authentication");
+        assert_ne!(
+            client
+                .notification_session_context_for_test()
+                .await
+                .unwrap()
+                .notification_session_token,
+            expired_token
+        );
+        server.join().expect("test server exits");
     }
 
     #[tokio::test]

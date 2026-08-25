@@ -550,16 +550,56 @@ async fn concurrent_and_restart_session_replay_keep_one_commit_and_one_diagnosti
 }
 
 #[tokio::test]
-async fn api_notification_session_identity_survives_failed_retry_and_rearms_on_real_boundaries() {
+async fn api_notification_session_reconnect_rearms_only_after_private_authentication() {
+    use std::io::{Read, Write};
+
     let harness = harness();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let address = listener.local_addr().expect("test listener address");
+    let server = std::thread::spawn(move || {
+        for body in [
+            r#"{"code":26200003,"message":"expired"}"#,
+            r#"{"code":26200003,"message":"still expired"}"#,
+            r#"{"code":0,"data":{"authenticated":true}}"#,
+            r#"{"code":0,"data":{"authenticated":true}}"#,
+            r#"{"code":26200003,"message":"expired again"}"#,
+        ] {
+            let (mut socket, _) = listener.accept().expect("accept test request");
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).expect("read test request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write test response");
+        }
+    });
+
     let client = ApiClient::new();
     let session = context("alpha", 0);
     let credential = ApiCredential {
         label: "Alpha".into(),
         api_key: "key-one".into(),
         api_secret: "secret-one".into(),
-        base_url: "https://api.example.test".into(),
+        base_url: format!("http://{address}"),
     };
+    client.time_sync().set_server_time(
+        client
+            .time_sync()
+            .local_timestamp_ms()
+            .saturating_add(1_000),
+    );
+    let observer = harness.observer.clone();
+    client.set_auth_failure_observer(Arc::new(move |context, failure| {
+        let observer = observer.clone();
+        Box::pin(async move {
+            observer
+                .observe_api_auth_failure(&context, failure, NOW)
+                .await
+        })
+    }));
 
     client
         .set_credential_for_session(credential.clone(), session.clone())
@@ -568,12 +608,23 @@ async fn api_notification_session_identity_survives_failed_retry_and_rearms_on_r
         .notification_session_context_for_test()
         .await
         .expect("first effective auth session");
-    let first_id = harness
-        .observer
-        .observe_api_auth_failure(&first, AuthFailureKind::SessionExpired, NOW)
+    let first_error = client
+        .private_get("/private/test", Vec::new())
         .await
-        .unwrap();
+        .expect_err("first expiry must be owned by the notification observer");
+    let first_id = match first_error {
+        crate::error::AppError::Notified {
+            notification_id, ..
+        } => notification_id,
+        other => panic!("first expiry must return its committed marker: {other:?}"),
+    };
 
+    client.clear_credential().await;
+    assert!(!client.has_credential().await);
+    assert!(client
+        .notification_session_context_for_test()
+        .await
+        .is_none());
     client
         .set_credential_for_session(credential.clone(), session.clone())
         .await;
@@ -585,14 +636,30 @@ async fn api_notification_session_identity_survives_failed_retry_and_rearms_on_r
         failed_retry.notification_session_token,
         first.notification_session_token
     );
-    let retry_id = harness
-        .observer
-        .observe_api_auth_failure(&failed_retry, AuthFailureKind::SessionExpired, NOW + 1)
+    let retry_error = client
+        .private_get("/private/test", Vec::new())
         .await
-        .unwrap();
+        .expect_err("unchanged reconnect remains the same expired edge");
+    let retry_id = match retry_error {
+        crate::error::AppError::Notified {
+            notification_id, ..
+        } => notification_id,
+        other => panic!("replayed expiry must retain its marker: {other:?}"),
+    };
     assert_eq!(retry_id, first_id);
+    assert_eq!(records(&harness).len(), 1);
+    assert_eq!(harness.persistence.files.lock().unwrap().len(), 1);
+    {
+        let events = harness.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].toast_candidate.is_some());
+    }
+    assert_eq!(harness.diagnostics.lock().unwrap().len(), 1);
 
-    client.confirm_connected_session(&session).await;
+    client
+        .private_get("/private/authenticated", Vec::new())
+        .await
+        .expect("a valid private response confirms recovery");
     let recovered = client
         .notification_session_context_for_test()
         .await
@@ -601,12 +668,30 @@ async fn api_notification_session_identity_survives_failed_retry_and_rearms_on_r
         recovered.notification_session_token,
         first.notification_session_token
     );
-    let recovered_id = harness
-        .observer
-        .observe_api_auth_failure(&recovered, AuthFailureKind::SessionExpired, NOW + 2)
+    client
+        .private_get("/private/authenticated", Vec::new())
         .await
-        .unwrap();
+        .expect("an already healthy session remains authenticated");
+    let still_recovered = client
+        .notification_session_context_for_test()
+        .await
+        .expect("healthy session remains installed");
+    assert_eq!(
+        still_recovered.notification_session_token,
+        recovered.notification_session_token
+    );
+    let recovered_error = client
+        .private_get("/private/test", Vec::new())
+        .await
+        .expect_err("the next expiry after authenticated recovery is a new edge");
+    let recovered_id = match recovered_error {
+        crate::error::AppError::Notified {
+            notification_id, ..
+        } => notification_id,
+        other => panic!("rearmed expiry must return a new marker: {other:?}"),
+    };
     assert_ne!(recovered_id, first_id);
+    server.join().expect("test server exits");
 
     let replaced_credential = ApiCredential {
         api_key: "key-two".into(),
@@ -624,12 +709,6 @@ async fn api_notification_session_identity_survives_failed_retry_and_rearms_on_r
         replaced.notification_session_token,
         recovered.notification_session_token
     );
-    let replaced_id = harness
-        .observer
-        .observe_api_auth_failure(&replaced, AuthFailureKind::SessionExpired, NOW + 3)
-        .await
-        .unwrap();
-    assert_ne!(replaced_id, recovered_id);
 
     let environment_credential = ApiCredential {
         base_url: "https://sandbox.example.test".into(),
@@ -646,12 +725,6 @@ async fn api_notification_session_identity_survives_failed_retry_and_rearms_on_r
         environment.notification_session_token,
         replaced.notification_session_token
     );
-    let environment_id = harness
-        .observer
-        .observe_api_auth_failure(&environment, AuthFailureKind::SessionExpired, NOW + 4)
-        .await
-        .unwrap();
-    assert_ne!(environment_id, replaced_id);
 
     client
         .set_credential_for_session(environment_credential, context("beta", 0))
@@ -677,17 +750,11 @@ async fn api_notification_session_identity_survives_failed_retry_and_rearms_on_r
         restarted.notification_session_token,
         first.notification_session_token
     );
-    let restarted_id = harness
-        .observer
-        .observe_api_auth_failure(&restarted, AuthFailureKind::SessionExpired, NOW + 5)
-        .await
-        .unwrap();
-    assert_ne!(restarted_id, first_id);
 
-    assert_eq!(records(&harness).len(), 5);
-    assert_eq!(harness.persistence.files.lock().unwrap().len(), 5);
-    assert_eq!(harness.events.lock().unwrap().len(), 5);
-    assert_eq!(harness.diagnostics.lock().unwrap().len(), 5);
+    assert_eq!(records(&harness).len(), 2);
+    assert_eq!(harness.persistence.files.lock().unwrap().len(), 2);
+    assert_eq!(harness.events.lock().unwrap().len(), 2);
+    assert_eq!(harness.diagnostics.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
