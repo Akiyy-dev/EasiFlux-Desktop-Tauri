@@ -1957,7 +1957,7 @@ async fn healthy_noop_observations_still_require_a_valid_account_scope() {
             .service
             .observe_environment(
                 EnvironmentObservation {
-                    account_id: "token-secret".into(),
+                    account_id: " trailing-account ".into(),
                     session_epoch: 1,
                     environment_key:
                         "env-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
