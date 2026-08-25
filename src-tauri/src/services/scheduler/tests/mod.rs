@@ -1,10 +1,14 @@
 use super::*;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 
 use crate::models::time::{TimeSnapshot, TimeSource, TimeSyncStatus};
 
 mod coordination;
+mod environment_notifications;
+mod notification_maintenance;
 mod rescheduling;
+mod round4_lifecycle;
+mod round5_lifecycle;
 
 #[test]
 fn task_id_parses_frontend_names() {
@@ -48,6 +52,50 @@ async fn kline_flush_executes_while_account_mutation_guard_is_held() {
     assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_outer_future_keeps_blocking_kline_work_serialized_across_restart() {
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let entered_first = Arc::new(tokio::sync::Notify::new());
+    let entered_second = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new((StdMutex::new(false), Condvar::new()));
+
+    let first = tokio::spawn(run_serialized_blocking(Arc::clone(&gate), {
+        let entered = Arc::clone(&entered_first);
+        let release = Arc::clone(&release);
+        move || {
+            entered.notify_one();
+            let (released, wake) = release.as_ref();
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
+    }));
+    entered_first.notified().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let second = tokio::spawn(run_serialized_blocking(Arc::clone(&gate), {
+        let entered = Arc::clone(&entered_second);
+        move || entered.notify_one()
+    }));
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), entered_second.notified())
+            .await
+            .is_err()
+    );
+
+    let (released, wake) = release.as_ref();
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+    tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .expect("the restarted flush should run after old blocking work exits")
+        .unwrap()
+        .unwrap();
+}
+
 #[test]
 fn kline_flush_delays_its_first_tick_while_existing_tasks_remain_immediate() {
     assert_eq!(first_tick_delay(TaskId::KlineFlush), Duration::from_secs(5));
@@ -88,7 +136,12 @@ async fn kline_flush_attempts_every_dirty_key_before_returning_a_joined_storage_
         Arc::new(|_| {}),
     ));
 
-    let result = execute_kline_flush(service).await;
+    let result = execute_kline_flush(
+        service,
+        Arc::new(KlineFlushCoordinator::new()),
+        KlineFlushOrigin::Background,
+    )
+    .await;
 
     assert!(matches!(result, Err(AppError::Storage(_))));
     assert!(kline_dir.join("BBB_1.jsonl").is_file());
@@ -144,13 +197,171 @@ async fn bootstrap_runs_every_applicable_task_and_collects_failures() {
     assert_eq!(*visited.lock().unwrap(), tasks);
     assert_eq!(failed, vec![TaskId::TimeSync, TaskId::Environment]);
 
-    let visible = bootstrap_failure_error(&failed).to_string();
+    let visible = aggregate_bootstrap_failure_error(&failed).to_string();
     assert!(visible.contains("时间同步"));
     assert!(visible.contains("环境检测"));
     assert!(!visible.contains("raw-key"));
     assert!(!visible.contains("raw-secret"));
     assert!(!visible.contains("apiKey"));
     assert!(!visible.contains("keyring"));
+}
+
+#[tokio::test]
+async fn queued_bootstrap_snapshots_connection_status_only_after_switch_commits() {
+    let coordinator = Arc::new(AccountLifecycleCoordinator::new());
+    let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mutation = coordinator.mutation_guard().await;
+    let phase = run_bootstrap_account_phase(
+        coordinator.as_ref(),
+        {
+            let connected = Arc::clone(&connected);
+            move || async move { connected.load(std::sync::atomic::Ordering::SeqCst) }
+        },
+        |_| async { Ok(()) },
+    );
+    tokio::pin!(phase);
+    assert!(matches!(
+        futures_util::poll!(&mut phase),
+        std::task::Poll::Pending
+    ));
+
+    connected.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(mutation);
+    let (tasks, failed) = phase.await;
+
+    assert!(failed.is_empty());
+    assert!(tasks.contains(&TaskId::Balances));
+    assert!(tasks.contains(&TaskId::PrivatePanels));
+    assert!(tasks.contains(&TaskId::DailyPnl));
+}
+
+#[test]
+fn bootstrap_suppresses_only_owned_markers_and_delivers_bare_session_failure_once() {
+    for error in [
+        AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            message: "账户会话已失效",
+            notification_id: "committed-id".into(),
+            cause: Some(crate::error::NotificationCause::AuthFailure(
+                crate::api::response::AuthFailureKind::SessionExpired,
+            )),
+        },
+        AppError::Observed("环境检测失败"),
+    ] {
+        assert!(!bootstrap_failure_needs_generic_error(&error));
+    }
+    let bare_session = AppError::AuthFailure(crate::api::response::AuthFailureKind::SessionExpired);
+    assert!(bootstrap_failure_needs_generic_error(&bare_session));
+    assert!(bootstrap_failure_needs_generic_error(
+        &AppError::Connection("ordinary failure".into())
+    ));
+
+    let sink = Arc::new(StdMutex::new(Vec::new()));
+    let emitter = EventEmitter::new_test(Arc::clone(&sink));
+    emit_bootstrap_failure_diagnostics(
+        &emitter,
+        BootstrapDeliveryOwnership::Background,
+        &[(TaskId::Balances, bare_session)],
+    );
+    let events = sink.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, "log:entry");
+    assert_eq!(events[1].0, "error:occurred");
+    assert_eq!(events[0].1["eventId"], events[1].1["eventId"]);
+}
+
+#[test]
+fn reconciliation_bootstrap_suppresses_child_delivery_while_background_keeps_it() {
+    let sink = Arc::new(StdMutex::new(Vec::new()));
+    let emitter = EventEmitter::new_test(Arc::clone(&sink));
+    let failures = vec![(
+        TaskId::TimeSync,
+        AppError::Internal("apiKey=raw-secret".into()),
+    )];
+
+    emit_bootstrap_failure_diagnostics(
+        &emitter,
+        BootstrapDeliveryOwnership::Reconciliation,
+        &failures,
+    );
+    assert!(sink.lock().unwrap().is_empty());
+
+    emit_bootstrap_failure_diagnostics(&emitter, BootstrapDeliveryOwnership::Background, &failures);
+    let events = sink.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, "log:entry");
+    assert_eq!(events[1].0, "error:occurred");
+    assert_eq!(events[0].1["eventId"], events[1].1["eventId"]);
+    assert!(!events[0].1.to_string().contains("raw-secret"));
+}
+
+#[test]
+fn direct_bootstrap_preserves_session_ownership_and_excludes_it_from_mixed_failures() {
+    let session = AppError::Notified {
+        code: "AUTH_SESSION_EXPIRED",
+        message: "账户会话已失效",
+        notification_id: "committed-session-id".into(),
+        cause: Some(crate::error::NotificationCause::AuthFailure(
+            crate::api::response::AuthFailureKind::SessionExpired,
+        )),
+    };
+    let session_only = vec![(TaskId::Balances, session.clone())];
+    let sink = Arc::new(StdMutex::new(Vec::new()));
+    let emitter = EventEmitter::new_test(Arc::clone(&sink));
+
+    emit_bootstrap_failure_diagnostics(
+        &emitter,
+        BootstrapDeliveryOwnership::Background,
+        &session_only,
+    );
+    assert!(sink.lock().unwrap().is_empty());
+    assert!(matches!(
+        bootstrap_failure_error(&session_only),
+        AppError::Notified {
+            code: "AUTH_SESSION_EXPIRED",
+            notification_id,
+            ..
+        } if notification_id == "committed-session-id"
+    ));
+
+    let mixed = vec![
+        (TaskId::Balances, session),
+        (
+            TaskId::Environment,
+            AppError::Connection("ordinary environment failure".into()),
+        ),
+    ];
+    let mixed_error = bootstrap_failure_error(&mixed);
+    let visible = mixed_error.user_message();
+    assert!(matches!(mixed_error, AppError::Connection(_)));
+    assert!(visible.contains("环境检测"));
+    assert!(!visible.contains("账户资产"));
+    assert!(!visible.contains("AUTH_SESSION_EXPIRED"));
+}
+
+#[test]
+fn detached_bootstrap_does_not_log_an_owned_session_failure_again() {
+    let delivered = Arc::new(StdMutex::new(Vec::new()));
+    let session = AppError::Notified {
+        code: "AUTH_SESSION_EXPIRED",
+        message: "账户会话已失效",
+        notification_id: "committed-session-id".into(),
+        cause: Some(crate::error::NotificationCause::AuthFailure(
+            crate::api::response::AuthFailureKind::SessionExpired,
+        )),
+    };
+
+    deliver_detached_bootstrap_failure(&session, {
+        let delivered = Arc::clone(&delivered);
+        move |message| delivered.lock().unwrap().push(message)
+    });
+    assert!(delivered.lock().unwrap().is_empty());
+
+    deliver_detached_bootstrap_failure(&AppError::Connection("ordinary".into()), {
+        let delivered = Arc::clone(&delivered);
+        move |message| delivered.lock().unwrap().push(message)
+    });
+    assert_eq!(delivered.lock().unwrap().as_slice(), ["连接错误: ordinary"]);
 }
 
 #[tokio::test]
@@ -264,7 +475,7 @@ async fn bootstrap_collects_failures_from_status_semantics() {
     .await;
 
     assert_eq!(failed, vec![TaskId::TimeSync, TaskId::Environment]);
-    let visible = bootstrap_failure_error(&failed).to_string();
+    let visible = aggregate_bootstrap_failure_error(&failed).to_string();
     assert!(!visible.contains("raw time failure"));
     assert!(!visible.contains("raw environment failure"));
 }

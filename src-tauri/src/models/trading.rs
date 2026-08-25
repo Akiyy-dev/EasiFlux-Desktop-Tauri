@@ -1,5 +1,61 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionContext {
+    pub submission_id: String,
+    pub account_id: String,
+    pub session_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionContext {
+    pub account_id: String,
+    pub session_epoch: u64,
+}
+
+pub use SessionContext as OrderStreamContext;
+
+impl From<&SubmissionContext> for SessionContext {
+    fn from(context: &SubmissionContext) -> Self {
+        Self {
+            account_id: context.account_id.clone(),
+            session_epoch: context.session_epoch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradingFailureKind {
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradingFailure {
+    pub kind: TradingFailureKind,
+}
+
+impl TradingFailure {
+    pub const fn rejected() -> Self {
+        Self {
+            kind: TradingFailureKind::Rejected,
+        }
+    }
+
+    pub const fn user_message(&self) -> &'static str {
+        match self.kind {
+            TradingFailureKind::Rejected => "订单请求被交易端拒绝",
+        }
+    }
+}
+
+impl std::fmt::Display for TradingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.user_message())
+    }
+}
+
+impl std::error::Error for TradingFailure {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub enum OrderStatus {

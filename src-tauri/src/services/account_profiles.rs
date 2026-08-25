@@ -4,7 +4,9 @@ mod switching;
 
 use crate::error::{AppError, AppResult};
 use crate::models::config::{ApiCredential, AppConfig, ConnectionStatus};
+use crate::models::trading::SessionContext;
 use crate::storage::CredentialStore;
+use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
@@ -29,9 +31,56 @@ pub(crate) trait AccountLifecyclePort: Send + Sync {
         account_id: &str,
         realtime: bool,
         credential: ApiCredential,
+        session_epoch: u64,
     ) -> AppResult<()>;
     async fn activate_public_environment(&self, credential: &ApiCredential);
+    async fn activate_session(&self, context: &SessionContext);
     async fn clear_account_data(&self);
+    async fn delete_notification_partition(
+        &self,
+        account_id: &str,
+    ) -> Result<(), NotificationPartitionCleanupError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NotificationPartitionCleanupError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DeleteAccountWarningCode {
+    NotificationCleanupPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAccountResult {
+    notification_cleanup_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning_code: Option<DeleteAccountWarningCode>,
+}
+
+impl DeleteAccountResult {
+    fn complete() -> Self {
+        Self {
+            notification_cleanup_pending: false,
+            warning_code: None,
+        }
+    }
+
+    fn cleanup_pending() -> Self {
+        Self {
+            notification_cleanup_pending: true,
+            warning_code: Some(DeleteAccountWarningCode::NotificationCleanupPending),
+        }
+    }
+
+    pub fn notification_cleanup_pending(self) -> bool {
+        self.notification_cleanup_pending
+    }
+
+    pub fn warning_code(self) -> Option<DeleteAccountWarningCode> {
+        self.warning_code
+    }
 }
 
 pub struct AccountLifecycleCoordinator {
@@ -59,6 +108,10 @@ impl AccountLifecycleCoordinator {
 
     pub fn current_session_epoch(&self) -> u64 {
         self.session_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn next_session_epoch(&self) -> u64 {
+        self.current_session_epoch().saturating_add(1)
     }
 
     pub(crate) fn advance_session_epoch(&self) -> u64 {

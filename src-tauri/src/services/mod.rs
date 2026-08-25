@@ -5,6 +5,7 @@ pub mod chart_workspace;
 pub mod connection;
 pub mod daily_pnl;
 pub mod market;
+pub mod notification;
 pub mod risk;
 pub mod scheduler;
 pub mod time;

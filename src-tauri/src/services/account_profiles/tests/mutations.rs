@@ -1,6 +1,11 @@
 use crate::models::config::{ConnectionStatus, SaveCredentialRequest, DEFAULT_BASE_URL};
 
-use super::super::{delete_account, save_credentials, AccountLifecycleCoordinator};
+use std::sync::Arc;
+
+use super::super::{
+    delete_account, run_serialized_account_mutation, save_credentials, AccountLifecycleCoordinator,
+    DeleteAccountWarningCode,
+};
 use super::support::FakeLifecyclePort;
 
 #[tokio::test]
@@ -100,4 +105,114 @@ async fn orphan_keyring_entry_absent_from_config_requires_complete_credentials()
 
     assert!(result.is_err());
     assert!(!port.runtime_config().accounts.contains(&"orphan".into()));
+}
+
+#[tokio::test]
+async fn delete_cleanup_success_is_awaited_after_commit_without_warning() {
+    let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
+
+    let result = delete_account(&AccountLifecycleCoordinator::new(), &port, "spare")
+        .await
+        .unwrap();
+
+    assert!(!result.notification_cleanup_pending());
+    assert_eq!(result.warning_code(), None);
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::json!({ "notificationCleanupPending": false })
+    );
+    assert!(!port.credentials.lock().unwrap().contains_key("spare"));
+    assert!(!port.persisted_config().accounts.contains(&"spare".into()));
+    assert!(!port.runtime_config().accounts.contains(&"spare".into()));
+    assert_eq!(
+        port.events(),
+        [
+            "delete:spare",
+            "persist:primary",
+            "notification-cleanup:spare"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn delete_cleanup_failure_returns_only_the_closed_pending_warning_after_commit() {
+    let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
+    port.failures.lock().unwrap().notification_cleanup = true;
+
+    let result = delete_account(&AccountLifecycleCoordinator::new(), &port, "spare")
+        .await
+        .expect("notification cleanup is non-critical after account commit");
+
+    assert!(result.notification_cleanup_pending());
+    assert_eq!(
+        result.warning_code(),
+        Some(DeleteAccountWarningCode::NotificationCleanupPending)
+    );
+    assert!(!port.credentials.lock().unwrap().contains_key("spare"));
+    assert!(!port.persisted_config().accounts.contains(&"spare".into()));
+    assert!(!port.runtime_config().accounts.contains(&"spare".into()));
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::json!({
+            "notificationCleanupPending": true,
+            "warningCode": "NOTIFICATION_CLEANUP_PENDING"
+        })
+    );
+}
+
+#[tokio::test]
+async fn delete_holds_the_mutation_guard_through_awaited_notification_cleanup() {
+    let port = Arc::new(FakeLifecyclePort::new(ConnectionStatus::Disconnected));
+    let coordinator = Arc::new(AccountLifecycleCoordinator::new());
+    let cleanup_started = Arc::new(tokio::sync::Notify::new());
+    let cleanup_release = Arc::new(tokio::sync::Notify::new());
+    port.delay_notification_cleanup(Arc::clone(&cleanup_started), Arc::clone(&cleanup_release));
+
+    let deleting = tokio::spawn({
+        let port = Arc::clone(&port);
+        let coordinator = Arc::clone(&coordinator);
+        async move { delete_account(coordinator.as_ref(), port.as_ref(), "spare").await }
+    });
+    cleanup_started.notified().await;
+    let concurrent = tokio::spawn({
+        let port = Arc::clone(&port);
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            run_serialized_account_mutation(coordinator.as_ref(), || async {
+                port.events.lock().unwrap().push("concurrent:update".into());
+            })
+            .await;
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!port.events().contains(&"concurrent:update".into()));
+
+    cleanup_release.notify_one();
+    deleting.await.unwrap().unwrap();
+    concurrent.await.unwrap();
+    let events = port.events();
+    assert!(
+        events
+            .iter()
+            .position(|event| event == "notification-cleanup:spare")
+            < events.iter().position(|event| event == "concurrent:update")
+    );
+}
+
+#[tokio::test]
+async fn save_rejects_unsafe_base_urls_before_keyring_or_config_mutation() {
+    let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
+    let mut request = draft("new", "key", "secret");
+    request.base_url = "https://user:raw-secret@example.test/api?token=raw".into();
+
+    let error = save_credentials(&AccountLifecycleCoordinator::new(), &port, request)
+        .await
+        .expect_err("credential-bearing URL must be rejected");
+
+    assert_eq!(error.to_string(), "认证失败: API 服务地址无效");
+    assert!(!port.credentials.lock().unwrap().contains_key("new"));
+    assert!(!port.runtime_config().accounts.contains(&"new".into()));
+    assert!(port.events().is_empty());
+    assert!(!error.to_string().contains("raw-secret"));
+    assert!(!error.to_string().contains("token="));
 }

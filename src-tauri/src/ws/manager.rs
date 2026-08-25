@@ -13,7 +13,12 @@ use crate::auth::Signer;
 use crate::auth::TimeSync;
 use crate::error::AppResult;
 use crate::events::EventEmitter;
-use crate::services::MarketService;
+use crate::models::config::normalize_account_id;
+use crate::models::config::AppConfig;
+use crate::models::trading::{Order, OrderStreamContext};
+use crate::services::connection::{ConnectionObservationSource, SessionNotificationObserver};
+use crate::services::trading::OrderNotificationObserver;
+use crate::services::{AccountLifecycleCoordinator, MarketService};
 
 use super::messages::{
     build_auth_message, build_ping_message, build_subscribe_message, default_auth_expires_ms,
@@ -28,6 +33,8 @@ const RECONNECT_SECS: u64 = 3;
 const PRIVATE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const PRIVATE_AUTH_ERROR: &str = "私有 WebSocket 鉴权失败";
 const PRIVATE_SUBSCRIPTION_ERROR: &str = "私有 WebSocket 订阅失败";
+const PUBLIC_SESSION_ERROR: &str = "公共 WebSocket 会话不可用";
+const PRIVATE_SESSION_ERROR: &str = "私有 WebSocket 会话不可用";
 
 #[derive(Clone, Copy)]
 enum FreshnessDomain {
@@ -156,6 +163,103 @@ struct Subscription {
     private: bool,
 }
 
+#[derive(Default)]
+struct OrderObservationBuffer {
+    context: Option<OrderStreamContext>,
+    snapshot_seeded: bool,
+    pending: Vec<Order>,
+}
+
+impl OrderObservationBuffer {
+    fn reset(&mut self, context: OrderStreamContext) {
+        self.context = Some(context);
+        self.snapshot_seeded = false;
+        self.pending.clear();
+    }
+
+    fn matches(&self, context: &OrderStreamContext) -> bool {
+        self.context.as_ref() == Some(context)
+    }
+
+    fn defer(&mut self, context: &OrderStreamContext, orders: Vec<Order>) -> bool {
+        if !self.matches(context) || self.snapshot_seeded {
+            return false;
+        }
+        self.pending.extend(orders);
+        true
+    }
+
+    fn pending_for_seed(&self, context: &OrderStreamContext) -> Option<Vec<Order>> {
+        if !self.matches(context) || self.snapshot_seeded {
+            return None;
+        }
+        Some(self.pending.clone())
+    }
+
+    fn finish_seed(&mut self, context: &OrderStreamContext) -> bool {
+        if !self.matches(context) || self.snapshot_seeded {
+            return false;
+        }
+        self.pending.clear();
+        self.snapshot_seeded = true;
+        true
+    }
+}
+
+async fn seed_order_gate<F, Fut>(
+    order_observation_buffer: &Arc<Mutex<OrderObservationBuffer>>,
+    order_snapshot_seeded: &AtomicBool,
+    context: &OrderStreamContext,
+    replay: F,
+) -> AppResult<()>
+where
+    F: FnOnce(Vec<Order>) -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
+    let mut buffer = order_observation_buffer.lock().await;
+    let Some(pending) = buffer.pending_for_seed(context) else {
+        return Ok(());
+    };
+    replay(pending).await?;
+    if buffer.finish_seed(context) {
+        order_snapshot_seeded.store(true, Ordering::Release);
+    }
+    Ok(())
+}
+
+async fn observe_manual_order_snapshots_for_session(
+    config: &Arc<RwLock<AppConfig>>,
+    account_lifecycle: &Arc<AccountLifecycleCoordinator>,
+    order_observation_buffer: &Arc<Mutex<OrderObservationBuffer>>,
+    observer: &OrderNotificationObserver,
+    context: &OrderStreamContext,
+    snapshots: &[Order],
+    now_ms: u64,
+) {
+    let active_account_id = normalize_account_id(&config.read().await.active_account_id);
+    if account_lifecycle.current_session_epoch() != context.session_epoch
+        || active_account_id != context.account_id
+    {
+        return;
+    }
+    let buffer = order_observation_buffer.lock().await;
+    if !buffer.matches(context) || !buffer.snapshot_seeded {
+        return;
+    }
+    for (offset, snapshot) in snapshots.iter().enumerate() {
+        observer
+            .observe(
+                &context.account_id,
+                context.session_epoch,
+                snapshot,
+                crate::services::notification::OrderObservationOrigin::Snapshot,
+                None,
+                now_ms.saturating_add(offset as u64),
+            )
+            .await;
+    }
+}
+
 pub struct WsManager {
     ws_public_url: Arc<RwLock<String>>,
     ws_private_url: Arc<RwLock<String>>,
@@ -171,10 +275,23 @@ pub struct WsManager {
     public_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     private_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     freshness: Arc<WsFreshness>,
+    notification_observer: OrderNotificationObserver,
+    session_notification_observer: SessionNotificationObserver,
+    config: Arc<RwLock<AppConfig>>,
+    account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    order_observation_buffer: Arc<Mutex<OrderObservationBuffer>>,
+    order_snapshot_seeded: Arc<AtomicBool>,
 }
 
 impl WsManager {
-    pub fn new(emitter: EventEmitter, time_sync: Arc<TimeSync>) -> Self {
+    pub fn new(
+        emitter: EventEmitter,
+        time_sync: Arc<TimeSync>,
+        notification_observer: OrderNotificationObserver,
+        config: Arc<RwLock<AppConfig>>,
+        account_lifecycle: Arc<AccountLifecycleCoordinator>,
+        session_notification_observer: SessionNotificationObserver,
+    ) -> Self {
         Self {
             ws_public_url: Arc::new(RwLock::new(WS_PUBLIC.to_string())),
             ws_private_url: Arc::new(RwLock::new(WS_PRIVATE.to_string())),
@@ -190,6 +307,12 @@ impl WsManager {
             public_task: Arc::new(Mutex::new(None)),
             private_task: Arc::new(Mutex::new(None)),
             freshness: Arc::new(WsFreshness::default()),
+            notification_observer,
+            session_notification_observer,
+            config,
+            account_lifecycle,
+            order_observation_buffer: Arc::new(Mutex::new(OrderObservationBuffer::default())),
+            order_snapshot_seeded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -233,7 +356,8 @@ impl WsManager {
     }
 
     pub fn is_private_panels_healthy(&self, stale_ms: u64) -> bool {
-        self.is_private_connected()
+        self.order_snapshot_seeded.load(Ordering::Acquire)
+            && self.is_private_connected()
             && self
                 .freshness
                 .is_private_panels_fresh_at(self.time_sync.local_timestamp_ms(), stale_ms)
@@ -262,11 +386,17 @@ impl WsManager {
         }
     }
 
-    pub async fn start(&self, symbol: &str) -> AppResult<()> {
+    pub async fn start(&self, symbol: &str, context: OrderStreamContext) -> AppResult<()> {
         self.stop().await;
+        self.order_observation_buffer
+            .lock()
+            .await
+            .reset(context.clone());
+        self.order_snapshot_seeded.store(false, Ordering::Release);
         *self.active_symbol.write().await = symbol.to_string();
         self.running.store(true, Ordering::Relaxed);
-        self.emitter.emit_websocket("connecting");
+        self.emitter
+            .emit_websocket_for_session(&context, "connecting");
 
         let ws_public = self.ws_public_url.read().await.clone();
         let ws_private = self.ws_private_url.read().await.clone();
@@ -283,6 +413,11 @@ impl WsManager {
         let private_connected = self.private_connected.clone();
         let subscriptions = self.subscriptions.clone();
         let freshness = self.freshness.clone();
+        let notification_observer = self.notification_observer.clone();
+        let session_notification_observer = self.session_notification_observer.clone();
+        let config = self.config.clone();
+        let account_lifecycle = self.account_lifecycle.clone();
+        let order_observation_buffer = self.order_observation_buffer.clone();
 
         if !public_topics.is_empty() {
             let emitter_p = emitter.clone();
@@ -292,6 +427,7 @@ impl WsManager {
             let sym = symbol_owned.clone();
             let subs = subscriptions.clone();
             let session_freshness = freshness.clone();
+            let stream_context = context.clone();
             let handle = tauri::async_runtime::spawn(async move {
                 run_public_loop(
                     ws_public,
@@ -302,6 +438,7 @@ impl WsManager {
                     running_p,
                     pc,
                     session_freshness,
+                    stream_context,
                 )
                 .await;
             });
@@ -317,6 +454,12 @@ impl WsManager {
                 let sym = symbol_owned.clone();
                 let subs = subscriptions.clone();
                 let session_freshness = freshness.clone();
+                let observer = notification_observer.clone();
+                let session_observer = session_notification_observer.clone();
+                let session_config = config.clone();
+                let lifecycle = account_lifecycle.clone();
+                let observation_buffer = order_observation_buffer.clone();
+                let stream_context = context.clone();
                 let handle = tauri::async_runtime::spawn(async move {
                     run_private_loop(
                         ws_private,
@@ -329,6 +472,12 @@ impl WsManager {
                         running_pr,
                         prc,
                         session_freshness,
+                        observer,
+                        session_observer,
+                        session_config,
+                        lifecycle,
+                        stream_context,
+                        observation_buffer,
                     )
                     .await;
                 });
@@ -337,6 +486,55 @@ impl WsManager {
         }
 
         Ok(())
+    }
+
+    /// Opens the live-order gate after the caller has seeded REST snapshots
+    /// while holding the account lifecycle read guard.
+    pub(crate) async fn seed_order_snapshots_and_mark(
+        &self,
+        context: &OrderStreamContext,
+        snapshots: &[Order],
+    ) -> AppResult<()> {
+        let active_account_id = normalize_account_id(&self.config.read().await.active_account_id);
+        if self.account_lifecycle.current_session_epoch() != context.session_epoch
+            || active_account_id != context.account_id
+        {
+            return Ok(());
+        }
+        seed_order_gate(
+            &self.order_observation_buffer,
+            &self.order_snapshot_seeded,
+            context,
+            |pending| {
+                self.notification_observer.seed_snapshot_then_replay(
+                    context,
+                    snapshots,
+                    pending,
+                    local_timestamp_ms(),
+                )
+            },
+        )
+        .await
+    }
+
+    /// Applies a manual REST snapshot only after the initial scheduler snapshot
+    /// has opened this immutable session's live-order gate. The caller already
+    /// holds the lifecycle read guard.
+    pub(crate) async fn observe_manual_order_snapshots(
+        &self,
+        context: &OrderStreamContext,
+        snapshots: &[Order],
+    ) {
+        observe_manual_order_snapshots_for_session(
+            &self.config,
+            &self.account_lifecycle,
+            &self.order_observation_buffer,
+            &self.notification_observer,
+            context,
+            snapshots,
+            local_timestamp_ms(),
+        )
+        .await;
     }
 
     pub async fn stop(&self) {
@@ -354,6 +552,19 @@ impl WsManager {
         )
         .await;
     }
+
+    pub(crate) async fn activate_committed_session(&self, context: &OrderStreamContext) {
+        if self.is_private_connected() {
+            self.session_notification_observer
+                .observe_connection_status_guarded(
+                    context,
+                    ConnectionObservationSource::PrivateWebsocket,
+                    crate::models::config::ConnectionStatus::Connected,
+                    local_timestamp_ms(),
+                )
+                .await;
+        }
+    }
 }
 
 async fn run_public_loop(
@@ -365,6 +576,7 @@ async fn run_public_loop(
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     freshness: Arc<WsFreshness>,
+    context: OrderStreamContext,
 ) {
     while running.load(Ordering::Relaxed) {
         let topics = topic_snapshot(&subscriptions, false).await;
@@ -381,14 +593,15 @@ async fn run_public_loop(
             &running,
             &connected,
             &freshness,
+            &context,
         )
         .await
         {
             Ok(()) => connected.store(false, Ordering::Relaxed),
-            Err(e) => {
+            Err(_) => {
                 connected.store(false, Ordering::Relaxed);
-                tracing::warn!("公共 WebSocket 错误：{}", e);
-                emitter.emit_websocket("error");
+                tracing::warn!("public websocket session unavailable");
+                emitter.emit_websocket_for_session(&context, "error");
             }
         }
         freshness.reset_public();
@@ -410,6 +623,12 @@ async fn run_private_loop(
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     freshness: Arc<WsFreshness>,
+    notification_observer: OrderNotificationObserver,
+    session_notification_observer: SessionNotificationObserver,
+    config: Arc<RwLock<AppConfig>>,
+    account_lifecycle: Arc<AccountLifecycleCoordinator>,
+    context: OrderStreamContext,
+    order_observation_buffer: Arc<Mutex<OrderObservationBuffer>>,
 ) {
     while running.load(Ordering::Relaxed) {
         let topics = topic_snapshot(&subscriptions, true).await;
@@ -428,15 +647,31 @@ async fn run_private_loop(
             &running,
             &connected,
             &freshness,
+            &notification_observer,
+            &session_notification_observer,
+            &config,
+            &account_lifecycle,
+            &context,
+            &order_observation_buffer,
         )
         .await
         {
             Ok(()) => connected.store(false, Ordering::Relaxed),
-            Err(e) => {
-                connected.store(false, Ordering::Relaxed);
-                tracing::warn!("私有 WebSocket 错误：{}", e);
-                emitter.emit_error(&format!("私有 WebSocket 异常：{}", e));
-                emitter.emit_websocket("error");
+            Err(_) => {
+                report_private_failure_if_running(&running, || async {
+                    connected.store(false, Ordering::Relaxed);
+                    tracing::warn!("private websocket session unavailable");
+                    emitter.emit_websocket_for_session(&context, "error");
+                    session_notification_observer
+                        .observe_connection_status(
+                            &context,
+                            ConnectionObservationSource::PrivateWebsocket,
+                            crate::models::config::ConnectionStatus::Error,
+                            local_timestamp_ms(),
+                        )
+                        .await;
+                })
+                .await;
             }
         }
         freshness.reset_private();
@@ -445,6 +680,18 @@ async fn run_private_loop(
         }
         tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
     }
+}
+
+async fn report_private_failure_if_running<F, Fut>(running: &AtomicBool, report: F) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if !running.load(Ordering::Acquire) {
+        return false;
+    }
+    report().await;
+    true
 }
 
 async fn run_public_session(
@@ -456,14 +703,17 @@ async fn run_public_session(
     running: &Arc<AtomicBool>,
     connected: &Arc<AtomicBool>,
     freshness: &Arc<WsFreshness>,
+    context: &OrderStreamContext,
 ) -> Result<(), String> {
-    let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
+    let (stream, _) = connect_async(url)
+        .await
+        .map_err(|_| PUBLIC_SESSION_ERROR.to_string())?;
     let (mut write, mut read) = stream.split();
     if !running.load(Ordering::Relaxed) {
         return Ok(());
     }
     connected.store(true, Ordering::Relaxed);
-    emitter.emit_websocket("connected");
+    emitter.emit_websocket_for_session(context, "connected");
 
     if let Some(market) = market {
         let interval = market.kline_interval().await;
@@ -475,7 +725,7 @@ async fn run_public_session(
             build_subscribe_message(topics).to_string().into(),
         ))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| PUBLIC_SESSION_ERROR.to_string())?;
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     loop {
@@ -484,17 +734,17 @@ async fn run_public_session(
         }
         tokio::select! {
             _ = heartbeat.tick() => {
-                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|e| e.to_string())?;
+                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|_| PUBLIC_SESSION_ERROR.to_string())?;
             }
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            handle_message(&value, symbol, emitter, market, Some(freshness));
+                            handle_message(&value, symbol, emitter, market, Some(freshness), context);
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return Err("连接已关闭".into()),
-                    Some(Err(e)) => return Err(e.to_string()),
+                    Some(Err(_)) => return Err(PUBLIC_SESSION_ERROR.to_string()),
                     _ => {}
                 }
             }
@@ -502,54 +752,14 @@ async fn run_public_session(
     }
 }
 
-fn has_consistent_auth_identity(response: &Value) -> bool {
-    let top_level = response.get("op");
-    let nested = response
-        .get("request")
-        .and_then(|request| request.get("op"));
-    let mut saw_identity = false;
-    for identity in [top_level, nested].into_iter().flatten() {
-        saw_identity = true;
-        if identity.as_str() != Some("auth") {
-            return false;
-        }
-    }
-    saw_identity
-}
-
-fn auth_code_is_success(code: &Value) -> bool {
-    if let Some(code) = code.as_i64() {
-        return code == 0 || code == 200;
-    }
-    code.as_str()
-        .is_some_and(|code| matches!(code, "0" | "200") || code.eq_ignore_ascii_case("success"))
-}
-
 fn validate_private_auth_ack(response: &Value) -> Result<(), &'static str> {
-    if !has_consistent_auth_identity(response) {
-        return Err(PRIVATE_AUTH_ERROR);
-    }
-
-    let mut has_success = false;
-    let mut has_failure = false;
-    if let Some(success) = response.get("success") {
-        if success.as_bool() == Some(true) {
-            has_success = true;
-        } else {
-            has_failure = true;
-        }
-    }
-    for field in ["code", "retCode", "ret_code"] {
-        if let Some(code) = response.get(field) {
-            if auth_code_is_success(code) {
-                has_success = true;
-            } else {
-                has_failure = true;
-            }
-        }
-    }
-
-    if has_success && !has_failure {
+    if response.get("op").and_then(Value::as_str) == Some("auth")
+        && response.get("success").and_then(Value::as_bool) == Some(true)
+        && response.get("request").is_none()
+        && ["code", "retCode", "ret_code"]
+            .iter()
+            .all(|field| response.get(*field).is_none())
+    {
         Ok(())
     } else {
         Err(PRIVATE_AUTH_ERROR)
@@ -618,8 +828,16 @@ async fn run_private_session(
     running: &Arc<AtomicBool>,
     connected: &Arc<AtomicBool>,
     freshness: &Arc<WsFreshness>,
+    notification_observer: &OrderNotificationObserver,
+    session_notification_observer: &SessionNotificationObserver,
+    config: &Arc<RwLock<AppConfig>>,
+    account_lifecycle: &Arc<AccountLifecycleCoordinator>,
+    context: &OrderStreamContext,
+    order_observation_buffer: &Arc<Mutex<OrderObservationBuffer>>,
 ) -> Result<(), String> {
-    let (stream, _) = connect_async(url).await.map_err(|e| e.to_string())?;
+    let (stream, _) = connect_async(url)
+        .await
+        .map_err(|_| PRIVATE_SESSION_ERROR.to_string())?;
     let (mut write, mut read) = stream.split();
 
     let expires = default_auth_expires_ms(time_sync.timestamp_ms());
@@ -630,10 +848,21 @@ async fn run_private_session(
         topics,
         running,
         connected,
-        || emitter.emit_websocket("connected"),
+        || {},
         PRIVATE_AUTH_TIMEOUT,
     )
     .await?;
+    if connected.load(Ordering::Relaxed) {
+        emitter.emit_websocket_for_session(context, "connected");
+        session_notification_observer
+            .observe_connection_status(
+                context,
+                ConnectionObservationSource::PrivateWebsocket,
+                crate::models::config::ConnectionStatus::Connected,
+                local_timestamp_ms(),
+            )
+            .await;
+    }
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     loop {
@@ -642,21 +871,90 @@ async fn run_private_session(
         }
         tokio::select! {
             _ = heartbeat.tick() => {
-                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|e| e.to_string())?;
+                write.send(Message::Text(build_ping_message().to_string().into())).await.map_err(|_| PRIVATE_SESSION_ERROR.to_string())?;
             }
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            handle_message(&value, symbol, emitter, market, Some(freshness));
+                            handle_message(&value, symbol, emitter, market, Some(freshness), context);
+                            observe_private_orders(
+                                &value,
+                                notification_observer,
+                                config,
+                                account_lifecycle,
+                                context,
+                                order_observation_buffer,
+                            )
+                            .await;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return Err("连接已关闭".into()),
-                    Some(Err(e)) => return Err(e.to_string()),
+                    Some(Err(_)) => return Err(PRIVATE_SESSION_ERROR.to_string()),
                     _ => {}
                 }
             }
         }
+    }
+}
+
+async fn observe_private_orders(
+    message: &Value,
+    observer: &OrderNotificationObserver,
+    config: &Arc<RwLock<AppConfig>>,
+    account_lifecycle: &Arc<AccountLifecycleCoordinator>,
+    context: &OrderStreamContext,
+    order_observation_buffer: &Arc<Mutex<OrderObservationBuffer>>,
+) {
+    let topic = message
+        .get("topic")
+        .or_else(|| message.get("channel"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if super::topics::event_name_for_topic(topic) != "order" {
+        return;
+    }
+    let data = message.get("data").unwrap_or(message);
+    let orders = if let Some(items) = data.as_array() {
+        items.iter().map(parse_order).collect::<Vec<_>>()
+    } else if data.is_object() {
+        vec![parse_order(data)]
+    } else {
+        Vec::new()
+    };
+    if orders.is_empty() {
+        return;
+    }
+
+    // Lock order is lifecycle -> config -> live buffer -> notification. The
+    // scheduler holds the same lifecycle read guard while seeding and opening
+    // the buffer, so a pending account switch cannot invert these locks.
+    let _lifecycle_guard = account_lifecycle.read_guard().await;
+    let active_account_id = normalize_account_id(&config.read().await.active_account_id);
+    if account_lifecycle.current_session_epoch() != context.session_epoch
+        || active_account_id != context.account_id
+    {
+        return;
+    }
+    let mut buffer = order_observation_buffer.lock().await;
+    if !buffer.matches(context) {
+        return;
+    }
+    if !buffer.snapshot_seeded {
+        let _ = buffer.defer(context, orders);
+        return;
+    }
+    for order in orders {
+        observer
+            .observe(
+                &context.account_id,
+                context.session_epoch,
+                &order,
+                crate::services::notification::OrderObservationOrigin::Realtime,
+                None,
+                local_timestamp_ms(),
+            )
+            .await;
     }
 }
 
@@ -713,6 +1011,7 @@ fn handle_message(
     emitter: &EventEmitter,
     market: Option<&Arc<MarketService>>,
     freshness: Option<&WsFreshness>,
+    context: &OrderStreamContext,
 ) {
     if let Some(freshness) = freshness {
         record_message_freshness(message, freshness, local_timestamp_ms());
@@ -755,15 +1054,19 @@ fn handle_message(
         }
         "order" => {
             let data = message.get("data").unwrap_or(message);
-            dispatch_list(data, |item| emitter.emit_order(parse_order(item)));
+            dispatch_list(data, |item| emitter.emit_order(context, parse_order(item)));
         }
         "position" => {
             let data = message.get("data").unwrap_or(message);
-            dispatch_list(data, |item| emitter.emit_position(parse_position(item)));
+            dispatch_list(data, |item| {
+                emitter.emit_position(context, parse_position(item))
+            });
         }
         "balance" => {
             let data = message.get("data").unwrap_or(message);
-            dispatch_list(data, |item| emitter.emit_balance(parse_balance(item)));
+            dispatch_list(data, |item| {
+                emitter.emit_balance(context, parse_balance(item))
+            });
         }
         _ => {}
     }
@@ -794,7 +1097,7 @@ async fn topic_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -804,9 +1107,570 @@ mod tests {
 
     use super::{
         abort_and_wait_for_tasks, abort_wait_and_reset_freshness, authenticate_and_subscribe,
-        await_private_auth_response, record_message_freshness, validate_private_auth_ack,
-        FreshnessDomain, WsFreshness, PRIVATE_AUTH_ERROR, PRIVATE_SUBSCRIPTION_ERROR,
+        await_private_auth_response, observe_manual_order_snapshots_for_session,
+        record_message_freshness, report_private_failure_if_running, seed_order_gate,
+        validate_private_auth_ack, FreshnessDomain, OrderObservationBuffer, WsFreshness,
+        PRIVATE_AUTH_ERROR, PRIVATE_SUBSCRIPTION_ERROR,
     };
+    use crate::models::config::AppConfig;
+    use crate::models::notification::{ListNotificationsRequest, NotificationFilter};
+    use crate::models::trading::{Order, OrderStatus, OrderStreamContext};
+    use crate::services::notification::{
+        NotificationAvailability, NotificationEmitter, NotificationRuntime, NotificationService,
+        ViewContext,
+    };
+    use crate::services::trading::OrderNotificationObserver;
+    use crate::services::AccountLifecycleCoordinator;
+    use crate::storage::notification_store::{NotificationFileV1, NotificationPersistence};
+    use crate::storage::NotificationStore;
+
+    struct FailAtPersistence {
+        attempts: AtomicUsize,
+        fail_at: usize,
+    }
+
+    impl NotificationPersistence for FailAtPersistence {
+        fn save(&self, _file: &NotificationFileV1) -> crate::error::AppResult<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == self.fail_at {
+                Err(crate::error::AppError::Storage(
+                    "private-notification-store-detail".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn buffered_order(id: &str, status: OrderStatus) -> Order {
+        Order {
+            order_id: id.into(),
+            symbol: "BTCUSDT".into(),
+            side: "Buy".into(),
+            order_type: "Limit".into(),
+            price: "100".into(),
+            qty: "1".into(),
+            status,
+            order_link_id: None,
+            filled_qty: "0".into(),
+            avg_price: "0".into(),
+        }
+    }
+
+    #[test]
+    fn live_order_buffer_preserves_frame_order_until_matching_snapshot_is_seeded() {
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let wrong = OrderStreamContext {
+            account_id: "beta".into(),
+            session_epoch: 7,
+        };
+        let mut buffer = OrderObservationBuffer::default();
+        buffer.reset(context.clone());
+        assert!(buffer.defer(
+            &context,
+            vec![
+                buffered_order("order-buffer-1", OrderStatus::New),
+                buffered_order("order-buffer-1", OrderStatus::PartiallyFilled),
+                buffered_order("order-buffer-1", OrderStatus::Filled),
+            ],
+        ));
+        assert!(buffer.pending_for_seed(&wrong).is_none());
+
+        let pending = buffer.pending_for_seed(&context).unwrap();
+        assert_eq!(
+            pending
+                .into_iter()
+                .map(|order| order.status)
+                .collect::<Vec<_>>(),
+            vec![
+                OrderStatus::New,
+                OrderStatus::PartiallyFilled,
+                OrderStatus::Filled,
+            ]
+        );
+        assert!(buffer.finish_seed(&context));
+        assert!(!buffer.defer(
+            &context,
+            vec![buffered_order("order-buffer-2", OrderStatus::New)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_seed_retains_pending_and_retries_once() {
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(
+            &context,
+            vec![
+                buffered_order("order-cancel-seed-1", OrderStatus::New),
+                buffered_order("order-cancel-seed-1", OrderStatus::Filled),
+            ],
+        ));
+        let seeded = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task_buffer = Arc::clone(&buffer);
+        let task_seeded = Arc::clone(&seeded);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            seed_order_gate(
+                &task_buffer,
+                &task_seeded,
+                &task_context,
+                |pending| async move {
+                    assert_eq!(pending.len(), 2);
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    Ok(())
+                },
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+
+        let drain_buffer = Arc::clone(&buffer);
+        let drain_context = context.clone();
+        let mut drain = tokio::spawn(async move {
+            drain_buffer.lock().await.defer(
+                &drain_context,
+                vec![buffered_order("order-cancel-seed-2", OrderStatus::New)],
+            )
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut drain)
+            .await
+            .is_err());
+        task.abort();
+        let _ = task.await;
+        assert!(drain.await.unwrap());
+
+        let gate = buffer.lock().await;
+        assert!(!gate.snapshot_seeded);
+        assert_eq!(gate.pending.len(), 3);
+        drop(gate);
+        let replayed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replayed_for_seed = Arc::clone(&replayed);
+        seed_order_gate(&buffer, &seeded, &context, move |pending| async move {
+            for order in pending {
+                let identity = (order.order_id, order.status);
+                let mut observed = replayed_for_seed.lock().unwrap();
+                if !observed.contains(&identity) {
+                    observed.push(identity);
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
+        assert_eq!(replayed.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_gate_replay_retains_full_batch_and_retries_partial_commit_once() {
+        let persistence = Arc::new(FailAtPersistence {
+            attempts: AtomicUsize::new(0),
+            fail_at: 2,
+        });
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_by_callback = Arc::clone(&emitted);
+        let emitter: NotificationEmitter = Arc::new(move |_| {
+            emitted_by_callback.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let service = Arc::new(NotificationService::from_snapshot(
+            NotificationFileV1::empty(),
+            Arc::clone(&persistence),
+            emitter,
+            1_784_606_400_000,
+        ));
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Available(
+            Arc::clone(&service),
+        )));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        let pending = vec![
+            buffered_order("order-gate-persist-1", OrderStatus::New),
+            buffered_order("order-gate-persist-1", OrderStatus::Filled),
+            buffered_order("order-gate-persist-2", OrderStatus::PartiallyFilled),
+            buffered_order("order-gate-persist-2", OrderStatus::Filled),
+        ];
+        assert!(buffer.lock().await.defer(&context, pending.clone()));
+        let seeded = AtomicBool::new(false);
+
+        let first = seed_order_gate(&buffer, &seeded, &context, |buffered| {
+            observer.seed_snapshot_then_replay(&context, &[], buffered, 1_784_606_400_000)
+        })
+        .await;
+
+        assert!(first.is_err());
+        let rendered = first.unwrap_err().to_string();
+        assert!(!rendered.contains("private-notification-store-detail"));
+        assert!(!seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(!gate.snapshot_seeded);
+        assert_eq!(
+            gate.pending
+                .iter()
+                .map(|order| (order.order_id.as_str(), order.status.clone()))
+                .collect::<Vec<_>>(),
+            pending
+                .iter()
+                .map(|order| (order.order_id.as_str(), order.status.clone()))
+                .collect::<Vec<_>>()
+        );
+        drop(gate);
+        assert_eq!(service.revision().await, "1");
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+
+        seed_order_gate(&buffer, &seeded, &context, |buffered| {
+            observer.seed_snapshot_then_replay(&context, &[], buffered, 1_784_606_400_100)
+        })
+        .await
+        .unwrap();
+
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
+        drop(gate);
+        assert_eq!(persistence.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(service.revision().await, "2");
+        assert_eq!(emitted.load(Ordering::SeqCst), 2);
+        let records = service
+            .list(
+                ViewContext::account("alpha").unwrap(),
+                ListNotificationsRequest {
+                    account_id: Some("alpha".into()),
+                    filter: NotificationFilter::All,
+                    cursor: None,
+                    limit: 100,
+                },
+                1_784_606_401_000,
+            )
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fail_once_gate_replay_stays_closed_until_the_batch_commits() {
+        let persistence = Arc::new(FailAtPersistence {
+            attempts: AtomicUsize::new(0),
+            fail_at: 1,
+        });
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_by_callback = Arc::clone(&emitted);
+        let service = Arc::new(NotificationService::from_snapshot(
+            NotificationFileV1::empty(),
+            Arc::clone(&persistence),
+            Arc::new(move |_| {
+                emitted_by_callback.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            1_784_606_400_000,
+        ));
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Available(
+            Arc::clone(&service),
+        )));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(
+            &context,
+            vec![
+                buffered_order("order-gate-fail-once-1", OrderStatus::New),
+                buffered_order("order-gate-fail-once-1", OrderStatus::Filled),
+            ],
+        ));
+        let seeded = AtomicBool::new(false);
+
+        let first = seed_order_gate(&buffer, &seeded, &context, |pending| {
+            observer.seed_snapshot_then_replay(&context, &[], pending, 1_784_606_400_000)
+        })
+        .await;
+
+        assert!(first.is_err());
+        assert!(!first
+            .unwrap_err()
+            .to_string()
+            .contains("private-notification-store-detail"));
+        assert!(!seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(!gate.snapshot_seeded);
+        assert_eq!(gate.pending.len(), 2);
+        drop(gate);
+        assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(service.revision().await, "0");
+        assert_eq!(emitted.load(Ordering::SeqCst), 0);
+
+        seed_order_gate(&buffer, &seeded, &context, |pending| {
+            observer.seed_snapshot_then_replay(&context, &[], pending, 1_784_606_400_100)
+        })
+        .await
+        .unwrap();
+
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
+        drop(gate);
+        assert_eq!(persistence.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(service.revision().await, "1");
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn permanent_invalid_order_content_is_skipped_and_gate_opens_without_retry_loop() {
+        let persistence = Arc::new(FailAtPersistence {
+            attempts: AtomicUsize::new(0),
+            fail_at: usize::MAX,
+        });
+        let service = Arc::new(NotificationService::from_snapshot(
+            NotificationFileV1::empty(),
+            Arc::clone(&persistence),
+            Arc::new(|_| Ok(())),
+            1_784_606_400_000,
+        ));
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Available(
+            Arc::clone(&service),
+        )));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let mut new = buffered_order("", OrderStatus::New);
+        new.order_link_id = Some("private-invalid-order-link".into());
+        let mut filled = new.clone();
+        filled.status = OrderStatus::Filled;
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(&context, vec![new, filled]));
+        let seeded = AtomicBool::new(false);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            seed_order_gate(&buffer, &seeded, &context, |pending| {
+                observer.seed_snapshot_then_replay(&context, &[], pending, 1_784_606_400_000)
+            }),
+        )
+        .await
+        .expect("permanent notification validation must not enter retry backoff");
+
+        assert!(result.is_ok());
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
+        drop(gate);
+        assert_eq!(persistence.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(service.revision().await, "0");
+        let records = service
+            .list(
+                ViewContext::account("alpha").unwrap(),
+                ListNotificationsRequest {
+                    account_id: Some("alpha".into()),
+                    filter: NotificationFilter::All,
+                    cursor: None,
+                    limit: 100,
+                },
+                1_784_606_401_000,
+            )
+            .await
+            .unwrap()
+            .items;
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unavailable_notification_runtime_opens_gate_without_retry_error() {
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Unavailable(
+            NotificationAvailability::new(
+                "NOTIFICATION_FUTURE_SCHEMA",
+                "private-unavailable-detail",
+            ),
+        )));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(
+            &context,
+            vec![
+                buffered_order("order-unavailable-runtime-1", OrderStatus::New),
+                buffered_order("order-unavailable-runtime-1", OrderStatus::Filled),
+            ],
+        ));
+        let seeded = AtomicBool::new(false);
+
+        let result = seed_order_gate(&buffer, &seeded, &context, |pending| {
+            observer.seed_snapshot_then_replay(&context, &[], pending, 1_784_606_400_000)
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert!(seeded.load(Ordering::Acquire));
+        let gate = buffer.lock().await;
+        assert!(gate.snapshot_seeded);
+        assert!(gate.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_snapshot_cannot_interleave_with_ws_drain_and_stale_context_is_noop() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "easiflux-manual-order-gate-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+            .join("notifications.v1.json");
+        let emitter: NotificationEmitter = Arc::new(|_| Ok(()));
+        let service = Arc::new(
+            NotificationService::load(
+                NotificationStore::with_path(path.clone()),
+                &["alpha".into()],
+                1_784_606_400_000,
+                emitter,
+            )
+            .unwrap(),
+        );
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Available(
+            Arc::clone(&service),
+        )));
+        let lifecycle = Arc::new(AccountLifecycleCoordinator::new());
+        let mut app_config = AppConfig::default();
+        app_config.active_account_id = "alpha".into();
+        let config = Arc::new(tokio::sync::RwLock::new(app_config));
+        let context = OrderStreamContext {
+            account_id: "alpha".into(),
+            session_epoch: lifecycle.current_session_epoch(),
+        };
+        let buffer = Arc::new(tokio::sync::Mutex::new(OrderObservationBuffer::default()));
+        buffer.lock().await.reset(context.clone());
+        assert!(buffer.lock().await.defer(
+            &context,
+            vec![
+                buffered_order("order-manual-gate-1", OrderStatus::New),
+                buffered_order("order-manual-gate-1", OrderStatus::Filled),
+            ],
+        ));
+        let seeded = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let seed_buffer = Arc::clone(&buffer);
+        let seed_flag = Arc::clone(&seeded);
+        let seed_context = context.clone();
+        let replay_context = context.clone();
+        let seed_observer = observer.clone();
+        let seed_task = tokio::spawn(async move {
+            seed_order_gate(
+                &seed_buffer,
+                &seed_flag,
+                &seed_context,
+                |pending| async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    seed_observer
+                        .seed_snapshot_then_replay(
+                            &replay_context,
+                            &[buffered_order("order-manual-gate-1", OrderStatus::Filled)],
+                            pending,
+                            1_784_606_400_000,
+                        )
+                        .await
+                },
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+
+        let manual_config = Arc::clone(&config);
+        let manual_lifecycle = Arc::clone(&lifecycle);
+        let manual_buffer = Arc::clone(&buffer);
+        let manual_observer = observer.clone();
+        let manual_context = context.clone();
+        let mut manual_task = tokio::spawn(async move {
+            observe_manual_order_snapshots_for_session(
+                &manual_config,
+                &manual_lifecycle,
+                &manual_buffer,
+                &manual_observer,
+                &manual_context,
+                &[buffered_order("order-manual-gate-1", OrderStatus::Filled)],
+                1_784_606_400_100,
+            )
+            .await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut manual_task)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        seed_task.await.unwrap().unwrap();
+        manual_task.await.unwrap();
+
+        let records = service
+            .list(
+                ViewContext::account("alpha").unwrap(),
+                ListNotificationsRequest {
+                    account_id: Some("alpha".into()),
+                    filter: NotificationFilter::All,
+                    cursor: None,
+                    limit: 100,
+                },
+                1_784_606_401_000,
+            )
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(records.len(), 1);
+
+        lifecycle.advance_session_epoch();
+        observe_manual_order_snapshots_for_session(
+            &config,
+            &lifecycle,
+            &buffer,
+            &observer,
+            &context,
+            &[buffered_order("order-stale-manual-1", OrderStatus::New)],
+            1_784_606_402_000,
+        )
+        .await;
+        assert!(observer
+            .observe(
+                "alpha",
+                context.session_epoch,
+                &buffered_order("order-stale-manual-1", OrderStatus::Filled),
+                crate::services::notification::OrderObservationOrigin::Realtime,
+                None,
+                1_784_606_402_001,
+            )
+            .await
+            .is_none());
+        assert_eq!(service.revision().await, "1");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -999,15 +1863,10 @@ mod tests {
     fn private_auth_ack_requires_an_explicit_compatible_success() {
         assert_eq!(PRIVATE_AUTH_ERROR, "私有 WebSocket 鉴权失败");
         assert_eq!(PRIVATE_SUBSCRIPTION_ERROR, "私有 WebSocket 订阅失败");
-        for response in [
-            json!({"op": "auth", "success": true}),
-            json!({"request": {"op": "auth"}, "code": 0}),
-            json!({"op": "auth", "retCode": "0"}),
-            json!({"op": "auth", "ret_code": 200}),
-            json!({"op": "auth", "code": "SUCCESS"}),
-        ] {
-            assert_eq!(validate_private_auth_ack(&response), Ok(()));
-        }
+        assert_eq!(
+            validate_private_auth_ack(&json!({"op": "auth", "success": true})),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1024,10 +1883,29 @@ mod tests {
             json!({"op": "subscribe", "success": true}),
             json!({"success": true}),
             json!({"op": "auth", "success": "true"}),
+            json!({"request": {"op": "auth"}, "code": 0}),
+            json!({"op": "auth", "retCode": "0"}),
+            json!({"op": "auth", "ret_code": 200}),
+            json!({"op": "auth", "code": "SUCCESS"}),
         ] {
             let error = validate_private_auth_ack(&response).unwrap_err();
             assert_eq!(error, PRIVATE_AUTH_ERROR);
             assert!(!error.contains("401"));
+        }
+    }
+
+    #[test]
+    fn private_websocket_auth_spoof_messages_remain_one_sanitized_protocol_error() {
+        for response in [
+            json!({"op": "auth", "success": false, "message": "session expired"}),
+            json!({"op": "auth", "success": false, "code": 26200003}),
+            json!({"op": "auth", "success": false, "message": "apiKey=raw-secret"}),
+        ] {
+            let error = validate_private_auth_ack(&response).unwrap_err();
+            assert_eq!(error, PRIVATE_AUTH_ERROR);
+            assert!(!error.contains("expired"));
+            assert!(!error.contains("26200003"));
+            assert!(!error.contains("raw-secret"));
         }
     }
 
@@ -1111,6 +1989,20 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert!(!connected.load(Ordering::SeqCst));
         assert!(!emitted_connected.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn private_loop_error_after_manual_stop_has_no_failure_side_effect() {
+        let running = AtomicBool::new(false);
+        let reports = AtomicUsize::new(0);
+
+        let reported = report_private_failure_if_running(&running, || async {
+            reports.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(!reported);
+        assert_eq!(reports.load(Ordering::SeqCst), 0);
     }
 
     #[test]

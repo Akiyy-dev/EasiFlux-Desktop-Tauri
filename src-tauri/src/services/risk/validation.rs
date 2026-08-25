@@ -1,8 +1,9 @@
-use rust_decimal::prelude::FromStr;
+use rust_decimal::prelude::{FromStr, ToPrimitive};
 use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
 use crate::models::config::RiskConfig;
+use crate::models::risk::{RiskViolation, RiskViolationCode};
 use crate::models::trading::PlaceOrderRequest;
 use crate::services::time::is_valid_iana_timezone;
 
@@ -31,20 +32,20 @@ pub(super) fn validate_order(
     config: &RiskConfig,
     request: &PlaceOrderRequest,
     reference_price: Option<&str>,
-) -> AppResult<()> {
+) -> Result<(), RiskViolation> {
     let qty = Decimal::from_str(&request.qty)
-        .map_err(|_| AppError::Risk(format!("无效订单数量: {}", request.qty)))?;
+        .map_err(|_| RiskViolation::new(RiskViolationCode::InvalidQuantity))?;
     if qty <= Decimal::ZERO {
-        return Err(AppError::Risk("订单数量必须大于 0".into()));
+        return Err(RiskViolation::new(RiskViolationCode::NonPositiveQuantity));
     }
 
     let max_qty = Decimal::from_str(&config.max_order_qty)
-        .map_err(|_| AppError::Config("风控最大订单数量配置无效".into()))?;
+        .map_err(|_| RiskViolation::new(RiskViolationCode::LedgerUnavailable))?;
     if qty > max_qty {
-        return Err(AppError::Risk(format!(
-            "订单数量 {} 超过最大限制 {}",
-            qty, max_qty
-        )));
+        return Err(violation_with_decimal_limit(
+            RiskViolationCode::MaxOrderQty,
+            max_qty,
+        ));
     }
 
     if request.order_type.to_lowercase() == "limit" {
@@ -57,15 +58,15 @@ fn validate_limit_price(
     config: &RiskConfig,
     request: &PlaceOrderRequest,
     reference_price: Option<&str>,
-) -> AppResult<()> {
+) -> Result<(), RiskViolation> {
     let price_str = request
         .price
         .as_deref()
-        .ok_or_else(|| AppError::Risk("限价单必须提供价格".into()))?;
+        .ok_or_else(|| RiskViolation::new(RiskViolationCode::MissingLimitPrice))?;
     let price = Decimal::from_str(price_str)
-        .map_err(|_| AppError::Risk(format!("无效限价: {price_str}")))?;
+        .map_err(|_| RiskViolation::new(RiskViolationCode::InvalidLimitPrice))?;
     if price <= Decimal::ZERO {
-        return Err(AppError::Risk("限价必须大于 0".into()));
+        return Err(RiskViolation::new(RiskViolationCode::NonPositiveLimitPrice));
     }
 
     let Some(ref_price) = reference_price
@@ -76,12 +77,20 @@ fn validate_limit_price(
     };
     let deviation = ((price - ref_price).abs() / ref_price) * Decimal::from(100);
     let max_deviation = Decimal::from_str(&config.max_price_deviation_pct)
-        .map_err(|_| AppError::Config("风控价格偏离配置无效".into()))?;
+        .map_err(|_| RiskViolation::new(RiskViolationCode::LedgerUnavailable))?;
     if deviation > max_deviation {
-        return Err(AppError::Risk(format!(
-            "限价偏离市价 {:.2}%，超过限制 {}%",
-            deviation, max_deviation
-        )));
+        return Err(violation_with_decimal_limit(
+            RiskViolationCode::MaxPriceDeviation,
+            max_deviation,
+        ));
     }
     Ok(())
+}
+
+fn violation_with_decimal_limit(code: RiskViolationCode, limit: Decimal) -> RiskViolation {
+    limit
+        .to_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|limit| RiskViolation::with_limit(code, limit))
+        .unwrap_or_else(|| RiskViolation::new(code))
 }

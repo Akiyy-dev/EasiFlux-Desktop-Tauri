@@ -7,6 +7,7 @@ import { tauriInvoke } from '../../../composables/useTauriCommand'
 import { useConnectionStore } from '../../../stores/connection'
 import { parseClosedPnlRecords, type ClosedPnlRecord } from '../../../utils/tradingRecords'
 import { reportError } from '../../../services/errorService'
+import { decodeCommandError } from '../../../services/notificationService'
 
 const props = defineProps<{
   active: boolean
@@ -65,7 +66,7 @@ async function refresh(): Promise<void> {
     })
     records.value = parseClosedPnlRecords(payload)
   } catch (error) {
-    reportError(error)
+    if (!decodeCommandError(error).notificationId) reportError(error)
   } finally {
     loading.value = false
   }

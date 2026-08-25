@@ -1,3 +1,5 @@
+import { decodeCommandError } from './notificationService'
+
 export type AccountReconciliationStep =
   | 'config'
   | 'profiles'
@@ -7,6 +9,20 @@ export type AccountReconciliationStep =
 export interface AccountReconciliationTask {
   step: AccountReconciliationStep
   run: () => Promise<unknown>
+}
+
+const RECONCILIATION_STEP_ORDER: readonly AccountReconciliationStep[] = [
+  'config',
+  'profiles',
+  'connection',
+  'bootstrap',
+]
+
+export function normalizeReconciliationSteps(
+  steps: readonly AccountReconciliationStep[],
+): AccountReconciliationStep[] {
+  const included = new Set(steps)
+  return RECONCILIATION_STEP_ORDER.filter((step) => included.has(step))
 }
 
 const FAILURE_LABELS: Record<AccountReconciliationStep, string> = {
@@ -20,9 +36,11 @@ export async function collectReconciliationFailures(
   tasks: AccountReconciliationTask[],
 ): Promise<AccountReconciliationStep[]> {
   const results = await Promise.allSettled(tasks.map(({ run }) => run()))
-  return results.flatMap((result, index) =>
-    result.status === 'rejected' ? [tasks[index].step] : [],
-  )
+  return normalizeReconciliationSteps(results.flatMap((result, index) =>
+    result.status === 'rejected' && !decodeCommandError(result.reason).notificationId
+      ? [tasks[index].step]
+      : [],
+  ))
 }
 
 export function formatReconciliationError(

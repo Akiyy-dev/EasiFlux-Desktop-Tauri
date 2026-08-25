@@ -88,6 +88,28 @@ fn profile_list_is_sanitized_and_isolates_keyring_failures() {
     assert!(!serialized.contains("raw keyring failure"));
 }
 
+#[test]
+fn profile_list_quarantines_unsafe_loaded_base_url_without_exposing_it() {
+    let repository = FakeCredentialRepository(HashMap::from([(
+        "primary".into(),
+        FakeCredential::Present(ApiCredential {
+            api_key: "key".into(),
+            api_secret: "secret".into(),
+            base_url: "https://user:raw-secret@example.test/api?token=raw".into(),
+            label: "Main".into(),
+        }),
+    )]));
+
+    let profiles = build_account_profiles(&["primary".into()], "primary", &repository);
+    let serialized = serde_json::to_string(&profiles).unwrap();
+
+    assert_eq!(profiles[0].credential_state, CredentialState::Unavailable);
+    assert_eq!(profiles[0].base_url, DEFAULT_BASE_URL);
+    assert!(!serialized.contains("raw-secret"));
+    assert!(!serialized.contains("token="));
+    assert!(!serialized.contains("example.test"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_list_holds_transaction_guard_across_all_credential_reads() {
     let port = Arc::new(FakeLifecyclePort::new(ConnectionStatus::Disconnected));

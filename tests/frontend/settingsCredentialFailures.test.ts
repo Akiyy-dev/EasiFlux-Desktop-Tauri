@@ -195,6 +195,56 @@ describe('QuickSetup connection failures', () => {
     expect(wrapper.findAll('button').some((button) => button.text() === '编辑凭据')).toBe(true)
   })
 
+  it('keeps a notification-aware connection failure inline without generic delivery', async () => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
+    useConfigStore().config = config
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'save_credentials') return Promise.resolve(undefined)
+      if (command === 'list_account_profiles') return Promise.resolve([profile])
+      if (command === 'connect') {
+        return Promise.reject({
+          code: 'CONNECTION_UNAVAILABLE',
+          message: '连接服务暂时不可用',
+          notificationId: 'notification-quick-setup-1',
+        })
+      }
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountQuickSetup()
+
+    await saveThroughEditor(wrapper)
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('连接服务暂时不可用')
+    expect(toastError).toHaveBeenCalledTimes(0)
+    expect(useLogStore().entries).toHaveLength(0)
+    expect(useLogStore().lastError).toBeNull()
+  })
+
+  it('delivers an ordinary connection failure through the generic owner exactly once', async () => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
+    useConfigStore().config = config
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'save_credentials') return Promise.resolve(undefined)
+      if (command === 'list_account_profiles') return Promise.resolve([profile])
+      if (command === 'connect') return Promise.reject(new Error('ordinary connection failure'))
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountQuickSetup()
+
+    await saveThroughEditor(wrapper)
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('ordinary connection failure')
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(useLogStore().entries).toHaveLength(1)
+    expect(useLogStore().lastError).toContain('ordinary connection failure')
+  })
+
   it('does not connect when a stale session config fetch resolves after reopen', async () => {
     const pendingConfig = deferred<AppConfig>()
     useConfigStore().config = null

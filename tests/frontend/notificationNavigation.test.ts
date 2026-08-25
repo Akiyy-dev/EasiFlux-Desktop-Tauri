@@ -1,0 +1,162 @@
+import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import AppShell from '../../src/components/layout/AppShell.vue'
+import NotificationPopover from '../../src/components/notifications/NotificationPopover.vue'
+import TopBar from '../../src/components/layout/TopBar.vue'
+import { flushActiveChartWorkspace } from '../../src/services/chartWorkspaceFlushRegistry'
+
+vi.mock('../../src/composables/useChartWorkspaceAutosaveHost', () => ({ useChartWorkspaceAutosaveHost: vi.fn() }))
+vi.mock('../../src/services/chartWorkspaceFlushRegistry', () => ({ flushActiveChartWorkspace: vi.fn().mockResolvedValue(undefined) }))
+vi.mock('../../src/services/errorService', () => ({ reportError: vi.fn() }))
+vi.mock('../../src/components/market/KlineChart.vue', () => ({
+  default: { template: '<div />' },
+}))
+
+function mountShell() {
+  const pinia = createPinia()
+  setActivePinia(pinia)
+  return mount(AppShell, {
+    attachTo: document.body,
+    global: {
+      plugins: [pinia],
+      stubs: {
+        TradingLayout: { template: '<div />' },
+        ChartWorkspacePage: { template: '<div />' },
+        DashboardPage: { template: '<div />' },
+        SettingsCenterPage: {
+          props: ['initialSection', 'initialAccountSection'],
+          template: '<section data-testid="settings-content" :data-account-section="initialAccountSection"><h1>设置</h1><h2 v-if="initialSection === \'notifications\'" id="notification-settings-title">通知设置</h2><h2 v-else>{{ initialSection }}</h2></section>',
+        },
+      },
+    },
+  })
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+describe('notification action navigation', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.mocked(flushActiveChartWorkspace).mockReset().mockResolvedValue(undefined)
+  })
+
+  afterEach(() => {
+    document.body.replaceChildren()
+  })
+
+  it.each([
+    [{ type: 'openTrading' }, 'trading', undefined, undefined],
+    [{ type: 'openAccountSettings', accountSection: 'api' }, 'settings', 'account', 'api'],
+    [{ type: 'openAccountSettings', accountSection: 'risk' }, 'settings', 'account', 'risk'],
+    [{ type: 'openGeneralSettings' }, 'settings', 'general', undefined],
+    [{ type: 'openNotificationSettings' }, 'settings', 'notifications', undefined],
+  ] as const)('maps %o through object navigation and keeps the chart flush', async (action, page, section, accountSection) => {
+    const wrapper = mountShell()
+    wrapper.getComponent(TopBar).vm.$emit('action', action)
+    await flushPromises()
+
+    expect(flushActiveChartWorkspace).toHaveBeenCalledWith('page')
+    if (page === 'trading') {
+      expect(wrapper.find('[data-testid="settings-content"]').exists()).toBe(false)
+    } else {
+      if (section === 'notifications') {
+        expect(wrapper.get('#notification-settings-title').text()).toBe('通知设置')
+      } else {
+        expect(wrapper.get('[data-testid="settings-content"]').text()).toContain(section)
+      }
+      expect(wrapper.get('[data-testid="settings-content"]').attributes('data-account-section')).toBe(accountSection ?? 'api')
+    }
+  })
+
+  it('focuses the stable notification settings heading after notification-settings navigation', async () => {
+    const wrapper = mountShell()
+    wrapper.getComponent(TopBar).vm.$emit('action', { type: 'openNotificationSettings' })
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    const heading = wrapper.get('#notification-settings-title')
+    expect(heading.attributes('tabindex')).toBe('-1')
+    expect(document.activeElement).toBe(heading.element)
+    wrapper.unmount()
+  })
+
+  it('focuses notification settings before an unrelated pending chart flush resolves', async () => {
+    const pendingFlush = deferred<void>()
+    vi.mocked(flushActiveChartWorkspace).mockReturnValueOnce(pendingFlush.promise)
+    const wrapper = mountShell()
+
+    wrapper.getComponent(TopBar).vm.$emit('action', { type: 'openNotificationSettings' })
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    const heading = wrapper.get('#notification-settings-title')
+    expect(heading.attributes('tabindex')).toBe('-1')
+    expect(document.activeElement).toBe(heading.element)
+    pendingFlush.resolve()
+    await flushPromises()
+    wrapper.unmount()
+  })
+
+  it('hands focus from the real notification footer sequence to the settings heading', async () => {
+    const wrapper = mountShell()
+
+    await wrapper.get('[data-testid="notification-bell"]').trigger('click')
+    await flushPromises()
+    const settings = document.querySelector('[data-testid="notification-settings"]')
+    expect(settings).toBeInstanceOf(HTMLButtonElement)
+    ;(settings as HTMLButtonElement).click()
+    await flushPromises()
+
+    const afterLeave = wrapper
+      .getComponent(NotificationPopover)
+      .getComponent({ name: 'Popover' })
+      .props('internalOnAfterLeave')
+    expect(afterLeave).toBeTypeOf('function')
+    ;(afterLeave as () => void)()
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(document.activeElement).toBe(wrapper.get('#notification-settings-title').element)
+    wrapper.unmount()
+  })
+
+  it('restores focus to the bell for an ordinary popover close', async () => {
+    const wrapper = mountShell()
+    const bell = wrapper.get('[data-testid="notification-bell"]')
+
+    await bell.trigger('click')
+    await flushPromises()
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(document.activeElement).toBe(bell.element)
+    wrapper.unmount()
+  })
+
+  it('restores focus after the full outside-pointer click sequence completes', async () => {
+    const wrapper = mountShell()
+    const bell = wrapper.get('[data-testid="notification-bell"]')
+    const outside = document.createElement('button')
+    document.body.append(outside)
+
+    await bell.trigger('click')
+    await flushPromises()
+    outside.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    await flushPromises()
+    outside.focus()
+    outside.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+    outside.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(document.activeElement).toBe(bell.element)
+    wrapper.unmount()
+    outside.remove()
+  })
+})

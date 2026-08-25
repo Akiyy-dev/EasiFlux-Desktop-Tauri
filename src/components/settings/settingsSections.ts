@@ -23,7 +23,7 @@ function section(
 const general = section('general', '通用', '配置应用的基础偏好。')
 const account = section('account', '账户', '管理账户与账户级设置。')
 const plugins = section('plugins', '插件', '管理插件的启用状态、权限与插件级配置。')
-const notifications = section('notifications', '通知', '配置通知渠道、提醒方式与免打扰规则。')
+const notifications = section('notifications', '通知', '配置实时应用内 Toast 偏好与当前账户通知清理。')
 const searchCommands = section('searchCommands', '搜索与命令', '配置全局搜索与命令面板的行为。')
 const hotkeys = section('hotkeys', '快捷键', '查看并管理应用快捷键。')
 const workspace = section('workspace', '工作区与窗口', '配置窗口布局、工作区保存与恢复行为。')

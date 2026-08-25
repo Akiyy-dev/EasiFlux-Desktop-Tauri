@@ -1,13 +1,16 @@
 /* eslint-disable vue/one-component-per-file -- Local component stubs verify mount preservation. */
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
+import type { MessageApi } from 'naive-ui'
 import { defineComponent, h, nextTick, onMounted } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import PositionsTab from '../../src/components/trading/order-center/PositionsTab.vue'
 import TradeFillsTab from '../../src/components/trading/order-center/TradeFillsTab.vue'
 import ClosedPnlTab from '../../src/components/trading/order-center/ClosedPnlTab.vue'
 import OrderCenter from '../../src/components/trading/OrderCenter.vue'
+import { installMessageApi } from '../../src/services/errorService'
 import { useConnectionStore } from '../../src/stores/connection'
+import { useLogStore } from '../../src/stores/log'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({
   tauriInvoke: vi.fn(),
@@ -20,8 +23,19 @@ vi.mock('../../src/services/dataSyncService', () => ({
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { refreshSyncTask } from '../../src/services/dataSyncService'
 
+function notifiedSessionError(): Error {
+  return Object.assign(new Error('private request failed'), {
+    cause: {
+      code: 'AUTH_SESSION_EXPIRED',
+      message: '账户会话已失效',
+      notificationId: 'notification-session-query',
+    },
+  })
+}
+
 describe('order center activation', () => {
   let pinia: Pinia
+  let toastError: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
     pinia = createPinia()
@@ -30,6 +44,10 @@ describe('order center activation', () => {
     vi.mocked(tauriInvoke).mockResolvedValue([])
     vi.mocked(refreshSyncTask).mockReset()
     vi.mocked(refreshSyncTask).mockResolvedValue()
+    toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
   })
 
   it('defers shared private-panel refresh until activation', async () => {
@@ -91,6 +109,76 @@ describe('order center activation', () => {
     await flushPromises()
     expect(tauriInvoke).toHaveBeenCalledTimes(1)
     expect(tauriInvoke).toHaveBeenCalledWith('fetch_closed_pnl', expect.any(Object))
+  })
+
+  it('keeps direct query paths as one-log one-Toast ordinary-error owners', async () => {
+    useConnectionStore().setStatus('connected')
+
+    const fills = mount(TradeFillsTab, {
+      props: { active: false },
+      global: { plugins: [pinia], stubs: { TanstackDataTable: true } },
+    })
+    const pnl = mount(ClosedPnlTab, {
+      props: { active: false },
+      global: { plugins: [pinia], stubs: { TanstackDataTable: true } },
+    })
+    await flushPromises()
+
+    const cases: Array<{
+      invoke: () => Promise<void>
+      reject: () => void
+    }> = [
+      {
+        invoke: () => (fills.vm as unknown as { refresh: () => Promise<void> }).refresh(),
+        reject: () => vi.mocked(tauriInvoke).mockRejectedValueOnce(new Error('fills query failed')),
+      },
+      {
+        invoke: () => (pnl.vm as unknown as { refresh: () => Promise<void> }).refresh(),
+        reject: () => vi.mocked(tauriInvoke).mockRejectedValueOnce(new Error('pnl query failed')),
+      },
+    ]
+
+    for (const testCase of cases) {
+      useLogStore().clear()
+      useLogStore().clearError()
+      toastError.mockClear()
+      testCase.reject()
+      await testCase.invoke()
+      expect(useLogStore().entries).toHaveLength(1)
+      expect(toastError).toHaveBeenCalledTimes(1)
+    }
+  })
+
+  it.each([
+    'trade fills query',
+    'closed PnL query',
+  ])('keeps notified session expiry out of generic delivery for %s', async (owner) => {
+    useConnectionStore().setStatus('connected')
+    let invoke: () => Promise<void>
+
+    if (owner === 'trade fills query') {
+      const wrapper = mount(TradeFillsTab, {
+        props: { active: false },
+        global: { plugins: [pinia], stubs: { TanstackDataTable: true } },
+      })
+      invoke = () => (wrapper.vm as unknown as { refresh: () => Promise<void> }).refresh()
+      vi.mocked(tauriInvoke).mockRejectedValueOnce(notifiedSessionError())
+    } else {
+      const wrapper = mount(ClosedPnlTab, {
+        props: { active: false },
+        global: { plugins: [pinia], stubs: { TanstackDataTable: true } },
+      })
+      invoke = () => (wrapper.vm as unknown as { refresh: () => Promise<void> }).refresh()
+      vi.mocked(tauriInvoke).mockRejectedValueOnce(notifiedSessionError())
+    }
+
+    useLogStore().clear()
+    useLogStore().clearError()
+    toastError.mockClear()
+    await invoke()
+
+    expect(useLogStore().entries).toHaveLength(0)
+    expect(toastError).toHaveBeenCalledTimes(0)
   })
 
   it('keeps tab component instances mounted while switching tabs', async () => {

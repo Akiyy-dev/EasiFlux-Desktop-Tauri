@@ -5,16 +5,21 @@ use std::sync::{Arc, Barrier, Mutex};
 use crate::error::{AppError, AppResult};
 use crate::models::config::{ApiCredential, AppConfig, ConnectionStatus};
 
-use super::super::{AccountLifecyclePort, AccountProfileListPort, CredentialRepository};
+use super::super::{
+    AccountLifecyclePort, AccountProfileListPort, CredentialRepository,
+    NotificationPartitionCleanupError,
+};
 
 #[derive(Default)]
 pub(super) struct FailurePlan {
     pub preflight: bool,
     pub target_connect: bool,
     pub former_connect: bool,
+    pub former_connect_notified: Option<String>,
     pub persist_for: Option<String>,
     pub restore_persist: bool,
     pub credential_load_for: Option<String>,
+    pub notification_cleanup: bool,
 }
 
 pub(super) struct FakeLifecyclePort {
@@ -31,6 +36,7 @@ pub(super) struct FakeLifecyclePort {
     pub delay_effects: bool,
     pub delay_connect: bool,
     profile_load_sync: Mutex<Option<(String, Arc<Barrier>, Arc<Barrier>)>>,
+    notification_cleanup_sync: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl FakeLifecyclePort {
@@ -56,6 +62,7 @@ impl FakeLifecyclePort {
             delay_effects: false,
             delay_connect: false,
             profile_load_sync: Mutex::new(None),
+            notification_cleanup_sync: Mutex::new(None),
         }
     }
 
@@ -94,6 +101,14 @@ impl FakeLifecyclePort {
         release: Arc<Barrier>,
     ) {
         *self.profile_load_sync.lock().unwrap() = Some((account_id.into(), started, release));
+    }
+
+    pub fn delay_notification_cleanup(
+        &self,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.notification_cleanup_sync.lock().unwrap() = Some((started, release));
     }
 }
 
@@ -218,6 +233,7 @@ impl AccountLifecyclePort for FakeLifecyclePort {
         account_id: &str,
         _realtime: bool,
         credential: ApiCredential,
+        _session_epoch: u64,
     ) -> AppResult<()> {
         self.events
             .lock()
@@ -235,6 +251,16 @@ impl AccountLifecyclePort for FakeLifecyclePort {
         if failures.former_connect && account_id == "primary" {
             return Err(AppError::Connection("former connection failed".into()));
         }
+        if account_id == "primary" {
+            if let Some(notification_id) = failures.former_connect_notified.clone() {
+                return Err(AppError::Notified {
+                    code: "CONNECTION_UNAVAILABLE",
+                    message: "交易连接暂时不可用",
+                    notification_id,
+                    cause: None,
+                });
+            }
+        }
         drop(failures);
         *self.status.lock().unwrap() = ConnectionStatus::Connected;
         Ok(())
@@ -244,10 +270,37 @@ impl AccountLifecyclePort for FakeLifecyclePort {
         self.analytics_clears.fetch_add(1, Ordering::SeqCst);
     }
 
+    async fn delete_notification_partition(
+        &self,
+        account_id: &str,
+    ) -> Result<(), NotificationPartitionCleanupError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("notification-cleanup:{account_id}"));
+        let synchronization = self.notification_cleanup_sync.lock().unwrap().clone();
+        if let Some((started, release)) = synchronization {
+            started.notify_one();
+            release.notified().await;
+        }
+        if self.failures.lock().unwrap().notification_cleanup {
+            Err(NotificationPartitionCleanupError)
+        } else {
+            Ok(())
+        }
+    }
+
     async fn activate_public_environment(&self, credential: &ApiCredential) {
         *self.public_base_url.lock().unwrap() = credential.clone().normalize().base_url;
         self.public_has_credential.store(false, Ordering::SeqCst);
         self.public_environment_activations
             .fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn activate_session(&self, context: &crate::models::trading::SessionContext) {
+        self.events.lock().unwrap().push(format!(
+            "activate:{}:{}",
+            context.account_id, context.session_epoch
+        ));
     }
 }

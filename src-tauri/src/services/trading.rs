@@ -6,14 +6,297 @@ use crate::api::mapper::build_order_query_params;
 use crate::api::{ApiClient, PrivateApi};
 use crate::error::{AppError, AppResult};
 use crate::events::EventEmitter;
-use crate::models::trading::{CancelOrderRequest, Order, PlaceOrderRequest};
+use crate::models::config::{normalize_account_id, AppConfig};
+use crate::models::risk::RiskViolation;
+use crate::models::trading::{
+    CancelOrderRequest, Order, OrderStatus, OrderStreamContext, PlaceOrderRequest,
+    SubmissionContext,
+};
 use crate::services::account_profiles::{
     run_account_private_mutation, AccountLifecycleCoordinator,
 };
-use crate::services::risk::RiskService;
+use crate::services::notification::policy::{PolicyContext, RiskViolationInput};
+use crate::services::notification::{
+    NotificationPolicy, NotificationRuntime, ObservedOrderStatus, OrderObservation,
+    OrderObservationOrigin,
+};
+use crate::services::risk::{RiskReservation, RiskService};
 use crate::services::time::TimeService;
 use crate::services::AnalyticsService;
 use crate::storage::{CacheStore, TradeLogStore};
+
+#[derive(Clone)]
+pub(crate) struct OrderNotificationObserver {
+    runtime: Arc<NotificationRuntime>,
+}
+
+impl OrderNotificationObserver {
+    pub(crate) fn new(runtime: Arc<NotificationRuntime>) -> Self {
+        Self { runtime }
+    }
+
+    pub(crate) async fn observe(
+        &self,
+        account_id: &str,
+        session_epoch: u64,
+        order: &Order,
+        origin: OrderObservationOrigin,
+        submission_id: Option<&str>,
+        now_ms: u64,
+    ) -> Option<String> {
+        self.observe_checked(
+            account_id,
+            session_epoch,
+            order,
+            origin,
+            submission_id,
+            now_ms,
+        )
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn observe_checked(
+        &self,
+        account_id: &str,
+        session_epoch: u64,
+        order: &Order,
+        origin: OrderObservationOrigin,
+        submission_id: Option<&str>,
+        now_ms: u64,
+    ) -> AppResult<Option<String>> {
+        let status = match order.status {
+            OrderStatus::New => ObservedOrderStatus::New,
+            OrderStatus::PartiallyFilled => ObservedOrderStatus::PartiallyFilled,
+            OrderStatus::Filled => ObservedOrderStatus::Filled,
+            OrderStatus::Cancelled => ObservedOrderStatus::Canceled,
+            OrderStatus::Rejected => ObservedOrderStatus::Rejected,
+            OrderStatus::Unknown => return Ok(None),
+        };
+        let order_id = (!order.order_id.trim().is_empty()).then(|| order.order_id.clone());
+        let submission_id = submission_id.map(str::to_owned);
+        let order_link_id = order
+            .order_link_id
+            .clone()
+            .filter(|value| is_correlatable_order_link(value));
+        if order_id.is_none() && submission_id.is_none() && order_link_id.is_none() {
+            return Ok(None);
+        }
+        let service = match self.runtime.service() {
+            Ok(service) => service,
+            Err(availability) => {
+                tracing::warn!(
+                    code = availability.code(),
+                    "order notification observer unavailable"
+                );
+                return Ok(None);
+            }
+        };
+        match service
+            .observe_order(
+                OrderObservation {
+                    account_id: account_id.into(),
+                    session_epoch,
+                    order_id,
+                    submission_id,
+                    order_link_id,
+                    status,
+                    origin,
+                },
+                now_ms,
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome.notification.map(|record| record.id)),
+            Err(error) => {
+                tracing::warn!(code = error.code(), "order notification observation failed");
+                if error.is_retryable_persistence_failure() {
+                    Err(AppError::Internal(
+                        "订单通知同步暂时不可用，请稍后重试".into(),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn seed_snapshot_then_replay(
+        &self,
+        context: &OrderStreamContext,
+        snapshots: &[Order],
+        buffered: Vec<Order>,
+        now_ms: u64,
+    ) -> AppResult<()> {
+        let mut offset = 0_u64;
+        let (deferred, baseline): (Vec<_>, Vec<_>) = snapshots.iter().partition(|snapshot| {
+            let mut saw_live_nonterminal = false;
+            buffered.iter().any(|live| {
+                if !orders_share_identity(snapshot, live) {
+                    return false;
+                }
+                if matches!(live.status, OrderStatus::New | OrderStatus::PartiallyFilled) {
+                    saw_live_nonterminal = true;
+                    return false;
+                }
+                saw_live_nonterminal
+                    && matches!(
+                        live.status,
+                        OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+                    )
+            })
+        });
+        for snapshot in baseline {
+            self.observe_checked(
+                &context.account_id,
+                context.session_epoch,
+                snapshot,
+                OrderObservationOrigin::Snapshot,
+                None,
+                now_ms.saturating_add(offset),
+            )
+            .await?;
+            offset = offset.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
+        for live in buffered {
+            self.observe_checked(
+                &context.account_id,
+                context.session_epoch,
+                &live,
+                OrderObservationOrigin::Realtime,
+                None,
+                now_ms.saturating_add(offset),
+            )
+            .await?;
+            offset = offset.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
+        for snapshot in deferred {
+            self.observe_checked(
+                &context.account_id,
+                context.session_epoch,
+                snapshot,
+                OrderObservationOrigin::Snapshot,
+                None,
+                now_ms.saturating_add(offset),
+            )
+            .await?;
+            offset = offset.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn observe_rejection(
+        &self,
+        context: &SubmissionContext,
+        order_link_id: Option<&str>,
+        now_ms: u64,
+    ) -> Option<String> {
+        let service = self.runtime.service().ok()?;
+        match service
+            .observe_order(
+                OrderObservation {
+                    account_id: context.account_id.clone(),
+                    session_epoch: context.session_epoch,
+                    order_id: None,
+                    submission_id: Some(context.submission_id.clone()),
+                    order_link_id: order_link_id
+                        .filter(|value| is_correlatable_order_link(value))
+                        .map(str::to_owned),
+                    status: ObservedOrderStatus::Rejected,
+                    origin: OrderObservationOrigin::Command,
+                },
+                now_ms,
+            )
+            .await
+        {
+            Ok(outcome) => outcome.notification.map(|record| record.id),
+            Err(error) => {
+                tracing::warn!(
+                    code = error.code(),
+                    "submission rejection notification failed"
+                );
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn observe_risk_block(
+        &self,
+        context: &SubmissionContext,
+        violation: &RiskViolation,
+        now_ms: u64,
+    ) -> Option<String> {
+        let service = self.runtime.service().ok()?;
+        let policy_context = PolicyContext::new(
+            context.account_id.clone(),
+            context.session_epoch,
+            context.submission_id.clone(),
+        )
+        .ok()?;
+        let input = NotificationPolicy
+            .risk_order_blocked(
+                policy_context,
+                RiskViolationInput {
+                    code: violation.code,
+                    limit: violation.safe_params.limit,
+                },
+            )
+            .ok()?;
+        match service.publish(input, now_ms).await {
+            Ok(outcome) => outcome.notification.map(|record| record.id),
+            Err(error) => {
+                tracing::warn!(code = error.code(), "risk notification observation failed");
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn observe_realtime_for_session(
+        &self,
+        coordinator: &AccountLifecycleCoordinator,
+        config: &tokio::sync::RwLock<AppConfig>,
+        context: &OrderStreamContext,
+        order: &Order,
+        now_ms: u64,
+    ) -> Option<String> {
+        let _guard = coordinator.read_guard().await;
+        let active_account_id = normalize_account_id(&config.read().await.active_account_id);
+        if coordinator.current_session_epoch() != context.session_epoch
+            || active_account_id != context.account_id
+        {
+            return None;
+        }
+        self.observe(
+            &context.account_id,
+            context.session_epoch,
+            order,
+            OrderObservationOrigin::Realtime,
+            None,
+            now_ms,
+        )
+        .await
+    }
+}
+
+fn orders_share_identity(left: &Order, right: &Order) -> bool {
+    (!left.order_id.trim().is_empty()
+        && !right.order_id.trim().is_empty()
+        && left.order_id == right.order_id)
+        || matches!(
+            (left.order_link_id.as_deref(), right.order_link_id.as_deref()),
+            (Some(left), Some(right))
+                if is_correlatable_order_link(left)
+                    && is_correlatable_order_link(right)
+                    && left == right
+        )
+}
+
+fn is_correlatable_order_link(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 36
+}
 
 pub struct TradingService {
     api: Arc<ApiClient>,
@@ -23,6 +306,7 @@ pub struct TradingService {
     emitter: EventEmitter,
     time: Arc<TimeService>,
     analytics: Arc<AnalyticsService>,
+    notification_observer: OrderNotificationObserver,
 }
 
 impl TradingService {
@@ -34,6 +318,7 @@ impl TradingService {
         emitter: EventEmitter,
         time: Arc<TimeService>,
         analytics: Arc<AnalyticsService>,
+        notification_runtime: Arc<NotificationRuntime>,
     ) -> Self {
         Self {
             api,
@@ -43,61 +328,90 @@ impl TradingService {
             emitter,
             time,
             analytics,
+            notification_observer: OrderNotificationObserver::new(notification_runtime),
         }
     }
 
     pub async fn place_order(
         &self,
-        coordinator: &AccountLifecycleCoordinator,
+        context: SubmissionContext,
         request: PlaceOrderRequest,
     ) -> AppResult<Order> {
-        execute_coordinated_reserved_order(
-            coordinator,
+        let session_context = OrderStreamContext::from(&context);
+        let now_ms = self.time.now_ms();
+        let reference_price = self
+            .cache
+            .get_ticker(&request.symbol)
+            .map(|ticker| ticker.last_price);
+        let result = execute_place_order(
+            self.api.as_ref(),
             &self.risk,
-            &request,
-            || self.cache.get_ticker(&request.symbol).map(|t| t.last_price),
-            || self.time.now_ms(),
-            || PrivateApi::create_order(&self.api, &request),
+            &self.notification_observer,
+            &context,
+            request,
+            reference_price.as_deref(),
+            now_ms,
             |order| async move {
                 let _ = self.trade_log.append_order(&order);
-                self.emitter.emit_order(order.clone());
+                self.emitter.emit_order(&session_context, order.clone());
                 self.emitter
                     .emit_log("info", &format!("下单成功: {}", order.order_id));
                 self.analytics.record_order(order).await;
             },
         )
-        .await
+        .await;
+        deliver_notified_placement(&self.emitter, result)
     }
 
     pub async fn cancel_order(
         &self,
-        coordinator: &AccountLifecycleCoordinator,
+        context: OrderStreamContext,
         request: CancelOrderRequest,
     ) -> AppResult<Order> {
-        execute_coordinated_private_mutation(
-            coordinator,
-            || PrivateApi::cancel_order(&self.api, &request),
-            |order| async move {
-                let _ = self.trade_log.append_order(&order);
-                self.emitter.emit_order(order.clone());
-                self.emitter
-                    .emit_log("info", &format!("撤单成功: {}", order.order_id));
-                self.analytics.record_order(order).await;
-            },
-        )
-        .await
+        let order = PrivateApi::cancel_order(&self.api, &request).await?;
+        self.notification_observer
+            .observe(
+                &context.account_id,
+                context.session_epoch,
+                &order,
+                OrderObservationOrigin::Command,
+                None,
+                self.time.now_ms(),
+            )
+            .await;
+        let _ = self.trade_log.append_order(&order);
+        self.emitter.emit_order(&context, order.clone());
+        self.emitter
+            .emit_log("info", &format!("撤单成功: {}", order.order_id));
+        self.analytics.record_order(order.clone()).await;
+        Ok(order)
     }
 
-    pub async fn refresh_orders(&self, symbol: Option<&str>) -> AppResult<Vec<Order>> {
-        let orders = self.fetch_open_orders(symbol).await?;
+    pub async fn refresh_orders(
+        &self,
+        context: &OrderStreamContext,
+        symbol: Option<&str>,
+    ) -> AppResult<Vec<Order>> {
+        let orders = self.fetch_open_orders(context, symbol).await?;
         for order in &orders {
-            self.emitter.emit_order(order.clone());
+            self.emitter.emit_order(context, order.clone());
             self.analytics.record_order(order.clone()).await;
         }
         Ok(orders)
     }
 
-    pub async fn fetch_open_orders(&self, symbol: Option<&str>) -> AppResult<Vec<Order>> {
+    pub async fn fetch_open_orders(
+        &self,
+        _context: &OrderStreamContext,
+        symbol: Option<&str>,
+    ) -> AppResult<Vec<Order>> {
+        self.fetch_open_orders_unobserved(symbol).await
+    }
+
+    pub(crate) async fn fetch_open_orders_unobserved(
+        &self,
+        symbol: Option<&str>,
+    ) -> AppResult<Vec<Order>> {
         let params =
             build_order_query_params(symbol, None, None, None, None, None, None, None, None, None);
         let payload = self.api.private_get(endpoints::OPEN_ORDERS, params).await?;
@@ -110,19 +424,123 @@ impl TradingService {
 
     pub async fn refresh_order_history(
         &self,
+        context: &OrderStreamContext,
         symbol: Option<&str>,
         limit: Option<u32>,
     ) -> AppResult<Vec<Order>> {
-        self.fetch_order_history(symbol, limit).await
+        self.fetch_order_history(context, symbol, limit).await
     }
 
     pub async fn fetch_order_history(
+        &self,
+        _context: &OrderStreamContext,
+        symbol: Option<&str>,
+        limit: Option<u32>,
+    ) -> AppResult<Vec<Order>> {
+        self.fetch_order_history_unobserved(symbol, limit).await
+    }
+
+    pub(crate) async fn fetch_order_history_unobserved(
         &self,
         symbol: Option<&str>,
         limit: Option<u32>,
     ) -> AppResult<Vec<Order>> {
         PrivateApi::order_history(&self.api, symbol, limit).await
     }
+}
+
+fn deliver_notified_placement<T>(emitter: &EventEmitter, result: AppResult<T>) -> AppResult<T> {
+    if let Err(AppError::Notified {
+        code,
+        notification_id,
+        ..
+    }) = &result
+    {
+        if *code != "AUTH_SESSION_EXPIRED" || notification_id.trim().is_empty() {
+            emitter.emit_diagnostic(&format!("NOTIFIED_PLACEMENT_FAILURE:{code}"), false);
+        }
+    }
+    result
+}
+
+async fn execute_place_order<S, SFut>(
+    api: &ApiClient,
+    risk: &Arc<tokio::sync::RwLock<RiskService>>,
+    observer: &OrderNotificationObserver,
+    context: &SubmissionContext,
+    mut request: PlaceOrderRequest,
+    reference_price: Option<&str>,
+    now_ms: u64,
+    success_side_effects: S,
+) -> AppResult<Order>
+where
+    S: FnOnce(Order) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let transmitted_order_link_id = match request.order_link_id.as_deref() {
+        Some(value) if is_correlatable_order_link(value) => value.to_owned(),
+        Some(_) => {
+            return Err(AppError::Trading(
+                "订单关联标识必须为 1 到 36 个字符".into(),
+            ))
+        }
+        None => context.submission_id.clone(),
+    };
+    request.order_link_id = Some(transmitted_order_link_id.clone());
+    let reservation_result = {
+        let risk = risk.read().await;
+        risk.reserve_order(&request, reference_price, now_ms)
+    };
+    let reservation = match reservation_result {
+        Ok(reservation) => reservation,
+        Err(violation) => {
+            let notification_id = observer
+                .observe_risk_block(context, &violation, now_ms)
+                .await;
+            return Err(match notification_id {
+                Some(notification_id) => AppError::Notified {
+                    code: "RISK_ORDER_BLOCKED",
+                    message: "订单被风控拦截",
+                    notification_id,
+                    cause: None,
+                },
+                None => violation.into(),
+            });
+        }
+    };
+
+    let order = match PrivateApi::create_order(api, &request).await {
+        Ok(order) => order,
+        Err(submit_error) => {
+            return Err(handle_failed_submission(
+                risk,
+                observer,
+                &reservation,
+                context,
+                &transmitted_order_link_id,
+                submit_error,
+                now_ms,
+            )
+            .await);
+        }
+    };
+
+    let mut observed_order = order.clone();
+    if observed_order.order_link_id.is_none() {
+        observed_order.order_link_id = Some(transmitted_order_link_id);
+    }
+    observer
+        .observe(
+            &context.account_id,
+            context.session_epoch,
+            &observed_order,
+            OrderObservationOrigin::Command,
+            Some(&context.submission_id),
+            now_ms,
+        )
+        .await;
+    success_side_effects(order.clone()).await;
+    Ok(order)
 }
 
 pub(crate) async fn execute_coordinated_reserved_order<P, N, F, Fut, S, SFut>(
@@ -195,28 +613,111 @@ where
     match submit().await {
         Ok(order) => Ok(order),
         Err(submit_error) => {
-            if !is_confirmed_submission_failure(&submit_error) {
+            if !is_certain_submission_failure(&submit_error) {
                 return Err(submit_error);
             }
             if let Err(release_error) = risk.read().await.release_reservation(&reservation, now_ms)
             {
-                return Err(AppError::Internal(format!(
-                    "订单提交失败: {}; 风控预占回滚失败: {}",
-                    submit_error.user_message(),
-                    release_error.user_message()
-                )));
+                tracing::warn!(
+                    release_error_kind = ?std::mem::discriminant(&release_error),
+                    "risk reservation rollback failed"
+                );
+                return Err(finalize_submission_failure(submit_error, true, None));
             }
             Err(submit_error)
         }
     }
 }
 
-fn is_confirmed_submission_failure(error: &AppError) -> bool {
-    !matches!(error, AppError::Connection(_) | AppError::Internal(_))
+fn is_certain_submission_failure(error: &AppError) -> bool {
+    is_confirmed_submission_rejection(error)
+        || matches!(
+            error,
+            AppError::AuthFailure(
+                crate::api::response::AuthFailureKind::SessionExpired
+                    | crate::api::response::AuthFailureKind::Timestamp
+                    | crate::api::response::AuthFailureKind::Signature
+                    | crate::api::response::AuthFailureKind::AccessDenied
+                    | crate::api::response::AuthFailureKind::RateLimited
+            )
+        )
+        || matches!(
+            error,
+            AppError::Notified {
+                cause: Some(crate::error::NotificationCause::AuthFailure(
+                    crate::api::response::AuthFailureKind::SessionExpired
+                )),
+                ..
+            }
+        )
+}
+
+fn is_confirmed_submission_rejection(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::TradingFailure(failure)
+            if failure.kind == crate::models::trading::TradingFailureKind::Rejected
+    )
+}
+
+async fn handle_failed_submission(
+    risk: &Arc<tokio::sync::RwLock<RiskService>>,
+    observer: &OrderNotificationObserver,
+    reservation: &RiskReservation,
+    context: &SubmissionContext,
+    transmitted_order_link_id: &str,
+    submit_error: AppError,
+    now_ms: u64,
+) -> AppError {
+    let rollback_failed = is_certain_submission_failure(&submit_error)
+        && risk
+            .read()
+            .await
+            .release_reservation(reservation, now_ms)
+            .is_err();
+    if rollback_failed {
+        tracing::warn!(
+            code = "RISK_RESERVATION_ROLLBACK_FAILED",
+            "risk reservation rollback failed after order submission"
+        );
+    }
+    let notification_id = if is_confirmed_submission_rejection(&submit_error) {
+        observer
+            .observe_rejection(context, Some(transmitted_order_link_id), now_ms)
+            .await
+    } else {
+        None
+    };
+    finalize_submission_failure(submit_error, rollback_failed, notification_id)
+}
+
+fn finalize_submission_failure(
+    submit_error: AppError,
+    rollback_failed: bool,
+    notification_id: Option<String>,
+) -> AppError {
+    if matches!(&submit_error, AppError::Notified { cause: Some(_), .. }) {
+        return submit_error;
+    }
+    if let Some(notification_id) = notification_id {
+        return AppError::Notified {
+            code: "ORDER_REJECTED",
+            message: "订单请求被交易端拒绝",
+            notification_id,
+            cause: None,
+        };
+    }
+    if rollback_failed {
+        AppError::Internal("订单提交失败且风控预占回滚失败".into())
+    } else {
+        submit_error
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    mod notification_observer;
+
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -285,8 +786,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submission_error_releases_reservation() {
-        let path = test_path("release");
+    async fn generic_trading_error_keeps_reservation_in_memory_and_on_disk() {
+        let path = test_path("ambiguous-trading");
         let risk = risk_with_limit(&path, 1);
         let request = market_order();
 
@@ -300,8 +801,92 @@ mod tests {
             .read()
             .await
             .reserve_order(&request, None, NOW_MS)
-            .is_ok());
+            .is_err());
+        assert_eq!(
+            RiskUsageStore::with_path(path.clone())
+                .load()
+                .unwrap()
+                .unwrap()
+                .occupied_orders,
+            1
+        );
         cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn typed_rejection_releases_reservation_in_memory_and_on_disk() {
+        let path = test_path("typed-rejection-release");
+        let risk = risk_with_limit(&path, 1);
+        let request = market_order();
+
+        let result = execute_reserved_order(&risk, &request, None, NOW_MS, || {
+            std::future::ready(Err::<Order, AppError>(AppError::TradingFailure(
+                crate::models::trading::TradingFailure::rejected(),
+            )))
+        })
+        .await;
+
+        assert!(matches!(result, Err(AppError::TradingFailure(_))));
+        assert!(risk
+            .read()
+            .await
+            .reserve_order(&request, None, NOW_MS)
+            .is_ok());
+        assert_eq!(
+            RiskUsageStore::with_path(path.clone())
+                .load()
+                .unwrap()
+                .unwrap()
+                .occupied_orders,
+            1,
+            "the second reservation proves both memory and disk were released"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn only_closed_typed_no_submit_failures_are_certain() {
+        let ambiguous = [
+            AppError::Auth("safe".into()),
+            AppError::Connection("safe".into()),
+            AppError::Trading("safe".into()),
+            AppError::Risk("safe".into()),
+            AppError::Config("safe".into()),
+            AppError::Storage("safe".into()),
+            AppError::NotConnected,
+            AppError::Internal("safe".into()),
+            AppError::Notified {
+                code: "ORDER_REJECTED",
+                message: "订单请求被交易端拒绝",
+                notification_id: uuid::Uuid::new_v4().to_string(),
+                cause: None,
+            },
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::MissingCredential),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::CredentialStorage),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::SigningConfiguration),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::Other),
+        ];
+        assert!(ambiguous
+            .iter()
+            .all(|error| !is_certain_submission_failure(error)));
+        for certain in [
+            AppError::TradingFailure(crate::models::trading::TradingFailure::rejected()),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::SessionExpired),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::Timestamp),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::Signature),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::AccessDenied),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::RateLimited),
+            AppError::Notified {
+                code: "AUTH_SESSION_EXPIRED",
+                message: "账户会话已失效",
+                notification_id: uuid::Uuid::new_v4().to_string(),
+                cause: Some(crate::error::NotificationCause::AuthFailure(
+                    crate::api::response::AuthFailureKind::SessionExpired,
+                )),
+            },
+        ] {
+            assert!(is_certain_submission_failure(&certain), "{certain:?}");
+        }
     }
 
     #[tokio::test]
@@ -346,6 +931,25 @@ mod tests {
             .reserve_order(&request, None, NOW_MS)
             .is_err());
         cleanup(&path);
+    }
+
+    #[test]
+    fn committed_rejection_notification_wins_over_secondary_rollback_failure() {
+        let notification_id = uuid::Uuid::new_v4().to_string();
+        let error = finalize_submission_failure(
+            AppError::TradingFailure(crate::models::trading::TradingFailure::rejected()),
+            true,
+            Some(notification_id.clone()),
+        );
+
+        assert!(matches!(
+            error,
+            AppError::Notified {
+                code: "ORDER_REJECTED",
+                notification_id: id,
+                ..
+            } if id == notification_id
+        ));
     }
 
     #[tokio::test]

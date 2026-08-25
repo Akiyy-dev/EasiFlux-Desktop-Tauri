@@ -2,8 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Mutex as AsyncMutex;
-
 use super::super::{execute_task_with_account_lifecycle, run_scheduled_task, TaskId, TaskRunState};
 use crate::error::AppError;
 use crate::services::account_profiles::run_serialized_account_mutation;
@@ -108,9 +106,9 @@ async fn pending_force_rerun_crosses_switch_only_with_new_account_context() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let release_network = Arc::new(tokio::sync::Notify::new());
     let run_count = Arc::new(AtomicUsize::new(0));
-    let run_state = AsyncMutex::new(TaskRunState::default());
+    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
 
-    let runs = run_scheduled_task(&run_state, false, || {
+    let runs = run_scheduled_task(Arc::clone(&run_state), false, || {
         let run = run_count.fetch_add(1, Ordering::SeqCst);
         let account_id = account_id.clone();
         let events = events.clone();
@@ -140,16 +138,14 @@ async fn pending_force_rerun_crosses_switch_only_with_new_account_context() {
         std::task::Poll::Pending
     ));
     {
-        let state = tokio::time::timeout(Duration::from_secs(1), run_state.lock())
-            .await
-            .expect("run state should be inspectable while the request is in flight");
+        let state = run_state.lock().unwrap();
         assert!(state.in_flight);
         assert!(!state.pending_force);
     }
 
     let unexpected_force_runs = Arc::new(AtomicUsize::new(0));
     let force_runs = unexpected_force_runs.clone();
-    let forced = run_scheduled_task(&run_state, true, move || {
+    let forced = run_scheduled_task(Arc::clone(&run_state), true, move || {
         force_runs.fetch_add(1, Ordering::SeqCst);
         async { Ok(()) }
     });
@@ -184,9 +180,7 @@ async fn pending_force_rerun_crosses_switch_only_with_new_account_context() {
 
     assert_eq!(run_count.load(Ordering::SeqCst), 2);
     {
-        let state = tokio::time::timeout(Duration::from_secs(1), run_state.lock())
-            .await
-            .expect("run state should return to idle");
+        let state = run_state.lock().unwrap();
         assert!(!state.in_flight);
         assert!(!state.pending_force);
     }
@@ -203,7 +197,7 @@ async fn pending_force_rerun_crosses_switch_only_with_new_account_context() {
 
 #[tokio::test]
 async fn force_at_completion_handoff_is_drained_without_lost_wakeup() {
-    let run_state = AsyncMutex::new(TaskRunState::default());
+    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
     let events = Arc::new(Mutex::new(Vec::new()));
     let release_first = Arc::new(tokio::sync::Notify::new());
     let owner_runs = Arc::new(AtomicUsize::new(0));
@@ -212,7 +206,7 @@ async fn force_at_completion_handoff_is_drained_without_lost_wakeup() {
     let first_events = events.clone();
     let first_release = release_first.clone();
     let first_runs = owner_runs.clone();
-    let first = run_scheduled_task(&run_state, false, move || {
+    let first = run_scheduled_task(Arc::clone(&run_state), false, move || {
         let run = first_runs.fetch_add(1, Ordering::SeqCst);
         let events = first_events.clone();
         let release = first_release.clone();
@@ -230,12 +224,8 @@ async fn force_at_completion_handoff_is_drained_without_lost_wakeup() {
         std::task::Poll::Pending
     ));
 
-    let handoff_barrier = tokio::time::timeout(Duration::from_secs(1), run_state.lock())
-        .await
-        .expect("test should hold the state transition barrier");
-
     let competing_runs = forced_runs.clone();
-    let forced = run_scheduled_task(&run_state, true, move || {
+    let forced = run_scheduled_task(Arc::clone(&run_state), true, move || {
         competing_runs.fetch_add(1, Ordering::SeqCst);
         async { Ok(()) }
     });
@@ -246,12 +236,6 @@ async fn force_at_completion_handoff_is_drained_without_lost_wakeup() {
     ));
 
     release_first.notify_one();
-    assert!(matches!(
-        futures_util::poll!(&mut first),
-        std::task::Poll::Pending
-    ));
-
-    drop(handoff_barrier);
     tokio::time::timeout(Duration::from_secs(1), async {
         let (first_result, forced_result) = tokio::join!(first.as_mut(), forced.as_mut());
         first_result.unwrap();
@@ -266,26 +250,21 @@ async fn force_at_completion_handoff_is_drained_without_lost_wakeup() {
         *events.lock().unwrap(),
         ["execute:owner:0", "execute:owner:1"]
     );
-    let state = tokio::time::timeout(Duration::from_secs(1), run_state.lock())
-        .await
-        .expect("run state should return to idle after the forced rerun finishes");
+    let state = run_state.lock().unwrap();
     assert!(!state.in_flight);
     assert!(!state.pending_force);
 }
 
 #[tokio::test]
 async fn periodic_and_forced_direct_claim_have_one_owner_and_one_rerun() {
-    let run_state = AsyncMutex::new(TaskRunState::default());
-    let claim_barrier = tokio::time::timeout(Duration::from_secs(1), run_state.lock())
-        .await
-        .expect("test should hold the claim barrier");
+    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
     let release_owner = Arc::new(tokio::sync::Notify::new());
     let periodic_runs = Arc::new(AtomicUsize::new(0));
     let direct_runs = Arc::new(AtomicUsize::new(0));
 
     let owner_release = release_owner.clone();
     let owner_runs = periodic_runs.clone();
-    let periodic = run_scheduled_task(&run_state, false, move || {
+    let periodic = run_scheduled_task(Arc::clone(&run_state), false, move || {
         let run = owner_runs.fetch_add(1, Ordering::SeqCst);
         let release = owner_release.clone();
         async move {
@@ -302,21 +281,11 @@ async fn periodic_and_forced_direct_claim_have_one_owner_and_one_rerun() {
     ));
 
     let competing_runs = direct_runs.clone();
-    let direct = run_scheduled_task(&run_state, true, move || {
+    let direct = run_scheduled_task(Arc::clone(&run_state), true, move || {
         competing_runs.fetch_add(1, Ordering::SeqCst);
         async { Ok(()) }
     });
     tokio::pin!(direct);
-    assert!(matches!(
-        futures_util::poll!(&mut direct),
-        std::task::Poll::Pending
-    ));
-
-    drop(claim_barrier);
-    assert!(matches!(
-        futures_util::poll!(&mut periodic),
-        std::task::Poll::Pending
-    ));
     assert!(matches!(
         futures_util::poll!(&mut direct),
         std::task::Poll::Pending
@@ -330,16 +299,14 @@ async fn periodic_and_forced_direct_claim_have_one_owner_and_one_rerun() {
 
     assert_eq!(periodic_runs.load(Ordering::SeqCst), 2);
     assert_eq!(direct_runs.load(Ordering::SeqCst), 0);
-    let state = tokio::time::timeout(Duration::from_secs(1), run_state.lock())
-        .await
-        .expect("run state should return to idle after the rerun");
+    let state = run_state.lock().unwrap();
     assert!(!state.in_flight);
     assert!(!state.pending_force);
 }
 
 #[tokio::test]
 async fn multiple_force_waiters_share_one_rerun_and_its_failure() {
-    let run_state = AsyncMutex::new(TaskRunState::default());
+    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
     let release_initial = Arc::new(tokio::sync::Notify::new());
     let release_rerun = Arc::new(tokio::sync::Notify::new());
     let owner_runs = Arc::new(AtomicUsize::new(0));
@@ -348,7 +315,7 @@ async fn multiple_force_waiters_share_one_rerun_and_its_failure() {
     let owner_release_initial = release_initial.clone();
     let owner_release_rerun = release_rerun.clone();
     let owner_count = owner_runs.clone();
-    let owner = run_scheduled_task(&run_state, false, move || {
+    let owner = run_scheduled_task(Arc::clone(&run_state), false, move || {
         let run = owner_count.fetch_add(1, Ordering::SeqCst);
         let release_initial = owner_release_initial.clone();
         let release_rerun = owner_release_rerun.clone();
@@ -369,7 +336,7 @@ async fn multiple_force_waiters_share_one_rerun_and_its_failure() {
     ));
 
     let first_count = unexpected_force_runs.clone();
-    let first_force = run_scheduled_task(&run_state, true, move || {
+    let first_force = run_scheduled_task(Arc::clone(&run_state), true, move || {
         first_count.fetch_add(1, Ordering::SeqCst);
         async { Ok(()) }
     });
@@ -391,7 +358,7 @@ async fn multiple_force_waiters_share_one_rerun_and_its_failure() {
     ));
 
     let second_count = unexpected_force_runs.clone();
-    let second_force = run_scheduled_task(&run_state, true, move || {
+    let second_force = run_scheduled_task(Arc::clone(&run_state), true, move || {
         second_count.fetch_add(1, Ordering::SeqCst);
         async { Ok(()) }
     });
@@ -417,19 +384,17 @@ async fn multiple_force_waiters_share_one_rerun_and_its_failure() {
     }
     assert_eq!(owner_runs.load(Ordering::SeqCst), 2);
     assert_eq!(unexpected_force_runs.load(Ordering::SeqCst), 0);
-    let state = tokio::time::timeout(Duration::from_secs(1), run_state.lock())
-        .await
-        .expect("run state should return to idle after notifying every waiter");
+    let state = run_state.lock().unwrap();
     assert!(!state.in_flight);
     assert!(!state.pending_force);
 }
 
 #[tokio::test]
 async fn non_force_request_still_skips_a_busy_task() {
-    let run_state = AsyncMutex::new(TaskRunState::default());
+    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
     let release_owner = Arc::new(tokio::sync::Notify::new());
     let owner_release = release_owner.clone();
-    let owner = run_scheduled_task(&run_state, false, move || {
+    let owner = run_scheduled_task(Arc::clone(&run_state), false, move || {
         let release = owner_release.clone();
         async move {
             release.notified().await;
@@ -444,7 +409,7 @@ async fn non_force_request_still_skips_a_busy_task() {
 
     let skipped_runs = Arc::new(AtomicUsize::new(0));
     let skipped_count = skipped_runs.clone();
-    let skipped = run_scheduled_task(&run_state, false, move || {
+    let skipped = run_scheduled_task(Arc::clone(&run_state), false, move || {
         skipped_count.fetch_add(1, Ordering::SeqCst);
         async { Ok(()) }
     });
@@ -463,7 +428,84 @@ async fn non_force_request_still_skips_a_busy_task() {
 }
 
 #[tokio::test]
-async fn environment_probe_finishes_before_account_switch_returns() {
+async fn aborting_an_in_flight_owner_releases_waiters_and_allows_the_next_run() {
+    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let owner = tokio::spawn({
+        let run_state = Arc::clone(&run_state);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        let runs = Arc::clone(&runs);
+        async move {
+            run_scheduled_task(Arc::clone(&run_state), false, move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                }
+            })
+            .await
+        }
+    });
+    entered.notified().await;
+
+    let forced = tokio::spawn({
+        let run_state = Arc::clone(&run_state);
+        async move { run_scheduled_task(run_state, true, || async { Ok(()) }).await }
+    });
+    loop {
+        if run_state.lock().unwrap().pending_force {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    owner.abort();
+    assert!(owner.await.unwrap_err().is_cancelled());
+    let forced_result = tokio::time::timeout(Duration::from_millis(100), forced).await;
+
+    let next_runs = Arc::clone(&runs);
+    run_scheduled_task(Arc::clone(&run_state), false, move || {
+        let runs = Arc::clone(&next_runs);
+        async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(forced_result.is_ok(), "a pre-stop waiter must not hang");
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn late_old_owner_drop_cannot_clear_a_newer_owner_token() {
+    let run_state = Arc::new(Mutex::new(TaskRunState::default()));
+    {
+        let mut state = run_state.lock().unwrap();
+        state.in_flight = true;
+        state.owner_token = Some(2);
+        state.next_owner_token = 2;
+    }
+    let stale_owner = super::super::TaskRunOwnerGuard::new(Arc::clone(&run_state), 1);
+
+    drop(stale_owner);
+
+    let state = run_state.lock().unwrap();
+    assert!(state.in_flight);
+    assert_eq!(state.owner_token, Some(2));
+}
+
+#[tokio::test]
+async fn environment_probe_does_not_block_account_switch() {
     let coordinator = AccountLifecycleCoordinator::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let release_probe = Arc::new(tokio::sync::Notify::new());
@@ -490,23 +532,53 @@ async fn environment_probe_finishes_before_account_switch_returns() {
         record(&switch_events, "switch:return");
     });
     tokio::pin!(switch);
-    assert!(matches!(
-        futures_util::poll!(&mut switch),
-        std::task::Poll::Pending
-    ));
+    tokio::time::timeout(Duration::from_secs(1), switch.as_mut())
+        .await
+        .expect("environment probing must remain independent of account switching");
+
+    assert_eq!(*events.lock().unwrap(), ["probe:primary", "switch:return"]);
 
     release_probe.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        let (probe_result, ()) = tokio::join!(probe.as_mut(), switch.as_mut());
-        probe_result.unwrap();
-    })
-    .await
-    .expect("environment probe and switch should serialize without deadlock");
+    tokio::time::timeout(Duration::from_secs(1), probe.as_mut())
+        .await
+        .expect("environment probe should finish after the switch")
+        .unwrap();
 
     assert_eq!(
         *events.lock().unwrap(),
-        ["probe:primary", "emit:primary", "switch:return"]
+        ["probe:primary", "switch:return", "emit:primary"]
     );
+}
+
+#[tokio::test]
+async fn environment_commit_fence_blocks_switch_until_status_event_and_observer_finish() {
+    let coordinator = Arc::new(AccountLifecycleCoordinator::new());
+    let entered_commit = Arc::new(tokio::sync::Notify::new());
+    let release_commit = Arc::new(tokio::sync::Notify::new());
+    let commit = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        let entered = Arc::clone(&entered_commit);
+        let release = Arc::clone(&release_commit);
+        async move {
+            let _guard = coordinator.read_guard().await;
+            entered.notify_one();
+            release.notified().await;
+        }
+    });
+    entered_commit.notified().await;
+
+    let mutation = coordinator.mutation_guard();
+    tokio::pin!(mutation);
+    assert!(matches!(
+        futures_util::poll!(&mut mutation),
+        std::task::Poll::Pending
+    ));
+
+    release_commit.notify_one();
+    commit.await.unwrap();
+    let _mutation_guard = tokio::time::timeout(Duration::from_secs(1), mutation.as_mut())
+        .await
+        .expect("switch should proceed only after the environment commit fence drops");
 }
 
 #[tokio::test]

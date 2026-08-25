@@ -4,12 +4,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../../src/App.vue'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useAccountStore } from '../../src/stores/account'
+import { useConfigStore } from '../../src/stores/config'
 import type { AppConfig, Balance } from '../../src/types/models'
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   listeners: new Map<string, (payload: unknown) => void>(),
   closeGuard: vi.fn(),
+  reportError: vi.fn(),
+  showBackendError: vi.fn(),
 }))
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: mocks.invoke }))
@@ -21,6 +24,10 @@ vi.mock('../../src/composables/useTauriEvent', () => ({
 }))
 vi.mock('../../src/composables/useChartWorkspaceCloseGuard', () => ({
   useChartWorkspaceCloseGuard: mocks.closeGuard,
+}))
+vi.mock('../../src/services/errorService', () => ({
+  reportError: mocks.reportError,
+  showBackendError: mocks.showBackendError,
 }))
 vi.mock('../../src/components/layout/AppShell.vue', () => ({
   default: { template: '<div />' },
@@ -47,6 +54,8 @@ describe('App account-bound event handlers', () => {
     setActivePinia(pinia)
     mocks.listeners.clear()
     mocks.closeGuard.mockReset()
+    mocks.reportError.mockReset()
+    mocks.showBackendError.mockReset()
     mocks.invoke.mockReset()
     mocks.invoke.mockImplementation((command: string) => {
       if (command === 'get_config') return Promise.resolve(config)
@@ -88,24 +97,53 @@ describe('App account-bound event handlers', () => {
   })
 
   it('does not write a stale balance event into the account store', () => {
+    useConfigStore().config = config
     useAccountProfilesStore().adoptSessionEpoch(2)
     const balance: Balance = {
       asset: 'USDT', available: '10', frozen: '0', total: '10',
     }
 
-    mocks.listeners.get('balance:updated')?.({ sessionEpoch: 1, payload: balance })
+    mocks.listeners.get('balance:updated')?.({
+      accountId: 'primary', sessionEpoch: 1, payload: balance,
+    })
 
     expect(useAccountStore().balances).toEqual([])
   })
 
   it('accepts the current epoch balance payload', () => {
+    useConfigStore().config = config
     useAccountProfilesStore().adoptSessionEpoch(2)
     const balance: Balance = {
       asset: 'USDT', available: '10', frozen: '0', total: '10',
     }
 
-    mocks.listeners.get('balance:updated')?.({ sessionEpoch: 2, payload: balance })
+    mocks.listeners.get('balance:updated')?.({
+      accountId: 'primary', sessionEpoch: 2, payload: balance,
+    })
 
     expect(useAccountStore().balances).toEqual([balance])
+  })
+
+  it('routes the typed backend error envelope to the Toast-only adapter', () => {
+    const event = { eventId: 'backend:event:1', message: '后台任务失败' }
+
+    mocks.listeners.get('error:occurred')?.(event)
+
+    expect(mocks.showBackendError).toHaveBeenCalledWith(event)
+    expect(mocks.reportError).not.toHaveBeenCalledWith(event)
+  })
+
+  it('rejects a current-epoch event owned by a different account', () => {
+    useConfigStore().config = config
+    useAccountProfilesStore().adoptSessionEpoch(2)
+    const balance: Balance = {
+      asset: 'USDT', available: '99', frozen: '0', total: '99',
+    }
+
+    mocks.listeners.get('balance:updated')?.({
+      accountId: 'backup', sessionEpoch: 2, payload: balance,
+    })
+
+    expect(useAccountStore().balances).toEqual([])
   })
 })

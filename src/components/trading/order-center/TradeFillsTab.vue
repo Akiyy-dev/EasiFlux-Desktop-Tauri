@@ -7,6 +7,7 @@ import { tauriInvoke } from '../../../composables/useTauriCommand'
 import { useConnectionStore } from '../../../stores/connection'
 import { parseTradeFills, type TradeFill } from '../../../utils/tradingRecords'
 import { reportError } from '../../../services/errorService'
+import { decodeCommandError } from '../../../services/notificationService'
 
 const props = defineProps<{
   active: boolean
@@ -58,7 +59,7 @@ async function refresh(): Promise<void> {
     })
     fills.value = parseTradeFills(payload)
   } catch (error) {
-    reportError(error)
+    if (!decodeCommandError(error).notificationId) reportError(error)
   } finally {
     loading.value = false
   }

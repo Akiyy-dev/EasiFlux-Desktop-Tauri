@@ -6,6 +6,7 @@ import type {
   AccountProfile,
   AccountSessionEvent,
   AccountSwitchResult,
+  DeleteAccountResult,
   SaveCredentialRequest,
 } from '../types/models'
 import { clearAccountBoundState } from '../services/accountSessionService'
@@ -16,9 +17,16 @@ import { normalizeAccountId } from '../utils/account'
 import {
   collectReconciliationFailures,
   formatReconciliationError,
+  normalizeReconciliationSteps,
   type AccountReconciliationStep,
   type AccountReconciliationTask,
 } from '../services/accountReconciliationService'
+import { createClientNotification } from '../services/notificationService'
+import type {
+  ClientNotificationFailedStep,
+  ClientNotificationKind,
+} from '../types/notification'
+import { notifyWarning, reportError } from '../services/errorService'
 import {
   ACCOUNT_SWITCHING_MESSAGE,
   ACCOUNT_SYNCING_MESSAGE,
@@ -32,6 +40,22 @@ const ACCOUNT_PROFILE_REFRESH_MESSAGE =
   '请先刷新账户列表，再进行其他账户操作。'
 const ACCOUNT_MUTATION_BLOCKED_MESSAGE =
   '账户状态正在同步，暂时无法更改账户。'
+const NOTIFICATION_CLEANUP_PENDING_MESSAGE =
+  '账户已删除，通知清理将在稍后重试。'
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+interface AccountFailureRun {
+  accountId: string
+  sessionEpoch: number
+  attemptId: string
+  generation: number
+}
+
+interface ReconciliationAuthority {
+  accountId: string
+  sessionEpoch: number
+}
 
 function sanitizeProfile(profile: AccountProfile): AccountProfile {
   return {
@@ -49,6 +73,13 @@ function errorMessage(error: unknown): string {
   return '请求失败'
 }
 
+function parseEventAccountId(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim()
+  if (normalized.length === 0 || normalized !== value) return null
+  return normalized
+}
+
 export const useAccountProfilesStore = defineStore('accountProfiles', () => {
   const profiles = ref<AccountProfile[]>([])
   const loading = ref(false)
@@ -60,11 +91,15 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
   const reconciliationLoading = ref(false)
   const reconciliationFailedSteps = ref<AccountReconciliationStep[]>([])
   let latestListRequest = 0
+  let latestReconciliationListRequest = 0
+  let latestProfileResultGeneration = 0
   let reconciliationPromise: Promise<void> | null = null
-  let reconciliationContext: { activeAccountId: string } | null = null
+  let reconciliationAuthority: ReconciliationAuthority | null = null
+  let failureRunGeneration = 0
+  let transitionGeneration = 0
   const saveRequest = useAsyncState<void>()
   const switchRequest = useAsyncState<AccountSwitchResult>()
-  const deleteRequest = useAsyncState<void>()
+  const deleteRequest = useAsyncState<DeleteAccountResult>()
   const activeAccountId = computed(() => authoritativeActiveAccountId.value
     ?? normalizeAccountId(useConfigStore().config?.activeAccountId))
   const reconciliationError = computed(() =>
@@ -124,7 +159,66 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
   }
 
   function adoptSessionEpoch(nextEpoch: number): void {
-    if (nextEpoch > sessionEpoch.value) sessionEpoch.value = nextEpoch
+    if (nextEpoch <= sessionEpoch.value) return
+    failureRunGeneration += 1
+    reconciliationPromise = null
+    reconciliationLoading.value = false
+    reconciliationFailedSteps.value = []
+    sessionEpoch.value = nextEpoch
+    if (reconciliationAuthority?.accountId === activeAccountId.value) {
+      reconciliationAuthority = {
+        accountId: reconciliationAuthority.accountId,
+        sessionEpoch: nextEpoch,
+      }
+    }
+  }
+
+  function createFailureRun(
+    accountId: string,
+    epoch: number,
+    generation = ++failureRunGeneration,
+  ): AccountFailureRun {
+    if (!Number.isSafeInteger(epoch) || epoch < 0) {
+      throw new Error('客户端通知会话代次无效')
+    }
+    const attemptId = crypto.randomUUID().toLowerCase()
+    if (!UUID_V4_PATTERN.test(attemptId)) {
+      throw new Error('客户端通知尝试标识无效')
+    }
+    return {
+      accountId: normalizeAccountId(accountId),
+      sessionEpoch: epoch,
+      attemptId,
+      generation,
+    }
+  }
+
+  function ownsFailureRun(run: AccountFailureRun): boolean {
+    return run.generation === failureRunGeneration
+      && run.accountId === activeAccountId.value
+      && run.sessionEpoch === sessionEpoch.value
+  }
+
+  async function publishAccountFailure(
+    run: AccountFailureRun,
+    kind: ClientNotificationKind,
+    failedSteps: readonly ClientNotificationFailedStep[],
+    fallbackContext: string,
+  ): Promise<void> {
+    if (!ownsFailureRun(run)) return
+    try {
+      await createClientNotification({
+        accountId: run.accountId,
+        sessionEpoch: run.sessionEpoch,
+        attemptId: run.attemptId,
+        kind,
+        failedSteps,
+      })
+      if (!ownsFailureRun(run)) return
+    } catch {
+      if (!ownsFailureRun(run)) return
+      reportError(new Error('客户端通知提交失败'), fallbackContext)
+    }
   }
 
   function handleSessionEvent<T>(
@@ -132,10 +226,13 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
     handler: (payload: T) => void,
   ): boolean {
     if (transitionPending.value || recoveryRequired.value) return false
+    const eventAccountId = parseEventAccountId(event.accountId)
+    if (eventAccountId === null || eventAccountId !== activeAccountId.value) return false
+    if (!Number.isSafeInteger(event.sessionEpoch) || event.sessionEpoch < 0) return false
     const decision = decideAccountSessionEpoch(sessionEpoch.value, event.sessionEpoch)
     if (decision === 'reject') return false
     if (decision === 'advance') {
-      sessionEpoch.value = event.sessionEpoch
+      adoptSessionEpoch(event.sessionEpoch)
       clearAccountBoundState()
     }
     handler(event.payload)
@@ -144,19 +241,25 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
 
   async function refreshProfiles(): Promise<AccountProfile[]> {
     const requestId = ++latestListRequest
+    const resultGeneration = ++latestProfileResultGeneration
     loading.value = true
     listError.value = null
     try {
       const result = await tauriInvoke<AccountProfile[]>('list_account_profiles')
       const sanitized = alignActiveProfile(result.map(sanitizeProfile))
-      if (requestId === latestListRequest) {
+      if (
+        requestId === latestListRequest
+        && resultGeneration === latestProfileResultGeneration
+      ) {
         profiles.value = sanitized
-        loading.value = false
       }
+      if (requestId === latestListRequest) loading.value = false
       return sanitized
     } catch (error) {
       if (requestId === latestListRequest) {
-        listError.value = errorMessage(error)
+        if (resultGeneration === latestProfileResultGeneration) {
+          listError.value = errorMessage(error)
+        }
         loading.value = false
       }
       throw error
@@ -169,36 +272,61 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
     void refreshProfiles().catch(() => undefined)
   }
 
-  function runReconciliation(): Promise<void> {
+  function runReconciliation(existingRun?: AccountFailureRun): Promise<void> {
     if (reconciliationPromise) return reconciliationPromise
-    const context = reconciliationContext
-    if (!context) return Promise.resolve()
+    const authority = reconciliationAuthority
+    if (!authority) return Promise.resolve()
+    const context = existingRun ?? createFailureRun(
+      authority.accountId,
+      authority.sessionEpoch,
+    )
+    if (!ownsFailureRun(context)) return Promise.resolve()
     const configStore = useConfigStore()
     const connectionStore = useConnectionStore()
     const tasks: AccountReconciliationTask[] = [
-      { step: 'config', run: () => configStore.fetchConfig() },
-      { step: 'profiles', run: () => refreshProfiles() },
+      {
+        step: 'config',
+        run: () => configStore.fetchConfigForCompletion(() => ownsFailureRun(context)),
+      },
+      { step: 'profiles', run: () => refreshProfilesForRun(context) },
       {
         step: 'connection',
-        run: () => Promise.all([
-          connectionStore.refreshStatus(),
-          connectionStore.refreshWsStatus(),
-        ]),
+        run: async () => {
+          await Promise.all([
+            connectionStore.refreshStatus(() => ownsFailureRun(context)),
+            connectionStore.refreshWsStatus(() => ownsFailureRun(context)),
+          ])
+          if (!ownsFailureRun(context)) return
+        },
       },
     ]
     tasks.push({
       step: 'bootstrap',
-      run: () => tauriInvoke('scheduler_run_task', { task: 'bootstrap', force: true }),
+      run: () => tauriInvoke('scheduler_run_task', {
+        task: 'reconciliationBootstrap',
+        force: true,
+      }),
     })
     reconciliationLoading.value = true
     reconciliationFailedSteps.value = []
     const current = collectReconciliationFailures(tasks)
-      .then((failures) => {
-        reconciliationFailedSteps.value = failures
-        adoptActiveAccountId(context.activeAccountId)
+      .then(async (failures) => {
+        if (!ownsFailureRun(context)) return
+        const normalizedFailures = normalizeReconciliationSteps(failures)
+        if (normalizedFailures.length > 0) {
+          await publishAccountFailure(
+            context,
+            'accountReconciliationFailed',
+            normalizedFailures,
+            '账户同步失败通知提交失败',
+          )
+          if (!ownsFailureRun(context)) return
+        }
+        reconciliationFailedSteps.value = normalizedFailures
+        adoptActiveAccountId(context.accountId)
       })
       .finally(() => {
-        reconciliationLoading.value = false
+        if (ownsFailureRun(context)) reconciliationLoading.value = false
         if (reconciliationPromise === current) reconciliationPromise = null
       })
     reconciliationPromise = current
@@ -213,10 +341,12 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
   async function switchAccount(accountId: string): Promise<AccountSwitchResult> {
     if (switching.value) throw new Error('账户切换正在进行中')
     assertAccountMutationAllowed()
-    const previousContext = reconciliationContext
+    const previousAuthority = reconciliationAuthority
     const previousFailures = [...reconciliationFailedSteps.value]
+    const switchRun = createFailureRun(activeAccountId.value, sessionEpoch.value)
+    const transitionToken = ++transitionGeneration
     transitionPending.value = true
-    reconciliationContext = null
+    reconciliationAuthority = null
     reconciliationFailedSteps.value = []
     listError.value = null
     let result: AccountSwitchResult
@@ -228,16 +358,21 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
         }),
       )
     } catch (error) {
+      if (!ownsFailureRun(switchRun)) {
+        if (transitionToken === transitionGeneration) transitionPending.value = false
+        throw error
+      }
       const switchRequiresRecovery = errorMessage(error)
         .includes(ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER)
       const connectionStore = useConnectionStore()
       try {
-        reconciliationContext = previousContext
-        reconciliationFailedSteps.value = previousFailures
         const [apiStatus, websocketStatus] = await Promise.allSettled([
-          connectionStore.refreshStatus(),
-          connectionStore.refreshWsStatus(),
+          connectionStore.refreshStatus(() => ownsFailureRun(switchRun)),
+          connectionStore.refreshWsStatus(() => ownsFailureRun(switchRun)),
         ])
+        if (!ownsFailureRun(switchRun)) throw error
+        reconciliationAuthority = previousAuthority
+        reconciliationFailedSteps.value = previousFailures
         const statusRefreshFailed = apiStatus.status === 'rejected'
           || websocketStatus.status === 'rejected'
         if (apiStatus.status === 'rejected') {
@@ -250,44 +385,115 @@ export const useAccountProfilesStore = defineStore('accountProfiles', () => {
           recoveryRequired.value = true
           connectionStore.setWsStatus('disconnected')
         }
-      } finally {
-        transitionPending.value = false
-      }
-      if (!recoveryRequired.value) {
-        try {
-          await connectionStore.refreshWsStatus()
-        } catch {
-          recoveryRequired.value = true
-          connectionStore.setWsStatus('disconnected')
+        if (!recoveryRequired.value) {
+          if (transitionToken === transitionGeneration) transitionPending.value = false
+          try {
+            await connectionStore.refreshWsStatus(() => ownsFailureRun(switchRun))
+            if (!ownsFailureRun(switchRun)) throw error
+          } catch {
+            if (ownsFailureRun(switchRun)) {
+              recoveryRequired.value = true
+              connectionStore.setWsStatus('disconnected')
+            }
+          }
         }
+        if (recoveryRequired.value && ownsFailureRun(switchRun)) {
+          await publishAccountFailure(
+            switchRun,
+            'accountRecoveryFailed',
+            ['connection'],
+            '账户恢复失败通知提交失败',
+          )
+        }
+      } finally {
+        if (transitionToken === transitionGeneration) transitionPending.value = false
       }
       throw error
     }
+    let reconciliationRun: AccountFailureRun | null = null
+    let recoveryFailedStep: ClientNotificationFailedStep = 'bootstrap'
     try {
-      adoptSessionEpoch(result.sessionEpoch)
+      if (!ownsFailureRun(switchRun)) return result
+      if (result.sessionEpoch > sessionEpoch.value) sessionEpoch.value = result.sessionEpoch
       const normalizedActiveAccountId = adoptActiveAccountId(result.activeAccountId)
+      reconciliationRun = createFailureRun(
+        normalizedActiveAccountId,
+        sessionEpoch.value,
+        switchRun.generation,
+      )
       clearAccountBoundState()
+      recoveryFailedStep = 'connection'
       const connectionStore = useConnectionStore()
       connectionStore.setStatus(result.connected ? 'connected' : 'disconnected')
-      await connectionStore.refreshWsStatus()
-      reconciliationContext = {
-        activeAccountId: normalizedActiveAccountId,
+      await connectionStore.refreshWsStatus(() => (
+        reconciliationRun !== null && ownsFailureRun(reconciliationRun)
+      ))
+      if (!ownsFailureRun(reconciliationRun)) return result
+      reconciliationAuthority = {
+        accountId: normalizedActiveAccountId,
+        sessionEpoch: sessionEpoch.value,
       }
     } catch (error) {
-      recoveryRequired.value = true
-      useConnectionStore().setWsStatus('disconnected')
+      if (reconciliationRun && ownsFailureRun(reconciliationRun)) {
+        recoveryRequired.value = true
+        useConnectionStore().setWsStatus('disconnected')
+        await publishAccountFailure(
+          reconciliationRun,
+          'accountRecoveryFailed',
+          [recoveryFailedStep],
+          '账户恢复失败通知提交失败',
+        )
+      }
       throw error
     } finally {
-      transitionPending.value = false
+      if (transitionToken === transitionGeneration) transitionPending.value = false
     }
-    await runReconciliation()
+    if (reconciliationRun) await runReconciliation(reconciliationRun)
     return result
   }
 
-  async function deleteAccount(accountId: string): Promise<void> {
+  async function refreshProfilesForRun(run: AccountFailureRun): Promise<void> {
+    const requestId = ++latestReconciliationListRequest
+    const resultGeneration = ++latestProfileResultGeneration
+    if (
+      requestId === latestReconciliationListRequest
+      && resultGeneration === latestProfileResultGeneration
+      && ownsFailureRun(run)
+    ) {
+      listError.value = null
+    }
+    let result: AccountProfile[]
+    try {
+      result = await tauriInvoke<AccountProfile[]>('list_account_profiles')
+    } catch (error) {
+      if (
+        requestId !== latestReconciliationListRequest
+        || resultGeneration !== latestProfileResultGeneration
+        || !ownsFailureRun(run)
+      ) return
+      listError.value = errorMessage(error)
+      throw error
+    }
+    if (
+      requestId !== latestReconciliationListRequest
+      || resultGeneration !== latestProfileResultGeneration
+      || !ownsFailureRun(run)
+    ) return
+    profiles.value = alignActiveProfile(result.map(sanitizeProfile))
+    listError.value = null
+  }
+
+  async function deleteAccount(accountId: string): Promise<DeleteAccountResult> {
     assertAccountMutationAllowed()
-    await deleteRequest.run(() => tauriInvoke<void>('delete_account', { accountId }))
+    const result = await deleteRequest.run(() =>
+      tauriInvoke<DeleteAccountResult>('delete_account', { accountId }),
+    )
+    if (result?.notificationCleanupPending === true
+      && result.warningCode === 'NOTIFICATION_CLEANUP_PENDING') {
+      notifyWarning(NOTIFICATION_CLEANUP_PENDING_MESSAGE)
+    }
     void refreshProfiles().catch(() => undefined)
+    return result
   }
 
   return {

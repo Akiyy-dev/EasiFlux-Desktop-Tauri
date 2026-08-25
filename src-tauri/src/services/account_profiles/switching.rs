@@ -1,6 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::models::account::AccountSwitchResult;
 use crate::models::config::{normalize_account_id, ApiCredential, AppConfig, ConnectionStatus};
+use crate::models::trading::SessionContext;
 
 use super::{
     normalize_account_ids, safe_load, valid_credential, AccountLifecycleCoordinator,
@@ -45,6 +46,7 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
     target_config.accounts = accounts;
     if let Err(primary) = port.persist_config(&target_config) {
         return Err(rollback_switch(
+            coordinator,
             port,
             &former_config,
             former_status,
@@ -57,8 +59,17 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
 
     if former_status == ConnectionStatus::Connected {
         let realtime = start_realtime.unwrap_or(former_config.use_websocket);
-        if let Err(primary) = port.connect(&target_id, realtime, target_credential).await {
+        if let Err(primary) = port
+            .connect(
+                &target_id,
+                realtime,
+                target_credential,
+                coordinator.next_session_epoch(),
+            )
+            .await
+        {
             return Err(rollback_switch(
+                coordinator,
                 port,
                 &former_config,
                 former_status,
@@ -72,6 +83,11 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
     }
     port.clear_account_data().await;
     let session_epoch = coordinator.advance_session_epoch();
+    port.activate_session(&SessionContext {
+        account_id: target_id.clone(),
+        session_epoch,
+    })
+    .await;
     Ok(AccountSwitchResult {
         active_account_id: target_id,
         connected: former_status == ConnectionStatus::Connected,
@@ -80,6 +96,7 @@ pub(crate) async fn switch_account<P: AccountLifecyclePort>(
 }
 
 async fn rollback_switch<P: AccountLifecyclePort>(
+    coordinator: &AccountLifecycleCoordinator,
     port: &P,
     former_config: &AppConfig,
     former_status: ConnectionStatus,
@@ -88,7 +105,7 @@ async fn rollback_switch<P: AccountLifecyclePort>(
 ) -> AppError {
     let mut rollback_errors = Vec::new();
     if let Err(error) = port.persist_config(former_config) {
-        rollback_errors.push(error.to_string());
+        rollback_errors.push(error);
     }
     port.replace_runtime_config(former_config.clone()).await;
     if former_status == ConnectionStatus::Connected {
@@ -98,10 +115,11 @@ async fn rollback_switch<P: AccountLifecyclePort>(
                     &normalize_account_id(&former_config.active_account_id),
                     former_config.use_websocket,
                     credential,
+                    coordinator.current_session_epoch(),
                 )
                 .await
             {
-                rollback_errors.push(error.to_string());
+                rollback_errors.push(error);
             }
         }
     }
@@ -109,9 +127,17 @@ async fn rollback_switch<P: AccountLifecyclePort>(
         primary
     } else {
         port.disconnect().await;
+        if let Some(index) = rollback_errors
+            .iter()
+            .position(|error| matches!(error, AppError::Notified { .. }))
+        {
+            return rollback_errors.swap_remove(index);
+        }
+        if matches!(primary, AppError::Notified { .. }) {
+            return primary;
+        }
         AppError::Internal(format!(
-            "{ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER}: {primary}；回滚失败：{}",
-            rollback_errors.join("; ")
+            "{ACCOUNT_SWITCH_RECOVERY_REQUIRED_MARKER}: 账户切换失败且恢复原账户失败"
         ))
     }
 }

@@ -76,7 +76,7 @@ function installStartupResponses(options: {
   configError?: Error
   profiles?: AccountProfile[]
   profileError?: Error
-  connectError?: Error
+  connectError?: unknown
 } = {}): void {
   mocks.invoke.mockImplementation((command: string) => {
     if (command === 'get_version') return Promise.resolve('test-version')
@@ -226,6 +226,23 @@ describe('App credential-aware startup', () => {
       expect.objectContaining({ message: 'connect failed' }),
       '自动连接失败',
     )
+    expect(mocks.reportError).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves notification-aware automatic connection failure Rust-owned', async () => {
+    installStartupResponses({
+      profiles: [profile('present')],
+      connectError: {
+        code: 'CONNECTION_UNAVAILABLE',
+        message: '连接服务暂时不可用',
+        notificationId: 'notification-auto-connect-1',
+      },
+    })
+    mountStartupApp(pinia)
+
+    await settleStartup()
+
+    expect(mocks.reportError).not.toHaveBeenCalled()
   })
 
   it('keeps QuickSetup closed when the normal settings gear opens Settings Center', async () => {

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::models::notification::NotificationSettings;
+
 pub const DEFAULT_KLINE_LIMIT: u32 = 200;
 pub const DEFAULT_DEPTH_LIMIT: u32 = 20;
 
@@ -93,21 +95,53 @@ impl ApiCredential {
     pub fn normalize(mut self) -> Self {
         self.api_key = self.api_key.trim().to_string();
         self.api_secret = self.api_secret.trim().to_string();
-        self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
-        if self.base_url.is_empty() {
-            self.base_url = DEFAULT_BASE_URL.to_string();
-        }
+        let trimmed_base_url = self.base_url.trim();
+        self.base_url = if trimmed_base_url.is_empty() {
+            DEFAULT_BASE_URL.to_string()
+        } else {
+            canonical_api_base_url(trimmed_base_url).unwrap_or_else(|| trimmed_base_url.to_string())
+        };
         self.label = self.label.trim().to_string();
         self
     }
 
     pub fn is_valid(&self) -> bool {
-        !self.api_key.is_empty() && !self.api_secret.is_empty()
+        !self.api_key.is_empty()
+            && !self.api_secret.is_empty()
+            && !self.base_url.trim().is_empty()
+            && canonical_api_base_url(&self.base_url).is_some()
     }
 
     pub fn has_secret(&self) -> bool {
         !self.api_secret.is_empty()
     }
+}
+
+pub fn canonical_api_base_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let mut url = if trimmed.is_empty() {
+        url::Url::parse(DEFAULT_BASE_URL).ok()?
+    } else {
+        url::Url::parse(trimmed).ok()?
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_none()
+    {
+        return None;
+    }
+    if matches!(
+        (url.scheme(), url.port()),
+        ("https", Some(443)) | ("http", Some(80))
+    ) {
+        url.set_port(None).ok()?;
+    }
+    let normalized_path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&normalized_path);
+    Some(url.to_string().trim_end_matches('/').to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +167,8 @@ pub struct AppConfig {
     pub risk_max_daily_orders: u32,
     #[serde(default = "default_trading_day_timezone")]
     pub trading_day_timezone: String,
+    #[serde(default)]
+    pub notification_settings: NotificationSettings,
 }
 
 fn default_trading_day_timezone() -> String {
@@ -159,6 +195,7 @@ impl Default for AppConfig {
             risk_max_price_deviation_pct: "5".to_string(),
             risk_max_daily_orders: 500,
             trading_day_timezone: crate::models::time::DEFAULT_TRADING_DAY_TIMEZONE.to_string(),
+            notification_settings: NotificationSettings::default(),
         }
     }
 }
@@ -221,15 +258,21 @@ impl From<&AppConfig> for RiskConfig {
 }
 
 pub fn environment_label(base_url: &str) -> &'static str {
-    match url::Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_string()))
-        .as_deref()
+    let Ok(url) = url::Url::parse(base_url) else {
+        return "未知";
+    };
+    if url.scheme() == "https"
+        && url.host_str() == Some("api.easicoin.io")
+        && url.port().is_none()
+        && matches!(url.path(), "" | "/")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
     {
-        Some("api.easicoin.io") => "正式",
-        Some(_) => "开发",
-        None if base_url.contains("api.easicoin.io") => "正式",
-        None => "未知",
+        "正式"
+    } else {
+        "开发"
     }
 }
 
@@ -266,11 +309,83 @@ pub struct ConnectionSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::notification::NotificationSettings;
 
     #[test]
     fn normalize_account_id_empty_to_default() {
         assert_eq!(normalize_account_id(""), "default");
         assert_eq!(normalize_account_id("   "), "default");
         assert_eq!(normalize_account_id("main"), "main");
+    }
+
+    #[test]
+    fn notification_settings_default_all_toasts_to_enabled() {
+        assert_eq!(
+            NotificationSettings::default(),
+            NotificationSettings {
+                trading_toast: true,
+                risk_account_toast: true,
+                connection_system_toast: true,
+            },
+        );
+    }
+
+    #[test]
+    fn api_base_url_canonicalization_rejects_secret_bearing_or_ambiguous_urls() {
+        assert_eq!(
+            canonical_api_base_url(" https://CUSTOM.example.test:443/api/ ").as_deref(),
+            Some("https://custom.example.test/api")
+        );
+        assert_eq!(
+            canonical_api_base_url("http://custom.example.test:80").as_deref(),
+            Some("http://custom.example.test")
+        );
+        for unsafe_url in [
+            "https://user:secret@example.test/api",
+            "https://example.test/api?token=secret",
+            "https://example.test/api#secret",
+            "ftp://example.test/api",
+            "not a url",
+        ] {
+            assert!(canonical_api_base_url(unsafe_url).is_none(), "{unsafe_url}");
+            let normalized = ApiCredential {
+                api_key: "key".into(),
+                api_secret: "secret".into(),
+                base_url: unsafe_url.into(),
+                label: "label".into(),
+            }
+            .normalize();
+            assert_ne!(normalized.base_url, DEFAULT_BASE_URL);
+            assert!(!normalized.is_valid());
+            let normalized_twice = normalized.clone().normalize();
+            assert_eq!(normalized_twice.base_url, normalized.base_url);
+            assert!(!normalized_twice.is_valid());
+        }
+    }
+
+    #[test]
+    fn app_config_deserializes_without_notification_settings() {
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "activeSymbol": "BTCUSDT",
+            "activeAccountId": "default",
+            "watchlistSymbols": ["BTCUSDT"],
+            "theme": "dark",
+            "klineInterval": "1",
+            "useWebsocket": true,
+            "tickerPollInterval": 1.0,
+            "windowWidth": 1400,
+            "windowHeight": 900,
+            "accounts": ["default"],
+            "riskEnabled": true,
+            "riskMaxOrderQty": "100",
+            "riskMaxPriceDeviationPct": "5",
+            "riskMaxDailyOrders": 500
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.notification_settings,
+            NotificationSettings::default()
+        );
     }
 }

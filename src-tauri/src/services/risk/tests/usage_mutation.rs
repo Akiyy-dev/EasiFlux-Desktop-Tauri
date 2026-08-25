@@ -1,5 +1,6 @@
 use super::super::*;
 use super::support::*;
+use crate::models::risk::RiskViolationCode;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -16,9 +17,12 @@ fn enforces_daily_limit_across_service_restart() {
     }
 
     let restarted = service_with_limit(&path, 1);
-    assert!(restarted
+    let violation = restarted
         .reserve_order(&request, None, SHANGHAI_NOON)
-        .is_err());
+        .unwrap_err();
+    assert_eq!(violation.code, RiskViolationCode::DailyOrderLimit);
+    assert_eq!(violation.safe_params.limit, Some(1.0));
+    assert!(violation.safe_params.values_are_finite());
     cleanup_test_files(&path);
 }
 
@@ -119,11 +123,32 @@ fn persistence_failure_denies_reservation() {
     let ledger = blocker.join("risk_usage.toml");
     let service = service_with_limit(&ledger, 1);
 
-    assert!(matches!(
-        service.reserve_order(&market_order("1"), None, SHANGHAI_NOON),
-        Err(AppError::Storage(_))
-    ));
+    let violation = service
+        .reserve_order(&market_order("1"), None, SHANGHAI_NOON)
+        .unwrap_err();
+    assert_eq!(violation.code, RiskViolationCode::LedgerUnavailable);
+    assert_eq!(violation.safe_params.limit, None);
+    assert!(violation.safe_params.values_are_finite());
     let _ = std::fs::remove_file(blocker);
+}
+
+#[test]
+fn unreadable_ledger_returns_a_typed_safe_violation() {
+    let path = test_path("typed-ledger-unavailable");
+    std::fs::write(&path, "server body api_key=raw-key secret=raw-secret").unwrap();
+    let service = service_with_limit(&path, 1);
+
+    let violation = service
+        .reserve_order(&market_order("1"), None, SHANGHAI_NOON)
+        .unwrap_err();
+
+    assert_eq!(violation.code, RiskViolationCode::LedgerUnavailable);
+    assert_eq!(violation.safe_params.limit, None);
+    let serialized = serde_json::to_string(&violation).unwrap();
+    assert!(!serialized.contains("server body"));
+    assert!(!serialized.contains("raw-key"));
+    assert!(!serialized.contains("raw-secret"));
+    cleanup_test_files(&path);
 }
 
 #[test]

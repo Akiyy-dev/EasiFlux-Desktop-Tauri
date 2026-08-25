@@ -11,8 +11,12 @@ pub async fn test_connection(credential: ApiCredential) -> AppResult<()> {
 }
 
 pub(crate) async fn preflight_credential(credential: &ApiCredential) -> AppResult<()> {
+    let credential = credential.clone().normalize();
+    if !credential.is_valid() {
+        return Err(AppError::Auth("API 凭据或服务地址无效".into()));
+    }
     let temp = crate::api::ApiClient::new();
-    temp.set_credential(credential.clone().normalize()).await;
+    temp.set_credential(credential).await;
     crate::auth::time_sync::sync_from_server(
         temp.time_sync().as_ref(),
         crate::api::PublicApi::server_time(&temp),
@@ -65,10 +69,11 @@ pub async fn connect(
     )
     .await?;
 
-    let scheduler = state.scheduler.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = scheduler.bootstrap_connection().await;
-    });
+    if let Err(error) = state.scheduler.spawn_connection_bootstrap() {
+        let message = format!("连接初始化调度失败：{}", error.user_message());
+        state.emitter.emit_error(&message);
+        tracing::warn!(message = %error.user_message(), "connection bootstrap was rejected");
+    }
     Ok(())
 }
 
@@ -96,4 +101,30 @@ pub async fn get_websocket_status(
     state: State<'_, AppState>,
 ) -> AppResult<crate::models::config::ConnectionStatus> {
     Ok(state.emitter.websocket_status())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn preflight_rejects_unsafe_base_url_without_network_or_raw_diagnostic() {
+        const UNSAFE: &str = "https://user:raw-secret@127.0.0.1:9/api?token=raw";
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            preflight_credential(&ApiCredential {
+                label: "unsafe".into(),
+                api_key: "key".into(),
+                api_secret: "secret".into(),
+                base_url: UNSAFE.into(),
+            }),
+        )
+        .await
+        .expect("unsafe URL should fail before any network timeout");
+        let error = result.expect_err("unsafe URL must fail preflight");
+        let rendered = serde_json::to_string(&error).unwrap();
+        assert!(!rendered.contains("raw-secret"));
+        assert!(!rendered.contains("token="));
+        assert!(!rendered.contains("127.0.0.1"));
+    }
 }

@@ -7,6 +7,7 @@ import { useAccountProfilesStore } from '../../stores/accountProfiles'
 import { useConfigStore } from '../../stores/config'
 import { useConnectionStore } from '../../stores/connection'
 import { reportError } from '../../services/errorService'
+import { decodeCommandError } from '../../services/notificationService'
 import type { AccountProfile, CredentialState } from '../../types/models'
 
 const store = useAccountProfilesStore()
@@ -122,7 +123,10 @@ async function reconnectActiveAccount(): Promise<void> {
     if (ownsReconnect(attempt)) invalidateReconnect()
   } catch (error) {
     if (!ownsReconnect(attempt)) return
-    reconnectError.value = reportError(error, '账户重新连接失败')
+    const decoded = decodeCommandError(error)
+    reconnectError.value = decoded.notificationId
+      ? decoded.message
+      : reportError(error, '账户重新连接失败')
   }
 }
 

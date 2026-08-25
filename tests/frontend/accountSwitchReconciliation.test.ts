@@ -7,9 +7,14 @@ import { useAccountStore } from '../../src/stores/account'
 import { useConfigStore } from '../../src/stores/config'
 import { useConnectionStore } from '../../src/stores/connection'
 import { useOrderStore } from '../../src/stores/order'
-import type { AccountProfile, AppConfig } from '../../src/types/models'
+import type { AccountProfile, AccountSwitchResult, AppConfig } from '../../src/types/models'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
+const errorServiceMocks = vi.hoisted(() => ({
+  reportError: vi.fn(() => 'safe aggregate fallback'),
+  notifyWarning: vi.fn(),
+}))
+vi.mock('../../src/services/errorService', () => errorServiceMocks)
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -37,6 +42,329 @@ describe('post-switch reconciliation', () => {
     setActivePinia(createPinia())
     useConfigStore().config = primaryConfig
     vi.mocked(tauriInvoke).mockReset()
+    errorServiceMocks.reportError.mockClear()
+    errorServiceMocks.notifyWarning.mockClear()
+  })
+
+  it('publishes one closed reconciliation aggregate with a run-scoped UUID', async () => {
+    let websocketCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 7 })
+      }
+      if (command === 'get_websocket_status' && ++websocketCalls === 1) {
+        return Promise.resolve('connected')
+      }
+      if (command === 'get_config' || command === 'list_account_profiles'
+        || command === 'get_connection_status' || command === 'get_websocket_status'
+        || command === 'scheduler_run_task') {
+        return Promise.reject(new Error('untrusted raw phase failure'))
+      }
+      if (command === 'create_client_notification') {
+        return Promise.resolve({
+          notification: {
+            id: '00000000-0000-4000-8000-000000000001',
+            scope: { type: 'account', accountId: 'backup' },
+            category: 'riskAccount',
+            kind: 'accountReconciliationFailed',
+            severity: 'critical',
+            content: {
+              messageKey: 'account.reconciliationFailed',
+              params: { failedSteps: 'config,profiles,connection,bootstrap' },
+              fallbackTitle: '账户对账失败',
+              fallbackBody: '账户状态对账未完成，请检查账户配置。',
+            },
+            dedupeKey: 'backup:attempt:reconciliation',
+            occurrenceCount: 1,
+            createdAtMs: 1,
+            updatedAtMs: 1,
+          },
+          unreadCount: 1,
+          revision: '1',
+        })
+      }
+      return Promise.resolve(undefined)
+    })
+
+    await useAccountProfilesStore().switchAccount('backup')
+
+    const calls = vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'create_client_notification')
+    expect(calls).toHaveLength(1)
+    expect(calls[0][1]).toEqual({
+      request: {
+        accountId: 'backup',
+        sessionEpoch: 7,
+        attemptId: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        ),
+        kind: 'accountReconciliationFailed',
+        failedSteps: ['config', 'profiles', 'connection', 'bootstrap'],
+      },
+    })
+    expect(errorServiceMocks.reportError).not.toHaveBeenCalled()
+  })
+
+  it('publishes recovery with controlled steps and uses one safe fallback on bridge rejection', async () => {
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.reject(new Error(
+          'ACCOUNT_SWITCH_RECOVERY_REQUIRED: raw keyring path C:\\secret',
+        ))
+      }
+      if (command === 'get_connection_status' || command === 'get_websocket_status') {
+        return Promise.resolve('disconnected')
+      }
+      if (command === 'create_client_notification') {
+        return Promise.reject({ message: 'bridge raw secret must not be parsed' })
+      }
+      return Promise.resolve(undefined)
+    })
+
+    await expect(useAccountProfilesStore().switchAccount('backup')).rejects.toThrow(
+      'ACCOUNT_SWITCH_RECOVERY_REQUIRED',
+    )
+
+    const calls = vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'create_client_notification')
+    expect(calls).toHaveLength(1)
+    expect(calls[0][1]).toEqual({
+      request: {
+        accountId: 'primary',
+        sessionEpoch: 0,
+        attemptId: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        ),
+        kind: 'accountRecoveryFailed',
+        failedSteps: ['connection'],
+      },
+    })
+    expect(errorServiceMocks.reportError).toHaveBeenCalledTimes(1)
+    expect(errorServiceMocks.reportError).toHaveBeenCalledWith(
+      expect.any(Error),
+      '账户恢复失败通知提交失败',
+    )
+    expect((errorServiceMocks.reportError.mock.calls[0][0] as Error).message)
+      .not.toContain('raw secret')
+  })
+
+  it('ignores a late reconciliation result after the session epoch advances', async () => {
+    const lateConfig = deferred<AppConfig>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
+      }
+      if (command === 'get_config') return lateConfig.promise
+      if (command === 'list_account_profiles') return Promise.resolve([backupProfile])
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useAccountProfilesStore()
+    const switching = store.switchAccount('backup')
+    await vi.waitFor(() => expect(store.reconciliationLoading).toBe(true))
+
+    expect(store.handleSessionEvent(
+      { accountId: 'backup', sessionEpoch: 2, payload: 'connected' },
+      () => undefined,
+    )).toBe(true)
+    lateConfig.reject(new Error('late config failure'))
+    await switching
+
+    expect(store.sessionEpoch).toBe(2)
+    expect(store.reconciliationFailedSteps).toEqual([])
+    expect(store.reconciliationLoading).toBe(false)
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'create_client_notification')).toHaveLength(0)
+    expect(errorServiceMocks.reportError).not.toHaveBeenCalled()
+  })
+
+  it('ignores a late bridge rejection after a newer session generation takes ownership', async () => {
+    const lateBridge = deferred<never>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
+      }
+      if (command === 'get_config') return Promise.reject(new Error('config failed'))
+      if (command === 'list_account_profiles') return Promise.resolve([backupProfile])
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      if (command === 'get_websocket_status') return Promise.resolve('connected')
+      if (command === 'create_client_notification') return lateBridge.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useAccountProfilesStore()
+    const switching = store.switchAccount('backup')
+    await vi.waitFor(() => expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'create_client_notification')).toHaveLength(1))
+
+    expect(store.handleSessionEvent(
+      { accountId: 'backup', sessionEpoch: 2, payload: 'connected' },
+      () => undefined,
+    )).toBe(true)
+    lateBridge.reject({ message: 'stale raw bridge secret' })
+    await switching
+
+    expect(store.sessionEpoch).toBe(2)
+    expect(store.reconciliationFailedSteps).toEqual([])
+    expect(store.reconciliationLoading).toBe(false)
+    expect(errorServiceMocks.reportError).not.toHaveBeenCalled()
+  })
+
+  it.each(['api', 'websocket'] as const)(
+    'suppresses a same-context stale %s rejection after a newer status refresh succeeds',
+    async (lateChannel) => {
+      const lateApi = deferred<'connecting'>()
+      const lateWebsocket = deferred<'connecting'>()
+      let apiCalls = 0
+      let websocketCalls = 0
+      vi.mocked(tauriInvoke).mockImplementation((command) => {
+        if (command === 'switch_account') {
+          return Promise.reject(new Error('target failed and rolled back'))
+        }
+        if (command === 'get_connection_status') {
+          apiCalls += 1
+          return apiCalls === 1 ? lateApi.promise : Promise.resolve('connected')
+        }
+        if (command === 'get_websocket_status') {
+          websocketCalls += 1
+          return websocketCalls === 1
+            ? lateWebsocket.promise
+            : Promise.resolve('connected')
+        }
+        return Promise.resolve(undefined)
+      })
+      const store = useAccountProfilesStore()
+      const connection = useConnectionStore()
+      const switching = store.switchAccount('backup')
+      await vi.waitFor(() => {
+        expect(apiCalls).toBe(1)
+        expect(websocketCalls).toBe(1)
+      })
+
+      await Promise.all([connection.refreshStatus(), connection.refreshWsStatus()])
+      if (lateChannel === 'api') {
+        lateApi.reject(new Error('stale api rejection'))
+        lateWebsocket.resolve('connecting')
+      } else {
+        lateApi.resolve('connecting')
+        lateWebsocket.reject(new Error('stale websocket rejection'))
+      }
+      await expect(switching).rejects.toThrow('target failed and rolled back')
+
+      expect(connection.status).toBe('connected')
+      expect(connection.wsStatus).toBe('connected')
+      expect(store.recoveryRequired).toBe(false)
+      expect(store.switching).toBe(false)
+      expect(vi.mocked(tauriInvoke).mock.calls
+        .filter(([command]) => command === 'create_client_notification')).toHaveLength(0)
+      expect(errorServiceMocks.reportError).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['fetch', 'save'] as const)(
+    'does not let an old reconciliation config response overwrite a newer config %s',
+    async (newerOwner) => {
+      const oldReconciliation = deferred<AppConfig>()
+      let getConfigCalls = 0
+      vi.mocked(tauriInvoke).mockImplementation((command) => {
+        if (command === 'switch_account') {
+          return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
+        }
+        if (command === 'get_websocket_status') return Promise.resolve('connected')
+        if (command === 'get_config') {
+          getConfigCalls += 1
+          return getConfigCalls === 1
+            ? oldReconciliation.promise
+            : Promise.resolve({ ...backupConfig, windowWidth: 1777 })
+        }
+        if (command === 'save_config') {
+          return Promise.resolve({ ...backupConfig, windowWidth: 1888 })
+        }
+        if (command === 'list_account_profiles') return Promise.resolve([backupProfile])
+        if (command === 'get_connection_status') return Promise.resolve('connected')
+        return Promise.resolve(undefined)
+      })
+      const store = useAccountProfilesStore()
+      const configStore = useConfigStore()
+      const switching = store.switchAccount('backup')
+      await vi.waitFor(() => expect(getConfigCalls).toBe(1))
+
+      if (newerOwner === 'fetch') {
+        await configStore.fetchConfig()
+      } else {
+        await configStore.saveConfig({ ...backupConfig, windowWidth: 1888 })
+      }
+      oldReconciliation.resolve({ ...backupConfig, windowWidth: 900 })
+      await switching
+
+      expect(configStore.config?.windowWidth).toBe(newerOwner === 'fetch' ? 1777 : 1888)
+      expect(store.reconciliationFailedSteps).toEqual([])
+    },
+  )
+
+  it('classifies local account-state clearing as the bootstrap recovery phase', async () => {
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: false, sessionEpoch: 1 })
+      }
+      return Promise.resolve(undefined)
+    })
+    const account = useAccountStore()
+    vi.spyOn(account, 'clearAccountData').mockImplementationOnce(() => {
+      throw new Error('local clear failed')
+    })
+
+    await expect(useAccountProfilesStore().switchAccount('backup')).rejects.toThrow(
+      'local clear failed',
+    )
+
+    const bridgeCall = vi.mocked(tauriInvoke).mock.calls
+      .find(([command]) => command === 'create_client_notification')
+    expect(bridgeCall?.[1]).toMatchObject({
+      request: {
+        accountId: 'backup',
+        sessionEpoch: 1,
+        kind: 'accountRecoveryFailed',
+        failedSteps: ['bootstrap'],
+      },
+    })
+  })
+
+  it('releases its transition token when its run is invalidated during the backend switch', async () => {
+    const pendingSwitch = deferred<AccountSwitchResult>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') return pendingSwitch.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useAccountProfilesStore()
+    const switching = store.switchAccount('backup')
+    store.adoptSessionEpoch(1)
+    pendingSwitch.resolve({ activeAccountId: 'backup', connected: false, sessionEpoch: 2 })
+
+    await switching
+
+    expect(store.switching).toBe(false)
+    expect(store.tradingBlocked).toBe(false)
+  })
+
+  it('releases its transition token when invalidated during initial websocket refresh', async () => {
+    const initialWebsocket = deferred<'connected'>()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
+      }
+      if (command === 'get_websocket_status') return initialWebsocket.promise
+      return Promise.resolve(undefined)
+    })
+    const store = useAccountProfilesStore()
+    const switching = store.switchAccount('backup')
+    await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('get_websocket_status'))
+    store.adoptSessionEpoch(2)
+    initialWebsocket.resolve('connected')
+
+    await switching
+
+    expect(store.switching).toBe(false)
+    expect(store.tradingBlocked).toBe(false)
   })
 
   const failures = [
@@ -174,6 +502,107 @@ describe('post-switch reconciliation', () => {
       .filter(([command]) => command === 'switch_account')).toHaveLength(1)
   })
 
+  it('does not strand an older normal profile refresh when reconciliation becomes newer', async () => {
+    const normalProfiles = deferred<AccountProfile[]>()
+    const retryProfiles = deferred<AccountProfile[]>()
+    const freshProfile = { ...backupProfile, label: 'Fresh backup' }
+    let configCalls = 0
+    let listCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
+      }
+      if (command === 'get_config') {
+        configCalls += 1
+        return configCalls === 1
+          ? Promise.reject(new Error('temporary config failure'))
+          : Promise.resolve(backupConfig)
+      }
+      if (command === 'list_account_profiles') {
+        listCalls += 1
+        if (listCalls === 1) return Promise.resolve([backupProfile])
+        return listCalls === 2 ? normalProfiles.promise : retryProfiles.promise
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useAccountProfilesStore()
+    await store.switchAccount('backup')
+
+    const normalRefresh = store.refreshProfiles()
+    const retry = store.retryReconciliation()
+    await vi.waitFor(() => expect(listCalls).toBe(3))
+    retryProfiles.resolve([backupProfile])
+    await retry
+    normalProfiles.resolve([freshProfile])
+    await normalRefresh
+
+    expect(store.profiles).toEqual([backupProfile])
+    expect(store.loading).toBe(false)
+    expect(store.listError).toBeNull()
+  })
+
+  it('does not let older reconciliation profiles overwrite a newer normal success', async () => {
+    const reconciliationProfiles = deferred<AccountProfile[]>()
+    const freshProfile = { ...backupProfile, label: 'Fresh backup' }
+    let listCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
+      }
+      if (command === 'get_config') return Promise.resolve(backupConfig)
+      if (command === 'list_account_profiles') {
+        listCalls += 1
+        return listCalls === 1
+          ? reconciliationProfiles.promise
+          : Promise.resolve([freshProfile])
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useAccountProfilesStore()
+    const switching = store.switchAccount('backup')
+    await vi.waitFor(() => expect(listCalls).toBe(1))
+
+    await store.refreshProfiles()
+    expect(store.profiles).toEqual([freshProfile])
+    reconciliationProfiles.resolve([backupProfile])
+    await switching
+
+    expect(store.profiles).toEqual([freshProfile])
+    expect(store.listError).toBeNull()
+  })
+
+  it('does not let older reconciliation success clear a newer normal failure', async () => {
+    const reconciliationProfiles = deferred<AccountProfile[]>()
+    let listCalls = 0
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
+      }
+      if (command === 'get_config') return Promise.resolve(backupConfig)
+      if (command === 'list_account_profiles') {
+        listCalls += 1
+        return listCalls === 1
+          ? reconciliationProfiles.promise
+          : Promise.reject(new Error('newer normal profile failure'))
+      }
+      if (command === 'get_connection_status') return Promise.resolve('connected')
+      return Promise.resolve(undefined)
+    })
+    const store = useAccountProfilesStore()
+    const switching = store.switchAccount('backup')
+    await vi.waitFor(() => expect(listCalls).toBe(1))
+
+    await expect(store.refreshProfiles()).rejects.toThrow('newer normal profile failure')
+    expect(store.listError).toBe('newer normal profile failure')
+    reconciliationProfiles.resolve([backupProfile])
+    await switching
+
+    expect(store.profiles).toEqual([])
+    expect(store.listError).toBe('newer normal profile failure')
+  })
+
   it('preserves the successful reconciliation command order', async () => {
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'switch_account') {
@@ -191,7 +620,7 @@ describe('post-switch reconciliation', () => {
     ])
   })
 
-  it('runs strict bootstrap after switching to a disconnected account', async () => {
+  it('uses the closed reconciliation bootstrap after switching to a disconnected account', async () => {
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'switch_account') {
         return Promise.resolve({ activeAccountId: 'backup', connected: false, sessionEpoch: 1 })
@@ -209,8 +638,41 @@ describe('post-switch reconciliation', () => {
       'get_connection_status', 'get_websocket_status', 'scheduler_run_task',
     ])
     expect(tauriInvoke).toHaveBeenLastCalledWith('scheduler_run_task', {
-      task: 'bootstrap', force: true,
+      task: 'reconciliationBootstrap', force: true,
     })
+  })
+
+  it('does not republish an owned session marker returned by reconciliation bootstrap', async () => {
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'switch_account') {
+        return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
+      }
+      if (command === 'get_config') return Promise.resolve(backupConfig)
+      if (command === 'list_account_profiles') return Promise.resolve([backupProfile])
+      if (command === 'get_connection_status' || command === 'get_websocket_status') {
+        return Promise.resolve('connected')
+      }
+      if (command === 'scheduler_run_task') {
+        return Promise.reject({
+          message: 'bootstrap failed',
+          cause: {
+            code: 'AUTH_SESSION_EXPIRED',
+            message: '账户会话已失效',
+            notificationId: 'committed-session-id',
+          },
+        })
+      }
+      return Promise.resolve(undefined)
+    })
+
+    const store = useAccountProfilesStore()
+    await store.switchAccount('backup')
+
+    expect(store.reconciliationFailedSteps).toEqual([])
+    expect(store.reconciliationError).toBeNull()
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([command]) => command === 'create_client_notification')).toHaveLength(0)
+    expect(errorServiceMocks.reportError).not.toHaveBeenCalled()
   })
 
   it('keeps a backend recovery marker blocked across refreshes, retries, and events', async () => {
@@ -241,7 +703,7 @@ describe('post-switch reconciliation', () => {
     await store.refreshProfiles()
     await store.retryReconciliation()
     const accepted = store.handleSessionEvent(
-      { sessionEpoch: 0, payload: 'connected' },
+      { accountId: 'primary', sessionEpoch: 0, payload: 'connected' },
       (status) => connection.setWsStatus(status),
     )
 

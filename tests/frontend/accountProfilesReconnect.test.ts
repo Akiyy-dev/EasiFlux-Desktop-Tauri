@@ -1,11 +1,14 @@
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { MessageApi } from 'naive-ui'
 import AccountProfilesPanel from '../../src/components/account/AccountProfilesPanel.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
+import { installMessageApi } from '../../src/services/errorService'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConfigStore } from '../../src/stores/config'
 import { useConnectionStore } from '../../src/stores/connection'
+import { useLogStore } from '../../src/stores/log'
 import type { AccountProfile, AppConfig } from '../../src/types/models'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
@@ -141,6 +144,10 @@ describe('AccountProfilesPanel credential reconnect', () => {
   })
 
   it('keeps saved status, connection error, and retry action after reconnect failure', async () => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'list_account_profiles') return Promise.resolve(profiles)
       if (command === 'connect') return Promise.reject(new Error('socket refused'))
@@ -159,10 +166,42 @@ describe('AccountProfilesPanel credential reconnect', () => {
     expect(wrapper.get('[role="alert"]').text()).toContain('socket refused')
     expect(wrapper.get('[data-testid="account-reconnect"]').exists()).toBe(true)
     expect(tauriInvoke).not.toHaveBeenCalledWith('save_credentials', expect.anything())
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(useLogStore().entries).toHaveLength(1)
 
     await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
     await flushPromises()
     expect(tauriInvoke).not.toHaveBeenCalledWith('save_credentials', expect.anything())
+  })
+
+  it('keeps a notification-aware reconnect failure inline without generic delivery', async () => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_account_profiles') return Promise.resolve(profiles)
+      if (command === 'connect') {
+        return Promise.reject({
+          code: 'CONNECTION_UNAVAILABLE',
+          message: '连接服务暂时不可用',
+          notificationId: 'notification-profile-reconnect-1',
+        })
+      }
+      return Promise.resolve(undefined)
+    })
+    const wrapper = mountPanel()
+    await flushPromises()
+    vi.mocked(tauriInvoke).mockClear()
+    await emitSaved(wrapper, 'primary')
+
+    await wrapper.get('[data-testid="account-reconnect"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('连接服务暂时不可用')
+    expect(toastError).toHaveBeenCalledTimes(0)
+    expect(useLogStore().entries).toHaveLength(0)
+    expect(useLogStore().lastError).toBeNull()
   })
 
   it('does not offer reconnect for credentials saved on a non-active account', async () => {

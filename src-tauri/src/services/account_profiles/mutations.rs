@@ -3,14 +3,14 @@ use crate::models::config::{normalize_account_id, ApiCredential, SaveCredentialR
 
 use super::{
     normalize_account_ids, safe_load, valid_credential, AccountLifecycleCoordinator,
-    AccountLifecyclePort,
+    AccountLifecyclePort, DeleteAccountResult,
 };
 
 pub(crate) async fn delete_account<P: AccountLifecyclePort>(
     coordinator: &AccountLifecycleCoordinator,
     port: &P,
     account_id: &str,
-) -> AppResult<()> {
+) -> AppResult<DeleteAccountResult> {
     let _guard = coordinator.mutation_guard().await;
     let config = port.read_config().await;
     let active = normalize_account_id(&config.active_account_id);
@@ -42,7 +42,14 @@ pub(crate) async fn delete_account<P: AccountLifecyclePort>(
         return Err(primary);
     }
     port.replace_runtime_config(next).await;
-    Ok(())
+    if port.delete_notification_partition(&target).await.is_err() {
+        tracing::warn!(
+            warning_code = "NOTIFICATION_CLEANUP_PENDING",
+            "notification partition cleanup pending after account deletion"
+        );
+        return Ok(DeleteAccountResult::cleanup_pending());
+    }
+    Ok(DeleteAccountResult::complete())
 }
 
 pub(crate) async fn save_credentials<P: AccountLifecyclePort>(
@@ -81,6 +88,9 @@ pub(crate) async fn save_credentials<P: AccountLifecyclePort>(
     credential = credential.normalize();
     if credential.label.is_empty() {
         credential.label = account_id.clone();
+    }
+    if !credential.is_valid() {
+        return Err(AppError::Auth("API 服务地址无效".into()));
     }
     port.save_credential(&account_id, &credential)
         .map_err(|_| AppError::Auth("保存账户凭据失败".into()))?;

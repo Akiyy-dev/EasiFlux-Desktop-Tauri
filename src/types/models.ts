@@ -81,8 +81,16 @@ export interface AccountSwitchResult {
 }
 
 export interface AccountSessionEvent<T> {
+  accountId: string
   sessionEpoch: number
   payload: T
+}
+
+export type DeleteAccountWarningCode = 'NOTIFICATION_CLEANUP_PENDING'
+
+export interface DeleteAccountResult {
+  notificationCleanupPending: boolean
+  warningCode?: DeleteAccountWarningCode
 }
 
 export interface SaveCredentialRequest {
@@ -315,6 +323,12 @@ export interface LogEntry {
   level: string
   message: string
   timestamp: number
+  eventId?: string
+}
+
+export interface BackendErrorEvent {
+  eventId: string
+  message: string
 }
 
 export interface PingResponse {
@@ -333,6 +347,7 @@ export interface ProbeEndpointResult {
   parsedCount: number
   firstItemKeys: string[]
   error?: string
+  notificationId?: string
 }
 
 export interface ProbePrivateEndpointsResult {

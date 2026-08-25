@@ -48,7 +48,7 @@ describe('account-bound event routing', () => {
     const listener = vi.fn()
 
     const accepted = profiles.handleSessionEvent(
-      { sessionEpoch: 1, payload: 'stale' },
+      { accountId: 'primary', sessionEpoch: 1, payload: 'stale' },
       listener,
     )
 
@@ -66,7 +66,7 @@ describe('account-bound event routing', () => {
     const observedAtHandler: Array<{ summary: unknown; openOrders: number }> = []
 
     const accepted = profiles.handleSessionEvent(
-      { sessionEpoch: 1, payload: 'new-session' },
+      { accountId: 'primary', sessionEpoch: 1, payload: 'new-session' },
       () => {
         observedAtHandler.push({
           summary: account.summary,
@@ -83,6 +83,69 @@ describe('account-bound event routing', () => {
     }])
   })
 
+  it('fails closed on malformed account ownership before an epoch can advance', () => {
+    useConfigStore().config = { ...config, activeAccountId: 'default' }
+    const profiles = useAccountProfilesStore()
+    const account = useAccountStore()
+    const clear = vi.spyOn(account, 'clearAccountData')
+    const handler = vi.fn()
+
+    for (const accountId of [undefined, null, '', '   ', ' default ', 17]) {
+      const accepted = profiles.handleSessionEvent(
+        { accountId, sessionEpoch: 9, payload: 'malformed' } as never,
+        handler,
+      )
+      expect(accepted).toBe(false)
+    }
+
+    expect(handler).not.toHaveBeenCalled()
+    expect(clear).not.toHaveBeenCalled()
+    expect(profiles.sessionEpoch).toBe(0)
+  })
+
+  it('rejects wrong-account equal and higher epochs before clearing or advancing', () => {
+    const profiles = useAccountProfilesStore()
+    const account = useAccountStore()
+    const clear = vi.spyOn(account, 'clearAccountData')
+    const handler = vi.fn()
+
+    for (const sessionEpoch of [0, 4]) {
+      expect(profiles.handleSessionEvent(
+        { accountId: 'backup', sessionEpoch, payload: 'wrong-owner' },
+        handler,
+      )).toBe(false)
+    }
+
+    expect(handler).not.toHaveBeenCalled()
+    expect(clear).not.toHaveBeenCalled()
+    expect(profiles.sessionEpoch).toBe(0)
+  })
+
+  it('rejects malformed epochs before clearing or advancing', () => {
+    const profiles = useAccountProfilesStore()
+    const account = useAccountStore()
+    const clear = vi.spyOn(account, 'clearAccountData')
+    const handler = vi.fn()
+
+    for (const sessionEpoch of [
+      undefined, null, '1', Number.NaN, Number.POSITIVE_INFINITY, -1, 0.5,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      expect(profiles.handleSessionEvent(
+        { accountId: 'primary', sessionEpoch, payload: 'malformed-epoch' } as never,
+        handler,
+      )).toBe(false)
+      expect(profiles.handleSessionEvent(
+        { accountId: 'backup', sessionEpoch, payload: 'wrong-and-malformed' } as never,
+        handler,
+      )).toBe(false)
+    }
+
+    expect(handler).not.toHaveBeenCalled()
+    expect(clear).not.toHaveBeenCalled()
+    expect(profiles.sessionEpoch).toBe(0)
+  })
+
   it('rejects a delayed old-A event after a rapid A to B to A cycle', () => {
     const profiles = useAccountProfilesStore()
     const received: string[] = []
@@ -90,10 +153,10 @@ describe('account-bound event routing', () => {
       profiles.handleSessionEvent(event, (payload) => received.push(payload))
     }
 
-    route({ sessionEpoch: 0, payload: 'A-before-switch' })
-    route({ sessionEpoch: 1, payload: 'B' })
-    route({ sessionEpoch: 2, payload: 'A-after-switch' })
-    route({ sessionEpoch: 0, payload: 'A-delayed-old-session' })
+    route({ accountId: 'primary', sessionEpoch: 0, payload: 'A-before-switch' })
+    route({ accountId: 'primary', sessionEpoch: 1, payload: 'B' })
+    route({ accountId: 'primary', sessionEpoch: 2, payload: 'A-after-switch' })
+    route({ accountId: 'primary', sessionEpoch: 0, payload: 'A-delayed-old-session' })
 
     expect(received).toEqual(['A-before-switch', 'B', 'A-after-switch'])
     expect(profiles.sessionEpoch).toBe(2)
@@ -124,6 +187,7 @@ describe('account-bound event routing', () => {
 
     const equalAccepted = profiles.handleSessionEvent(
       {
+        accountId: 'primary',
         sessionEpoch: 0,
         payload: { accountId: 'primary', balances: [], totalEquity: '11' },
       },
@@ -131,6 +195,7 @@ describe('account-bound event routing', () => {
     )
     const higherAccepted = profiles.handleSessionEvent(
       {
+        accountId: 'backup',
         sessionEpoch: 1,
         payload: { accountId: 'backup', balances: [], totalEquity: '99' },
       },
@@ -147,14 +212,14 @@ describe('account-bound event routing', () => {
     pendingSwitch.resolve({ activeAccountId: 'backup', connected: false, sessionEpoch: 1 })
     await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('get_websocket_status'))
     expect(profiles.handleSessionEvent(
-      { sessionEpoch: 1, payload: 'target-during-websocket-status-refresh' },
+      { accountId: 'backup', sessionEpoch: 1, payload: 'target-during-websocket-status-refresh' },
       listener,
     )).toBe(false)
     barrierWsStatus.resolve('connecting')
     await vi.waitFor(() => expect(wsStatusCalls).toBe(2))
     const connection = useConnectionStore()
     expect(profiles.handleSessionEvent(
-      { sessionEpoch: 1, payload: 'connected' },
+      { accountId: 'backup', sessionEpoch: 1, payload: 'connected' },
       (status) => connection.setWsStatus(status),
     )).toBe(true)
     postBarrierWsStatus.resolve('connecting')
@@ -166,6 +231,7 @@ describe('account-bound event routing', () => {
     expect(connection.wsStatus).toBe('connected')
     expect(profiles.handleSessionEvent(
       {
+        accountId: 'backup',
         sessionEpoch: 1,
         payload: { accountId: 'backup', balances: [], totalEquity: '12' },
       },
@@ -198,13 +264,13 @@ describe('account-bound event routing', () => {
     const switching = profiles.switchAccount('backup')
 
     expect(profiles.handleSessionEvent(
-      { sessionEpoch: 1, payload: 'target-before-failure' },
+      { accountId: 'backup', sessionEpoch: 1, payload: 'target-before-failure' },
       listener,
     )).toBe(false)
     pendingSwitch.reject(new Error('target failed and rolled back'))
     await vi.waitFor(() => expect(tauriInvoke).toHaveBeenCalledWith('get_connection_status'))
     expect(profiles.handleSessionEvent(
-      { sessionEpoch: 0, payload: 'former-during-status-refresh' },
+      { accountId: 'primary', sessionEpoch: 0, payload: 'former-during-status-refresh' },
       listener,
     )).toBe(false)
     pendingStatus.resolve('connected')
@@ -212,7 +278,7 @@ describe('account-bound event routing', () => {
     await vi.waitFor(() => expect(wsStatusCalls).toBe(2))
     const connection = useConnectionStore()
     expect(profiles.handleSessionEvent(
-      { sessionEpoch: 0, payload: 'connected' },
+      { accountId: 'primary', sessionEpoch: 0, payload: 'connected' },
       (status) => connection.setWsStatus(status),
     )).toBe(true)
     postBarrierWsStatus.resolve('connecting')
@@ -224,7 +290,7 @@ describe('account-bound event routing', () => {
     expect(connection.wsStatus).toBe('connected')
     expect(listener).not.toHaveBeenCalled()
     expect(profiles.handleSessionEvent(
-      { sessionEpoch: 0, payload: 'former-after-rollback' },
+      { accountId: 'primary', sessionEpoch: 0, payload: 'former-after-rollback' },
       listener,
     )).toBe(true)
     expect(listener).toHaveBeenCalledWith('former-after-rollback')
@@ -249,7 +315,7 @@ describe('account-bound event routing', () => {
     expect(profiles.recoveryRequired).toBe(true)
     const listener = vi.fn()
     expect(profiles.handleSessionEvent(
-      { sessionEpoch: 1, payload: 'after-local-failure' },
+      { accountId: 'backup', sessionEpoch: 1, payload: 'after-local-failure' },
       listener,
     )).toBe(false)
     expect(listener).not.toHaveBeenCalled()

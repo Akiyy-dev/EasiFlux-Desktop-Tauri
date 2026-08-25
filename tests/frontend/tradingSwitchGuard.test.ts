@@ -2,15 +2,18 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { nextTick } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { MessageApi } from 'naive-ui'
 import OpenOrdersTab from '../../src/components/trading/order-center/OpenOrdersTab.vue'
 import OrderPanel from '../../src/components/trading/OrderPanel.vue'
 import OrderTable from '../../src/components/trading/OrderTable.vue'
 import { useOrderPanel } from '../../src/composables/useOrderPanel'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { refreshSyncTask } from '../../src/services/dataSyncService'
+import { installMessageApi } from '../../src/services/errorService'
 import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConnectionStore } from '../../src/stores/connection'
 import { useOrderStore } from '../../src/stores/order'
+import { useLogStore } from '../../src/stores/log'
 import type { AccountSwitchResult, AppConfig, Order } from '../../src/types/models'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
@@ -19,6 +22,16 @@ vi.mock('../../src/services/dataSyncService', () => ({ refreshSyncTask: vi.fn() 
 const order: Order = {
   orderId: 'order-1', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Limit',
   price: '60000', qty: '0.1', status: 'New', filledQty: '0', avgPrice: '0',
+}
+
+function notifiedSessionError(): Error {
+  return Object.assign(new Error('private mutation failed'), {
+    cause: {
+      code: 'AUTH_SESSION_EXPIRED',
+      message: '账户会话已失效',
+      notificationId: 'notification-session-cancel',
+    },
+  })
 }
 
 function deferred<T>() {
@@ -233,5 +246,148 @@ describe('account-switch trading mutation guard', () => {
       ?.attributes('disabled')).toBeUndefined()
     expect(legacy.findAll('button').find((item) => item.text() === '撤单')
       ?.attributes('disabled')).toBeUndefined()
+  })
+
+  it.each([
+    'current single cancel',
+    'current batch cancel',
+    'current cancel all',
+    'legacy single cancel',
+  ])('keeps ordinary %s frontend-owned exactly once', async (owner) => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useOrderStore().setOpenOrders([order])
+    vi.mocked(tauriInvoke).mockImplementation((command) => (
+      command === (owner === 'current cancel all' ? 'cancel_all_orders' : 'cancel_order')
+        ? Promise.reject(new Error('ordinary cancellation failure'))
+        : Promise.resolve(undefined)
+    ))
+    const current = mount(OpenOrdersTab, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+    const legacy = mount(OrderTable, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+    await flushPromises()
+
+    const currentVm = current.vm as unknown as {
+      cancelOne: (row: Order) => Promise<void>
+      batchCancel: (rows: Order[]) => Promise<void>
+      cancelAll: () => Promise<void>
+    }
+    const cancel = owner === 'current single cancel'
+      ? () => currentVm.cancelOne(order)
+      : owner === 'current batch cancel'
+        ? () => currentVm.batchCancel([order])
+        : owner === 'current cancel all'
+          ? () => currentVm.cancelAll()
+          : () => (legacy.vm as unknown as {
+              cancel: (row: Order) => Promise<void>
+            }).cancel(order)
+
+    useLogStore().clear()
+    useLogStore().clearError()
+    await cancel()
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(useLogStore().entries).toHaveLength(1)
+  })
+
+  it.each([
+    'current single cancel',
+    'current batch cancel',
+    'current cancel all',
+    'legacy single cancel',
+  ])('keeps notified session expiry out of generic delivery for %s', async (owner) => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useOrderStore().setOpenOrders([order])
+    vi.mocked(tauriInvoke).mockImplementation((command) => (
+      command === (owner === 'current cancel all' ? 'cancel_all_orders' : 'cancel_order')
+        ? Promise.reject(notifiedSessionError())
+        : Promise.resolve(undefined)
+    ))
+    const current = mount(OpenOrdersTab, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+    const legacy = mount(OrderTable, {
+      props: { active: false }, global: { plugins: [pinia] },
+    })
+    await flushPromises()
+
+    const currentVm = current.vm as unknown as {
+      cancelOne: (row: Order) => Promise<void>
+      batchCancel: (rows: Order[]) => Promise<void>
+      cancelAll: () => Promise<void>
+    }
+    const cancel = owner === 'current single cancel'
+      ? () => currentVm.cancelOne(order)
+      : owner === 'current batch cancel'
+        ? () => currentVm.batchCancel([order])
+        : owner === 'current cancel all'
+          ? () => currentVm.cancelAll()
+          : () => (legacy.vm as unknown as {
+              cancel: (row: Order) => Promise<void>
+            }).cancel(order)
+
+    useLogStore().clear()
+    useLogStore().clearError()
+    toastError.mockClear()
+    await cancel()
+    expect(toastError).toHaveBeenCalledTimes(0)
+    expect(useLogStore().entries).toHaveLength(0)
+  })
+
+  it.each([
+    ['RISK_ORDER_BLOCKED', '订单触发风险限制'],
+    ['ORDER_REJECTED', '订单已被交易所拒绝'],
+    ['ACCOUNT_SESSION_EXPIRED', '账户会话已失效'],
+  ])('keeps notified placement %s inline without generic delivery', async (code, message) => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
+    vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'place_order') {
+        return Promise.reject({
+          code,
+          message,
+          notificationId: `notification-${code.toLowerCase()}`,
+        })
+      }
+      return Promise.resolve(undefined)
+    })
+    const panel = useOrderPanel()
+    panel.qty.value = '0.1'
+    panel.price.value = '60000'
+    await nextTick()
+
+    await panel.submit()
+
+    expect(panel.validationMessage.value).toBe(message)
+    expect(toastError).toHaveBeenCalledTimes(0)
+    expect(useLogStore().entries).toHaveLength(0)
+    expect(useLogStore().lastError).toBeNull()
+  })
+
+  it('keeps an ordinary placement failure frontend-owned exactly once', async () => {
+    const toastError = vi.fn()
+    installMessageApi({ error: toastError } as unknown as MessageApi)
+    useLogStore().clear()
+    useLogStore().clearError()
+    vi.mocked(tauriInvoke).mockImplementation((command) => (
+      command === 'place_order'
+        ? Promise.reject(new Error('ordinary placement failure'))
+        : Promise.resolve(undefined)
+    ))
+    const panel = useOrderPanel()
+    panel.qty.value = '0.1'
+    panel.price.value = '60000'
+    await nextTick()
+
+    await panel.submit()
+
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(useLogStore().entries).toHaveLength(1)
+    expect(useLogStore().lastError).toContain('ordinary placement failure')
   })
 })

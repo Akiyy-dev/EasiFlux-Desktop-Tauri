@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 import AppCard from '../ui/AppCard.vue'
 import TopBar from './TopBar.vue'
 import NavigationRail from './NavigationRail.vue'
@@ -22,6 +22,7 @@ import type {
   SidebarSectionKey,
   SidebarTarget,
 } from '../../types/navigation'
+import type { NotificationUiAction } from '../../types/notification'
 
 const activePage = ref<PrimaryPage>('home')
 const previousNonSettingsPage = ref<Exclude<PrimaryPage, 'settings'>>('home')
@@ -124,11 +125,37 @@ function selectSection(section: SidebarSectionKey): void {
     activePluginSection.value = section
   }
 }
+
+function focusNotificationSettingsHeading(): void {
+  void nextTick(() => {
+    const heading = globalThis.document.getElementById('notification-settings-title')
+    if (!(heading instanceof globalThis.HTMLElement)) return
+    heading.tabIndex = -1
+    heading.focus()
+  })
+}
+
+function handleNotificationAction(action: NotificationUiAction): void {
+  switch (action.type) {
+    case 'openTrading':
+      void navigateTo({ page: 'trading' })
+      return
+    case 'openAccountSettings':
+      void navigateTo({ page: 'settings', settingsSection: 'account', accountSection: action.accountSection })
+      return
+    case 'openGeneralSettings':
+      void navigateTo({ page: 'settings', settingsSection: 'general' })
+      return
+    case 'openNotificationSettings':
+      void navigateTo({ page: 'settings', settingsSection: 'notifications' })
+      focusNotificationSettingsHeading()
+  }
+}
 </script>
 
 <template>
   <div class="app-shell">
-    <TopBar :title="pageTitle" />
+    <TopBar :title="pageTitle" @action="handleNotificationAction" />
     <div class="workbench">
       <NavigationRail
         :active="activePage"
