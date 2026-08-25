@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-23-notification-center-design.md`
 
+**Implementation Status:** Completed and independently reviewed on 2026-08-25. The checkboxes below remain the approved RED/GREEN execution recipe rather than being rewritten as a historical activity log. Final evidence: frontend 69 files / 601 tests, Vue typecheck, ESLint with 0 errors, and Vite production build passed; Rust 630 tests, Clippy, and locked build passed; native Tauri minimum-window and focus/transition acceptance passed. Repository-wide Rust formatting retains the documented pre-existing 10-file debt.
+
 ## Global Constraints
 
 - Implement only PRD-13 v1: in-app center plus in-app Toast. Do not add an OS notification plugin, SQLite, sound, DND, a history page, arbitrary URLs, or a new window.

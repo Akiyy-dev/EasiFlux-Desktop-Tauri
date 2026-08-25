@@ -2,7 +2,15 @@
 
 日期：2026-08-23
 
-状态：书面规格已由用户复核确认，进入实施计划
+状态：已实施并完成自动化与桌面验收（2026-08-25）
+
+## 实施与验证记录
+
+- PRD-13 v1 已在 `dev/prd-13-notification-center` 分支完成；实现提交截至 `b207b67`，未引入新的 Cargo 或 NPM 依赖。
+- 最终前端门禁：Vitest 69 个文件、601 个测试全部通过；`vue-tsc --noEmit` 通过；`eslint src` 为 0 error、78 条既有 warning；Vite 生产构建通过（保留既有大 chunk 提示）。
+- 最终 Rust 门禁：630 个测试全部通过；`cargo clippy --all-targets` 与 `cargo build --locked` 通过。仓库级 `cargo fmt --check` 仍报告 10 个未触碰文件的既有格式化债务，已与本功能回归明确区分。
+- 原生 Tauri 验收覆盖 1024×640 最小客户区下的弹层定位与完整边界、Escape/外部点击关闭及焦点返回、设置入口离场后导航与通知标题焦点、重启后的持久通知读取；角标边界、账户/Global 隔离、已读/删除/清空、分页、Toast 门控、恢复与幂等由 Rust 和前端自动化测试覆盖。
+- 最终独立代码复审结果：Critical 0、Important 0、Minor 0。`.superpowers/`、本地 pnpm 缓存和无关工作区修改均未纳入提交。
 
 ## 1. 背景与目标
 
