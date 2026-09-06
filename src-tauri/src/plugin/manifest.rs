@@ -35,7 +35,7 @@ macro_rules! impl_reverse_domain_id {
 
         impl fmt::Display for $type {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(&self.0)
+                formatter.write_str(self.as_str())
             }
         }
 
