@@ -298,12 +298,13 @@ src/
 
 - `plugin_invalid_id`
 - `plugin_not_found`
+- `plugin_catalog_invalid`
 - `plugin_not_toggleable`
-- `plugin_manifest_not_activatable`
 - `plugin_state_unavailable`
 - `plugin_state_persist_failed`
+- `plugin_revision_exhausted`
 
-前端展示短、可操作的中文信息，并保留结构化错误供日志记录。目录加载失败与单插件启停失败分开呈现。
+前端只接受上述闭集中的精确 `{ code, message }` 结构，展示文案由前端按 `code` 映射为简短、可操作的中文，不回显后端原始 message、路径、JSON 或堆栈。目录加载失败与单插件启停失败分开呈现。阶段 0 的合法内置项始终可切换，因此 `plugin_not_toggleable` 保留在协议闭集中，但当前没有独立可达状态。
 
 ## 10. 安全模型
 

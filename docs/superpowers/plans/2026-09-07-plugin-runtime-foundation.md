@@ -217,6 +217,7 @@ Commit: `feat(plugin): add isolated registry runtime`
 - Modify: `src-tauri/src/lib.rs`
 - Modify: `src-tauri/build.rs`
 - Modify: `src-tauri/capabilities/default.json`
+- Create: `src-tauri/capabilities/plugin-runtime.json`
 
 ### Step 1: Write wiring and authority tests
 
@@ -225,8 +226,8 @@ Before production wiring, add focused tests that prove:
 - catalog command retries an unavailable state then returns a snapshot;
 - mutation command delegates to the write-locked registry and returns revision plus item;
 - startup helper returns a registry even when persistence construction or load fails; absence/inaccessibility of the config directory must not panic or escape `AppState::new`, and a later retry reconstructs the store before reloading;
-- local `main` resolves access for `get_plugin_catalog` and `set_plugin_enabled`;
-- an unrelated window and a remote origin do not resolve access to either plugin command.
+- local `main` WebView resolves access for `get_plugin_catalog` and `set_plugin_enabled`;
+- an unrelated window, a secondary WebView hosted by the `main` native window, and a remote origin do not resolve access to either plugin command.
 
 Prefer testable inner functions accepting `&RwLock<PluginRegistry>`; keep `tauri::State` wrappers trivial. Run and capture RED:
 
@@ -240,7 +241,7 @@ cargo test --manifest-path src-tauri/Cargo.toml capability_tests --locked
 - Add `get_plugin_catalog` and `set_plugin_enabled` to `generate_handler!`.
 - Initialize `PluginRegistry` from `builtin_manifests()` and `PluginStateStore::try_new()` without propagating plugin errors from `AppState::new`. Preserve enough unavailable state for the catalog command to reconstruct the store and retry path resolution later.
 - Replace the simple build call with `tauri_build::try_build(tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&["get_plugin_catalog", "set_plugin_enabled"])))` and a build-only failure message. The locked Tauri builder auto-generates `allow-get-plugin-catalog` and `allow-set-plugin-enabled`; do not create a redundant custom permission file.
-- Grant the generated identifiers `allow-get-plugin-catalog` and `allow-set-plugin-enabled` only to the existing capability whose exact window is `main`, and keep remote URLs absent.
+- Keep the existing default window capability unchanged. Grant the generated identifiers `allow-get-plugin-catalog` and `allow-set-plugin-enabled` through a dedicated capability with only `webviews: ["main"]`, no `windows` selector and no remote URLs. Tauri resolves window and WebView selector lists with OR semantics, so the plugin grants must not live under `windows: ["main"]` or every WebView in that native window would inherit them.
 - Do not change framework plugin dependencies or grant filesystem/network/shell permissions.
 
 ### Step 3: Verify generated authority and commit
@@ -273,9 +274,9 @@ getPluginCatalog() -> tauriInvoke('get_plugin_catalog')
 setPluginEnabled(id, enabled) -> tauriInvoke('set_plugin_enabled', { id, enabled })
 ```
 
-Accept one complete valid response. Reject unknown keys at snapshot/item/manifest/mutation levels, wrong schema/source/status/availability/reason, missing nullable fields, numeric or non-canonical revision, non-empty Phase 0 arrays and malformed nested values. Canonical revision is `0` or a non-zero decimal without sign/leading zero and must not exceed `u64::MAX`; validate with string/`BigInt`, never `Number`. Validate plugin and publisher IDs with the same reverse-domain contract. Enforce cross-field consistency: available has null reason, unavailable has a reason, blocked is non-toggleable with a reason, and enabled/disabled are toggleable with null reason.
+Accept one complete valid response. Reject unknown keys at snapshot/item/manifest/mutation levels, wrong schema/source/status/availability/reason, missing nullable fields, numeric or non-canonical revision, invalid SemVer, non-empty Phase 0 arrays and malformed nested values. Canonical revision is `0` or a non-zero decimal without sign/leading zero and must not exceed `u64::MAX`; validate with string/`BigInt`, never `Number`. Validate plugin and publisher IDs with the same reverse-domain contract. Enforce cross-field consistency: available has null reason and no blocked items; unavailable has a reason and every item is blocked/non-toggleable with the same reason; enabled/disabled are toggleable with null reason. Reject duplicate or non-increasing catalog IDs. Mutation results may contain only enabled/disabled toggleable items.
 
-Decode only exact structured errors `{ code, message }`. Known plugin codes map to frontend-controlled Chinese copy. Extra fields, unknown codes, wrong field types and raw Error/path/JSON/stack details all fall back to a stable generic message without reflecting private input.
+Decode only exact structured errors `{ code, message }`. The closed code set is `plugin_invalid_id`, `plugin_not_found`, `plugin_catalog_invalid`, `plugin_state_unavailable`, `plugin_state_persist_failed`, `plugin_revision_exhausted`, and `plugin_not_toggleable`. Known plugin codes map to frontend-controlled Chinese copy. Extra fields, unknown codes, wrong field types and raw Error/path/JSON/stack details all fall back to a stable generic message without reflecting private input.
 
 Run and capture RED:
 
@@ -291,15 +292,16 @@ Define the DTOs from the spec and runtime validators that compare exact key sets
 
 With real Pinia and a mocked external service boundary, test:
 
-- concurrent `load()` calls share one flight;
-- after a ready result, a later ordinary `load()` is a no-op; only `retry()` forces a new request;
+- concurrent `load()`/`retry()` calls share one in-flight request;
+- ordinary `load()` starts only from idle; after either an initial success or failure, only explicit `retry()` forces a new request;
 - initial success/failure, retry recovery and refresh failure preserving confirmed data;
 - case-insensitive query across name/id/publisher/description and intersection with all/enabled/disabled/blocked filter without mutating catalog order;
 - pending state and errors are per ID;
-- successful mutation replaces only the target item and adopts returned revision;
+- successful mutation replaces only the target item and adopts returned revision without ever lowering the global revision;
 - failure preserves confirmed state;
 - a second request for the same ID owns the result so late first success/failure cannot overwrite data, error or pending state;
-- requests for different IDs remain independent;
+- requests for different IDs remain independent even when responses resolve out of revision order;
+- a stale load snapshot cannot overwrite a newer confirmed mutation, while a newer full snapshot supersedes older per-item mutation responses;
 - unknown ID leaves state unchanged.
 
 Run and capture RED:
@@ -310,7 +312,7 @@ Run and capture RED:
 
 ### Step 4: Implement the Pinia store
 
-Expose catalog, load status/error, query, status filter, immutable `visiblePlugins`, replaced `Set` pending IDs, per-ID action errors, `load`, `retry`, `setQuery`, `setStatusFilter` and `setEnabled`. Keep request sequence ownership outside reactive state and never optimistically mutate status.
+Expose catalog, load status/error, query, status filter, immutable `visiblePlugins`, replaced `Set` pending IDs, per-ID action errors, `load`, `retry`, `setQuery`, `setStatusFilter` and `setEnabled`. Keep request sequence ownership outside reactive state and never optimistically mutate status. Compare revisions with `BigInt`; track the confirmed revision for the full snapshot and each item so older responses cannot regress state, while an older response for an otherwise untouched different ID can still publish that item's confirmed result.
 
 ### Step 5: Verify and commit
 
@@ -341,7 +343,7 @@ Test real rendered behavior:
 - enabled/disabled/blocked have visible labels;
 - switch `checked` state and accessible name match the plugin/current state; `aria-describedby` reaches only status/error elements that actually exist;
 - blocked or `canToggle=false` is disabled with reason; pending disables only this card and sets busy semantics;
-- enabled switch emits `{ id, enabled: false }`, disabled emits true, and non-toggleable emits nothing;
+- enabled switch emits `toggle(id, false)`, disabled emits `toggle(id, true)`, and non-toggleable emits nothing;
 - per-card error uses `role="alert"`.
 
 Run and capture RED:
@@ -361,6 +363,7 @@ Test:
 - narrow prop `section: PluginSection`; first mount loads once and `installed → market → installed` keeps query/filter and does not reload;
 - focusable `h1` receives focus once on entry; mount the focus test into `document.body` and await `nextTick`;
 - loading `role=status`, first-load `role=alert` + retry, refresh error retains cards;
+- a successful but unavailable snapshot shows a sanitized subsystem alert even for an empty catalog, and renders any returned items as blocked cards;
 - installed view search/filter, distinct empty-catalog and no-match states;
 - market shows only trusted built-in catalog, “随应用提供”, and contains no install/download/update button;
 - manage uses the same catalog to count enabled/disabled/blocked and list requested/granted permissions;
@@ -402,4 +405,4 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked --target-dir D:\EasiFlu
 cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --target-dir D:\EasiFlux\EasiFlux-Desktop-Tauri\target\plugin-system-cargo -- -D warnings
 ```
 
-If clippy fails only on warnings proven present at `main@b628874`, record the exact baseline evidence and ensure no new warning appears in changed files. Do not weaken lint levels or edit unrelated code to hide baseline debt.
+If clippy fails only on warnings proven present at `main@8aa8d1c`, record the exact baseline evidence and ensure no new warning appears in changed files. Do not weaken lint levels or edit unrelated code to hide baseline debt.
