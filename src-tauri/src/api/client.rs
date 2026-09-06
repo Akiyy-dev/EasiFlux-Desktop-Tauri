@@ -214,6 +214,24 @@ impl ApiClient {
         self.credential.read().await.is_some()
     }
 
+    /// Stable across reconnects, but never shared by different credentials or endpoints.
+    pub(crate) async fn order_submission_scope(&self, account_id: &str) -> AppResult<String> {
+        let _install = self.session_install_lock.lock().await;
+        let credential = self.credential.read().await;
+        let credential = credential.as_ref().ok_or(AppError::NotConnected)?;
+        let mut hash = Sha256::new();
+        hash.update(b"easiflux.order-submissions.v1\0");
+        for field in [
+            account_id,
+            credential.base_url.as_str(),
+            credential.api_key.as_str(),
+        ] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        Ok(hex::encode(hash.finalize()))
+    }
+
     pub async fn base_url(&self) -> String {
         self.base_url.read().await.clone()
     }
@@ -486,6 +504,53 @@ pub fn encode_query(params: &QueryParams) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn order_submission_scope_survives_reconnect_and_isolates_account_key_and_environment() {
+        let client = ApiClient::new();
+        assert!(client.order_submission_scope("alpha").await.is_err());
+        let credential = ApiCredential {
+            label: "test".into(),
+            api_key: "fake-key".into(),
+            api_secret: "fake-secret".into(),
+            base_url: "https://sandbox.example.test".into(),
+        };
+        client.set_credential(credential.clone()).await;
+        let original = client.order_submission_scope("alpha").await.unwrap();
+        assert_eq!(original.len(), 64);
+        assert!(!original.contains("fake-key"));
+        assert_ne!(
+            original,
+            client.order_submission_scope("beta").await.unwrap()
+        );
+        client.clear_credential().await;
+        client.set_credential(credential.clone()).await;
+        assert_eq!(
+            original,
+            client.order_submission_scope("alpha").await.unwrap()
+        );
+        let mut changed = credential.clone();
+        changed.api_secret = "rotated-secret".into();
+        client.set_credential(changed).await;
+        assert_eq!(
+            original,
+            client.order_submission_scope("alpha").await.unwrap()
+        );
+        let mut changed = credential.clone();
+        changed.api_key = "other-key".into();
+        client.set_credential(changed).await;
+        assert_ne!(
+            original,
+            client.order_submission_scope("alpha").await.unwrap()
+        );
+        let mut changed = credential;
+        changed.base_url = "https://production.example.test".into();
+        client.set_credential(changed).await;
+        assert_ne!(
+            original,
+            client.order_submission_scope("alpha").await.unwrap()
+        );
+    }
     use crate::auth::Signer;
     use crate::models::config::RECV_WINDOW_MS;
     use std::sync::atomic::{AtomicUsize, Ordering};

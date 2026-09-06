@@ -41,6 +41,12 @@ pub enum AppError {
     },
     #[error("{0}")]
     Observed(&'static str),
+    #[error("订单提交结果待确认，请查询原订单，勿重复提交")]
+    OrderSubmissionUnknown { order_link_id: String },
+    #[error("存在待确认订单，请先查询原订单结果")]
+    OrderSubmissionBlocked { order_link_id: String },
+    #[error("{0}")]
+    OrderSubmissionRejected(String),
 }
 
 impl Serialize for AppError {
@@ -49,6 +55,27 @@ impl Serialize for AppError {
         S: serde::Serializer,
     {
         match self {
+            Self::OrderSubmissionUnknown { order_link_id }
+            | Self::OrderSubmissionBlocked { order_link_id } => {
+                use serde::ser::SerializeStruct;
+                let code = if matches!(self, Self::OrderSubmissionUnknown { .. }) {
+                    "ORDER_SUBMISSION_UNKNOWN"
+                } else {
+                    "ORDER_SUBMISSION_BLOCKED"
+                };
+                let mut value = serializer.serialize_struct("OrderSubmissionError", 3)?;
+                value.serialize_field("code", code)?;
+                value.serialize_field("message", &self.to_string())?;
+                value.serialize_field("orderLinkId", order_link_id)?;
+                value.end()
+            }
+            Self::OrderSubmissionRejected(message) => {
+                use serde::ser::SerializeStruct;
+                let mut value = serializer.serialize_struct("OrderSubmissionError", 2)?;
+                value.serialize_field("code", "ORDER_SUBMISSION_REJECTED")?;
+                value.serialize_field("message", message)?;
+                value.end()
+            }
             Self::Notified {
                 code,
                 message,
@@ -133,6 +160,25 @@ impl From<toml::ser::Error> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_submission_errors_expose_identity_and_certainty_without_provider_details() {
+        let error = AppError::OrderSubmissionUnknown {
+            order_link_id: "original-id".into(),
+        };
+        let payload = serde_json::to_value(error).unwrap();
+        assert_eq!(payload["code"], "ORDER_SUBMISSION_UNKNOWN");
+        assert_eq!(payload["orderLinkId"], "original-id");
+        let blocked = serde_json::to_value(AppError::OrderSubmissionBlocked {
+            order_link_id: "original-id".into(),
+        })
+        .unwrap();
+        assert_eq!(blocked["code"], "ORDER_SUBMISSION_BLOCKED");
+        let rejected =
+            serde_json::to_value(AppError::OrderSubmissionRejected("未提交".into())).unwrap();
+        assert_eq!(rejected["code"], "ORDER_SUBMISSION_REJECTED");
+        assert_eq!(rejected["message"], "未提交");
+    }
 
     fn assert_private_detail_is_hidden(error: &AppError, private_detail: &str) {
         assert!(matches!(error, AppError::Auth(_)));

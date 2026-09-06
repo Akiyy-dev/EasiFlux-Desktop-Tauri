@@ -5,6 +5,7 @@ pub mod config;
 pub mod diagnostic;
 pub mod market;
 pub mod notification;
+pub mod order_submission;
 pub mod risk;
 pub mod time;
 pub mod trading;

@@ -39,13 +39,15 @@ pub(super) fn validate_order(
         return Err(RiskViolation::new(RiskViolationCode::NonPositiveQuantity));
     }
 
-    let max_qty = Decimal::from_str(&config.max_order_qty)
-        .map_err(|_| RiskViolation::new(RiskViolationCode::LedgerUnavailable))?;
-    if qty > max_qty {
-        return Err(violation_with_decimal_limit(
-            RiskViolationCode::MaxOrderQty,
-            max_qty,
-        ));
+    if request.reduce_only != Some(true) {
+        let max_qty = Decimal::from_str(&config.max_order_qty)
+            .map_err(|_| RiskViolation::new(RiskViolationCode::LedgerUnavailable))?;
+        if qty > max_qty {
+            return Err(violation_with_decimal_limit(
+                RiskViolationCode::MaxOrderQty,
+                max_qty,
+            ));
+        }
     }
 
     if request.order_type.to_lowercase() == "limit" {
@@ -73,7 +75,9 @@ fn validate_limit_price(
         .and_then(|value| Decimal::from_str(value).ok())
         .filter(|value| *value > Decimal::ZERO)
     else {
-        return Ok(());
+        return Err(RiskViolation::new(
+            RiskViolationCode::ReferencePriceUnavailable,
+        ));
     };
     let deviation = ((price - ref_price).abs() / ref_price) * Decimal::from(100);
     let max_deviation = Decimal::from_str(&config.max_price_deviation_pct)

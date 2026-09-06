@@ -610,6 +610,7 @@ describe('post-switch reconciliation', () => {
       }
       if (command === 'get_config') return Promise.resolve(backupConfig)
       if (command === 'list_account_profiles') return Promise.resolve([backupProfile])
+      if (command === 'list_pending_order_submissions') return Promise.resolve([])
       if (command === 'get_connection_status') return Promise.resolve('connected')
       return Promise.resolve(undefined)
     })
@@ -617,6 +618,7 @@ describe('post-switch reconciliation', () => {
     expect(vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)).toEqual([
       'switch_account', 'get_websocket_status', 'get_config', 'list_account_profiles',
       'get_connection_status', 'get_websocket_status', 'scheduler_run_task',
+      'list_pending_order_submissions',
     ])
   })
 

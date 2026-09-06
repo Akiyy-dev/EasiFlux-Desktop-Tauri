@@ -269,6 +269,7 @@ describe('account-switch order guard', () => {
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'switch_account') return pending.promise
       if (command === 'list_account_profiles') return Promise.resolve([])
+      if (command === 'list_pending_order_submissions') return Promise.resolve([])
       if (command === 'get_connection_status') return Promise.resolve('disconnected')
       return Promise.resolve(undefined)
     })

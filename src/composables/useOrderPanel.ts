@@ -33,6 +33,9 @@ export function useOrderPanel() {
   const { summary } = storeToRefs(accountStore)
   const { activeSymbol, ticker } = storeToRefs(marketStore)
   const { positions } = storeToRefs(positionStore)
+  const {
+    pendingSubmissions, pendingLoading, pendingError, pendingStatusMessage, queryingOrderLinkId,
+  } = storeToRefs(orderStore)
   const direction = ref<TradeDirection>('Buy')
   const tradeMode = ref<TradeMode>('open')
   const orderType = ref<BasicOrderType>('Limit')
@@ -52,9 +55,10 @@ export function useOrderPanel() {
   const closeableQtyNumber = computed(() =>
     Math.abs(Number.parseFloat(closePosition.value?.size ?? '0')),
   )
-  const tradingBlockedMessage = computed(() => profilesStore.tradingBlockedMessage)
+  const tradingBlockedMessage = computed(() => profilesStore.tradingBlockedMessage
+    ?? orderStore.submissionBlockedMessage(tradeMode.value === 'close'))
   const tradingBlockIsFailure = computed(() =>
-    profilesStore.tradingBlocked && !profilesStore.switching,
+    (profilesStore.tradingBlocked && !profilesStore.switching) || Boolean(pendingError.value),
   )
 
   function formatQty(value: number): string {
@@ -91,7 +95,10 @@ export function useOrderPanel() {
     return direction.value === 'Buy' ? '\u9884\u671f\u5f00\u7acb\u591a\u4ed3' : '\u9884\u671f\u5f00\u7acb\u7a7a\u4ed3'
   })
   const canSubmit = computed(() => connectionStore.connected
-    && !profilesStore.tradingBlocked && !submitting.value && !validationMessage.value)
+    && !tradingBlockedMessage.value && !submitting.value && !validationMessage.value)
+  const canQuerySubmission = computed(() => connectionStore.connected
+    && !profilesStore.switching && !orderStore.placing && !submitting.value
+    && !pendingLoading.value && !queryingOrderLinkId.value)
 
   function updateValidation(): void {
     validationMessage.value = validateOrderDraft({
@@ -133,10 +140,36 @@ export function useOrderPanel() {
     }
   })
   watch(orderType, (next) => { if (next === 'Market') price.value = '' })
+  watch([() => profilesStore.activeAccountId, () => profilesStore.sessionEpoch], () => {
+    qty.value = ''
+    price.value = ''
+    sizePct.value = 0
+  })
+  watch(() => orderStore.submissionSession, () => { submitting.value = false })
+
+  function currentSubmissionSession(): string {
+    return `${profilesStore.activeAccountId}:${profilesStore.sessionEpoch}:${orderStore.submissionSession}`
+  }
+
+  async function reconcileSubmission(orderLinkId: string): Promise<void> {
+    if (!canQuerySubmission.value) return
+    const session = currentSubmissionSession()
+    const order = await orderStore.reconcileSubmission(orderLinkId)
+    if (!order || currentSubmissionSession() !== session) return
+    qty.value = ''
+    price.value = ''
+    sizePct.value = 0
+    updateValidation()
+    await Promise.all([
+      refreshSyncTask('privatePanels', true), refreshSyncTask('account', true),
+    ])
+    if (currentSubmissionSession() === session) notifySuccess('原订单结果已确认')
+  }
 
   async function submit(): Promise<void> {
-    if (profilesStore.tradingBlockedMessage) {
-      notifyWarning(profilesStore.tradingBlockedMessage)
+    if (submitting.value) return
+    if (tradingBlockedMessage.value) {
+      notifyWarning(tradingBlockedMessage.value)
       return
     }
     updateValidation()
@@ -144,6 +177,8 @@ export function useOrderPanel() {
       notifyWarning(validationMessage.value)
       return
     }
+    const session = currentSubmissionSession()
+    const submittedAction = actionLabel.value
     submitting.value = true
     try {
       await orderStore.placeOrder({
@@ -152,22 +187,29 @@ export function useOrderPanel() {
         positionIdx: tradeMode.value === 'close' ? closePosition.value?.positionIdx : 0,
         price: orderType.value === 'Limit' ? price.value : undefined,
         reduceOnly: tradeMode.value === 'close',
+        orderLinkId: crypto.randomUUID(),
       })
+      if (currentSubmissionSession() !== session) return
       await Promise.all([
         refreshSyncTask('privatePanels', true), refreshSyncTask('account', true),
       ])
+      if (currentSubmissionSession() !== session) return
       qty.value = ''
       sizePct.value = 0
-      notifySuccess(orderSuccessMessage(actionLabel.value))
+      notifySuccess(orderSuccessMessage(submittedAction))
     } catch (error) {
+      if (currentSubmissionSession() !== session) return
       const decoded = decodeCommandError(error)
+      if (decoded.code === 'ORDER_SUBMISSION_UNKNOWN'
+        || decoded.code === 'ORDER_SUBMISSION_BLOCKED'
+        || decoded.code === 'ORDER_SUBMISSION_ACK_PENDING') return
       if (decoded.notificationId) {
         validationMessage.value = decoded.message
       } else {
-        reportError(error, orderFailureMessage(actionLabel.value))
+        reportError(decoded.message, orderFailureMessage(submittedAction))
       }
     } finally {
-      submitting.value = false
+      if (currentSubmissionSession() === session) submitting.value = false
     }
   }
 
@@ -175,6 +217,8 @@ export function useOrderPanel() {
     activeSymbol, direction, tradeMode, orderType, qty, price, sizePct, submitting,
     validationMessage, availableBalance, equityBalance, closeableQty, leverageLabel,
     actionLabel, directionHint, canSubmit, tradingBlockedMessage, tradingBlockIsFailure,
+    pendingSubmissions, pendingLoading, pendingError, pendingStatusMessage, queryingOrderLinkId,
+    canQuerySubmission, reconcileSubmission, refreshPendingSubmissions: orderStore.refreshPendingSubmissions,
     applyQuickPercent, submit,
   }
 }
