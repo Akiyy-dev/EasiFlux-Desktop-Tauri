@@ -1,7 +1,7 @@
 # EasiFlux 插件系统设计
 
-日期：2026-09-07  
-基线：`main@8aa8d1c`  
+日期：2026-09-07
+基线：`main@8aa8d1c`
 设计分支：`plugin/system-design`
 
 ## 1. 背景与目标
