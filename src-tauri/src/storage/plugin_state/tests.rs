@@ -83,6 +83,103 @@ fn missing_candidates_load_empty_v1_without_creating_directories() {
     assert!(!fixture.0.exists());
 }
 
+// Catches accepting a second wire spelling for the same revision identity.
+#[test]
+fn revisions_require_canonical_decimal_strings() {
+    for revision in ["00", "01"] {
+        let fixture = Fixture::new();
+        let invalid = document(1).replace(
+            "\"revision\":\"1\"",
+            &format!("\"revision\":\"{revision}\""),
+        );
+        fixture.write("", &invalid);
+        assert_sanitized(fixture.store().load().unwrap_err());
+        assert!(serde_json::from_str::<PluginStateFileV1>(&invalid).is_err());
+    }
+    for revision in [0, u64::MAX] {
+        let fixture = Fixture::new();
+        fixture.write("", document(revision));
+        assert_eq!(fixture.store().load().unwrap().revision, revision);
+    }
+}
+
+// Catches future-schema sniffing that needs to materialize/recursively parse
+// unknown layouts and consequently downgrades a valid future main to an old sidecar.
+#[test]
+fn deeply_nested_future_main_is_terminal_without_mutating_any_candidate() {
+    for depth in [129, 4096] {
+        let nested = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        for future in [
+            format!(r#"{{"schemaVersion":2,"newLayout":{nested}}}"#),
+            format!(r#"{{"newLayout":{nested},"schemaVersion":18446744073709551615}}"#),
+        ] {
+            let fixture = Fixture::new();
+            for (suffix, contents) in [
+                ("", future.as_str()),
+                (".tmp", &document(1)),
+                (".bak", &document(2)),
+                (".pending", "uncommitted"),
+                (".bak.pending", "staged-backup"),
+            ] {
+                fixture.write(suffix, contents);
+            }
+            let paths = ["", ".tmp", ".bak", ".pending", ".bak.pending"];
+            let before: Vec<_> = paths
+                .iter()
+                .map(|suffix| fs::read(sidecar(&fixture.path(), suffix)).unwrap())
+                .collect();
+            let error = fixture.store().load().unwrap_err();
+            assert!(matches!(
+                &error,
+                AppError::Plugin {
+                    code: "plugin_state_unsupported_schema",
+                    ..
+                }
+            ));
+            assert_sanitized(error);
+            assert_sanitized(fixture.store().save(&state(3)).unwrap_err());
+            for (suffix, expected) in paths.iter().zip(before) {
+                assert_eq!(
+                    fs::read(sidecar(&fixture.path(), suffix)).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+// Catches accepting positional arrays as schema headers or treating an ambiguous
+// duplicate header / malformed unknown layout as a valid future schema.
+#[test]
+fn schema_inspection_rejects_non_object_roots_and_ambiguous_or_malformed_headers() {
+    for invalid in [
+        r#"[1,"0",[]]"#,
+        r#"{"schemaVersion":1,"schemaVersion":2,"revision":"0","entries":[]}"#,
+        r#"{"schemaVersion":2,"schemaVersion":1,"revision":"0","entries":[]}"#,
+        r#"{"schemaVersion":2,"schemaVersion":2}"#,
+        r#"{"schemaVersion":2,"newLayout":[1,]}"#,
+        r#"{"schemaVersion":2,"newLayout":{"nested":true,}}"#,
+        r#"{"schemaVersion":2} trailing"#,
+        r#"{"newLayout":{"schemaVersion":2},"revision":"0","entries":[]}"#,
+    ] {
+        let fixture = Fixture::new();
+        fixture.write("", invalid);
+        let error = fixture.store().load().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AppError::Plugin {
+                    code: "plugin_state_unavailable",
+                    ..
+                }
+            ),
+            "{invalid}"
+        );
+        fixture.write(".bak", document(4));
+        assert_eq!(fixture.store().load().unwrap().revision, 4, "{invalid}");
+    }
+}
+
 // Catches omitted trust identity, numeric revision serialization, and nonpersistent saves.
 #[test]
 fn save_creates_parents_and_round_trips_a_bound_identity_and_string_revision() {
@@ -306,8 +403,12 @@ fn injected_write_rotation_promotion_and_restore_failures_never_publish_uncommit
                 continue;
             }
             let mut store = fixture.store();
+            let requested = failures.clone();
             let failures = failures.clone();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&observed);
             store.file.hook = Some(Arc::new(move |step| {
+                recorded.lock().unwrap().push(step);
                 if failures.contains(&step) {
                     Err(std::io::Error::other("raw-secret state.json injected"))
                 } else {
@@ -315,6 +416,14 @@ fn injected_write_rotation_promotion_and_restore_failures_never_publish_uncommit
                 }
             }));
             assert_sanitized(store.save(&state(2)).unwrap_err());
+            for fault in requested {
+                if fault != WriteStep::Restore || prior.is_some() {
+                    assert!(
+                        observed.lock().unwrap().contains(&fault),
+                        "requested fault {fault:?} did not run"
+                    );
+                }
+            }
             assert_eq!(
                 store.load().unwrap().revision,
                 if prior.is_some() { 1 } else { 0 }

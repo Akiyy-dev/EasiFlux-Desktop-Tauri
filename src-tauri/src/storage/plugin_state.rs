@@ -100,12 +100,59 @@ mod decimal_revision {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
         let value = String::deserialize(deserializer)?;
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
             return Err(serde::de::Error::custom(
-                "revision must be a decimal string",
+                "revision must be a canonical decimal string",
             ));
         }
         value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Inspect only a top-level schema field while still validating the entire JSON
+/// envelope. serde_json skips IgnoredAny values with an iterative stack, so an
+/// unknown future layout does not hit Value deserialization's recursion limit.
+/// The caller has already bounded the bytes, which also bounds the skip stack.
+struct StateSchema(u64);
+
+impl<'de> Deserialize<'de> for StateSchema {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SchemaVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SchemaVisitor {
+            type Value = StateSchema;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a state object with one integer schemaVersion")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut schema = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "schemaVersion" {
+                        if schema.is_some() {
+                            return Err(serde::de::Error::duplicate_field("schemaVersion"));
+                        }
+                        schema = Some(map.next_value::<u64>()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                schema
+                    .map(StateSchema)
+                    .ok_or_else(|| serde::de::Error::missing_field("schemaVersion"))
+            }
+        }
+
+        // deserialize_map deliberately rejects positional arrays, unlike a
+        // derived struct visitor that may also implement visit_seq.
+        deserializer.deserialize_map(SchemaVisitor)
     }
 }
 
@@ -153,21 +200,22 @@ impl PluginStateStore {
                 }
                 CandidateBytes::Bounded(bytes) => bytes,
             };
-            // Sniff only bounded bytes, and do not require the future document
-            // to conform to today's layout. Deserialize from the original bytes
-            // below so duplicate JSON fields are not silently collapsed.
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if value
-                    .get("schemaVersion")
-                    .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|version| version > 1)
-                {
-                    return Err(AppError::Plugin {
-                        code: "plugin_state_unsupported_schema",
-                        message: "插件状态版本暂不受支持",
-                        diagnostic: None,
-                    });
+            // from_slice also checks trailing data. Never interpret a malformed
+            // or duplicate schema header as a valid future version.
+            let schema = match serde_json::from_slice::<StateSchema>(&bytes) {
+                Ok(schema) => schema.0,
+                Err(error) => {
+                    tracing::warn!(error = %error, candidate = index, "invalid plugin state header");
+                    invalid = true;
+                    continue;
                 }
+            };
+            if schema > 1 {
+                return Err(AppError::Plugin {
+                    code: "plugin_state_unsupported_schema",
+                    message: "插件状态版本暂不受支持",
+                    diagnostic: None,
+                });
             }
             match serde_json::from_slice::<PluginStateFileV1>(&bytes) {
                 Ok(state) => return Ok(Some(state)),
