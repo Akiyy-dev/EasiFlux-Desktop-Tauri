@@ -4,7 +4,7 @@ use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const APPROVAL_FINGERPRINT_NONE: &str = "v1:none";
-pub const PLUGIN_MANIFEST_SCHEMA_V1: &str = "easiflux.plugin.manifest.v1";
+pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V1: u32 = 1;
 
 const MAX_IDENTIFIER_LENGTH: usize = 128;
 const MAX_IDENTIFIER_SEGMENT_LENGTH: usize = 63;
@@ -84,7 +84,7 @@ fn validate_reverse_domain(value: &str) -> Result<(), String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginManifestV1 {
-    pub schema: String,
+    pub schema_version: u32,
     pub id: PluginId,
     pub publisher_id: PluginPublisherId,
     pub publisher: String,
@@ -98,7 +98,7 @@ pub struct PluginManifestV1 {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PluginManifestV1Wire {
-    schema: String,
+    schema_version: u32,
     id: PluginId,
     publisher_id: PluginPublisherId,
     publisher: String,
@@ -116,7 +116,7 @@ impl<'de> Deserialize<'de> for PluginManifestV1 {
     {
         let wire = PluginManifestV1Wire::deserialize(deserializer)?;
         let manifest = Self {
-            schema: wire.schema,
+            schema_version: wire.schema_version,
             id: wire.id,
             publisher_id: wire.publisher_id,
             publisher: wire.publisher,
@@ -133,7 +133,7 @@ impl<'de> Deserialize<'de> for PluginManifestV1 {
 
 impl PluginManifestV1 {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != PLUGIN_MANIFEST_SCHEMA_V1 {
+        if self.schema_version != PLUGIN_MANIFEST_SCHEMA_VERSION_V1 {
             return Err("unsupported plugin manifest schema".into());
         }
         validate_display_text("publisher", &self.publisher, MAX_PUBLISHER_DISPLAY_LENGTH)?;
@@ -195,22 +195,52 @@ pub struct PluginCatalogItem {
     pub manifest: PluginManifestV1,
     pub source: PluginSource,
     pub status: PluginStatus,
-    pub availability: PluginAvailability,
-    pub availability_reason: Option<PluginAvailabilityReason>,
-    pub approval_fingerprint: String,
+    pub status_reason_code: Option<String>,
+    pub can_toggle: bool,
+    pub granted_capabilities: Vec<String>,
+}
+
+impl PluginCatalogItem {
+    pub fn phase0(
+        manifest: PluginManifestV1,
+        source: PluginSource,
+        status: PluginStatus,
+        can_toggle: bool,
+        status_reason_code: Option<String>,
+    ) -> Self {
+        Self {
+            manifest,
+            source,
+            status,
+            status_reason_code,
+            can_toggle,
+            granted_capabilities: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCatalogSnapshot {
+    pub schema_version: u32,
     pub revision: String,
+    pub availability: PluginAvailability,
+    pub availability_reason_code: Option<PluginAvailabilityReason>,
     pub plugins: Vec<PluginCatalogItem>,
 }
 
 impl PluginCatalogSnapshot {
-    pub fn new(revision: u64, plugins: Vec<PluginCatalogItem>) -> Self {
+    pub fn new(
+        revision: u64,
+        availability: PluginAvailability,
+        availability_reason_code: Option<PluginAvailabilityReason>,
+        plugins: Vec<PluginCatalogItem>,
+    ) -> Self {
         Self {
+            schema_version: PLUGIN_MANIFEST_SCHEMA_VERSION_V1,
             revision: revision.to_string(),
+            availability,
+            availability_reason_code,
             plugins,
         }
     }
@@ -238,7 +268,7 @@ mod tests {
     use crate::plugin::builtin::builtin_manifests;
 
     const VALID_MANIFEST: &str = r#"{
-        "schema": "easiflux.plugin.manifest.v1",
+        "schemaVersion": 1,
         "id": "com.easiflux.analytics",
         "publisherId": "com.easiflux",
         "publisher": "EasiFlux",
@@ -266,7 +296,8 @@ mod tests {
     #[test]
     fn plugin_ids_reject_noncanonical_or_oversized_domains() {
         let overlong_segment = format!("com.{}", "a".repeat(64));
-        let overlong_id = format!("com.{}", "a".repeat(125));
+        let overlong_total = format!("{}.{}.a", "a".repeat(63), "b".repeat(63));
+        assert_eq!(overlong_total.len(), 129);
         for invalid in [
             "com.EasiFlux.analytics",
             "analytics",
@@ -277,7 +308,7 @@ mod tests {
             "com.analytics-",
             "com.分析",
             overlong_segment.as_str(),
-            overlong_id.as_str(),
+            overlong_total.as_str(),
         ] {
             assert!(
                 PluginId::parse(invalid).is_err(),
@@ -301,7 +332,8 @@ mod tests {
             longest_publisher
         );
         let publisher_overlong_segment = format!("com.{}", "a".repeat(64));
-        let publisher_overlong_id = format!("com.{}", "a".repeat(125));
+        let publisher_overlong_total = format!("{}.{}.a", "a".repeat(63), "b".repeat(63));
+        assert_eq!(publisher_overlong_total.len(), 129);
         for invalid in [
             "com.EasiFlux",
             "easiflux",
@@ -310,7 +342,7 @@ mod tests {
             "com.easiflux-",
             "com.发布者",
             publisher_overlong_segment.as_str(),
-            publisher_overlong_id.as_str(),
+            publisher_overlong_total.as_str(),
         ] {
             assert!(
                 PluginPublisherId::parse(invalid).is_err(),
@@ -324,13 +356,14 @@ mod tests {
         let manifest: PluginManifestV1 = serde_json::from_str(VALID_MANIFEST).unwrap();
         assert_eq!(manifest.id.as_str(), "com.easiflux.analytics");
         assert_eq!(manifest.publisher_id.as_str(), "com.easiflux");
+        assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.version.to_string(), "1.2.3");
     }
 
     #[test]
     fn manifest_rejects_invalid_schema_text_version_reserved_fields_and_unknown_fields() {
         let cases = [
-            VALID_MANIFEST.replace("easiflux.plugin.manifest.v1", "other.schema.v1"),
+            VALID_MANIFEST.replace("\"schemaVersion\": 1", "\"schemaVersion\": 2"),
             VALID_MANIFEST.replace("\"Analytics\"", "\"   \""),
             VALID_MANIFEST.replace("Analytics commands", "   "),
             VALID_MANIFEST.replace("\"EasiFlux\"", &format!("\"{}\"", "x".repeat(81))),
@@ -346,6 +379,10 @@ mod tests {
                 "\"version\": \"1.2.3\",",
                 "\"version\": \"1.2.3\", \"extra\": true,",
             ),
+            VALID_MANIFEST.replace(
+                "\"schemaVersion\": 1,",
+                "\"schemaVersion\": 1, \"schema\": \"legacy\",",
+            ),
         ];
 
         for document in cases {
@@ -359,27 +396,35 @@ mod tests {
     #[test]
     fn catalog_transport_serializes_strict_camel_case_with_string_revisions() {
         let manifest: PluginManifestV1 = serde_json::from_str(VALID_MANIFEST).unwrap();
-        let item = PluginCatalogItem {
+        let item = PluginCatalogItem::phase0(
             manifest,
-            source: PluginSource::BuiltIn,
-            status: PluginStatus::Disabled,
-            availability: PluginAvailability::Unavailable,
-            availability_reason: Some(PluginAvailabilityReason::CatalogInvalid),
-            approval_fingerprint: APPROVAL_FINGERPRINT_NONE.to_owned(),
-        };
+            PluginSource::BuiltIn,
+            PluginStatus::Blocked,
+            true,
+            Some("policyBlocked".into()),
+        );
+        assert!(item.granted_capabilities.is_empty());
 
-        let snapshot = PluginCatalogSnapshot::new(42, vec![item.clone()]);
+        let snapshot = PluginCatalogSnapshot::new(
+            42,
+            PluginAvailability::Unavailable,
+            Some(PluginAvailabilityReason::CatalogInvalid),
+            vec![item.clone()],
+        );
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             serde_json::json!({
+                "schemaVersion": 1,
                 "revision": "42",
+                "availability": "unavailable",
+                "availabilityReasonCode": "catalogInvalid",
                 "plugins": [{
                     "manifest": serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap(),
                     "source": "builtIn",
-                    "status": "disabled",
-                    "availability": "unavailable",
-                    "availabilityReason": "catalogInvalid",
-                    "approvalFingerprint": "v1:none"
+                    "status": "blocked",
+                    "statusReasonCode": "policyBlocked",
+                    "canToggle": true,
+                    "grantedCapabilities": []
                 }]
             })
         );
@@ -392,10 +437,10 @@ mod tests {
                 "plugin": {
                     "manifest": serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap(),
                     "source": "builtIn",
-                    "status": "disabled",
-                    "availability": "unavailable",
-                    "availabilityReason": "catalogInvalid",
-                    "approvalFingerprint": "v1:none"
+                    "status": "blocked",
+                    "statusReasonCode": "policyBlocked",
+                    "canToggle": true,
+                    "grantedCapabilities": []
                 }
             })
         );
