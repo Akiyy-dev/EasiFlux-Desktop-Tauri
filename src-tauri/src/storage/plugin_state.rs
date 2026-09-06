@@ -24,7 +24,7 @@ pub(crate) struct PluginStateFileV1 {
     pub entries: Vec<PluginStateEntryV1>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PluginStateEntryV1 {
     pub id: PluginId,
@@ -32,6 +32,49 @@ pub(crate) struct PluginStateEntryV1 {
     pub publisher_id: PluginPublisherId,
     pub approval_fingerprint: String,
     pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StateEntryWire {
+    id: PluginId,
+    source: PluginSource,
+    publisher_id: PluginPublisherId,
+    approval_fingerprint: String,
+    enabled: bool,
+}
+
+impl<'de> Deserialize<'de> for PluginStateEntryV1 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
+            type Value = PluginStateEntryV1;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a plugin state entry object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let wire =
+                    StateEntryWire::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(PluginStateEntryV1 {
+                    id: wire.id,
+                    source: wire.source,
+                    publisher_id: wire.publisher_id,
+                    approval_fingerprint: wire.approval_fingerprint,
+                    enabled: wire.enabled,
+                })
+            }
+        }
+
+        // Derived struct visitors also accept positional arrays. Constrain the
+        // representation before delegating strict field checks to the wire DTO.
+        deserializer.deserialize_map(EntryVisitor)
+    }
 }
 
 impl PluginStateFileV1 {

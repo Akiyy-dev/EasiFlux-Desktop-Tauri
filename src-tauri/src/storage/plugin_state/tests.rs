@@ -180,6 +180,28 @@ fn schema_inspection_rejects_non_object_roots_and_ambiguous_or_malformed_headers
     }
 }
 
+// Catches derived struct visitors accepting non-object entries and restoring
+// enabled state from a malformed main instead of the validated backup.
+#[test]
+fn positional_state_entry_rejects_main_and_recovers_backup_without_rewriting_evidence() {
+    let fixture = Fixture::new();
+    let invalid = r#"{"schemaVersion":1,"revision":"9","entries":[["com.easiflux.analytics","builtIn","com.easiflux","v1:none",true]]}"#;
+    let backup = document(3);
+    fixture.write("", invalid);
+    fixture.write(".bak", &backup);
+
+    let loaded = fixture.store().load().unwrap();
+    assert_eq!(loaded.revision, 3);
+    assert_eq!(loaded.entries.len(), 1);
+    assert!(!loaded.entries[0].enabled);
+    assert!(serde_json::from_str::<PluginStateFileV1>(invalid).is_err());
+    assert_eq!(fs::read_to_string(fixture.path()).unwrap(), invalid);
+    assert_eq!(
+        fs::read_to_string(sidecar(&fixture.path(), ".bak")).unwrap(),
+        backup
+    );
+}
+
 // Catches omitted trust identity, numeric revision serialization, and nonpersistent saves.
 #[test]
 fn save_creates_parents_and_round_trips_a_bound_identity_and_string_revision() {
