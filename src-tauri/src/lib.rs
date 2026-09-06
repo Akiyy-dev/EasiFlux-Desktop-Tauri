@@ -72,6 +72,8 @@ pub fn run() {
             delete_notification,
             clear_account_notifications,
             create_client_notification,
+            get_plugin_catalog,
+            set_plugin_enabled,
             get_risk_status,
             update_risk_config,
             save_credentials,
@@ -167,5 +169,36 @@ mod capability_tests {
             access.is_some(),
             "main window must be allowed to destroy itself after the close guard flushes chart workspaces"
         );
+    }
+
+    // Catches granting the plugin control surface to another window or remote content.
+    #[test]
+    fn plugin_commands_are_available_only_to_the_local_main_webview() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let authority = context.runtime_authority_mut();
+        let remote = Origin::Remote {
+            url: "https://example.invalid".parse().unwrap(),
+        };
+
+        for command in ["get_plugin_catalog", "set_plugin_enabled"] {
+            assert!(
+                authority
+                    .resolve_access(command, "main", "main", &Origin::Local)
+                    .is_some(),
+                "local main must resolve {command}"
+            );
+            assert!(
+                authority
+                    .resolve_access(command, "secondary", "secondary", &Origin::Local)
+                    .is_none(),
+                "another window must not resolve {command}"
+            );
+            assert!(
+                authority
+                    .resolve_access(command, "main", "main", &remote)
+                    .is_none(),
+                "remote content must not resolve {command}"
+            );
+        }
     }
 }

@@ -6,6 +6,8 @@
   "permissions": [
     "core:default",
     "core:window:allow-destroy",
+    "allow-get-plugin-catalog",
+    "allow-set-plugin-enabled",
     "opener:default"
   ]
 }

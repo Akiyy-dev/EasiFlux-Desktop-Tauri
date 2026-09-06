@@ -48,6 +48,17 @@ pub struct AppState {
     pub account_lifecycle: Arc<AccountLifecycleCoordinator>,
 }
 
+fn initialize_plugin_registry_with<F>(factory: F) -> Arc<RwLock<PluginRegistry>>
+where
+    F: FnOnce() -> PluginRegistry,
+{
+    Arc::new(RwLock::new(factory()))
+}
+
+fn initialize_plugin_registry() -> Arc<RwLock<PluginRegistry>> {
+    initialize_plugin_registry_with(PluginRegistry::new)
+}
+
 fn initialize_notification_runtime(
     store: NotificationStore,
     configured_accounts: &[String],
@@ -221,7 +232,7 @@ impl AppState {
             session_notification_observer,
         ));
 
-        let plugins = Arc::new(RwLock::new(PluginRegistry::new()));
+        let plugins = initialize_plugin_registry();
 
         Ok(Self {
             order_submissions: crate::storage::OrderSubmissionStore::new(),
@@ -255,12 +266,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
+    use crate::error::{AppError, AppResult};
     use crate::events::EventEmitter;
     use crate::models::notification::{
         NotificationAction, NotificationCategory, NotificationChangedEvent, NotificationContent,
         NotificationEntity, NotificationEntityType, NotificationKind, NotificationRecord,
         NotificationScalar, NotificationScope, NotificationSeverity,
     };
+    use crate::plugin::PluginRegistry;
     use crate::services::notification::{
         NotificationEmitter, NotificationRuntime, NotificationStorageFailureReporter,
     };
@@ -268,8 +281,75 @@ mod tests {
         NotificationFileV1, NotificationPartition, NotificationSourceEventIndexEntry,
         NotificationStore,
     };
+    use crate::storage::plugin_state::{PluginStateFileV1, PluginStatePersistence};
 
-    use super::{configured_notification_accounts, initialize_notification_runtime};
+    use super::{
+        configured_notification_accounts, initialize_notification_runtime,
+        initialize_plugin_registry_with,
+    };
+
+    #[derive(Clone)]
+    struct RetryableStoreResolver(Arc<Mutex<RetryableStoreState>>);
+
+    struct RetryableStoreState {
+        unavailable: bool,
+        resolutions: usize,
+    }
+
+    impl PluginStatePersistence for RetryableStoreResolver {
+        fn load(&self) -> AppResult<PluginStateFileV1> {
+            let mut state = self.0.lock().unwrap();
+            state.resolutions += 1;
+            if state.unavailable {
+                Err(AppError::Plugin {
+                    code: "plugin_state_unavailable",
+                    message: "插件状态存储暂不可用",
+                    diagnostic: Some("private config path".into()),
+                })
+            } else {
+                Ok(PluginStateFileV1::empty())
+            }
+        }
+
+        fn save(&self, _state: &PluginStateFileV1) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
+    // Catches startup propagating plugin path/load failure, or retry reusing a failed snapshot.
+    #[tokio::test]
+    async fn plugin_startup_contains_store_failure_and_catalog_retry_resolves_again() {
+        let resolver = RetryableStoreResolver(Arc::new(Mutex::new(RetryableStoreState {
+            unavailable: true,
+            resolutions: 0,
+        })));
+        let plugins = initialize_plugin_registry_with({
+            let resolver = resolver.clone();
+            move || PluginRegistry::initialize(Vec::new(), Box::new(resolver))
+        });
+
+        assert_eq!(
+            serde_json::to_value(plugins.read().await.catalog_snapshot()).unwrap()["availability"],
+            "unavailable"
+        );
+        resolver.0.lock().unwrap().unavailable = false;
+
+        let snapshot = crate::commands::plugin::get_plugin_catalog_from(&plugins)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "revision": "0",
+                "availability": "available",
+                "availabilityReasonCode": null,
+                "plugins": []
+            })
+        );
+        assert_eq!(resolver.0.lock().unwrap().resolutions, 2);
+    }
 
     fn test_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir()

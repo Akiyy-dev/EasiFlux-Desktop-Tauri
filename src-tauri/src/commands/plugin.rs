@@ -1,0 +1,199 @@
+use tauri::State;
+use tokio::sync::RwLock;
+
+use crate::error::AppResult;
+use crate::plugin::manifest::{PluginCatalogMutationResult, PluginCatalogSnapshot};
+use crate::plugin::PluginRegistry;
+use crate::state::AppState;
+
+pub(crate) async fn get_plugin_catalog_from(
+    registry: &RwLock<PluginRegistry>,
+) -> AppResult<PluginCatalogSnapshot> {
+    let mut registry = registry.write().await;
+    registry.retry_state_load();
+    Ok(registry.catalog_snapshot())
+}
+
+pub(crate) async fn set_plugin_enabled_from(
+    registry: &RwLock<PluginRegistry>,
+    id: &str,
+    enabled: bool,
+) -> AppResult<PluginCatalogMutationResult> {
+    let mut registry = registry.write().await;
+    registry.set_enabled(id, enabled)
+}
+
+#[tauri::command]
+pub async fn get_plugin_catalog(state: State<'_, AppState>) -> AppResult<PluginCatalogSnapshot> {
+    get_plugin_catalog_from(state.plugins.as_ref()).await
+}
+
+#[tauri::command]
+pub async fn set_plugin_enabled(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> AppResult<PluginCatalogMutationResult> {
+    set_plugin_enabled_from(state.plugins.as_ref(), &id, enabled).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::error::AppError;
+    use crate::plugin::manifest::{PluginId, PluginManifestV1, PluginPublisherId, PluginSource};
+    use crate::storage::plugin_state::{
+        PluginStateEntryV1, PluginStateFileV1, PluginStatePersistence,
+    };
+
+    #[derive(Clone)]
+    struct MemoryPersistence(Arc<Mutex<MemoryState>>);
+
+    struct MemoryState {
+        persisted: PluginStateFileV1,
+        load_error: bool,
+        loads: usize,
+        saves: Vec<PluginStateFileV1>,
+    }
+
+    impl MemoryPersistence {
+        fn new(persisted: PluginStateFileV1) -> Self {
+            Self(Arc::new(Mutex::new(MemoryState {
+                persisted,
+                load_error: false,
+                loads: 0,
+                saves: Vec::new(),
+            })))
+        }
+
+        fn registry(&self, manifests: Vec<PluginManifestV1>) -> PluginRegistry {
+            PluginRegistry::initialize(manifests, Box::new(self.clone()))
+        }
+    }
+
+    impl PluginStatePersistence for MemoryPersistence {
+        fn load(&self) -> AppResult<PluginStateFileV1> {
+            let mut state = self.0.lock().unwrap();
+            state.loads += 1;
+            if state.load_error {
+                return Err(storage_error());
+            }
+            Ok(state.persisted.clone())
+        }
+
+        fn save(&self, next: &PluginStateFileV1) -> AppResult<()> {
+            let mut state = self.0.lock().unwrap();
+            state.saves.push(next.clone());
+            state.persisted = next.clone();
+            Ok(())
+        }
+    }
+
+    fn storage_error() -> AppError {
+        AppError::Plugin {
+            code: "plugin_state_unavailable",
+            message: "插件状态存储暂不可用",
+            diagnostic: Some("private config path".into()),
+        }
+    }
+
+    fn manifest() -> PluginManifestV1 {
+        serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "id": "com.easiflux.alpha",
+            "name": "Alpha",
+            "version": "1.2.3",
+            "description": "Metadata only",
+            "publisherId": "com.easiflux",
+            "publisher": "EasiFlux",
+            "contributions": [],
+            "requestedCapabilities": []
+        }))
+        .unwrap()
+    }
+
+    fn enabled_entry() -> PluginStateEntryV1 {
+        PluginStateEntryV1 {
+            id: PluginId::parse("com.easiflux.alpha").unwrap(),
+            source: PluginSource::BuiltIn,
+            publisher_id: PluginPublisherId::parse("com.easiflux").unwrap(),
+            approval_fingerprint: "v1:none".into(),
+            enabled: true,
+        }
+    }
+
+    // Catches returning the stale unavailable snapshot without asking persistence again.
+    #[tokio::test]
+    async fn catalog_command_retries_unavailable_state_before_snapshotting() {
+        let persistence = MemoryPersistence::new(PluginStateFileV1 {
+            schema_version: 1,
+            revision: 7,
+            entries: vec![enabled_entry()],
+        });
+        persistence.0.lock().unwrap().load_error = true;
+        let registry = RwLock::new(persistence.registry(vec![manifest()]));
+        assert_eq!(
+            serde_json::to_value(registry.read().await.catalog_snapshot()).unwrap()["availability"],
+            "unavailable"
+        );
+
+        persistence.0.lock().unwrap().load_error = false;
+        let snapshot = get_plugin_catalog_from(&registry).await.unwrap();
+
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap(),
+            json!({
+                "schemaVersion": 1,
+                "revision": "7",
+                "availability": "available",
+                "availabilityReasonCode": null,
+                "plugins": [{
+                    "manifest": {
+                        "schemaVersion": 1,
+                        "id": "com.easiflux.alpha",
+                        "name": "Alpha",
+                        "version": "1.2.3",
+                        "description": "Metadata only",
+                        "publisherId": "com.easiflux",
+                        "publisher": "EasiFlux",
+                        "contributions": [],
+                        "requestedCapabilities": []
+                    },
+                    "source": "builtIn",
+                    "grantedCapabilities": [],
+                    "status": "enabled",
+                    "canToggle": true,
+                    "statusReasonCode": null
+                }]
+            })
+        );
+        assert_eq!(persistence.0.lock().unwrap().loads, 2);
+    }
+
+    // Catches bypassing the registry transaction or discarding its committed revision/item.
+    #[tokio::test]
+    async fn mutation_command_returns_the_persisted_registry_result() {
+        let persistence = MemoryPersistence::new(PluginStateFileV1::empty());
+        let registry = RwLock::new(persistence.registry(vec![manifest()]));
+
+        let result = set_plugin_enabled_from(&registry, "com.easiflux.alpha", true)
+            .await
+            .unwrap();
+
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["revision"], "1");
+        assert_eq!(value["plugin"]["manifest"]["id"], "com.easiflux.alpha");
+        assert_eq!(value["plugin"]["status"], "enabled");
+        assert_eq!(value["plugin"]["canToggle"], true);
+        assert_eq!(value["plugin"]["statusReasonCode"], Value::Null);
+        let persisted = persistence.0.lock().unwrap();
+        assert_eq!(persisted.saves.len(), 1);
+        assert_eq!(persisted.persisted.revision, 1);
+        assert_eq!(persisted.persisted.entries.len(), 1);
+        assert!(persisted.persisted.entries[0].enabled);
+    }
+}
