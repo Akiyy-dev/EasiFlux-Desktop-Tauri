@@ -24,6 +24,7 @@ use crate::storage::{
 use crate::ws::WsManager;
 
 pub struct AppState {
+    pub order_submissions: crate::storage::OrderSubmissionStore,
     pub config_store: ConfigStore,
     pub config: Arc<RwLock<AppConfig>>,
     pub api: Arc<ApiClient>,
@@ -223,6 +224,7 @@ impl AppState {
         let plugins = Arc::new(RwLock::new(PluginRegistry::new()));
 
         Ok(Self {
+            order_submissions: crate::storage::OrderSubmissionStore::new(),
             config_store,
             config,
             api,

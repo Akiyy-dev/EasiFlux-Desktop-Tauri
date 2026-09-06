@@ -11,6 +11,7 @@ pub enum RiskViolationCode {
     MissingLimitPrice,
     InvalidLimitPrice,
     NonPositiveLimitPrice,
+    ReferencePriceUnavailable,
     MaxPriceDeviation,
     DailyOrderLimit,
     LedgerUnavailable,
@@ -25,6 +26,7 @@ impl RiskViolationCode {
             "missingLimitPrice" => Self::MissingLimitPrice,
             "invalidLimitPrice" => Self::InvalidLimitPrice,
             "nonPositiveLimitPrice" => Self::NonPositiveLimitPrice,
+            "referencePriceUnavailable" => Self::ReferencePriceUnavailable,
             "maxPriceDeviation" => Self::MaxPriceDeviation,
             "dailyOrderLimit" => Self::DailyOrderLimit,
             "ledgerUnavailable" => Self::LedgerUnavailable,
@@ -81,6 +83,9 @@ impl RiskViolation {
             (RiskViolationCode::MissingLimitPrice, _) => "限价单必须提供价格".into(),
             (RiskViolationCode::InvalidLimitPrice, _) => "限价格式无效".into(),
             (RiskViolationCode::NonPositiveLimitPrice, _) => "限价必须大于 0".into(),
+            (RiskViolationCode::ReferencePriceUnavailable, _) => {
+                "无法获取有效的最新市价，请刷新行情后重试".into()
+            }
             (RiskViolationCode::MaxPriceDeviation, Some(limit)) => {
                 format!("限价偏离市价超过限制 {limit}%")
             }

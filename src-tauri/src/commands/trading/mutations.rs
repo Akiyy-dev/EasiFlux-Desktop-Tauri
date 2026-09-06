@@ -38,16 +38,111 @@ fn new_submission_context(
 #[tauri::command]
 pub async fn place_order(
     state: State<'_, AppState>,
-    request: PlaceOrderRequest,
+    mut request: PlaceOrderRequest,
 ) -> AppResult<Order> {
     let submission_id = uuid::Uuid::new_v4().to_string();
+    request
+        .order_link_id
+        .get_or_insert_with(|| submission_id.clone());
     run_account_private_mutation(state.account_lifecycle.as_ref(), || async {
+        let account_id = normalize_account_id(&state.config.read().await.active_account_id);
+        let scope = state
+            .api
+            .order_submission_scope(&account_id)
+            .await
+            .map_err(|error| {
+                crate::error::AppError::OrderSubmissionRejected(error.user_message())
+            })?;
         let context = new_submission_context(
             submission_id,
-            normalize_account_id(&state.config.read().await.active_account_id),
+            account_id,
             state.account_lifecycle.current_session_epoch(),
         );
-        state.trading.place_order(context, request).await
+        crate::services::order_submission::submit_once(
+            &state.order_submissions,
+            &scope,
+            request,
+            state.time.local_now_ms(),
+            |request| state.trading.place_order(context, request),
+        )
+        .await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_pending_order_submissions(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::models::order_submission::PendingOrderSubmission>> {
+    crate::services::account_profiles::run_account_private_operation(
+        state.account_lifecycle.as_ref(),
+        || async {
+            let account_id = normalize_account_id(&state.config.read().await.active_account_id);
+            let scope = state.api.order_submission_scope(&account_id).await?;
+            state.order_submissions.list_pending(&scope)
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn acknowledge_order_submission(
+    state: State<'_, AppState>,
+    order_link_id: String,
+) -> AppResult<()> {
+    run_account_private_mutation(state.account_lifecycle.as_ref(), || async {
+        let account_id = normalize_account_id(&state.config.read().await.active_account_id);
+        let scope = state.api.order_submission_scope(&account_id).await?;
+        state.order_submissions.acknowledge(&scope, &order_link_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn reconcile_order_submission(
+    state: State<'_, AppState>,
+    order_link_id: String,
+) -> AppResult<Option<Order>> {
+    run_account_private_mutation(state.account_lifecycle.as_ref(), || async {
+        let account_id = normalize_account_id(&state.config.read().await.active_account_id);
+        let scope = state.api.order_submission_scope(&account_id).await?;
+        let api = &state.api;
+        let order = crate::services::order_submission::reconcile(
+            &state.order_submissions,
+            &scope,
+            &order_link_id,
+            |request| async move {
+                let params = crate::api::mapper::build_order_query_params(
+                    Some(&request.symbol),
+                    None,
+                    None,
+                    request.order_link_id.as_deref(),
+                    None,
+                    Some(100),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let (open, history) = tokio::try_join!(
+                    api.private_get(crate::api::endpoints::OPEN_ORDERS, params.clone()),
+                    api.private_get(crate::api::endpoints::ORDERS, params),
+                )?;
+                let mut orders = crate::api::mapper::parse_orders(&open);
+                orders.extend(crate::api::mapper::parse_orders(&history));
+                Ok(orders)
+            },
+        )
+        .await?;
+        if let Some(order) = &order {
+            let context = OrderStreamContext {
+                account_id,
+                session_epoch: state.account_lifecycle.current_session_epoch(),
+            };
+            state.emitter.emit_order(&context, order.clone());
+            state.analytics.record_order(order.clone()).await;
+        }
+        Ok(order)
     })
     .await
 }

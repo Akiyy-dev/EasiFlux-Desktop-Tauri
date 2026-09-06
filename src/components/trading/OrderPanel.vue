@@ -7,6 +7,8 @@ const {
   activeSymbol, direction, tradeMode, orderType, qty, price, sizePct, submitting,
   validationMessage, availableBalance, equityBalance, closeableQty, leverageLabel,
   actionLabel, directionHint, canSubmit, tradingBlockedMessage, tradingBlockIsFailure,
+  pendingSubmissions, pendingLoading, pendingError, pendingStatusMessage, queryingOrderLinkId,
+  canQuerySubmission, reconcileSubmission, refreshPendingSubmissions,
   applyQuickPercent, submit,
 } = useOrderPanel()
 </script>
@@ -21,6 +23,39 @@ const {
       <div class="account-item align-right">
         <span>账户权益</span>
         <strong>{{ equityBalance }} USDT</strong>
+      </div>
+    </section>
+
+    <section
+      v-if="pendingSubmissions.length || pendingLoading || pendingError"
+      class="trade-card pending-submissions"
+      data-testid="pending-order-submissions"
+      aria-label="待确认订单"
+    >
+      <strong>待确认订单</strong>
+      <p class="pending-guidance">
+        请查询原订单结果；结果未确认前请勿重复提交。
+      </p>
+      <div v-for="pending in pendingSubmissions" :key="pending.orderLinkId" class="pending-submission">
+        <strong>{{ pending.symbol }} · {{ pending.side === 'Buy' ? '买入' : '卖出' }} · {{ pending.reduceOnly ? '只减仓' : '开仓' }}</strong>
+        <span>{{ pending.orderType === 'Market' ? '市价' : '限价' }} · 数量 {{ pending.qty }}<template v-if="pending.price"> · 价格 {{ pending.price }}</template></span>
+        <span class="pending-order-id">订单标识：{{ pending.orderLinkId }}</span>
+        <NButton
+          size="small"
+          :disabled="!canQuerySubmission"
+          :loading="queryingOrderLinkId === pending.orderLinkId"
+          @click="reconcileSubmission(pending.orderLinkId)"
+        >
+          查询订单结果
+        </NButton>
+      </div>
+      <span v-if="pendingLoading" role="status">正在读取待确认订单…</span>
+      <span v-if="pendingStatusMessage" role="status">{{ pendingStatusMessage }}</span>
+      <div v-if="pendingError" role="alert">
+        {{ pendingError }}
+        <NButton size="small" :disabled="!canQuerySubmission" @click="refreshPendingSubmissions">
+          重新读取待确认订单
+        </NButton>
       </div>
     </section>
 
@@ -149,3 +184,26 @@ const {
 
 <style scoped src="./orderPanelLayout.css"></style>
 <style scoped src="./orderPanelControls.css"></style>
+
+<style scoped>
+.pending-submissions {
+  border-color: var(--warning, #c98c31);
+}
+
+.pending-guidance {
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.pending-submission {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ef-space-2);
+}
+
+.pending-order-id {
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  font-size: var(--ef-text-sm);
+}
+</style>

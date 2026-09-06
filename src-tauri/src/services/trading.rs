@@ -25,6 +25,8 @@ use crate::services::time::TimeService;
 use crate::services::AnalyticsService;
 use crate::storage::{CacheStore, TradeLogStore};
 
+mod quote;
+
 #[derive(Clone)]
 pub(crate) struct OrderNotificationObserver {
     runtime: Arc<NotificationRuntime>,
@@ -302,7 +304,6 @@ pub struct TradingService {
     api: Arc<ApiClient>,
     risk: Arc<tokio::sync::RwLock<RiskService>>,
     trade_log: Arc<TradeLogStore>,
-    cache: Arc<CacheStore>,
     emitter: EventEmitter,
     time: Arc<TimeService>,
     analytics: Arc<AnalyticsService>,
@@ -314,7 +315,7 @@ impl TradingService {
         api: Arc<ApiClient>,
         risk: Arc<tokio::sync::RwLock<RiskService>>,
         trade_log: Arc<TradeLogStore>,
-        cache: Arc<CacheStore>,
+        _cache: Arc<CacheStore>,
         emitter: EventEmitter,
         time: Arc<TimeService>,
         analytics: Arc<AnalyticsService>,
@@ -324,7 +325,6 @@ impl TradingService {
             api,
             risk,
             trade_log,
-            cache,
             emitter,
             time,
             analytics,
@@ -338,11 +338,13 @@ impl TradingService {
         request: PlaceOrderRequest,
     ) -> AppResult<Order> {
         let session_context = OrderStreamContext::from(&context);
+        let requires_reference_price = self.risk.read().await.requires_reference_price(&request);
+        let reference_price = if requires_reference_price {
+            quote::fresh_reference_price(self.api.as_ref(), &request.symbol).await
+        } else {
+            None
+        };
         let now_ms = self.time.now_ms();
-        let reference_price = self
-            .cache
-            .get_ticker(&request.symbol)
-            .map(|ticker| ticker.last_price);
         let result = execute_place_order(
             self.api.as_ref(),
             &self.risk,
@@ -500,7 +502,13 @@ where
             return Err(match notification_id {
                 Some(notification_id) => AppError::Notified {
                     code: "RISK_ORDER_BLOCKED",
-                    message: "订单被风控拦截",
+                    message: if violation.code
+                        == crate::models::risk::RiskViolationCode::ReferencePriceUnavailable
+                    {
+                        "无法获取有效的最新市价，请稍后重试"
+                    } else {
+                        "订单被风控拦截"
+                    },
                     notification_id,
                     cause: None,
                 },
@@ -629,7 +637,7 @@ where
     }
 }
 
-fn is_certain_submission_failure(error: &AppError) -> bool {
+pub(crate) fn is_certain_submission_failure(error: &AppError) -> bool {
     is_confirmed_submission_rejection(error)
         || matches!(
             error,
@@ -707,7 +715,9 @@ fn finalize_submission_failure(
             cause: None,
         };
     }
-    if rollback_failed {
+    // A failed local rollback cannot make a confirmed API rejection uncertain.
+    // The caller already records the rollback failure separately.
+    if rollback_failed && !is_certain_submission_failure(&submit_error) {
         AppError::Internal("订单提交失败且风控预占回滚失败".into())
     } else {
         submit_error
@@ -950,6 +960,57 @@ mod tests {
                 ..
             } if id == notification_id
         ));
+    }
+
+    #[tokio::test]
+    async fn confirmed_rejection_does_not_remain_pending_when_risk_rollback_fails() {
+        for submit_error in [
+            AppError::TradingFailure(crate::models::trading::TradingFailure::rejected()),
+            AppError::AuthFailure(crate::api::response::AuthFailureKind::Signature),
+        ] {
+            let path = test_path("rejected-rollback");
+            let blocked_temp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+            let journal_dir = path.with_extension("submissions");
+            let journal = crate::storage::OrderSubmissionStore::with_dir(journal_dir.clone());
+            let risk = risk_with_limit(&path, 1);
+            let mut request = market_order();
+            request.order_link_id = Some("confirmed-rejection".into());
+
+            let result = crate::services::order_submission::submit_once(
+                &journal,
+                "rollback-account",
+                request,
+                NOW_MS,
+                |request| {
+                    let risk = &risk;
+                    let blocked_temp = &blocked_temp;
+                    async move {
+                        execute_reserved_order(risk, &request, None, NOW_MS, || async {
+                            // Reservation already reached disk; fail only its rollback write.
+                            std::fs::create_dir(blocked_temp).unwrap();
+                            Err(submit_error)
+                        })
+                        .await
+                    }
+                },
+            )
+            .await;
+            let pending = journal.list_pending("rollback-account").unwrap();
+            let original = journal
+                .get("rollback-account", "confirmed-rejection")
+                .unwrap()
+                .unwrap();
+            std::fs::remove_dir(&blocked_temp).unwrap();
+            std::fs::remove_dir_all(&journal_dir).unwrap();
+            cleanup(&path);
+
+            assert!(matches!(result, Err(AppError::OrderSubmissionRejected(_))));
+            assert!(pending.is_empty());
+            assert!(matches!(
+                original.outcome,
+                crate::models::order_submission::SubmissionOutcome::Rejected
+            ));
+        }
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ import { useAccountProfilesStore } from '../../src/stores/accountProfiles'
 import { useConnectionStore } from '../../src/stores/connection'
 import { useOrderStore } from '../../src/stores/order'
 import { useLogStore } from '../../src/stores/log'
-import type { AccountSwitchResult, AppConfig, Order } from '../../src/types/models'
+import type { AccountSwitchResult, AppConfig, Order, PlaceOrderRequest } from '../../src/types/models'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
 vi.mock('../../src/services/dataSyncService', () => ({ refreshSyncTask: vi.fn() }))
@@ -65,6 +65,7 @@ describe('account-switch trading mutation guard', () => {
     vi.mocked(tauriInvoke).mockImplementation((command) => {
       if (command === 'switch_account') return pending.promise
       if (command === 'list_account_profiles') return Promise.resolve([])
+      if (command === 'list_pending_order_submissions') return Promise.resolve([])
       if (command === 'get_connection_status') return Promise.resolve('disconnected')
       if (command === 'place_order' || command === 'cancel_order') return Promise.resolve(order)
       return Promise.resolve(undefined)
@@ -83,7 +84,7 @@ describe('account-switch trading mutation guard', () => {
 
   async function blockTradingWithBootstrapFailure() {
     let bootstrapCalls = 0
-    vi.mocked(tauriInvoke).mockImplementation((command) => {
+    vi.mocked(tauriInvoke).mockImplementation((command, args) => {
       if (command === 'switch_account') {
         return Promise.resolve({ activeAccountId: 'backup', connected: true, sessionEpoch: 1 })
       }
@@ -91,6 +92,7 @@ describe('account-switch trading mutation guard', () => {
         return Promise.resolve({ activeAccountId: 'backup' } as AppConfig)
       }
       if (command === 'list_account_profiles') return Promise.resolve([])
+      if (command === 'list_pending_order_submissions') return Promise.resolve([])
       if (command === 'get_connection_status') return Promise.resolve('connected')
       if (command === 'scheduler_run_task') {
         bootstrapCalls += 1
@@ -98,7 +100,8 @@ describe('account-switch trading mutation guard', () => {
           ? Promise.reject(new Error('bootstrap raw-secret'))
           : Promise.resolve(undefined)
       }
-      if (command === 'place_order' || command === 'cancel_order') return Promise.resolve(order)
+      if (command === 'place_order') return Promise.resolve({ ...order, orderLinkId: (args!.request as PlaceOrderRequest).orderLinkId })
+      if (command === 'cancel_order') return Promise.resolve(order)
       return Promise.resolve(undefined)
     })
     const store = useAccountProfilesStore()
@@ -123,9 +126,11 @@ describe('account-switch trading mutation guard', () => {
   })
 
   it('keeps the normal store mutation path and skips an uncoordinated cancel-all refresh', async () => {
-    vi.mocked(tauriInvoke).mockImplementation((command) => {
-      if (command === 'place_order' || command === 'cancel_order') return Promise.resolve(order)
+    vi.mocked(tauriInvoke).mockImplementation((command, args) => {
+      if (command === 'place_order') return Promise.resolve({ ...order, orderLinkId: (args!.request as PlaceOrderRequest).orderLinkId })
+      if (command === 'cancel_order') return Promise.resolve(order)
       if (command === 'refresh_orders') return Promise.resolve([])
+      if (command === 'list_pending_order_submissions') return Promise.resolve([])
       return Promise.resolve(undefined)
     })
     const store = useOrderStore()
@@ -347,6 +352,7 @@ describe('account-switch trading mutation guard', () => {
     useLogStore().clear()
     useLogStore().clearError()
     vi.mocked(tauriInvoke).mockImplementation((command) => {
+      if (command === 'list_pending_order_submissions') return Promise.resolve([])
       if (command === 'place_order') {
         return Promise.reject({
           code,
@@ -369,15 +375,15 @@ describe('account-switch trading mutation guard', () => {
     expect(useLogStore().lastError).toBeNull()
   })
 
-  it('keeps an ordinary placement failure frontend-owned exactly once', async () => {
+  it('keeps a certain placement failure frontend-owned exactly once', async () => {
     const toastError = vi.fn()
     installMessageApi({ error: toastError } as unknown as MessageApi)
     useLogStore().clear()
     useLogStore().clearError()
     vi.mocked(tauriInvoke).mockImplementation((command) => (
       command === 'place_order'
-        ? Promise.reject(new Error('ordinary placement failure'))
-        : Promise.resolve(undefined)
+        ? Promise.reject({ code: 'ORDER_SUBMISSION_REJECTED', message: 'ordinary placement failure' })
+        : Promise.resolve(command === 'list_pending_order_submissions' ? [] : undefined)
     ))
     const panel = useOrderPanel()
     panel.qty.value = '0.1'

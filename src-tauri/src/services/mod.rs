@@ -6,6 +6,7 @@ pub mod connection;
 pub mod daily_pnl;
 pub mod market;
 pub mod notification;
+pub mod order_submission;
 pub mod risk;
 pub mod scheduler;
 pub mod time;

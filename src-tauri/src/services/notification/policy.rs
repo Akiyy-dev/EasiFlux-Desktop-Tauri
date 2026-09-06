@@ -508,6 +508,7 @@ fn risk_code(code: RiskViolationCode) -> &'static str {
         RiskViolationCode::MissingLimitPrice => "missingLimitPrice",
         RiskViolationCode::InvalidLimitPrice => "invalidLimitPrice",
         RiskViolationCode::NonPositiveLimitPrice => "nonPositiveLimitPrice",
+        RiskViolationCode::ReferencePriceUnavailable => "referencePriceUnavailable",
         RiskViolationCode::MaxPriceDeviation => "maxPriceDeviation",
         RiskViolationCode::DailyOrderLimit => "dailyOrderLimit",
         RiskViolationCode::LedgerUnavailable => "ledgerUnavailable",

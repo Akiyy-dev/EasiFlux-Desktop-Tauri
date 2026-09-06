@@ -91,6 +91,10 @@ impl RiskService {
         }
     }
 
+    pub(crate) fn requires_reference_price(&self, request: &PlaceOrderRequest) -> bool {
+        self.config.enabled && request.order_type.eq_ignore_ascii_case("limit")
+    }
+
     pub fn reserve_order(
         &self,
         request: &PlaceOrderRequest,
@@ -102,6 +106,10 @@ impl RiskService {
         }
 
         validation::validate_order(&self.config, request, reference_price)?;
+
+        if request.reduce_only == Some(true) {
+            return Ok(RiskReservation::not_counted());
+        }
 
         let timezone = resolve_trading_day_timezone(&self.config.trading_day_timezone);
         let trading_day = trading_day_key(now_ms, &timezone);
