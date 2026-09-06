@@ -70,7 +70,7 @@ function requestToggle(): void {
           :disabled="disabled"
           :aria-label="`${plugin.manifest.name}，当前${statusLabel}`"
           :aria-describedby="describedBy"
-          @change="requestToggle"
+          @click.prevent="requestToggle"
         >
       </label>
     </header>

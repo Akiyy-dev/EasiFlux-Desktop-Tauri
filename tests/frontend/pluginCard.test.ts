@@ -95,22 +95,34 @@ describe('PluginCard', () => {
     expect(blocked.get('article').attributes('aria-busy')).toBeUndefined()
   })
 
-  it('emits the requested confirmed-state transition and ignores non-toggleable input', async () => {
+  it('emits the requested confirmed-state transition and ignores non-toggleable input', () => {
     const enabled = mountCard(pluginFixture('enabled'))
-    await enabled.get('[role="switch"]').trigger('change')
+    enabled.get<HTMLInputElement>('[role="switch"]').element.click()
     expect(enabled.emitted('toggle')).toEqual([
       ['com.easiflux.analytics.overview', false],
     ])
 
     const disabled = mountCard(pluginFixture('disabled'))
-    await disabled.get('[role="switch"]').trigger('change')
+    disabled.get<HTMLInputElement>('[role="switch"]').element.click()
     expect(disabled.emitted('toggle')).toEqual([
       ['com.easiflux.analytics.overview', true],
     ])
 
     const blocked = mountCard(pluginFixture('blocked'))
-    await blocked.get('[role="switch"]').trigger('change')
+    blocked.get<HTMLInputElement>('[role="switch"]').element.click()
     expect(blocked.emitted('toggle')).toBeUndefined()
+  })
+
+  it('keeps a native checkbox click on the confirmed prop while emitting one request', () => {
+    const wrapper = mountCard(pluginFixture('disabled'))
+    const control = wrapper.get<HTMLInputElement>('[role="switch"]')
+
+    control.element.click()
+
+    expect(control.element.checked).toBe(false)
+    expect(wrapper.emitted('toggle')).toEqual([
+      ['com.easiflux.analytics.overview', true],
+    ])
   })
 
   it('announces a card action error and references only existing description elements', () => {

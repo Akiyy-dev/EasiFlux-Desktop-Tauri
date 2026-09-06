@@ -91,10 +91,6 @@ function validMutation(
   return { revision: '43', plugin: validItem(id, status) }
 }
 
-function clone<T>(value: T): T {
-  return structuredClone(value)
-}
-
 function firstItem(snapshot: WireObject): WireObject {
   return (snapshot.plugins as WireObject[])[0]
 }

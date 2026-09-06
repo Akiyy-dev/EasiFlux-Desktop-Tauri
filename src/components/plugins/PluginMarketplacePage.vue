@@ -145,14 +145,17 @@ onMounted(() => {
         </button>
       </div>
 
-      <p
+      <div
         v-if="store.availability === 'unavailable'"
         class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
         data-testid="plugin-availability-alert"
         role="alert"
       >
-        {{ availabilityMessage }}
-      </p>
+        <p>{{ availabilityMessage }}</p>
+        <button class="ef-btn ef-btn-secondary ef-btn-sm" type="button" @click="retry">
+          重试插件子系统
+        </button>
+      </div>
 
       <section v-if="props.section === 'installed'" class="plugin-marketplace-page__section">
         <div class="plugin-marketplace-page__controls">

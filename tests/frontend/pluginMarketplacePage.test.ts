@@ -236,6 +236,34 @@ describe('PluginMarketplacePage catalog views', () => {
       .toContain('当前没有已安装插件')
   })
 
+  it('recovers an unavailable snapshot only after its explicit retry action', async () => {
+    serviceMocks.getCatalog
+      .mockResolvedValueOnce(unavailableSnapshot())
+      .mockResolvedValueOnce(availableSnapshot([], '4'))
+    const firstEntry = mountPage()
+    await flushPromises()
+
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(1)
+    expect(firstEntry.get('[data-testid="plugin-availability-alert"]')
+      .get('button').text()).toContain('重试')
+
+    firstEntry.unmount()
+    const ordinaryReentry = mountPage()
+    await flushPromises()
+
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(1)
+    expect(ordinaryReentry.find('[data-testid="plugin-availability-alert"]').exists()).toBe(true)
+
+    await ordinaryReentry.get('[data-testid="plugin-availability-alert"]')
+      .get('button').trigger('click')
+    await flushPromises()
+
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(2)
+    expect(ordinaryReentry.find('[data-testid="plugin-availability-alert"]').exists()).toBe(false)
+    expect(ordinaryReentry.get('[data-testid="plugin-catalog-empty"]').text())
+      .toContain('当前没有已安装插件')
+  })
+
   it('keeps unavailable catalog items visible as blocked cards', async () => {
     const blocked = pluginItem(
       'com.easiflux.alpha',
@@ -325,7 +353,8 @@ describe('PluginMarketplacePage catalog views', () => {
     const wrapper = mountPage()
     await flushPromises()
 
-    await wrapper.get('[role="switch"]').trigger('change')
+    wrapper.get<HTMLInputElement>('[role="switch"]').element.click()
+    await nextTick()
 
     expect(serviceMocks.setEnabled).toHaveBeenCalledWith('com.easiflux.beta', true)
     expect(wrapper.get('[data-testid="plugin-status"]').text()).toContain('已停用')
@@ -334,6 +363,37 @@ describe('PluginMarketplacePage catalog views', () => {
     response.resolve(mutation('com.easiflux.beta', true))
     await flushPromises()
     expect(wrapper.get('[data-testid="plugin-status"]').text()).toContain('已启用')
+  })
+
+  it('keeps a native switch click confirmed through pending and rejected persistence', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([
+      pluginItem('com.easiflux.beta', 'Beta 交易', 'disabled'),
+    ]))
+    const response = deferred<PluginCatalogMutationResult>()
+    serviceMocks.setEnabled.mockReturnValueOnce(response.promise)
+    const wrapper = mountPage()
+    await flushPromises()
+    const control = wrapper.get<HTMLInputElement>('[role="switch"]')
+
+    control.element.click()
+    await nextTick()
+
+    expect(serviceMocks.setEnabled).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.setEnabled).toHaveBeenCalledWith('com.easiflux.beta', true)
+    expect(control.element.checked).toBe(false)
+    expect(control.element.disabled).toBe(true)
+
+    response.reject({
+      code: 'plugin_state_persist_failed',
+      message: 'D:\\private\\plugins\\state.json',
+    })
+    await flushPromises()
+
+    const confirmedControl = wrapper.get<HTMLInputElement>('[role="switch"]')
+    expect(confirmedControl.element.checked).toBe(false)
+    expect(confirmedControl.element.disabled).toBe(false)
+    expect(wrapper.get('[role="alert"]').text()).toContain('保存插件状态失败，请重试。')
+    expect(wrapper.text()).not.toContain('private')
   })
 })
 
