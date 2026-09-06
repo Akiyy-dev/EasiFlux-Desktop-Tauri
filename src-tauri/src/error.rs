@@ -47,6 +47,12 @@ pub enum AppError {
     OrderSubmissionBlocked { order_link_id: String },
     #[error("{0}")]
     OrderSubmissionRejected(String),
+    #[error("{message}")]
+    Plugin {
+        code: &'static str,
+        message: &'static str,
+        diagnostic: Option<String>,
+    },
 }
 
 impl Serialize for AppError {
@@ -73,6 +79,13 @@ impl Serialize for AppError {
                 use serde::ser::SerializeStruct;
                 let mut value = serializer.serialize_struct("OrderSubmissionError", 2)?;
                 value.serialize_field("code", "ORDER_SUBMISSION_REJECTED")?;
+                value.serialize_field("message", message)?;
+                value.end()
+            }
+            Self::Plugin { code, message, .. } => {
+                use serde::ser::SerializeStruct;
+                let mut value = serializer.serialize_struct("PluginError", 2)?;
+                value.serialize_field("code", code)?;
                 value.serialize_field("message", message)?;
                 value.end()
             }
@@ -233,5 +246,35 @@ mod tests {
         assert!(serde_json::to_value(AppError::Connection("safe".into()))
             .unwrap()
             .is_string());
+    }
+
+    #[test]
+    fn plugin_errors_expose_only_the_safe_contract() {
+        const PRIVATE_DETAIL: &str = "failed at D:\\private\\plugin.toml with raw-secret";
+        let error = AppError::Plugin {
+            code: "plugin_not_found",
+            message: "插件不存在",
+            diagnostic: Some(PRIVATE_DETAIL.into()),
+        };
+
+        assert_eq!(error.to_string(), "插件不存在");
+        assert_eq!(error.user_message(), "插件不存在");
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::json!({ "code": "plugin_not_found", "message": "插件不存在" })
+        );
+
+        let error = AppError::Plugin {
+            code: "plugin_not_found",
+            message: "插件不存在",
+            diagnostic: Some(PRIVATE_DETAIL.into()),
+        };
+        for rendered in [
+            error.to_string(),
+            error.user_message(),
+            serde_json::to_string(&error).unwrap(),
+        ] {
+            assert!(!rendered.contains(PRIVATE_DETAIL));
+        }
     }
 }
