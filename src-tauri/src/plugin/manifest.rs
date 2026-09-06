@@ -189,32 +189,103 @@ pub enum PluginAvailabilityReason {
     CatalogInvalid,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCatalogItem {
-    pub manifest: PluginManifestV1,
-    pub source: PluginSource,
-    pub status: PluginStatus,
-    pub status_reason_code: Option<String>,
-    pub can_toggle: bool,
-    pub granted_capabilities: Vec<String>,
+    manifest: PluginManifestV1,
+    source: PluginSource,
+    status: PluginStatus,
+    status_reason_code: Option<PluginAvailabilityReason>,
+    can_toggle: bool,
+    granted_capabilities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginCatalogItemWire {
+    manifest: PluginManifestV1,
+    source: PluginSource,
+    status: PluginStatus,
+    status_reason_code: Option<PluginAvailabilityReason>,
+    can_toggle: bool,
+    granted_capabilities: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for PluginCatalogItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PluginCatalogItemWire::deserialize(deserializer)?;
+        validate_catalog_item_state(&wire.status, wire.can_toggle, &wire.status_reason_code)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            manifest: wire.manifest,
+            source: wire.source,
+            status: wire.status,
+            status_reason_code: wire.status_reason_code,
+            can_toggle: wire.can_toggle,
+            granted_capabilities: wire.granted_capabilities,
+        })
+    }
 }
 
 impl PluginCatalogItem {
-    pub fn phase0(
+    pub fn enabled(manifest: PluginManifestV1, source: PluginSource) -> Self {
+        Self {
+            manifest,
+            source,
+            status: PluginStatus::Enabled,
+            status_reason_code: None,
+            can_toggle: true,
+            granted_capabilities: Vec::new(),
+        }
+    }
+
+    pub fn disabled(manifest: PluginManifestV1, source: PluginSource) -> Self {
+        Self {
+            manifest,
+            source,
+            status: PluginStatus::Disabled,
+            status_reason_code: None,
+            can_toggle: true,
+            granted_capabilities: Vec::new(),
+        }
+    }
+
+    pub fn blocked(
         manifest: PluginManifestV1,
         source: PluginSource,
-        status: PluginStatus,
-        can_toggle: bool,
-        status_reason_code: Option<String>,
+        status_reason_code: PluginAvailabilityReason,
     ) -> Self {
         Self {
             manifest,
             source,
-            status,
-            status_reason_code,
-            can_toggle,
+            status: PluginStatus::Blocked,
+            status_reason_code: Some(status_reason_code),
+            can_toggle: false,
             granted_capabilities: Vec::new(),
+        }
+    }
+}
+
+fn validate_catalog_item_state(
+    status: &PluginStatus,
+    can_toggle: bool,
+    status_reason_code: &Option<PluginAvailabilityReason>,
+) -> Result<(), &'static str> {
+    match status {
+        PluginStatus::Enabled | PluginStatus::Disabled
+            if can_toggle && status_reason_code.is_none() =>
+        {
+            Ok(())
+        }
+        PluginStatus::Blocked if !can_toggle && status_reason_code.is_some() => Ok(()),
+        PluginStatus::Enabled | PluginStatus::Disabled => {
+            Err("toggleable plugin items must not have a status reason code")
+        }
+        PluginStatus::Blocked => {
+            Err("blocked plugin items must be non-toggleable with a reason code")
         }
     }
 }
@@ -396,14 +467,11 @@ mod tests {
     #[test]
     fn catalog_transport_serializes_strict_camel_case_with_string_revisions() {
         let manifest: PluginManifestV1 = serde_json::from_str(VALID_MANIFEST).unwrap();
-        let item = PluginCatalogItem::phase0(
+        let item = PluginCatalogItem::blocked(
             manifest,
             PluginSource::BuiltIn,
-            PluginStatus::Blocked,
-            true,
-            Some("policyBlocked".into()),
+            PluginAvailabilityReason::CatalogInvalid,
         );
-        assert!(item.granted_capabilities.is_empty());
 
         let snapshot = PluginCatalogSnapshot::new(
             42,
@@ -422,8 +490,8 @@ mod tests {
                     "manifest": serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap(),
                     "source": "builtIn",
                     "status": "blocked",
-                    "statusReasonCode": "policyBlocked",
-                    "canToggle": true,
+                    "statusReasonCode": "catalogInvalid",
+                    "canToggle": false,
                     "grantedCapabilities": []
                 }]
             })
@@ -438,12 +506,89 @@ mod tests {
                     "manifest": serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap(),
                     "source": "builtIn",
                     "status": "blocked",
-                    "statusReasonCode": "policyBlocked",
-                    "canToggle": true,
+                    "statusReasonCode": "catalogInvalid",
+                    "canToggle": false,
                     "grantedCapabilities": []
                 }
             })
         );
+    }
+
+    #[test]
+    fn enabled_catalog_items_are_toggleable_without_a_reason_code() {
+        let manifest: PluginManifestV1 = serde_json::from_str(VALID_MANIFEST).unwrap();
+        let item = PluginCatalogItem::enabled(manifest, PluginSource::BuiltIn);
+
+        assert_eq!(
+            serde_json::to_value(item).unwrap(),
+            serde_json::json!({
+                "manifest": serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap(),
+                "source": "builtIn",
+                "status": "enabled",
+                "statusReasonCode": null,
+                "canToggle": true,
+                "grantedCapabilities": []
+            })
+        );
+    }
+
+    #[test]
+    fn disabled_catalog_items_are_toggleable_without_a_reason_code() {
+        let manifest: PluginManifestV1 = serde_json::from_str(VALID_MANIFEST).unwrap();
+        let item = PluginCatalogItem::disabled(manifest, PluginSource::BuiltIn);
+
+        assert_eq!(
+            serde_json::to_value(item).unwrap(),
+            serde_json::json!({
+                "manifest": serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap(),
+                "source": "builtIn",
+                "status": "disabled",
+                "statusReasonCode": null,
+                "canToggle": true,
+                "grantedCapabilities": []
+            })
+        );
+    }
+
+    #[test]
+    fn catalog_items_reject_contradictory_state_or_unknown_reason_codes() {
+        let manifest = serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap();
+        for invalid in [
+            serde_json::json!({
+                "manifest": manifest.clone(),
+                "source": "builtIn",
+                "status": "blocked",
+                "statusReasonCode": "catalogInvalid",
+                "canToggle": true,
+                "grantedCapabilities": []
+            }),
+            serde_json::json!({
+                "manifest": manifest.clone(),
+                "source": "builtIn",
+                "status": "blocked",
+                "statusReasonCode": null,
+                "canToggle": false,
+                "grantedCapabilities": []
+            }),
+            serde_json::json!({
+                "manifest": manifest.clone(),
+                "source": "builtIn",
+                "status": "disabled",
+                "statusReasonCode": "stateUnavailable",
+                "canToggle": true,
+                "grantedCapabilities": []
+            }),
+            serde_json::json!({
+                "manifest": manifest,
+                "source": "builtIn",
+                "status": "blocked",
+                "statusReasonCode": "policyBlocked",
+                "canToggle": false,
+                "grantedCapabilities": []
+            }),
+        ] {
+            assert!(serde_json::from_value::<PluginCatalogItem>(invalid).is_err());
+        }
     }
 
     #[test]
