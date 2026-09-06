@@ -1,11 +1,5 @@
 pub mod builtin;
 pub mod manifest;
+pub mod registry;
 
-#[derive(Default)]
-pub struct PluginRegistry;
-
-impl PluginRegistry {
-    pub fn new() -> Self {
-        Self
-    }
-}
+pub use registry::PluginRegistry;
