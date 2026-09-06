@@ -189,6 +189,12 @@ mod capability_tests {
             );
             assert!(
                 authority
+                    .resolve_access(command, "main", "secondary", &Origin::Local)
+                    .is_none(),
+                "another webview in the main window must not resolve {command}"
+            );
+            assert!(
+                authority
                     .resolve_access(command, "secondary", "secondary", &Origin::Local)
                     .is_none(),
                 "another window must not resolve {command}"

@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "plugin-runtime",
+  "description": "Plugin runtime commands for the main webview",
+  "webviews": ["main"],
+  "permissions": [
+    "allow-get-plugin-catalog",
+    "allow-set-plugin-enabled"
+  ]
+}
