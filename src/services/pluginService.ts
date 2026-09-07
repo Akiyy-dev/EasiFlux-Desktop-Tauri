@@ -5,6 +5,7 @@ import type {
   PluginCatalogItem,
   PluginCatalogMutationResult,
   PluginCatalogSnapshot,
+  PluginLocalDiscoverySummary,
   PluginManifestV1,
   PluginStatus,
 } from '../types/plugin'
@@ -22,6 +23,9 @@ type PluginErrorCode =
   | 'plugin_state_persist_failed'
   | 'plugin_revision_exhausted'
   | 'plugin_not_toggleable'
+  | 'plugin_catalog_stale'
+  | 'plugin_catalog_generation_exhausted'
+  | 'plugin_state_capacity_exceeded'
 
 const ERROR_MESSAGES = {
   plugin_invalid_id: '插件标识无效。',
@@ -31,13 +35,18 @@ const ERROR_MESSAGES = {
   plugin_state_persist_failed: '保存插件状态失败，请重试。',
   plugin_revision_exhausted: '插件状态版本已达到上限，请联系支持。',
   plugin_not_toggleable: '该插件当前无法更改启用状态。',
+  plugin_catalog_stale: '插件目录已更新，请刷新后重试。',
+  plugin_catalog_generation_exhausted: '插件目录版本已达到上限，请联系支持。',
+  plugin_state_capacity_exceeded: '插件状态容量已达到上限，请联系支持。',
 } satisfies Record<PluginErrorCode, string>
 
 const SNAPSHOT_KEYS = [
   'schemaVersion',
   'revision',
+  'catalogGeneration',
   'availability',
   'availabilityReasonCode',
+  'localDiscovery',
   'plugins',
 ] as const
 const ITEM_KEYS = [
@@ -59,7 +68,8 @@ const MANIFEST_KEYS = [
   'contributions',
   'requestedCapabilities',
 ] as const
-const MUTATION_KEYS = ['revision', 'plugin'] as const
+const MUTATION_KEYS = ['schemaVersion', 'revision', 'catalogGeneration', 'plugin'] as const
+const LOCAL_DISCOVERY_KEYS = ['status', 'rejectedPackageCount'] as const
 const ERROR_KEYS = ['code', 'message'] as const
 
 function invalidResponse(): never {
@@ -205,7 +215,7 @@ function parseStatus(value: unknown): PluginStatus {
 function parseCatalogItem(value: unknown): PluginCatalogItem {
   const item = requireExactObject(value, ITEM_KEYS)
   const manifest = parseManifest(item.manifest)
-  if (item.source !== 'builtIn') invalidResponse()
+  if (item.source !== 'builtIn' && item.source !== 'localDeclarative') invalidResponse()
   const status = parseStatus(item.status)
   const statusReasonCode = parseReason(item.statusReasonCode)
   if (typeof item.canToggle !== 'boolean') invalidResponse()
@@ -218,7 +228,7 @@ function parseCatalogItem(value: unknown): PluginCatalogItem {
 
   return {
     manifest,
-    source: 'builtIn',
+    source: item.source,
     status,
     statusReasonCode,
     canToggle: item.canToggle,
@@ -233,8 +243,10 @@ function parseAvailability(value: unknown): PluginAvailability {
 
 function parseSnapshot(value: unknown): PluginCatalogSnapshot {
   const snapshot = requireExactObject(value, SNAPSHOT_KEYS)
-  if (snapshot.schemaVersion !== 1 || !Array.isArray(snapshot.plugins)) invalidResponse()
+  if (snapshot.schemaVersion !== 2 || !Array.isArray(snapshot.plugins)) invalidResponse()
   const revision = requireCanonicalRevision(snapshot.revision)
+  const catalogGeneration = requireCanonicalRevision(snapshot.catalogGeneration)
+  const localDiscovery = parseLocalDiscovery(snapshot.localDiscovery)
   const availability = parseAvailability(snapshot.availability)
   const availabilityReasonCode = parseReason(snapshot.availabilityReasonCode)
   const plugins = snapshot.plugins.map(parseCatalogItem)
@@ -257,8 +269,10 @@ function parseSnapshot(value: unknown): PluginCatalogSnapshot {
   ) invalidResponse()
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision,
+    catalogGeneration,
+    localDiscovery,
     availability,
     availabilityReasonCode,
     plugins,
@@ -267,21 +281,48 @@ function parseSnapshot(value: unknown): PluginCatalogSnapshot {
 
 function parseMutation(value: unknown): PluginCatalogMutationResult {
   const mutation = requireExactObject(value, MUTATION_KEYS)
+  if (mutation.schemaVersion !== 2) invalidResponse()
   const revision = requireCanonicalRevision(mutation.revision)
+  const catalogGeneration = requireCanonicalRevision(mutation.catalogGeneration)
   const plugin = parseCatalogItem(mutation.plugin)
   if (plugin.status === 'blocked') invalidResponse()
-  return { revision, plugin }
+  return { schemaVersion: 2, revision, catalogGeneration, plugin }
+}
+
+function parseLocalDiscovery(value: unknown): PluginLocalDiscoverySummary {
+  const summary = requireExactObject(value, LOCAL_DISCOVERY_KEYS)
+  const { status, rejectedPackageCount } = summary
+  if (status !== 'available' && status !== 'degraded' && status !== 'unavailable') {
+    invalidResponse()
+  }
+  if (
+    typeof rejectedPackageCount !== 'number'
+    || !Number.isInteger(rejectedPackageCount)
+    || rejectedPackageCount < 0
+    || rejectedPackageCount > 256
+    || (status === 'degraded' ? rejectedPackageCount === 0 : rejectedPackageCount !== 0)
+  ) invalidResponse()
+  return { status, rejectedPackageCount }
 }
 
 export async function getPluginCatalog(): Promise<PluginCatalogSnapshot> {
   return parseSnapshot(await tauriInvoke<unknown>('get_plugin_catalog'))
 }
 
+export async function reloadPluginCatalog(): Promise<PluginCatalogSnapshot> {
+  return parseSnapshot(await tauriInvoke<unknown>('reload_plugin_catalog'))
+}
+
 export async function setPluginEnabled(
   id: string,
   enabled: boolean,
+  expectedCatalogGeneration: string,
 ): Promise<PluginCatalogMutationResult> {
-  const result = parseMutation(await tauriInvoke<unknown>('set_plugin_enabled', { id, enabled }))
+  const result = parseMutation(await tauriInvoke<unknown>('set_plugin_enabled', {
+    id,
+    enabled,
+    expectedCatalogGeneration,
+  }))
   const expectedStatus = enabled ? 'enabled' : 'disabled'
   if (result.plugin.manifest.id !== id || result.plugin.status !== expectedStatus) invalidResponse()
   return result

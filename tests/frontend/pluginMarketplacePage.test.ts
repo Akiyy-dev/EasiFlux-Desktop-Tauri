@@ -89,8 +89,10 @@ function availableSnapshot(
   revision = '1',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision,
+    catalogGeneration: '1',
+    localDiscovery: { status: 'available', rejectedPackageCount: 0 },
     availability: 'available',
     availabilityReasonCode: null,
     plugins,
@@ -102,8 +104,10 @@ function unavailableSnapshot(
   reason: PluginAvailabilityReason = 'stateUnavailable',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: '3',
+    catalogGeneration: '1',
+    localDiscovery: { status: 'available', rejectedPackageCount: 0 },
     availability: 'unavailable',
     availabilityReasonCode: reason,
     plugins,
@@ -115,7 +119,9 @@ function mutation(
   enabled: boolean,
 ): PluginCatalogMutationResult {
   return {
+    schemaVersion: 2,
     revision: '2',
+    catalogGeneration: '1',
     plugin: pluginItem(id, 'Beta 交易', enabled ? 'enabled' : 'disabled'),
   }
 }
@@ -356,7 +362,7 @@ describe('PluginMarketplacePage catalog views', () => {
     wrapper.get<HTMLInputElement>('[role="switch"]').element.click()
     await nextTick()
 
-    expect(serviceMocks.setEnabled).toHaveBeenCalledWith('com.easiflux.beta', true)
+    expect(serviceMocks.setEnabled).toHaveBeenCalledWith('com.easiflux.beta', true, '1')
     expect(wrapper.get('[data-testid="plugin-status"]').text()).toContain('已停用')
     expect(wrapper.get<HTMLInputElement>('[role="switch"]').element.disabled).toBe(true)
 
@@ -379,7 +385,7 @@ describe('PluginMarketplacePage catalog views', () => {
     await nextTick()
 
     expect(serviceMocks.setEnabled).toHaveBeenCalledTimes(1)
-    expect(serviceMocks.setEnabled).toHaveBeenCalledWith('com.easiflux.beta', true)
+    expect(serviceMocks.setEnabled).toHaveBeenCalledWith('com.easiflux.beta', true, '1')
     expect(control.element.checked).toBe(false)
     expect(control.element.disabled).toBe(true)
 

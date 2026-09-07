@@ -3,6 +3,7 @@ import { defineStore } from 'pinia'
 import {
   getPluginCatalog,
   pluginErrorMessage,
+  reloadPluginCatalog,
   setPluginEnabled,
 } from '../services/pluginService'
 import type {
@@ -10,6 +11,7 @@ import type {
   PluginAvailabilityReason,
   PluginCatalogItem,
   PluginCatalogSnapshot,
+  PluginLocalDiscoverySummary,
   PluginStatus,
 } from '../types/plugin'
 
@@ -19,16 +21,21 @@ export type PluginStatusFilter = 'all' | PluginStatus
 export const usePluginStore = defineStore('plugin', () => {
   const catalog = ref<PluginCatalogItem[]>([])
   const revision = ref('0')
+  const catalogGeneration = ref('0')
+  const localDiscovery = ref<PluginLocalDiscoverySummary | null>(null)
   const availability = ref<PluginAvailability | null>(null)
   const availabilityReasonCode = ref<PluginAvailabilityReason | null>(null)
   const loadStatus = ref<PluginLoadStatus>('idle')
   const loadError = ref<string | null>(null)
+  const reloadStatus = ref<PluginLoadStatus>('idle')
+  const reloadError = ref<string | null>(null)
   const query = ref('')
   const statusFilter = ref<PluginStatusFilter>('all')
   const pendingIds = ref(new Set<string>())
   const actionErrors = ref<Record<string, string>>({})
 
   let loadFlight: Promise<void> | null = null
+  let reloadFlight: Promise<void> | null = null
   let hasConfirmedSnapshot = false
   let mutationSequence = 0
   const mutationOwners = new Map<string, number>()
@@ -55,6 +62,27 @@ export const usePluginStore = defineStore('plugin', () => {
   }
 
   function adoptSnapshot(snapshot: PluginCatalogSnapshot): void {
+    const nextGeneration = BigInt(snapshot.catalogGeneration)
+    const currentGeneration = BigInt(catalogGeneration.value)
+    if (nextGeneration < currentGeneration) return
+    if (nextGeneration > currentGeneration || !hasConfirmedSnapshot) {
+      // Membership and content identity belong to the generation, not the state revision.
+      catalog.value = snapshot.plugins
+      catalogGeneration.value = snapshot.catalogGeneration
+      revision.value = snapshot.revision
+      availability.value = snapshot.availability
+      availabilityReasonCode.value = snapshot.availabilityReasonCode
+      localDiscovery.value = snapshot.localDiscovery
+      confirmedItemRevisions.clear()
+      for (const plugin of snapshot.plugins) {
+        confirmedItemRevisions.set(plugin.manifest.id, BigInt(snapshot.revision))
+      }
+      mutationOwners.clear()
+      pendingIds.value = new Set()
+      actionErrors.value = {}
+      return
+    }
+
     const snapshotRevision = BigInt(snapshot.revision)
     const currentById = new Map(
       catalog.value.map((plugin) => [plugin.manifest.id, plugin] as const),
@@ -96,13 +124,15 @@ export const usePluginStore = defineStore('plugin', () => {
       confirmedItemRevisions.set(id, itemRevision)
     }
     catalog.value = nextCatalog
-    availability.value = snapshot.availability
-    availabilityReasonCode.value = snapshot.availabilityReasonCode
+    if (snapshotRevision >= BigInt(revision.value)) {
+      availability.value = snapshot.availability
+      availabilityReasonCode.value = snapshot.availabilityReasonCode
+      localDiscovery.value = snapshot.localDiscovery
+    }
     adoptGlobalRevision(snapshot.revision)
   }
 
   function beginLoad(): Promise<void> {
-    const refreshingConfirmedData = hasConfirmedSnapshot
     loadStatus.value = 'loading'
     loadError.value = null
 
@@ -115,7 +145,7 @@ export const usePluginStore = defineStore('plugin', () => {
         loadError.value = null
       } catch (error) {
         loadError.value = pluginErrorMessage(error)
-        loadStatus.value = refreshingConfirmedData ? 'ready' : 'error'
+        loadStatus.value = hasConfirmedSnapshot ? 'ready' : 'error'
       }
     })()
     loadFlight = request
@@ -134,6 +164,30 @@ export const usePluginStore = defineStore('plugin', () => {
   function retry(): Promise<void> {
     if (loadFlight) return loadFlight
     return beginLoad()
+  }
+
+  function reload(): Promise<void> {
+    if (reloadFlight) return reloadFlight
+    reloadStatus.value = 'loading'
+    reloadError.value = null
+    const request = (async () => {
+      try {
+        const snapshot = await reloadPluginCatalog()
+        adoptSnapshot(snapshot)
+        hasConfirmedSnapshot = true
+        loadStatus.value = 'ready'
+        loadError.value = null
+        reloadStatus.value = 'ready'
+      } catch (error) {
+        reloadError.value = pluginErrorMessage(error)
+        reloadStatus.value = 'error'
+      }
+    })()
+    reloadFlight = request
+    void request.finally(() => {
+      if (reloadFlight === request) reloadFlight = null
+    })
+    return request
   }
 
   function setQuery(value: string): void {
@@ -163,30 +217,34 @@ export const usePluginStore = defineStore('plugin', () => {
     if (!existing || !existing.canToggle) return false
 
     const owner = ++mutationSequence
+    const requestGeneration = catalogGeneration.value
     mutationOwners.set(id, owner)
     replacePending(id, true)
     replaceActionError(id, null)
 
     try {
-      const result = await setPluginEnabled(id, enabled)
-      if (mutationOwners.get(id) !== owner) return false
+      const result = await setPluginEnabled(id, enabled, requestGeneration)
+      if (
+        mutationOwners.get(id) !== owner
+        || result.catalogGeneration !== requestGeneration
+        || catalogGeneration.value !== requestGeneration
+      ) return false
 
       const resultRevision = BigInt(result.revision)
       const confirmedRevision = confirmedItemRevisions.get(id)
       const itemIndex = catalog.value.findIndex((plugin) => plugin.manifest.id === id)
       if (
-        itemIndex !== -1
-        && (confirmedRevision === undefined || resultRevision >= confirmedRevision)
-      ) {
-        catalog.value = catalog.value.map((plugin, index) => (
-          index === itemIndex ? result.plugin : plugin
-        ))
-        confirmedItemRevisions.set(id, resultRevision)
-      }
+        itemIndex === -1
+        || (confirmedRevision !== undefined && resultRevision < confirmedRevision)
+      ) return false
+      catalog.value = catalog.value.map((plugin, index) => (
+        index === itemIndex ? result.plugin : plugin
+      ))
+      confirmedItemRevisions.set(id, resultRevision)
       adoptGlobalRevision(result.revision)
       return true
     } catch (error) {
-      if (mutationOwners.get(id) === owner) {
+      if (mutationOwners.get(id) === owner && catalogGeneration.value === requestGeneration) {
         replaceActionError(id, pluginErrorMessage(error))
       }
       return false
@@ -201,10 +259,14 @@ export const usePluginStore = defineStore('plugin', () => {
   return {
     catalog,
     revision,
+    catalogGeneration,
+    localDiscovery,
     availability,
     availabilityReasonCode,
     loadStatus,
     loadError,
+    reloadStatus,
+    reloadError,
     query,
     statusFilter,
     pendingIds,
@@ -212,6 +274,7 @@ export const usePluginStore = defineStore('plugin', () => {
     visiblePlugins,
     load,
     retry,
+    reload,
     setQuery,
     setStatusFilter,
     setEnabled,

@@ -11,12 +11,14 @@ import { usePluginStore } from '../../src/stores/plugin'
 
 const serviceMocks = vi.hoisted(() => ({
   getCatalog: vi.fn(),
+  reloadCatalog: vi.fn(),
   setEnabled: vi.fn(),
 }))
 
 vi.mock('../../src/services/pluginService', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../src/services/pluginService')>(),
   getPluginCatalog: serviceMocks.getCatalog,
+  reloadPluginCatalog: serviceMocks.reloadCatalog,
   setPluginEnabled: serviceMocks.setEnabled,
 }))
 
@@ -69,10 +71,13 @@ function snapshot(
     item('com.easiflux.alpha', 'disabled'),
     item('com.easiflux.beta', 'enabled'),
   ],
+  catalogGeneration = '1',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision,
+    catalogGeneration,
+    localDiscovery: { status: 'available', rejectedPackageCount: 0 },
     availability: 'available',
     availabilityReasonCode: null,
     plugins,
@@ -84,8 +89,10 @@ function unavailableSnapshot(
   reason: PluginAvailabilityReason = 'stateUnavailable',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision,
+    catalogGeneration: '1',
+    localDiscovery: { status: 'available', rejectedPackageCount: 0 },
     availability: 'unavailable',
     availabilityReasonCode: reason,
     plugins: [
@@ -99,9 +106,12 @@ function mutation(
   revision: string,
   id: string,
   enabled: boolean,
+  catalogGeneration = '1',
 ): PluginCatalogMutationResult {
   return {
+    schemaVersion: 2,
     revision,
+    catalogGeneration,
     plugin: item(id, enabled ? 'enabled' : 'disabled'),
   }
 }
@@ -112,6 +122,224 @@ async function loadedStore(revision = '1') {
   await store.load()
   return store
 }
+
+describe('plugin store catalog generations', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.reloadCatalog.mockReset()
+    serviceMocks.setEnabled.mockReset()
+  })
+
+  it('captures the confirmed generation in the mutation request without fallback', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('4', undefined, '9007199254740993'))
+    const store = usePluginStore()
+    await store.load()
+    serviceMocks.setEnabled.mockResolvedValueOnce(mutation('5', 'com.easiflux.alpha', true, '9007199254740993'))
+    await store.setEnabled('com.easiflux.alpha', true)
+    expect(serviceMocks.setEnabled).toHaveBeenCalledExactlyOnceWith('com.easiflux.alpha', true, '9007199254740993')
+    expect(store.catalog[0].status).toBe('enabled')
+  })
+
+  it('new generation replaces membership and late old mutation cannot revive it', async () => {
+    const store = await loadedStore()
+    const oldMutation = deferred<PluginCatalogMutationResult>()
+    serviceMocks.setEnabled.mockReturnValueOnce(oldMutation.promise)
+    const toggle = store.setEnabled('com.easiflux.alpha', true)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('1', [], '2'))
+    await store.reload()
+    oldMutation.resolve(mutation('5', 'com.easiflux.alpha', true))
+    await expect(toggle).resolves.toBe(false)
+    expect(store.catalog).toEqual([])
+    expect(store.catalogGeneration).toBe('2')
+    expect(store.revision).toBe('1')
+    expect(store.pendingIds.size).toBe(0)
+  })
+
+  it('new generation replaces metadata, source, discovery and item revisions even with a lower state revision', async () => {
+    const store = await loadedStore('9')
+    const replacement = { ...item('com.easiflux.alpha', 'disabled', { name: 'Replacement', version: '2.0.0' }), source: 'localDeclarative' as const }
+    serviceMocks.reloadCatalog.mockResolvedValueOnce({
+      ...snapshot('2', [replacement], '2'),
+      localDiscovery: { status: 'degraded', rejectedPackageCount: 2 },
+    })
+    await store.reload()
+    expect(store.catalog).toEqual([replacement])
+    expect(store.catalogGeneration).toBe('2')
+    expect(store.localDiscovery).toEqual({ status: 'degraded', rejectedPackageCount: 2 })
+    serviceMocks.setEnabled.mockResolvedValueOnce({ ...mutation('3', 'com.easiflux.alpha', true, '2'), plugin: { ...replacement, status: 'enabled' } })
+    await store.setEnabled('com.easiflux.alpha', true)
+    expect(store.catalog[0].status).toBe('enabled')
+  })
+
+  it('ignores older generation snapshots entirely even with larger revisions and precise u64 generations', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('1', undefined, '9007199254740993'))
+    const store = usePluginStore()
+    await store.load()
+    const confirmed = store.catalog
+    serviceMocks.reloadCatalog.mockResolvedValueOnce({
+      ...snapshot('100', [], '9007199254740992'),
+      localDiscovery: { status: 'unavailable', rejectedPackageCount: 0 },
+    })
+    await store.reload()
+    expect(store.catalog).toBe(confirmed)
+    expect(store.catalogGeneration).toBe('9007199254740993')
+    expect(store.localDiscovery).toEqual({ status: 'available', rejectedPackageCount: 0 })
+    expect(store.revision).toBe('1')
+  })
+
+  it('keeps same-generation higher item revisions while adopting newer results for untouched items', async () => {
+    const store = await loadedStore('1')
+    serviceMocks.setEnabled.mockResolvedValueOnce(mutation('5', 'com.easiflux.alpha', true))
+    await store.setEnabled('com.easiflux.alpha', true)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('4', [item('com.easiflux.alpha'), item('com.easiflux.beta', 'disabled')]))
+    await store.reload()
+    expect(store.catalog.map((plugin) => plugin.status)).toEqual(['enabled', 'disabled'])
+    expect(store.revision).toBe('5')
+  })
+
+  it('does not regress same-generation availability from an older state snapshot', async () => {
+    const store = await loadedStore('5')
+    serviceMocks.getCatalog.mockResolvedValueOnce(unavailableSnapshot('4'))
+    await store.retry()
+    expect(store.availability).toBe('available')
+    expect(store.availabilityReasonCode).toBeNull()
+    expect(store.catalog.map((plugin) => plugin.status)).toEqual(['disabled', 'enabled'])
+  })
+
+  it('coalesces load and reload flights separately and ignores a late old initial load', async () => {
+    const loadResponse = deferred<PluginCatalogSnapshot>()
+    const reloadResponse = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(loadResponse.promise)
+    serviceMocks.reloadCatalog.mockReturnValueOnce(reloadResponse.promise)
+    const store = usePluginStore()
+    const loading = store.load()
+    const loadingAgain = store.load()
+    const reloading = store.reload()
+    const reloadingAgain = store.reload()
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(1)
+    expect(store.loadStatus).toBe('loading')
+    expect(store.reloadStatus).toBe('loading')
+    reloadResponse.resolve(snapshot('2', [], '2'))
+    await Promise.all([reloading, reloadingAgain])
+    loadResponse.resolve(snapshot('3'))
+    await Promise.all([loading, loadingAgain])
+    expect(store.catalog).toEqual([])
+    expect(store.catalogGeneration).toBe('2')
+    expect(store.revision).toBe('2')
+    expect(store.loadStatus).toBe('ready')
+    expect(store.reloadStatus).toBe('ready')
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('2', [], '2'))
+    await store.reload()
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps catalog ready when an old initial load fails after reload confirms a generation', async () => {
+    const response = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(response.promise)
+    const store = usePluginStore()
+    const loading = store.load()
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('2', [], '2'))
+    await store.reload()
+    response.reject({ code: 'plugin_catalog_stale', message: 'private' })
+    await loading
+    expect(store.loadStatus).toBe('ready')
+    expect(store.catalogGeneration).toBe('2')
+  })
+
+  it('retains confirmed catalog on stale reload failure and only retries explicitly', async () => {
+    const store = await loadedStore('4')
+    const confirmed = store.catalog
+    serviceMocks.reloadCatalog.mockRejectedValueOnce({ code: 'plugin_catalog_stale', message: 'private' })
+    await store.reload()
+    expect(store.catalog).toBe(confirmed)
+    expect(store.loadStatus).toBe('ready')
+    expect(store.reloadStatus).toBe('error')
+    expect(store.reloadError).toBe('插件目录已更新，请刷新后重试。')
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(1)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('4', [], '2'))
+    await store.reload()
+    expect(store.reloadError).toBeNull()
+    expect(store.reloadStatus).toBe('ready')
+  })
+
+  it('does not automatically replay stale mutations or discard confirmed data', async () => {
+    const store = await loadedStore('4')
+    const confirmed = store.catalog
+    serviceMocks.setEnabled.mockRejectedValueOnce({ code: 'plugin_catalog_stale', message: 'private' })
+    await expect(store.setEnabled('com.easiflux.alpha', true)).resolves.toBe(false)
+    expect(store.catalog).toBe(confirmed)
+    expect(store.actionErrors['com.easiflux.alpha']).toBe('插件目录已更新，请刷新后重试。')
+    expect(serviceMocks.setEnabled).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.reloadCatalog).not.toHaveBeenCalled()
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects a mutation response whose generation differs from the captured request', async () => {
+    const store = await loadedStore()
+    serviceMocks.setEnabled.mockResolvedValueOnce(mutation('9', 'com.easiflux.alpha', true, '2'))
+    await expect(store.setEnabled('com.easiflux.alpha', true)).resolves.toBe(false)
+    expect(store.catalog[0].status).toBe('disabled')
+    expect(store.revision).toBe('1')
+  })
+
+  it('does not publish a late failure onto a new generation when no newer mutation exists', async () => {
+    const store = await loadedStore()
+    const response = deferred<PluginCatalogMutationResult>()
+    serviceMocks.setEnabled.mockReturnValueOnce(response.promise)
+    const changing = store.setEnabled('com.easiflux.alpha', true)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('1', undefined, '2'))
+    await store.reload()
+    response.reject({ code: 'plugin_catalog_stale', message: 'private' })
+    await changing
+    expect(store.actionErrors).toEqual({})
+    expect(store.pendingIds.size).toBe(0)
+  })
+
+  it('requires the target to still exist even if a same-generation mutation revision is newer', async () => {
+    const store = await loadedStore()
+    const response = deferred<PluginCatalogMutationResult>()
+    serviceMocks.setEnabled.mockReturnValueOnce(response.promise)
+    const changing = store.setEnabled('com.easiflux.alpha', true)
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('2', []))
+    await store.retry()
+    response.resolve(mutation('3', 'com.easiflux.alpha', true))
+    await expect(changing).resolves.toBe(false)
+    expect(store.catalog).toEqual([])
+    expect(store.revision).toBe('2')
+  })
+
+  it('accepts equal per-item revisions for idempotent mutation confirmations', async () => {
+    const store = await loadedStore('4')
+    serviceMocks.setEnabled.mockResolvedValueOnce(mutation('4', 'com.easiflux.alpha', false))
+    await expect(store.setEnabled('com.easiflux.alpha', false)).resolves.toBe(true)
+    expect(store.catalog[0].status).toBe('disabled')
+    expect(store.pendingIds.size).toBe(0)
+  })
+
+  it.each(['resolve', 'reject'] as const)('old-generation %s cannot overwrite replacement data, errors, or pending ownership', async (outcome) => {
+    const store = await loadedStore()
+    const oldResponse = deferred<PluginCatalogMutationResult>()
+    const newResponse = deferred<PluginCatalogMutationResult>()
+    serviceMocks.setEnabled.mockReturnValueOnce(oldResponse.promise).mockReturnValueOnce(newResponse.promise)
+    const oldRequest = store.setEnabled('com.easiflux.alpha', true)
+    const replacement = item('com.easiflux.alpha', 'disabled', { name: 'New contents' })
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('1', [replacement], '2'))
+    await store.reload()
+    expect(store.pendingIds.size).toBe(0)
+    const newRequest = store.setEnabled('com.easiflux.alpha', true)
+    if (outcome === 'resolve') oldResponse.resolve(mutation('9', 'com.easiflux.alpha', true))
+    else oldResponse.reject({ code: 'plugin_not_found', message: 'private' })
+    await oldRequest
+    expect(store.catalog).toEqual([replacement])
+    expect(store.pendingIds.has('com.easiflux.alpha')).toBe(true)
+    expect(store.actionErrors).toEqual({})
+    newResponse.reject({ code: 'plugin_state_persist_failed', message: 'private' })
+    await newRequest
+    expect(store.actionErrors['com.easiflux.alpha']).toBe('保存插件状态失败，请重试。')
+  })
+})
 
 describe('plugin store loading and filtering', () => {
   beforeEach(() => {

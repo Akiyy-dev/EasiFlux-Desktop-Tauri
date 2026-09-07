@@ -1,7 +1,13 @@
-export type PluginSource = 'builtIn'
+export type PluginSource = 'builtIn' | 'localDeclarative'
+export type LocalDiscoveryStatus = 'available' | 'degraded' | 'unavailable'
 export type PluginStatus = 'enabled' | 'disabled' | 'blocked'
 export type PluginAvailability = 'available' | 'unavailable'
 export type PluginAvailabilityReason = 'stateUnavailable' | 'catalogInvalid'
+
+export interface PluginLocalDiscoverySummary {
+  status: LocalDiscoveryStatus
+  rejectedPackageCount: number
+}
 
 export interface PluginManifestV1 {
   schemaVersion: 1
@@ -25,14 +31,18 @@ export interface PluginCatalogItem {
 }
 
 export interface PluginCatalogSnapshot {
-  schemaVersion: 1
+  schemaVersion: 2
   revision: string
+  catalogGeneration: string
   availability: PluginAvailability
   availabilityReasonCode: PluginAvailabilityReason | null
+  localDiscovery: PluginLocalDiscoverySummary
   plugins: PluginCatalogItem[]
 }
 
 export interface PluginCatalogMutationResult {
+  schemaVersion: 2
   revision: string
+  catalogGeneration: string
   plugin: PluginCatalogItem
 }

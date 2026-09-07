@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import {
   getPluginCatalog,
+  reloadPluginCatalog,
   pluginErrorMessage,
   setPluginEnabled,
 } from '../../src/services/pluginService'
@@ -61,8 +62,10 @@ function blockedItem(
 
 function validSnapshot(): WireObject {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: '42',
+    catalogGeneration: '2',
+    localDiscovery: { status: 'available', rejectedPackageCount: 0 },
     availability: 'available',
     availabilityReasonCode: null,
     plugins: [
@@ -76,8 +79,10 @@ function unavailableSnapshot(
   reason: 'stateUnavailable' | 'catalogInvalid' = 'stateUnavailable',
 ): WireObject {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: '42',
+    catalogGeneration: '2',
+    localDiscovery: { status: 'available', rejectedPackageCount: 0 },
     availability: 'unavailable',
     availabilityReasonCode: reason,
     plugins: [blockedItem('com.easiflux.analytics', reason)],
@@ -88,7 +93,7 @@ function validMutation(
   id = 'com.easiflux.analytics',
   status: 'enabled' | 'disabled' = 'enabled',
 ): WireObject {
-  return { revision: '43', plugin: validItem(id, status) }
+  return { schemaVersion: 2, revision: '43', catalogGeneration: '2', plugin: validItem(id, status) }
 }
 
 function firstItem(snapshot: WireObject): WireObject {
@@ -106,7 +111,7 @@ async function expectCatalogRejected(value: unknown): Promise<void> {
 
 async function expectMutationRejected(value: unknown): Promise<void> {
   vi.mocked(tauriInvoke).mockResolvedValueOnce(value)
-  await expect(setPluginEnabled('com.easiflux.analytics', true)).rejects.toThrow(
+  await expect(setPluginEnabled('com.easiflux.analytics', true, '2')).rejects.toThrow(
     INVALID_RESPONSE_ERROR,
   )
 }
@@ -124,14 +129,111 @@ describe('plugin service transport validation', () => {
     expect(tauriInvoke).toHaveBeenCalledWith('get_plugin_catalog')
   })
 
-  it('invokes the fixed mutation command with only id and enabled', async () => {
+  it('accepts local declarative records and uses the fixed explicit reload command', async () => {
+    const snapshotV2 = {
+      schemaVersion: 2,
+      revision: '4',
+      catalogGeneration: '2',
+      availability: 'available',
+      availabilityReasonCode: null,
+      localDiscovery: { status: 'degraded', rejectedPackageCount: 1 },
+      plugins: [{ ...validItem('com.example.alpha'), source: 'localDeclarative' }],
+    }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshotV2)
+    await expect(reloadPluginCatalog()).resolves.toEqual(snapshotV2)
+    expect(tauriInvoke).toHaveBeenCalledWith('reload_plugin_catalog')
+  })
+
+  it.each([
+    { status: 'available', rejectedPackageCount: 0 },
+    { status: 'degraded', rejectedPackageCount: 1 },
+    { status: 'degraded', rejectedPackageCount: 256 },
+    { status: 'unavailable', rejectedPackageCount: 0 },
+  ])('accepts the bounded correlated local summary %j independently of top-level health', async (summary) => {
+    const snapshot = validSnapshot()
+    snapshot.localDiscovery = summary
+    snapshot.catalogGeneration = U64_MAX
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
+    await expect(getPluginCatalog()).resolves.toEqual(snapshot)
+  })
+
+  it.each([
+    null, [], {},
+    { status: 'unknown', rejectedPackageCount: 0 },
+    { status: 'degraded', rejectedPackageCount: -1 },
+    { status: 'degraded', rejectedPackageCount: 1.5 },
+    { status: 'degraded', rejectedPackageCount: 257 },
+    { status: 'degraded', rejectedPackageCount: '1' },
+    { status: 'degraded', rejectedPackageCount: true },
+    { status: 'degraded', rejectedPackageCount: NaN },
+    { status: 'degraded', rejectedPackageCount: Infinity },
+    { status: 'degraded', rejectedPackageCount: 0 },
+    { status: 'available', rejectedPackageCount: 1 },
+    { status: 'unavailable', rejectedPackageCount: 1 },
+    { status: 'available', rejectedPackageCount: 0, path: 'private' },
+    { status: 'available' },
+  ])('rejects malformed or contradictory local summary %j', async (summary) => {
+    const snapshot = validSnapshot()
+    snapshot.localDiscovery = summary
+    await expectCatalogRejected(snapshot)
+  })
+
+  it.each([1, null, '', '00', '01', '+1', '-1', '1.0', '1e2', ' 1', '1 ', '18446744073709551616', '9'.repeat(100)])(
+    'rejects noncanonical generation in both envelopes: %j', async (generation) => {
+      const snapshot = validSnapshot()
+      snapshot.catalogGeneration = generation
+      await expectCatalogRejected(snapshot)
+      const mutation = validMutation()
+      mutation.catalogGeneration = generation
+      await expectMutationRejected(mutation)
+    },
+  )
+
+  it.each(['schemaVersion', 'catalogGeneration', 'localDiscovery'])('rejects a missing snapshot %s', async (key) => {
+    const snapshot = validSnapshot()
+    delete snapshot[key]
+    await expectCatalogRejected(snapshot)
+  })
+
+  it.each(['schemaVersion', 'catalogGeneration', 'revision', 'plugin'])('rejects a missing mutation %s', async (key) => {
+    const mutation = validMutation()
+    delete mutation[key]
+    await expectMutationRejected(mutation)
+  })
+
+  it('rejects a v1 mutation envelope', async () => {
+    const mutation = validMutation()
+    mutation.schemaVersion = 1
+    await expectMutationRejected(mutation)
+  })
+
+  it('validates reload responses with the same strict parser', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ ...validSnapshot(), privatePath: 'secret' })
+    await expect(reloadPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+
+  it('invokes the fixed mutation command with the captured catalog generation', async () => {
     const mutation = validMutation()
     vi.mocked(tauriInvoke).mockResolvedValueOnce(mutation)
 
-    await expect(setPluginEnabled('com.easiflux.analytics', true)).resolves.toEqual(mutation)
+    await expect(setPluginEnabled('com.easiflux.analytics', true, '2')).resolves.toEqual(mutation)
     expect(tauriInvoke).toHaveBeenCalledWith('set_plugin_enabled', {
       id: 'com.easiflux.analytics',
       enabled: true,
+      expectedCatalogGeneration: '2',
+    })
+  })
+
+  it('accepts a local mutation without changing its source or generation payload', async () => {
+    const mutation = validMutation('com.example.alpha')
+    const localItem = mutation.plugin as WireObject
+    localItem.source = 'localDeclarative'
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(mutation)
+    await expect(setPluginEnabled('com.example.alpha', true, '2')).resolves.toEqual(mutation)
+    expect(tauriInvoke).toHaveBeenCalledWith('set_plugin_enabled', {
+      id: 'com.example.alpha',
+      enabled: true,
+      expectedCatalogGeneration: '2',
     })
   })
 
@@ -182,7 +284,7 @@ describe('plugin service transport validation', () => {
   })
 
   it.each([
-    ['snapshot schema', (snapshot: WireObject) => { snapshot.schemaVersion = 2 }],
+    ['snapshot schema', (snapshot: WireObject) => { snapshot.schemaVersion = 1 }],
     ['manifest schema', (snapshot: WireObject) => {
       manifestFromItem(firstItem(snapshot)).schemaVersion = '1'
     }],
@@ -215,6 +317,9 @@ describe('plugin service transport validation', () => {
     const snapshot = validSnapshot()
     snapshot.revision = revision
     await expectCatalogRejected(snapshot)
+    const mutation = validMutation()
+    mutation.revision = revision
+    await expectMutationRejected(mutation)
   })
 
   it('rejects an oversized revision without attempting unbounded BigInt parsing', async () => {
@@ -382,6 +487,9 @@ describe('plugin service transport validation', () => {
 
 describe('plugin error sanitization', () => {
   it.each([
+    ['plugin_catalog_stale', '插件目录已更新，请刷新后重试。'],
+    ['plugin_catalog_generation_exhausted', '插件目录版本已达到上限，请联系支持。'],
+    ['plugin_state_capacity_exceeded', '插件状态容量已达到上限，请联系支持。'],
     ['plugin_invalid_id', '插件标识无效。'],
     ['plugin_not_found', '未找到该插件。'],
     ['plugin_catalog_invalid', '插件目录不可用，请稍后重试。'],
