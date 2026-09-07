@@ -44,3 +44,13 @@ jobs:
         working-directory: src-tauri
       - run: cargo clippy
         working-directory: src-tauri
+
+  windows-discovery-security:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: cargo test --manifest-path src-tauri/Cargo.toml plugin::discovery::safe_fs::tests --lib
