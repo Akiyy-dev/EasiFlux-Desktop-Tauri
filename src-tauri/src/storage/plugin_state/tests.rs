@@ -92,12 +92,36 @@ fn state(revision: u64) -> PluginStateFileV2 {
     }
 }
 
+const LOCAL_FINGERPRINT_A: &str =
+    "v1:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const LOCAL_FINGERPRINT_B: &str =
+    "v1:sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+fn local_entry(id: &str, fingerprint: &str) -> PluginStateEntryV2 {
+    PluginStateEntryV2 {
+        id: PluginId::parse(id).unwrap(),
+        source: PluginSource::LocalDeclarative,
+        publisher_id: PluginPublisherId::parse("com.easiflux").unwrap(),
+        approval_fingerprint: fingerprint.into(),
+        enabled: true,
+    }
+}
+
 // Catches loading v1 into a v1 runtime state instead of canonical v2 while
 // forgetting to request a deferred migration write.
 #[test]
 fn v1_load_is_lossless_and_marks_v2_rewrite() {
     let fixture = state_store_fixture();
-    fixture.write_primary(br#"{"schemaVersion":1,"revision":"7","entries":[{"id":"com.easiflux.alpha","source":"builtIn","publisherId":"com.easiflux","approvalFingerprint":"v1:none","enabled":true}]}"#);
+    let primary = br#"{"schemaVersion":1,"revision":"7","entries":[{"id":"com.easiflux.alpha","source":"builtIn","publisherId":"com.easiflux","approvalFingerprint":"v1:none","enabled":true}]}"#;
+    fixture.write_primary(primary);
+    let paths = ["", ".tmp", ".bak", ".pending", ".bak.pending"];
+    let before: Vec<_> = paths
+        .iter()
+        .map(|suffix| {
+            let path = sidecar(&fixture.fixture.path(), suffix);
+            (path.clone(), path.exists().then(|| fs::read(path).unwrap()))
+        })
+        .collect();
 
     let loaded = fixture.store.load().unwrap();
 
@@ -105,6 +129,47 @@ fn v1_load_is_lossless_and_marks_v2_rewrite() {
     assert_eq!(loaded.state.schema_version, 2);
     assert_eq!(loaded.state.revision, 7);
     assert!(loaded.state.entries[0].enabled);
+    for (path, expected) in before {
+        assert_eq!(path.exists(), expected.is_some());
+        if let Some(expected) = expected {
+            assert_eq!(fs::read(path).unwrap(), expected);
+        }
+    }
+}
+
+// Catches accidentally routing legacy documents through the permissive v2
+// decoder, or accepting v1 encodings that cannot safely migrate to v2.
+#[test]
+fn v1_wire_decoder_rejects_noncanonical_or_non_builtin_documents() {
+    let base = r#"{"schemaVersion":1,"revision":"7","entries":[{"id":"com.easiflux.alpha","source":"builtIn","publisherId":"com.easiflux","approvalFingerprint":"v1:none","enabled":true}]}"#;
+    let duplicate_entry = r#"{"schemaVersion":1,"revision":"7","entries":[{"id":"com.easiflux.alpha","source":"builtIn","publisherId":"com.easiflux","approvalFingerprint":"v1:none","enabled":true},{"id":"com.easiflux.alpha","source":"builtIn","publisherId":"com.easiflux","approvalFingerprint":"v1:none","enabled":false}]}"#;
+    for invalid in [
+        base.replace(
+            r#"[{"id":"com.easiflux.alpha","source":"builtIn","publisherId":"com.easiflux","approvalFingerprint":"v1:none","enabled":true}]"#,
+            r#"[["com.easiflux.alpha","builtIn","com.easiflux","v1:none",true]]"#,
+        ),
+        base.replace("\"schemaVersion\":1", "\"schemaVersion\":1,\"unknown\":true"),
+        base.replace("\"enabled\":true", "\"enabled\":true,\"unknown\":true"),
+        base.replace("\"schemaVersion\":1", "\"schemaVersion\":1,\"schemaVersion\":1"),
+        base.replace("\"enabled\":true", "\"enabled\":true,\"enabled\":true"),
+        base.replace("builtIn", "localDeclarative"),
+        base.replace("builtIn", "localDeclarative")
+            .replace("v1:none", LOCAL_FINGERPRINT_A),
+        base.replace("v1:none", LOCAL_FINGERPRINT_A),
+        base.replace("\"revision\":\"7\"", "\"revision\":7"),
+        base.replace("\"revision\":\"7\"", "\"revision\":\"07\""),
+        base.replace("\"revision\":\"7\"", "\"revision\":\"+7\""),
+        base.replace(
+            "\"revision\":\"7\"",
+            "\"revision\":\"18446744073709551616\"",
+        ),
+        duplicate_entry.into(),
+    ] {
+        assert!(serde_json::from_str::<PluginStateFileV1Wire>(&invalid).is_err());
+        let fixture = Fixture::new();
+        fixture.write("", &invalid);
+        assert_sanitized(fixture.store().load().unwrap_err());
+    }
 }
 
 // Catches downgrading an unknown primary schema by accepting an older backup.
@@ -381,6 +446,84 @@ fn duplicate_composite_identities_are_rejected_without_collapsing_other_publishe
     value["entries"][1]["publisherId"] = "com.other".into();
     fixture.write("", serde_json::to_vec(&value).unwrap());
     assert_eq!(fixture.store().load().unwrap().state.entries.len(), 2);
+}
+
+// Catches losing local-declarative decisions, rewriting their schema, or
+// accepting an invalid local fingerprint during a normal persistence cycle.
+#[test]
+fn local_declarative_v2_state_round_trips_through_load_and_save() {
+    let fixture = Fixture::new();
+    let expected = PluginStateFileV2 {
+        schema_version: 2,
+        revision: 7,
+        entries: vec![local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A)],
+    };
+    fixture.write("", serde_json::to_vec(&expected).unwrap());
+
+    let loaded = fixture.store().load().unwrap();
+
+    assert!(!loaded.requires_rewrite);
+    assert_eq!(loaded.state, expected);
+    fixture.store().save(&loaded.state).unwrap();
+    assert_eq!(fixture.store().load().unwrap().state, expected);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(fixture.path()).unwrap()).unwrap()
+            ["schemaVersion"],
+        2
+    );
+}
+
+// Catches treating a built-in fingerprint as a valid local-declarative trust
+// record, including nearly valid but noncanonical SHA-256 encodings.
+#[test]
+fn local_declarative_v2_rejects_noncanonical_fingerprints() {
+    let uppercase = LOCAL_FINGERPRINT_A.replace("abcdef", "Abcdef");
+    let nonhex = LOCAL_FINGERPRINT_A.replace("abcdef", "gbcdef");
+    let short = &LOCAL_FINGERPRINT_A[..LOCAL_FINGERPRINT_A.len() - 1];
+    for fingerprint in ["v1:none", uppercase.as_str(), nonhex.as_str(), short] {
+        let invalid = PluginStateFileV2 {
+            schema_version: 2,
+            revision: 7,
+            entries: vec![local_entry("com.easiflux.local", fingerprint)],
+        };
+        let fixture = Fixture::new();
+        fixture.write("", serde_json::to_vec(&invalid).unwrap());
+        assert_sanitized(fixture.store().load().unwrap_err());
+        assert_sanitized(fixture.store().save(&invalid).unwrap_err());
+    }
+}
+
+// Catches collapsing distinct source/fingerprint identities, while ensuring an
+// exact composite duplicate is still rejected instead of last-wins merging.
+#[test]
+fn v2_composite_identity_distinguishes_source_and_fingerprint() {
+    let built_in = PluginStateEntryV2 {
+        id: PluginId::parse("com.easiflux.shared").unwrap(),
+        source: PluginSource::BuiltIn,
+        publisher_id: PluginPublisherId::parse("com.easiflux").unwrap(),
+        approval_fingerprint: APPROVAL_FINGERPRINT_NONE.into(),
+        enabled: false,
+    };
+    let local_a = local_entry("com.easiflux.shared", LOCAL_FINGERPRINT_A);
+    let local_b = local_entry("com.easiflux.shared", LOCAL_FINGERPRINT_B);
+    let valid = PluginStateFileV2 {
+        schema_version: 2,
+        revision: 7,
+        entries: vec![built_in, local_a.clone(), local_b],
+    };
+    let fixture = Fixture::new();
+    fixture.write("", serde_json::to_vec(&valid).unwrap());
+    assert_eq!(fixture.store().load().unwrap().state, valid);
+
+    let duplicate = PluginStateFileV2 {
+        schema_version: 2,
+        revision: 7,
+        entries: vec![local_a.clone(), local_a],
+    };
+    let fixture = Fixture::new();
+    fixture.write("", serde_json::to_vec(&duplicate).unwrap());
+    assert_sanitized(fixture.store().load().unwrap_err());
+    assert_sanitized(fixture.store().save(&duplicate).unwrap_err());
 }
 
 // Catches off-by-one limits and JSON/UTF8 parsing before the byte bound.
