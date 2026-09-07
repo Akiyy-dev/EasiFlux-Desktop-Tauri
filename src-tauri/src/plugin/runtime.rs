@@ -1,6 +1,7 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 
 use futures_util::FutureExt;
 use tokio::sync::{Mutex, RwLock};
@@ -14,7 +15,7 @@ use super::PluginRegistry;
 pub(crate) struct PluginRuntime {
     registry: RwLock<PluginRegistry>,
     discovery: Arc<dyn LocalPluginDiscovery>,
-    reload_gate: Mutex<()>,
+    reload_gate: Arc<Mutex<()>>,
     initial_discovery_attempted: AtomicBool,
 }
 
@@ -30,7 +31,7 @@ impl PluginRuntime {
         Self {
             registry: RwLock::new(registry),
             discovery,
-            reload_gate: Mutex::new(()),
+            reload_gate: Arc::new(Mutex::new(())),
             initial_discovery_attempted: AtomicBool::new(false),
         }
     }
@@ -66,16 +67,30 @@ impl PluginRuntime {
 
     async fn request_discovery(self: &Arc<Self>, force: bool) -> AppResult<PluginCatalogSnapshot> {
         let runtime = Arc::clone(self);
-        // The owned task retains the gate through scan + publication even if a
-        // command caller disappears. Catch/report panics even for detached callers.
+        // Reserve FIFO position before spawning: worker scheduling need not match
+        // acceptance order. Only lock acquisition is unconstrained so cooperative
+        // budget exhaustion cannot defer registration. A pending waiter stays
+        // pinned when transferred, retaining its queue position after cancellation.
+        let mut gate = Box::pin(tokio::task::unconstrained(
+            Arc::clone(&self.reload_gate).lock_owned(),
+        ));
+        let reservation = futures_util::poll!(&mut gate);
+        // No suspension separates reservation and spawn. The owned task retains
+        // the waiter/guard through scan + publication even if the caller disappears.
         tokio::spawn(async move {
-            AssertUnwindSafe(runtime.discover_and_publish(force))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    tracing::error!("plugin catalog request failed");
-                    Err(runtime_error())
-                })
+            AssertUnwindSafe(async move {
+                let _gate = match reservation {
+                    Poll::Ready(guard) => guard,
+                    Poll::Pending => gate.await,
+                };
+                runtime.discover_and_publish(force).await
+            })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                tracing::error!("plugin catalog request failed");
+                Err(runtime_error())
+            })
         })
         .await
         .map_err(|_| {
@@ -85,7 +100,6 @@ impl PluginRuntime {
     }
 
     async fn discover_and_publish(&self, force: bool) -> AppResult<PluginCatalogSnapshot> {
-        let _gate = self.reload_gate.lock().await;
         if !force && self.initial_discovery_attempted.load(Ordering::Acquire) {
             return Ok(self.recover_and_snapshot().await);
         }

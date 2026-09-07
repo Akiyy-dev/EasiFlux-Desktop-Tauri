@@ -406,3 +406,195 @@ async fn blocking_worker_failure_publishes_unavailable_and_allows_explicit_retry
         "2"
     );
 }
+
+// Catches accepting A before B but registering B first under Tokio's worker LIFO
+// scheduling. The harness itself runs on the sole worker, so neither owned
+// request can run between the consecutive first polls below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn reload_acceptance_order_survives_lifo_and_caller_cancellation() {
+    let harness = tokio::spawn(async {
+        let (discovery, mut scans) = ControlledDiscovery::new(vec![
+            local("1.0.0"),
+            local("2.0.0"),
+            local("3.0.0"),
+            local("4.0.0"),
+            local("5.0.0"),
+        ]);
+        let runtime = runtime_with(discovery.clone(), &MemoryPersistence::default());
+        let mut first = Box::pin(runtime.reload_catalog());
+        let mut second = Box::pin(runtime.reload_catalog());
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        scans[0].wait_started().await;
+        scans[0].release();
+        scans[1].wait_started().await;
+        scans[1].release();
+        let first = serde_json::to_value(first.await.unwrap()).unwrap();
+        let second = serde_json::to_value(second.await.unwrap()).unwrap();
+        assert_eq!(
+            first["catalogGeneration"], "1",
+            "first accepted reload must publish first"
+        );
+        assert_eq!(
+            item(&first, "com.example.alpha")["manifest"]["version"],
+            "1.0.0"
+        );
+        assert_eq!(second["catalogGeneration"], "2");
+        assert_eq!(
+            item(&second, "com.example.alpha")["manifest"]["version"],
+            "2.0.0"
+        );
+
+        let mut active = Box::pin(runtime.reload_catalog());
+        let mut queued = Box::pin(runtime.reload_catalog());
+        let mut last = Box::pin(runtime.reload_catalog());
+        assert!(futures_util::poll!(&mut active).is_pending());
+        assert!(futures_util::poll!(&mut queued).is_pending());
+        assert!(futures_util::poll!(&mut last).is_pending());
+        scans[2].wait_started().await;
+        // Both the active caller and an already accepted queued caller disappear.
+        drop(active);
+        drop(queued);
+        assert!(runtime.reload_gate.try_lock().is_err());
+        scans[2].release();
+        scans[3].wait_started().await;
+        assert_eq!(runtime.registry.try_read().unwrap().catalog_generation(), 3);
+        assert!(futures_util::poll!(&mut last).is_pending());
+        scans[3].release();
+        scans[4].wait_started().await;
+        assert_eq!(runtime.registry.try_read().unwrap().catalog_generation(), 4);
+        scans[4].release();
+        let last = serde_json::to_value(last.await.unwrap()).unwrap();
+        assert_eq!(last["catalogGeneration"], "5");
+        assert_eq!(
+            item(&last, "com.example.alpha")["manifest"]["version"],
+            "5.0.0"
+        );
+        assert_eq!(runtime.get_catalog().await.unwrap().catalog_generation, "5");
+        assert_eq!(discovery.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(discovery.max_active.load(Ordering::SeqCst), 1);
+    });
+    tokio::time::timeout(WATCHDOG, harness)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+// Catches a first lock poll yielding for cooperative budget instead of reserving
+// FIFO position, which would reintroduce scheduling-dependent acceptance order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn acceptance_reservation_ignores_exhausted_cooperative_budget() {
+    let harness = tokio::spawn(async {
+        let (discovery, mut scans) = ControlledDiscovery::new(vec![local("1.0.0"), local("2.0.0")]);
+        let runtime = runtime_with(discovery, &MemoryPersistence::default());
+        let mut first = Box::pin(runtime.reload_catalog());
+        let mut second = Box::pin(runtime.reload_catalog());
+        let mut exhausted = false;
+        for _ in 0..1024 {
+            let budget = tokio::task::consume_budget();
+            tokio::pin!(budget);
+            if futures_util::poll!(&mut budget).is_pending() {
+                exhausted = true;
+                break;
+            }
+        }
+        assert!(exhausted, "the harness must deplete its cooperative budget");
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        scans[0].wait_started().await;
+        scans[0].release();
+        scans[1].wait_started().await;
+        scans[1].release();
+        assert_eq!(first.await.unwrap().catalog_generation, "1");
+        assert_eq!(second.await.unwrap().catalog_generation, "2");
+    });
+    tokio::time::timeout(WATCHDOG, harness)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+struct RecoveryPanicPersistence(AtomicUsize);
+
+impl PluginStatePersistence for RecoveryPanicPersistence {
+    fn load(&self) -> AppResult<PluginStateLoad> {
+        match self.0.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(AppError::Internal("synthetic unavailable store".into())),
+            1 => panic!("synthetic private state-recovery detail"),
+            _ => Ok(PluginStateLoad {
+                state: PluginStateFileV2::empty(),
+                requires_rewrite: false,
+            }),
+        }
+    }
+
+    fn save(&self, _next: &PluginStateFileV2) -> AppResult<()> {
+        Ok(())
+    }
+}
+
+// Catches an owned request panic after successful discovery escaping its safe
+// boundary, retaining the gate, or losing the completed-attempt marker.
+#[tokio::test]
+async fn post_discovery_recovery_panic_is_safe_releases_gate_and_remains_retryable() {
+    let (discovery, mut scans) = ControlledDiscovery::new(vec![local("1.0.0"), local("2.0.0")]);
+    let runtime = Arc::new(PluginRuntime::initialize(
+        PluginRegistry::initialize(
+            vec![],
+            Box::new(RecoveryPanicPersistence(AtomicUsize::new(0))),
+        ),
+        discovery.clone(),
+    ));
+    scans[0].release();
+    let error = runtime.get_catalog().await.unwrap_err();
+    scans[0].wait_started().await;
+    assert!(matches!(error, AppError::Internal(_)));
+    assert_eq!(
+        serde_json::to_value(error).unwrap(),
+        json!("内部错误: 插件目录请求暂不可用")
+    );
+    assert!(runtime.reload_gate.try_lock().is_ok());
+    let recovered = serde_json::to_value(runtime.get_catalog().await.unwrap()).unwrap();
+    assert_eq!(recovered["catalogGeneration"], "1");
+    assert_eq!(recovered["availability"], "available");
+    assert_eq!(discovery.calls.load(Ordering::SeqCst), 1);
+    scans[1].release();
+    assert_eq!(
+        runtime.reload_catalog().await.unwrap().catalog_generation,
+        "2"
+    );
+    scans[1].wait_started().await;
+    assert!(runtime.reload_gate.try_lock().is_ok());
+}
+
+// Catches a detached request retaining its gate or losing the attempted marker
+// after a post-discovery panic. No global logger or panic hook is changed.
+#[tokio::test]
+async fn cancelled_waiter_recovery_panic_releases_gate_and_remains_usable() {
+    let (discovery, mut scans) = ControlledDiscovery::new(vec![local("1.0.0"), local("2.0.0")]);
+    let runtime = Arc::new(PluginRuntime::initialize(
+        PluginRegistry::initialize(
+            vec![],
+            Box::new(RecoveryPanicPersistence(AtomicUsize::new(0))),
+        ),
+        discovery.clone(),
+    ));
+    let mut waiter = Box::pin(runtime.get_catalog());
+    assert!(futures_util::poll!(&mut waiter).is_pending());
+    scans[0].wait_started().await;
+    drop(waiter);
+    assert!(runtime.reload_gate.try_lock().is_err());
+    scans[0].release();
+    let finished = tokio::time::timeout(WATCHDOG, runtime.reload_gate.lock())
+        .await
+        .unwrap();
+    drop(finished);
+    assert_eq!(runtime.get_catalog().await.unwrap().catalog_generation, "1");
+    assert_eq!(discovery.calls.load(Ordering::SeqCst), 1);
+    scans[1].release();
+    assert_eq!(
+        runtime.reload_catalog().await.unwrap().catalog_generation,
+        "2"
+    );
+    scans[1].wait_started().await;
+}
