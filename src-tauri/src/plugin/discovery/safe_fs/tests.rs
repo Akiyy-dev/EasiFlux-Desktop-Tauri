@@ -127,6 +127,32 @@ fn manifest_directory_is_rejected() {
 }
 
 #[test]
+fn manifest_hard_link_to_outside_file_is_rejected() {
+    let f = Fixture::new();
+    let outside = Fixture::new();
+    let secret = outside.root().join("outside-manifest");
+    fs::write(&secret, b"outside bytes").unwrap();
+    let p = f.package(0, b"");
+    fs::remove_file(p.join("manifest.json")).unwrap();
+    fs::hard_link(&secret, p.join("manifest.json")).unwrap();
+
+    let result = f.scan().unwrap();
+    assert!(result.packages.is_empty());
+    assert_eq!(result.rejected_package_count, 1);
+    assert_eq!(fs::read(&secret).unwrap(), b"outside bytes");
+}
+
+#[test]
+fn ordinary_single_link_manifest_is_accepted() {
+    let f = Fixture::new();
+    f.package(0, b"single-link bytes");
+    let result = f.scan().unwrap();
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(result.packages[0].manifest_bytes, b"single-link bytes");
+    assert_eq!(result.rejected_package_count, 0);
+}
+
+#[test]
 fn manifest_at_16_kib_is_returned_as_unparsed_bytes() {
     let f = Fixture::new();
     let bytes = vec![0xff; 16 * 1024];
@@ -240,7 +266,21 @@ fn slots_are_sorted_deterministically() {
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, FileTypeExt};
+
+    fn create_fifo(path: &Path) {
+        // POSIX mkfifo is available on macOS too, unlike rustix 1.1.4's
+        // mknodat/mkfifoat. Pass the absolute fixture path as one argument,
+        // never through a shell, and fail the test if creation is unavailable.
+        assert!(path.is_absolute());
+        let output = std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(path)
+            .output()
+            .expect("POSIX mkfifo must be available for Unix security tests");
+        assert!(output.status.success(), "mkfifo failed: {output:?}");
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_fifo());
+    }
 
     #[test]
     fn root_intermediate_symlink_is_unavailable() {
@@ -288,14 +328,7 @@ mod unix {
         let p = f.package(0, b"");
         let manifest = p.join("manifest.json");
         fs::remove_file(&manifest).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &manifest,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-            0,
-        )
-        .unwrap();
+        create_fifo(&manifest);
         let root = f.root().to_owned();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {

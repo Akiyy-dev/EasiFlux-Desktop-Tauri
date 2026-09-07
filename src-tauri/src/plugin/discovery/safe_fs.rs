@@ -245,7 +245,9 @@ mod platform {
             .map_err(|_| ())?;
             // Do not read (or trust a pre-open type check) before this fstat.
             let metadata = fstat(&fd).map_err(|_| ())?;
-            if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+            if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+                || metadata.st_nlink != 1
+            {
                 return Err(());
             }
             Ok(File::from(fd))
@@ -258,10 +260,12 @@ mod platform {
     use super::*;
     use std::fs::{self, OpenOptions};
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
     use std::path::{PathBuf, Prefix};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_FLAG_SEQUENTIAL_SCAN, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     pub(super) fn is_reparse_point(attributes: u32) -> bool {
@@ -297,6 +301,13 @@ mod platform {
             .map_err(|_| ())?;
         let metadata = file.metadata().map_err(|_| ())?;
         if !metadata.is_file() || is_reparse_point(metadata.file_attributes()) {
+            return Err(());
+        }
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: file owns a live handle throughout the call; information is a
+        // valid, writable struct of the exact type required by this Win32 API.
+        let success = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+        if success == 0 || information.nNumberOfLinks != 1 {
             return Err(());
         }
         Ok(file)
