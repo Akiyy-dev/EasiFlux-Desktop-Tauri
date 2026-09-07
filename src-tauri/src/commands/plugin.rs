@@ -18,9 +18,10 @@ pub(crate) async fn set_plugin_enabled_from(
     registry: &RwLock<PluginRegistry>,
     id: &str,
     enabled: bool,
+    expected_catalog_generation: &str,
 ) -> AppResult<PluginCatalogMutationResult> {
     let mut registry = registry.write().await;
-    registry.set_enabled(id, enabled)
+    registry.set_enabled(id, enabled, expected_catalog_generation)
 }
 
 #[tauri::command]
@@ -33,8 +34,15 @@ pub async fn set_plugin_enabled(
     state: State<'_, AppState>,
     id: String,
     enabled: bool,
+    expected_catalog_generation: String,
 ) -> AppResult<PluginCatalogMutationResult> {
-    set_plugin_enabled_from(state.plugins.as_ref(), &id, enabled).await
+    set_plugin_enabled_from(
+        state.plugins.as_ref(),
+        &id,
+        enabled,
+        &expected_catalog_generation,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -179,13 +187,32 @@ mod tests {
         assert_eq!(persistence.0.lock().unwrap().loads, 2);
     }
 
+    // Catches a helper substituting the current generation for the caller's stale token.
+    #[tokio::test]
+    async fn mutation_command_rejects_stale_or_noncanonical_generation_without_storage_access() {
+        let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+        let registry = RwLock::new(persistence.registry(vec![manifest()]));
+        for generation in ["1", "00", "+0", "", "18446744073709551616"] {
+            let error = set_plugin_enabled_from(&registry, "com.easiflux.alpha", true, generation)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                serde_json::to_value(error).unwrap()["code"],
+                "plugin_catalog_stale"
+            );
+        }
+        assert_eq!(persistence.0.lock().unwrap().loads, 1);
+        assert!(persistence.0.lock().unwrap().saves.is_empty());
+        assert_eq!(registry.read().await.catalog_snapshot().revision, "0");
+    }
+
     // Catches bypassing the registry transaction or discarding its committed revision/item.
     #[tokio::test]
     async fn mutation_command_returns_the_persisted_registry_result() {
         let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
         let registry = RwLock::new(persistence.registry(vec![manifest()]));
 
-        let result = set_plugin_enabled_from(&registry, "com.easiflux.alpha", true)
+        let result = set_plugin_enabled_from(&registry, "com.easiflux.alpha", true, "0")
             .await
             .unwrap();
 

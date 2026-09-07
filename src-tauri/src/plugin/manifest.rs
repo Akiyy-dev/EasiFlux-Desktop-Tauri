@@ -204,6 +204,17 @@ pub struct LocalDiscoverySummary {
 }
 
 impl LocalDiscoverySummary {
+    pub(crate) fn with_additional_rejections(mut self, rejected: u32) -> Self {
+        if rejected != 0 && self.status != LocalDiscoveryStatus::Unavailable {
+            self.status = LocalDiscoveryStatus::Degraded;
+            self.rejected_package_count = self
+                .rejected_package_count
+                .saturating_add(rejected)
+                .min(256);
+        }
+        self
+    }
+
     pub fn available() -> Self {
         Self {
             status: LocalDiscoveryStatus::Available,
