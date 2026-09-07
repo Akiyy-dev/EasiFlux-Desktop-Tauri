@@ -483,6 +483,51 @@ fn sequential_changes_to_two_ids_retain_both_values() {
     }
 }
 
+// Catches flattening identity capacity into persistence failure or committing on rejection.
+#[test]
+fn capacity_exceeded_rejects_513th_identity_without_save_or_commit() {
+    assert_capacity_transaction_is_atomic(7);
+}
+
+#[test]
+fn capacity_exceeded_takes_precedence_over_revision_exhaustion() {
+    assert_capacity_transaction_is_atomic(u64::MAX);
+}
+
+fn assert_capacity_transaction_is_atomic(revision: u64) {
+    for requires_rewrite in [false, true] {
+        let original = PluginStateFileV2 {
+            schema_version: 2,
+            revision,
+            entries: (0..512)
+                .map(|n| entry(&format!("com.example.orphan{n}"), "com.easiflux", false))
+                .collect(),
+        };
+        let memory = MemoryPersistence::new(original.clone());
+        memory.0.lock().unwrap().loaded.requires_rewrite = requires_rewrite;
+        let mut registry = memory.registry_with_builtin();
+        let before = registry.catalog_snapshot();
+        assert_eq!(
+            error_code(registry.set_enabled("com.easiflux.alpha", true, "0")),
+            "plugin_state_capacity_exceeded"
+        );
+        assert_eq!(registry.catalog_snapshot(), before);
+        let Runtime::Available {
+            state,
+            requires_rewrite: marker,
+            ..
+        } = &registry.runtime
+        else {
+            panic!("capacity rejection must not disable the registry");
+        };
+        assert_eq!(state, &original);
+        assert_eq!(*marker, requires_rewrite);
+        let persisted = memory.0.lock().unwrap();
+        assert!(persisted.saves.is_empty());
+        assert_eq!(persisted.persisted, original);
+    }
+}
+
 // Catches overflowing a persisted u64 revision or saving the wrapped revision.
 #[test]
 fn exhausted_revision_refuses_changes_but_allows_idempotence() {

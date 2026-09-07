@@ -54,6 +54,27 @@ fn invalid_package_is_isolated_and_duplicate_ids_have_no_winner() {
     assert_eq!(outcome.summary, LocalDiscoverySummary::degraded(4).unwrap());
 }
 
+// Catches admitting frontend-blank display text or rejecting its valid sibling.
+#[test]
+fn feff_only_display_text_rejects_each_bad_package_without_poisoning_siblings() {
+    for field in ["name", "publisher", "description"] {
+        let mut bad: serde_json::Value =
+            serde_json::from_slice(&valid_manifest("com.example.bad")).unwrap();
+        bad[field] = serde_json::json!("\u{feff}");
+        let fixture = Fixture::new();
+        let outcome = parse_package_scan(fixture.scan(&[
+            serde_json::to_vec(&bad).unwrap(),
+            valid_manifest("com.example.good"),
+        ]));
+        assert_eq!(outcome.records.len(), 1, "blank {field} package survived");
+        assert_eq!(
+            outcome.records[0].manifest().id.as_str(),
+            "com.example.good"
+        );
+        assert_eq!(outcome.summary, LocalDiscoverySummary::degraded(1).unwrap());
+    }
+}
+
 // Catches parsing through a lossy Value/string intermediary or accepting reserved functionality.
 #[test]
 fn strict_package_errors_are_isolated_and_counted() {
@@ -120,11 +141,11 @@ fn each_discovery_resolves_again_and_root_failures_are_unavailable() {
         (n == 0).then(|| fixture.0.join("missing"))
     };
     assert_eq!(
-        discover_with_root(&resolve),
+        discover_with_root(resolve),
         LocalDiscoveryOutcome::available(vec![])
     );
     assert_eq!(
-        discover_with_root(&resolve),
+        discover_with_root(resolve),
         LocalDiscoveryOutcome::unavailable()
     );
     fs::write(fixture.0.join("file"), b"{}").unwrap();

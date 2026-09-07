@@ -78,6 +78,7 @@ mod tests {
     struct MemoryState {
         persisted: PluginStateFileV2,
         load_error: bool,
+        requires_rewrite: bool,
         loads: usize,
         saves: Vec<PluginStateFileV2>,
     }
@@ -87,6 +88,7 @@ mod tests {
             Self(Arc::new(Mutex::new(MemoryState {
                 persisted,
                 load_error: false,
+                requires_rewrite: false,
                 loads: 0,
                 saves: Vec::new(),
             })))
@@ -106,7 +108,7 @@ mod tests {
             }
             Ok(PluginStateLoad {
                 state: state.persisted.clone(),
-                requires_rewrite: false,
+                requires_rewrite: state.requires_rewrite,
             })
         }
 
@@ -232,6 +234,61 @@ mod tests {
             get_plugin_catalog_from(&registry).await.unwrap().revision,
             "0"
         );
+    }
+
+    // Catches losing the capacity code or transaction atomicity at the command boundary.
+    #[tokio::test]
+    async fn mutation_command_capacity_exceeded_preserves_transaction_and_rewrite() {
+        assert_capacity_command_is_atomic(7).await;
+    }
+
+    #[tokio::test]
+    async fn mutation_command_capacity_exceeded_precedes_revision_exhaustion() {
+        assert_capacity_command_is_atomic(u64::MAX).await;
+    }
+
+    async fn assert_capacity_command_is_atomic(revision: u64) {
+        let original = PluginStateFileV2 {
+            schema_version: 2,
+            revision,
+            entries: (0..512)
+                .map(|n| PluginStateEntryV2 {
+                    id: PluginId::parse(format!("com.example.orphan{n:03}")).unwrap(),
+                    enabled: false,
+                    ..enabled_entry()
+                })
+                .collect(),
+        };
+        let persistence = MemoryPersistence::new(original.clone());
+        persistence.0.lock().unwrap().requires_rewrite = true;
+        let mut retained = manifest();
+        retained.id = PluginId::parse("com.example.orphan000").unwrap();
+        let runtime = Arc::new(PluginRuntime::initialize(
+            persistence.registry(vec![manifest(), retained]),
+            Arc::new(FixedDiscovery(LocalDiscoveryOutcome::available(vec![]))),
+        ));
+        let before = get_plugin_catalog_from(&runtime).await.unwrap();
+        let error = set_plugin_enabled_from(&runtime, "com.easiflux.alpha", true, "1")
+            .await
+            .unwrap_err();
+        let error = serde_json::to_value(error).unwrap();
+        assert_eq!(error["code"], "plugin_state_capacity_exceeded");
+        assert_eq!(error.as_object().unwrap().len(), 2);
+        assert_eq!(get_plugin_catalog_from(&runtime).await.unwrap(), before);
+        {
+            let memory = persistence.0.lock().unwrap();
+            assert!(memory.saves.is_empty());
+            assert_eq!(memory.persisted, original);
+        }
+        // A same-value decision still rewrites after the failed transaction,
+        // proving the registry retained its rewrite marker, including at u64::MAX.
+        let rewritten = set_plugin_enabled_from(&runtime, "com.example.orphan000", false, "1")
+            .await
+            .unwrap();
+        assert_eq!(rewritten.revision, revision.to_string());
+        let memory = persistence.0.lock().unwrap();
+        assert_eq!(memory.saves, vec![original.clone()]);
+        assert_eq!(memory.persisted, original);
     }
 
     // Catches bypassing the registry transaction or discarding its committed revision/item.

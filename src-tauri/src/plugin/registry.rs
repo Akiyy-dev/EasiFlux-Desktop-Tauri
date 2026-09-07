@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::error::{AppError, AppResult};
 use crate::storage::plugin_state::{
     PluginStateEntryV2, PluginStateFileV2, PluginStatePersistence, PluginStateStore,
+    MAX_PLUGIN_STATE_ENTRIES,
 };
 
 use super::builtin::builtin_manifests;
@@ -103,8 +104,6 @@ impl PluginRegistry {
         self.catalog_generation
     }
 
-    // Task 5 wires this policy operation into the runtime's explicit discovery lifecycle.
-    #[allow(dead_code)]
     pub(crate) fn apply_local_discovery(
         &mut self,
         outcome: LocalDiscoveryOutcome,
@@ -245,6 +244,14 @@ impl PluginRegistry {
             approval_fingerprint: identity.approval_fingerprint,
             enabled,
         });
+        // Capacity is a distinct transaction outcome and must not be masked by
+        // revision exhaustion or flattened into a persistence failure.
+        if next.entries.len() > MAX_PLUGIN_STATE_ENTRIES {
+            return Err(plugin_error(
+                "plugin_state_capacity_exceeded",
+                "插件状态容量已达上限",
+            ));
+        }
         sort_state_entries(&mut next.entries);
         // Serialization order is not a logical decision. It may require a save,
         // like v1 migration, but must not consume a revision (even at u64::MAX).

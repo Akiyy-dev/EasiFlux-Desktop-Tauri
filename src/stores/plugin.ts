@@ -55,6 +55,7 @@ export const usePluginStore = defineStore('plugin', () => {
   let snapshotSequence = 0n
   let confirmedSnapshotRevision = 0n
   let confirmedSnapshotOrder = 0n
+  let latestAdoptedRequestOrder = 0n
   let mutationSequence = 0
   const mutationOwners = new Map<string, number>()
   const confirmedItemRevisions = new Map<string, bigint>()
@@ -94,6 +95,7 @@ export const usePluginStore = defineStore('plugin', () => {
       localDiscovery.value = snapshot.localDiscovery
       confirmedSnapshotRevision = snapshotRevision
       confirmedSnapshotOrder = requestOrder
+      if (requestOrder > latestAdoptedRequestOrder) latestAdoptedRequestOrder = requestOrder
       confirmedItemRevisions.clear()
       for (const plugin of snapshot.plugins) {
         confirmedItemRevisions.set(plugin.manifest.id, snapshotRevision)
@@ -112,6 +114,7 @@ export const usePluginStore = defineStore('plugin', () => {
     ) return
     confirmedSnapshotRevision = snapshotRevision
     confirmedSnapshotOrder = requestOrder
+    if (requestOrder > latestAdoptedRequestOrder) latestAdoptedRequestOrder = requestOrder
     const currentById = new Map(
       catalog.value.map((plugin) => [plugin.manifest.id, plugin] as const),
     )
@@ -173,6 +176,12 @@ export const usePluginStore = defineStore('plugin', () => {
         loadStatus.value = 'ready'
         loadError.value = null
       } catch (error) {
+        // Separate flights can settle out of order. Only an adopted newer
+        // snapshot supersedes this failure; an ignored response does not.
+        if (requestOrder < latestAdoptedRequestOrder) {
+          loadStatus.value = 'ready'
+          return
+        }
         loadError.value = pluginErrorMessage(error)
         loadStatus.value = hasConfirmedSnapshot ? 'ready' : 'error'
       }
@@ -209,6 +218,10 @@ export const usePluginStore = defineStore('plugin', () => {
         loadError.value = null
         reloadStatus.value = 'ready'
       } catch (error) {
+        if (requestOrder < latestAdoptedRequestOrder) {
+          reloadStatus.value = 'ready'
+          return
+        }
         reloadError.value = pluginErrorMessage(error)
         reloadStatus.value = 'error'
       }

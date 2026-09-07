@@ -109,7 +109,8 @@ function requireString(value: unknown): string {
 
 function requireDisplayText(value: unknown, maxBytes: number): string {
   const text = requireString(value)
-  if (text.trim().length === 0 || textEncoder.encode(text).byteLength > maxBytes) {
+  // Match Rust's Unicode whitespace policy plus U+FEFF, retaining trim's rejections.
+  if (/^[\p{White_Space}\uFEFF]*$/u.test(text) || textEncoder.encode(text).byteLength > maxBytes) {
     invalidResponse()
   }
   return text
@@ -250,6 +251,11 @@ function parseSnapshot(value: unknown): PluginCatalogSnapshot {
   const availability = parseAvailability(snapshot.availability)
   const availabilityReasonCode = parseReason(snapshot.availabilityReasonCode)
   const plugins = snapshot.plugins.map(parseCatalogItem)
+
+  if (
+    localDiscovery.status === 'unavailable'
+    && plugins.some((plugin) => plugin.source === 'localDeclarative')
+  ) invalidResponse()
 
   for (let index = 1; index < plugins.length; index += 1) {
     if (plugins[index - 1].manifest.id >= plugins[index].manifest.id) invalidResponse()

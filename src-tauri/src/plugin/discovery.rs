@@ -1,6 +1,3 @@
-// Runtime ownership and explicit reload wiring are introduced in Task 5.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 

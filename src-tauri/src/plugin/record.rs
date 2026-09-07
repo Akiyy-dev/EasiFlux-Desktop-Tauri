@@ -6,7 +6,6 @@ use crate::plugin::manifest::{
     PluginId, PluginManifestV1, PluginPublisherId, PluginSource, APPROVAL_FINGERPRINT_NONE,
 };
 
-#[allow(dead_code)]
 const LOCAL_FINGERPRINT_DOMAIN: &[u8] = b"EasiFlux.localDeclarative.manifest.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,7 +23,6 @@ pub(crate) struct PluginIdentity {
     pub(crate) approval_fingerprint: String,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CanonicalManifestV1<'a> {
@@ -65,7 +63,6 @@ impl PluginRecord {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn local_declarative(manifest: PluginManifestV1) -> Result<Self, String> {
         manifest.validate()?;
         let canonical = CanonicalManifestV1::from(&manifest);
@@ -89,7 +86,7 @@ impl PluginRecord {
         self.source
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn approval_fingerprint(&self) -> &str {
         &self.approval_fingerprint
     }

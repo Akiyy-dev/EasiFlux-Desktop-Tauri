@@ -56,6 +56,8 @@ fn parse_slot_name(name: &OsStr) -> Option<LocalPackageSlot> {
 }
 
 pub(super) struct PackageBytes {
+    // Retained only so tests can assert deterministic scan ordering.
+    #[cfg(test)]
     pub(super) slot: LocalPackageSlot,
     pub(super) manifest_bytes: Vec<u8>,
 }
@@ -155,6 +157,7 @@ pub(super) fn read_package_candidates(
         match read_bounded(&mut manifest, limits, &mut total) {
             Ok(manifest_bytes) if directory.check_shape().is_ok() => {
                 result.packages.push(PackageBytes {
+                    #[cfg(test)]
                     slot,
                     manifest_bytes,
                 });

@@ -173,7 +173,12 @@ impl PluginManifestV1 {
 }
 
 fn validate_display_text(label: &str, value: &str, max_length: usize) -> Result<(), String> {
-    if value.trim().is_empty() || value.len() > max_length {
+    // Shared with the frontend: Unicode White_Space plus ECMAScript's U+FEFF.
+    if value
+        .chars()
+        .all(|ch| ch.is_whitespace() || ch == '\u{feff}')
+        || value.len() > max_length
+    {
         return Err(format!(
             "plugin {label} must be non-blank and at most {max_length} bytes"
         ));
@@ -222,7 +227,6 @@ impl LocalDiscoverySummary {
         }
     }
 
-    #[allow(dead_code)]
     pub fn degraded(rejected_package_count: u32) -> Result<Self, String> {
         if !(1..=256).contains(&rejected_package_count) {
             return Err("degraded discovery count must be between 1 and 256".to_owned());
@@ -233,7 +237,6 @@ impl LocalDiscoverySummary {
         })
     }
 
-    #[allow(dead_code)]
     pub fn unavailable() -> Self {
         Self {
             status: LocalDiscoveryStatus::Unavailable,
@@ -514,6 +517,32 @@ mod tests {
         assert_eq!(manifest.publisher_id.as_str(), "com.easiflux");
         assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.version.to_string(), "1.2.3");
+    }
+
+    #[test]
+    fn manifest_rejects_feff_only_name() {
+        assert_blank_display_rejected("name");
+    }
+
+    #[test]
+    fn manifest_rejects_feff_only_publisher() {
+        assert_blank_display_rejected("publisher");
+    }
+
+    #[test]
+    fn manifest_rejects_feff_only_description() {
+        assert_blank_display_rejected("description");
+    }
+
+    fn assert_blank_display_rejected(field: &str) {
+        for blank in ["\u{feff}", " \u{feff}\t\u{85}\n"] {
+            let mut document: serde_json::Value = serde_json::from_str(VALID_MANIFEST).unwrap();
+            document[field] = serde_json::json!(blank);
+            assert!(
+                serde_json::from_value::<PluginManifestV1>(document).is_err(),
+                "{field} must reject whitespace and U+FEFF-only display text"
+            );
+        }
     }
 
     #[test]

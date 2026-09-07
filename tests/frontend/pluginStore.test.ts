@@ -246,6 +246,40 @@ describe('plugin store catalog generations', () => {
     await loading
     expect(store.loadStatus).toBe('ready')
     expect(store.catalogGeneration).toBe('2')
+    expect(store.loadError).toBeNull()
+  })
+
+  it.each(['load', 'reload'] as const)('ignores a late %s failure only after a newer snapshot is adopted', async (older) => {
+    const store = await loadedStore('4')
+    const response = deferred<PluginCatalogSnapshot>()
+    const olderService = older === 'load' ? serviceMocks.getCatalog : serviceMocks.reloadCatalog
+    const newerService = older === 'load' ? serviceMocks.reloadCatalog : serviceMocks.getCatalog
+    olderService.mockReturnValueOnce(response.promise)
+    const pending = older === 'load' ? store.retry() : store.reload()
+    const fresh = snapshot('4', [item('com.easiflux.alpha', 'enabled')])
+    newerService.mockResolvedValueOnce(fresh)
+    await (older === 'load' ? store.reload() : store.retry())
+    response.reject({ code: 'plugin_state_unavailable', message: 'private' })
+    await pending
+    expect(store.catalog).toEqual(fresh.plugins)
+    expect(store.loadError).toBeNull()
+    expect(store.reloadError).toBeNull()
+    expect(store.loadStatus).toBe('ready')
+    expect(store.reloadStatus).toBe('ready')
+  })
+
+  it('keeps current load failures when a later request returns an ignored older snapshot', async () => {
+    const store = await loadedStore('4')
+    const response = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(response.promise)
+    const pending = store.retry()
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('3'))
+    await store.reload()
+    response.reject({ code: 'plugin_state_unavailable', message: 'private' })
+    await pending
+    expect(store.revision).toBe('4')
+    expect(store.loadStatus).toBe('ready')
+    expect(store.loadError).toBe('插件状态暂不可用，请重试。')
   })
 
   it('retains confirmed catalog on stale reload failure and only retries explicitly', async () => {

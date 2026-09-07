@@ -73,6 +73,9 @@ const availabilityMessage = computed(() => {
   }
   return '插件状态子系统暂时不可用，插件启停已暂停。'
 })
+const localDiscoveryMessage = computed(() => store.availability === 'available'
+  ? '本地插件发现暂时不可用，内置插件仍可使用。请重新扫描本地插件。'
+  : '本地插件发现暂时不可用，请重新扫描本地插件。')
 
 function eventValue(event: unknown): string | null {
   const value = (event as { target?: { value?: unknown } }).target?.value
@@ -186,7 +189,7 @@ onMounted(() => {
         data-testid="plugin-local-discovery-alert"
         role="alert"
       >
-        本地插件发现暂时不可用，请重新扫描本地插件。
+        {{ localDiscoveryMessage }}
       </div>
 
       <div

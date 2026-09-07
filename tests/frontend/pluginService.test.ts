@@ -157,6 +157,37 @@ describe('plugin service transport validation', () => {
     await expect(getPluginCatalog()).resolves.toEqual(snapshot)
   })
 
+  describe.each([
+    ['get', getPluginCatalog],
+    ['reload', reloadPluginCatalog],
+  ] as const)('%s local discovery consistency', (_command, request) => {
+    it.each(['available', 'unavailable'])('rejects local records with unavailable discovery when state is %s', async (availability) => {
+      const snapshot = availability === 'available' ? validSnapshot() : unavailableSnapshot()
+      snapshot.localDiscovery = { status: 'unavailable', rejectedPackageCount: 0 }
+      firstItem(snapshot).source = 'localDeclarative'
+      vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
+      await expect(request()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+    })
+
+    it.each(['available', 'unavailable'])('permits only built-ins with unavailable discovery when state is %s', async (availability) => {
+      const snapshot = availability === 'available' ? validSnapshot() : unavailableSnapshot()
+      snapshot.localDiscovery = { status: 'unavailable', rejectedPackageCount: 0 }
+      vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
+      await expect(request()).resolves.toEqual(snapshot)
+    })
+
+    it.each([
+      { status: 'available', rejectedPackageCount: 0 },
+      { status: 'degraded', rejectedPackageCount: 1 },
+    ])('preserves discovered locals when state is unavailable and discovery is %j', async (summary) => {
+      const snapshot = unavailableSnapshot()
+      snapshot.localDiscovery = summary
+      firstItem(snapshot).source = 'localDeclarative'
+      vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
+      await expect(request()).resolves.toEqual(snapshot)
+    })
+  })
+
   it.each([
     null, [], {},
     { status: 'unknown', rejectedPackageCount: 0 },
@@ -390,6 +421,17 @@ describe('plugin service transport validation', () => {
     const snapshot = validSnapshot()
     manifestFromItem(firstItem(snapshot))[field] = invalid
     await expectCatalogRejected(snapshot)
+  })
+
+  it.each(['name', 'publisher', 'description'])('rejects Unicode whitespace and U+FEFF-only %s in get and reload', async (field) => {
+    for (const blank of ['\uFEFF', ' \uFEFF\t\u0085\n', '\u0085']) {
+      const snapshot = validSnapshot()
+      manifestFromItem(firstItem(snapshot))[field] = blank
+      for (const request of [getPluginCatalog, reloadPluginCatalog]) {
+        vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
+        await expect(request()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+      }
+    }
   })
 
   it.each([

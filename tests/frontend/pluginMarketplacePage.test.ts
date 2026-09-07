@@ -233,9 +233,46 @@ describe('PluginMarketplacePage local discovery', () => {
     const notice = wrapper.find('[data-testid="plugin-local-discovery-alert"]')
     expect(notice.exists()).toBe(true)
     expect(notice.attributes('role')).toBe('alert')
-    expect(notice.text()).toBe('本地插件发现暂时不可用，请重新扫描本地插件。')
+    expect(notice.text()).toContain('本地插件发现暂时不可用')
+    expect(notice.text()).toContain('内置插件仍可使用')
+    expect(notice.text()).toContain('请重新扫描本地插件')
     expect(wrapper.find('[data-testid="plugin-availability-alert"]').exists()).toBe(false)
     expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+  })
+
+  it('does not promise usable built-ins during simultaneous state and discovery failure', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...unavailableSnapshot([pluginItem('com.easiflux.alpha', 'Alpha 研究', 'blocked')]),
+      localDiscovery: { status: 'unavailable', rejectedPackageCount: 0 },
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+    const notice = wrapper.get('[data-testid="plugin-local-discovery-alert"]')
+    expect(notice.text()).toContain('本地插件发现暂时不可用')
+    expect(notice.text()).not.toContain('内置插件仍可使用')
+    expect(wrapper.get('[data-testid="plugin-availability-alert"]').text()).toContain('插件启停已暂停')
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(2)
+    wrapper.unmount()
+  })
+
+  it('never reinstates a stale load alert after a newer reload has recovered the page', async () => {
+    const initial = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(initial.promise)
+    const wrapper = mountPage()
+    const store = usePluginStore()
+    // A separate caller can explicitly reload while the initial page load is pending.
+    serviceMocks.reloadCatalog.mockResolvedValueOnce({ ...availableSnapshot(), catalogGeneration: '2' })
+    await store.reload()
+    await flushPromises()
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+    initial.reject({ code: 'plugin_state_unavailable', message: 'private-path' })
+    await flushPromises()
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+    expect(store.loadError).toBeNull()
+    expect(store.loadStatus).toBe('ready')
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+    expect(wrapper.get<HTMLButtonElement>('header button').element.disabled).toBe(false)
+    wrapper.unmount()
   })
 
   it('preserves confirmed catalog and discovery on reload failure without exposing raw errors', async () => {
