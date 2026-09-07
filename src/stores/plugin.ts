@@ -18,6 +18,21 @@ import type {
 export type PluginLoadStatus = 'idle' | 'loading' | 'ready' | 'error'
 export type PluginStatusFilter = 'all' | PluginStatus
 
+function hasSameImmutableContent(current: PluginCatalogItem, returned: PluginCatalogItem): boolean {
+  const currentFields = Object.entries(current.manifest)
+  return current.source === returned.source
+    && currentFields.length === Object.keys(returned.manifest).length
+    && currentFields.every(([key, value]) => (
+      Object.prototype.hasOwnProperty.call(returned.manifest, key)
+      // Strictly parsed v1 values are scalars or empty arrays. Compare each field
+      // independently so equivalent manifest key insertion orders do not matter.
+      && JSON.stringify(value) === JSON.stringify(
+        returned.manifest[key as keyof PluginCatalogItem['manifest']],
+      )
+    ))
+    && JSON.stringify(current.grantedCapabilities) === JSON.stringify(returned.grantedCapabilities)
+}
+
 export const usePluginStore = defineStore('plugin', () => {
   const catalog = ref<PluginCatalogItem[]>([])
   const revision = ref('0')
@@ -37,6 +52,9 @@ export const usePluginStore = defineStore('plugin', () => {
   let loadFlight: Promise<void> | null = null
   let reloadFlight: Promise<void> | null = null
   let hasConfirmedSnapshot = false
+  let snapshotSequence = 0n
+  let confirmedSnapshotRevision = 0n
+  let confirmedSnapshotOrder = 0n
   let mutationSequence = 0
   const mutationOwners = new Map<string, number>()
   const confirmedItemRevisions = new Map<string, bigint>()
@@ -61,9 +79,10 @@ export const usePluginStore = defineStore('plugin', () => {
     if (BigInt(nextRevision) > BigInt(revision.value)) revision.value = nextRevision
   }
 
-  function adoptSnapshot(snapshot: PluginCatalogSnapshot): void {
+  function adoptSnapshot(snapshot: PluginCatalogSnapshot, requestOrder: bigint): void {
     const nextGeneration = BigInt(snapshot.catalogGeneration)
     const currentGeneration = BigInt(catalogGeneration.value)
+    const snapshotRevision = BigInt(snapshot.revision)
     if (nextGeneration < currentGeneration) return
     if (nextGeneration > currentGeneration || !hasConfirmedSnapshot) {
       // Membership and content identity belong to the generation, not the state revision.
@@ -73,9 +92,11 @@ export const usePluginStore = defineStore('plugin', () => {
       availability.value = snapshot.availability
       availabilityReasonCode.value = snapshot.availabilityReasonCode
       localDiscovery.value = snapshot.localDiscovery
+      confirmedSnapshotRevision = snapshotRevision
+      confirmedSnapshotOrder = requestOrder
       confirmedItemRevisions.clear()
       for (const plugin of snapshot.plugins) {
-        confirmedItemRevisions.set(plugin.manifest.id, BigInt(snapshot.revision))
+        confirmedItemRevisions.set(plugin.manifest.id, snapshotRevision)
       }
       mutationOwners.clear()
       pendingIds.value = new Set()
@@ -83,7 +104,14 @@ export const usePluginStore = defineStore('plugin', () => {
       return
     }
 
-    const snapshotRevision = BigInt(snapshot.revision)
+    // A full snapshot confirms every item at least at its revision. Compare against
+    // that confirmation, not the global revision that unrelated mutations can advance.
+    if (
+      snapshotRevision < confirmedSnapshotRevision
+      || (snapshotRevision === confirmedSnapshotRevision && requestOrder < confirmedSnapshotOrder)
+    ) return
+    confirmedSnapshotRevision = snapshotRevision
+    confirmedSnapshotOrder = requestOrder
     const currentById = new Map(
       catalog.value.map((plugin) => [plugin.manifest.id, plugin] as const),
     )
@@ -133,13 +161,14 @@ export const usePluginStore = defineStore('plugin', () => {
   }
 
   function beginLoad(): Promise<void> {
+    const requestOrder = ++snapshotSequence
     loadStatus.value = 'loading'
     loadError.value = null
 
     const request = (async () => {
       try {
         const snapshot = await getPluginCatalog()
-        adoptSnapshot(snapshot)
+        adoptSnapshot(snapshot, requestOrder)
         hasConfirmedSnapshot = true
         loadStatus.value = 'ready'
         loadError.value = null
@@ -168,12 +197,13 @@ export const usePluginStore = defineStore('plugin', () => {
 
   function reload(): Promise<void> {
     if (reloadFlight) return reloadFlight
+    const requestOrder = ++snapshotSequence
     reloadStatus.value = 'loading'
     reloadError.value = null
     const request = (async () => {
       try {
         const snapshot = await reloadPluginCatalog()
-        adoptSnapshot(snapshot)
+        adoptSnapshot(snapshot, requestOrder)
         hasConfirmedSnapshot = true
         loadStatus.value = 'ready'
         loadError.value = null
@@ -236,6 +266,7 @@ export const usePluginStore = defineStore('plugin', () => {
       if (
         itemIndex === -1
         || (confirmedRevision !== undefined && resultRevision < confirmedRevision)
+        || !hasSameImmutableContent(catalog.value[itemIndex], result.plugin)
       ) return false
       catalog.value = catalog.value.map((plugin, index) => (
         index === itemIndex ? result.plugin : plugin
