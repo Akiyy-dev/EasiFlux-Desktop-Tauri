@@ -281,7 +281,9 @@ mod tests {
         NotificationFileV1, NotificationPartition, NotificationSourceEventIndexEntry,
         NotificationStore,
     };
-    use crate::storage::plugin_state::{PluginStateFileV1, PluginStatePersistence};
+    use crate::storage::plugin_state::{
+        PluginStateFileV2, PluginStateLoad, PluginStatePersistence,
+    };
 
     use super::{
         configured_notification_accounts, initialize_notification_runtime,
@@ -297,7 +299,7 @@ mod tests {
     }
 
     impl PluginStatePersistence for RetryableStoreResolver {
-        fn load(&self) -> AppResult<PluginStateFileV1> {
+        fn load(&self) -> AppResult<PluginStateLoad> {
             let mut state = self.0.lock().unwrap();
             state.resolutions += 1;
             if state.unavailable {
@@ -307,11 +309,14 @@ mod tests {
                     diagnostic: Some("private config path".into()),
                 })
             } else {
-                Ok(PluginStateFileV1::empty())
+                Ok(PluginStateLoad {
+                    state: PluginStateFileV2::empty(),
+                    requires_rewrite: false,
+                })
             }
         }
 
-        fn save(&self, _state: &PluginStateFileV1) -> AppResult<()> {
+        fn save(&self, _state: &PluginStateFileV2) -> AppResult<()> {
             Ok(())
         }
     }

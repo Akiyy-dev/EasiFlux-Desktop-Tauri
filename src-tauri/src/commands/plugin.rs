@@ -47,21 +47,21 @@ mod tests {
     use crate::error::AppError;
     use crate::plugin::manifest::{PluginId, PluginManifestV1, PluginPublisherId, PluginSource};
     use crate::storage::plugin_state::{
-        PluginStateEntryV1, PluginStateFileV1, PluginStatePersistence,
+        PluginStateEntryV2, PluginStateFileV2, PluginStateLoad, PluginStatePersistence,
     };
 
     #[derive(Clone)]
     struct MemoryPersistence(Arc<Mutex<MemoryState>>);
 
     struct MemoryState {
-        persisted: PluginStateFileV1,
+        persisted: PluginStateFileV2,
         load_error: bool,
         loads: usize,
-        saves: Vec<PluginStateFileV1>,
+        saves: Vec<PluginStateFileV2>,
     }
 
     impl MemoryPersistence {
-        fn new(persisted: PluginStateFileV1) -> Self {
+        fn new(persisted: PluginStateFileV2) -> Self {
             Self(Arc::new(Mutex::new(MemoryState {
                 persisted,
                 load_error: false,
@@ -76,16 +76,19 @@ mod tests {
     }
 
     impl PluginStatePersistence for MemoryPersistence {
-        fn load(&self) -> AppResult<PluginStateFileV1> {
+        fn load(&self) -> AppResult<PluginStateLoad> {
             let mut state = self.0.lock().unwrap();
             state.loads += 1;
             if state.load_error {
                 return Err(storage_error());
             }
-            Ok(state.persisted.clone())
+            Ok(PluginStateLoad {
+                state: state.persisted.clone(),
+                requires_rewrite: false,
+            })
         }
 
-        fn save(&self, next: &PluginStateFileV1) -> AppResult<()> {
+        fn save(&self, next: &PluginStateFileV2) -> AppResult<()> {
             let mut state = self.0.lock().unwrap();
             state.saves.push(next.clone());
             state.persisted = next.clone();
@@ -116,8 +119,8 @@ mod tests {
         .unwrap()
     }
 
-    fn enabled_entry() -> PluginStateEntryV1 {
-        PluginStateEntryV1 {
+    fn enabled_entry() -> PluginStateEntryV2 {
+        PluginStateEntryV2 {
             id: PluginId::parse("com.easiflux.alpha").unwrap(),
             source: PluginSource::BuiltIn,
             publisher_id: PluginPublisherId::parse("com.easiflux").unwrap(),
@@ -129,8 +132,8 @@ mod tests {
     // Catches returning the stale unavailable snapshot without asking persistence again.
     #[tokio::test]
     async fn catalog_command_retries_unavailable_state_before_snapshotting() {
-        let persistence = MemoryPersistence::new(PluginStateFileV1 {
-            schema_version: 1,
+        let persistence = MemoryPersistence::new(PluginStateFileV2 {
+            schema_version: 2,
             revision: 7,
             entries: vec![enabled_entry()],
         });
@@ -179,7 +182,7 @@ mod tests {
     // Catches bypassing the registry transaction or discarding its committed revision/item.
     #[tokio::test]
     async fn mutation_command_returns_the_persisted_registry_result() {
-        let persistence = MemoryPersistence::new(PluginStateFileV1::empty());
+        let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
         let registry = RwLock::new(persistence.registry(vec![manifest()]));
 
         let result = set_plugin_enabled_from(&registry, "com.easiflux.alpha", true)

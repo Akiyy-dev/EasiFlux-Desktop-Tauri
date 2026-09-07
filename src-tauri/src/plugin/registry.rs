@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::{AppError, AppResult};
 use crate::storage::plugin_state::{
-    PluginStateEntryV1, PluginStateFileV1, PluginStatePersistence, PluginStateStore,
+    PluginStateEntryV2, PluginStateFileV2, PluginStatePersistence, PluginStateStore,
 };
 
 use super::builtin::builtin_manifests;
@@ -15,7 +15,8 @@ use super::record::PluginRecord;
 
 enum Runtime {
     Available {
-        state: PluginStateFileV1,
+        state: PluginStateFileV2,
+        requires_rewrite: bool,
         persistence: Arc<dyn PluginStatePersistence>,
     },
     Unavailable {
@@ -34,11 +35,11 @@ pub struct PluginRegistry {
 struct SystemPersistence;
 
 impl PluginStatePersistence for SystemPersistence {
-    fn load(&self) -> AppResult<PluginStateFileV1> {
+    fn load(&self) -> AppResult<crate::storage::plugin_state::PluginStateLoad> {
         PluginStateStore::try_new()?.load()
     }
 
-    fn save(&self, state: &PluginStateFileV1) -> AppResult<()> {
+    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
         PluginStateStore::try_new()?.save(state)
     }
 }
@@ -129,9 +130,10 @@ impl PluginRegistry {
             return;
         };
         match persistence.load() {
-            Ok(state) if state.validate().is_ok() => {
+            Ok(loaded) if loaded.state.validate().is_ok() => {
                 self.runtime = Runtime::Available {
-                    state,
+                    state: loaded.state,
+                    requires_rewrite: loaded.requires_rewrite,
                     persistence: Arc::clone(persistence),
                 };
             }
@@ -162,7 +164,12 @@ impl PluginRegistry {
             .manifests
             .get(&id)
             .ok_or_else(|| plugin_error("plugin_not_found", "插件不存在"))?;
-        let Runtime::Available { state, persistence } = &mut self.runtime else {
+        let Runtime::Available {
+            state,
+            requires_rewrite,
+            persistence,
+        } = &mut self.runtime
+        else {
             return Err(plugin_error(
                 "plugin_state_unavailable",
                 "插件状态存储暂不可用",
@@ -170,38 +177,44 @@ impl PluginRegistry {
         };
         // Every valid phase-0 built-in is toggleable; unavailable items were
         // rejected above. No executable activation or capability grants occur.
-        if is_enabled(state, record) == enabled {
+        if is_enabled(state, record) == enabled && !*requires_rewrite {
             return Ok(PluginCatalogMutationResult::new(
                 state.revision.to_string(),
                 "0".to_owned(),
                 catalog_item(record, enabled),
             ));
         }
+        let decision_changed = is_enabled(state, record) != enabled;
         let mut next = state.clone();
-        next.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| plugin_error("plugin_revision_exhausted", "插件状态版本已达上限"))?;
-        if let Some(entry) = next
-            .entries
-            .iter_mut()
-            .find(|entry| matches_identity(entry, record))
-        {
-            entry.enabled = enabled;
-        } else {
-            let identity = record.identity();
-            next.entries.push(PluginStateEntryV1 {
-                id: identity.id,
-                source: identity.source,
-                publisher_id: identity.publisher_id,
-                approval_fingerprint: identity.approval_fingerprint,
-                enabled,
-            });
+        if decision_changed {
+            next.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| plugin_error("plugin_revision_exhausted", "插件状态版本已达上限"))?;
+            if let Some(entry) = next
+                .entries
+                .iter_mut()
+                .find(|entry| matches_identity(entry, record))
+            {
+                entry.enabled = enabled;
+            } else {
+                let identity = record.identity();
+                next.entries.push(PluginStateEntryV2 {
+                    id: identity.id,
+                    source: identity.source,
+                    publisher_id: identity.publisher_id,
+                    approval_fingerprint: identity.approval_fingerprint,
+                    enabled,
+                });
+            }
         }
+        next.validate_for_persistence()
+            .map_err(|_| plugin_error("plugin_state_persist_failed", "插件状态保存失败"))?;
         persistence
             .save(&next)
             .map_err(|_| plugin_error("plugin_state_persist_failed", "插件状态保存失败"))?;
         *state = next;
+        *requires_rewrite = false;
         Ok(PluginCatalogMutationResult::new(
             state.revision.to_string(),
             "0".to_owned(),
@@ -210,7 +223,7 @@ impl PluginRegistry {
     }
 }
 
-fn matches_identity(entry: &PluginStateEntryV1, record: &PluginRecord) -> bool {
+fn matches_identity(entry: &PluginStateEntryV2, record: &PluginRecord) -> bool {
     let identity = record.identity();
     entry.id == identity.id
         && entry.source == identity.source
@@ -218,7 +231,7 @@ fn matches_identity(entry: &PluginStateEntryV1, record: &PluginRecord) -> bool {
         && entry.approval_fingerprint == identity.approval_fingerprint
 }
 
-fn is_enabled(state: &PluginStateFileV1, record: &PluginRecord) -> bool {
+fn is_enabled(state: &PluginStateFileV2, record: &PluginRecord) -> bool {
     state
         .entries
         .iter()

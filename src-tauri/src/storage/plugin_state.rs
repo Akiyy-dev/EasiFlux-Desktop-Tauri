@@ -17,16 +17,16 @@ pub(crate) const MAX_PLUGIN_STATE_ENTRIES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PluginStateFileV1 {
+pub(crate) struct PluginStateFileV2 {
     pub schema_version: u32,
     #[serde(with = "decimal_revision")]
     pub revision: u64,
-    pub entries: Vec<PluginStateEntryV1>,
+    pub entries: Vec<PluginStateEntryV2>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PluginStateEntryV1 {
+pub(crate) struct PluginStateEntryV2 {
     pub id: PluginId,
     pub source: PluginSource,
     pub publisher_id: PluginPublisherId,
@@ -36,7 +36,7 @@ pub(crate) struct PluginStateEntryV1 {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StateEntryWire {
+struct PluginStateEntryV2Dto {
     id: PluginId,
     source: PluginSource,
     publisher_id: PluginPublisherId,
@@ -44,49 +44,228 @@ struct StateEntryWire {
     enabled: bool,
 }
 
-impl<'de> Deserialize<'de> for PluginStateEntryV1 {
+impl<'de> Deserialize<'de> for PluginStateEntryV2 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct EntryVisitor;
-
         impl<'de> serde::de::Visitor<'de> for EntryVisitor {
-            type Value = PluginStateEntryV1;
-
+            type Value = PluginStateEntryV2;
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("a plugin state entry object")
             }
-
             fn visit_map<M: serde::de::MapAccess<'de>>(
                 self,
                 map: M,
             ) -> Result<Self::Value, M::Error> {
-                let wire =
-                    StateEntryWire::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
-                Ok(PluginStateEntryV1 {
-                    id: wire.id,
-                    source: wire.source,
-                    publisher_id: wire.publisher_id,
-                    approval_fingerprint: wire.approval_fingerprint,
-                    enabled: wire.enabled,
+                let dto = PluginStateEntryV2Dto::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(PluginStateEntryV2 {
+                    id: dto.id,
+                    source: dto.source,
+                    publisher_id: dto.publisher_id,
+                    approval_fingerprint: dto.approval_fingerprint,
+                    enabled: dto.enabled,
                 })
             }
         }
-
-        // Derived struct visitors also accept positional arrays. Constrain the
-        // representation before delegating strict field checks to the wire DTO.
         deserializer.deserialize_map(EntryVisitor)
     }
 }
 
-impl PluginStateFileV1 {
-    pub fn empty() -> Self {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginStateFileV2Dto {
+    schema_version: u32,
+    #[serde(with = "decimal_revision")]
+    revision: u64,
+    entries: Vec<PluginStateEntryV2>,
+}
+
+impl<'de> Deserialize<'de> for PluginStateFileV2 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FileVisitor;
+        impl<'de> serde::de::Visitor<'de> for FileVisitor {
+            type Value = PluginStateFileV2;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a plugin state object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let dto = PluginStateFileV2Dto::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                let state = PluginStateFileV2 {
+                    schema_version: dto.schema_version,
+                    revision: dto.revision,
+                    entries: dto.entries,
+                };
+                state.validate().map_err(serde::de::Error::custom)?;
+                Ok(state)
+            }
+        }
+        deserializer.deserialize_map(FileVisitor)
+    }
+}
+
+impl PluginStateFileV2 {
+    pub(crate) fn empty() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             revision: 0,
             entries: Vec::new(),
         }
     }
 
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 2 {
+            return Err("unsupported state schema");
+        }
+        if self.entries.len() > MAX_PLUGIN_STATE_ENTRIES {
+            return Err("too many state entries");
+        }
+        let mut identities = BTreeSet::new();
+        for entry in &self.entries {
+            if !valid_fingerprint(entry.source, &entry.approval_fingerprint) {
+                return Err("invalid state trust identity");
+            }
+            if !identities.insert((
+                entry.id.clone(),
+                entry.source,
+                entry.publisher_id.clone(),
+                entry.approval_fingerprint.clone(),
+            )) {
+                return Err("duplicate state trust identity");
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_for_persistence(&self) -> Result<(), &'static str> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|_| "state serialization failed")?;
+        if bytes.len() > MAX_PLUGIN_STATE_BYTES {
+            return Err("state exceeds byte limit");
+        }
+        Ok(())
+    }
+}
+
+fn valid_fingerprint(source: PluginSource, fingerprint: &str) -> bool {
+    match source {
+        PluginSource::BuiltIn => fingerprint == APPROVAL_FINGERPRINT_NONE,
+        PluginSource::LocalDeclarative => {
+            fingerprint
+                .strip_prefix("v1:sha256:")
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+enum PluginStateV1Source {
+    BuiltIn,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginStateEntryV1Dto {
+    id: PluginId,
+    source: PluginStateV1Source,
+    publisher_id: PluginPublisherId,
+    approval_fingerprint: String,
+    enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PluginStateEntryV1Wire {
+    id: PluginId,
+    publisher_id: PluginPublisherId,
+    approval_fingerprint: String,
+    enabled: bool,
+}
+
+impl<'de> Deserialize<'de> for PluginStateEntryV1Wire {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntryVisitor;
+        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
+            type Value = PluginStateEntryV1Wire;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a plugin state v1 entry object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let dto = PluginStateEntryV1Dto::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                let PluginStateV1Source::BuiltIn = dto.source;
+                Ok(PluginStateEntryV1Wire {
+                    id: dto.id,
+                    publisher_id: dto.publisher_id,
+                    approval_fingerprint: dto.approval_fingerprint,
+                    enabled: dto.enabled,
+                })
+            }
+        }
+        deserializer.deserialize_map(EntryVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginStateFileV1Dto {
+    schema_version: u32,
+    #[serde(with = "decimal_revision")]
+    revision: u64,
+    entries: Vec<PluginStateEntryV1Wire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PluginStateFileV1Wire {
+    schema_version: u32,
+    revision: u64,
+    entries: Vec<PluginStateEntryV1Wire>,
+}
+
+impl<'de> Deserialize<'de> for PluginStateFileV1Wire {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FileVisitor;
+        impl<'de> serde::de::Visitor<'de> for FileVisitor {
+            type Value = PluginStateFileV1Wire;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a plugin state v1 object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let dto = PluginStateFileV1Dto::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                let state = PluginStateFileV1Wire {
+                    schema_version: dto.schema_version,
+                    revision: dto.revision,
+                    entries: dto.entries,
+                };
+                state.validate().map_err(serde::de::Error::custom)?;
+                Ok(state)
+            }
+        }
+        deserializer.deserialize_map(FileVisitor)
+    }
+}
+
+impl PluginStateFileV1Wire {
+    fn validate(&self) -> Result<(), &'static str> {
         if self.schema_version != 1 {
             return Err("unsupported state schema");
         }
@@ -95,52 +274,40 @@ impl PluginStateFileV1 {
         }
         let mut identities = BTreeSet::new();
         for entry in &self.entries {
-            // Both identifier types can only be constructed through validated
-            // parsing. Phase 0 accepts no external source or approval token.
-            if entry.source != PluginSource::BuiltIn
-                || entry.approval_fingerprint != APPROVAL_FINGERPRINT_NONE
-            {
+            if entry.approval_fingerprint != APPROVAL_FINGERPRINT_NONE {
                 return Err("invalid state trust identity");
             }
-            // Source and fingerprint are fixed by v1. They are therefore implicit
-            // in this tuple; a new source requires a schema migration, not a cast.
             if !identities.insert((&entry.id, &entry.publisher_id)) {
                 return Err("duplicate state trust identity");
             }
         }
         Ok(())
     }
-}
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StateWire {
-    schema_version: u32,
-    #[serde(with = "decimal_revision")]
-    revision: u64,
-    entries: Vec<PluginStateEntryV1>,
-}
-
-impl<'de> Deserialize<'de> for PluginStateFileV1 {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = StateWire::deserialize(deserializer)?;
-        let state = Self {
-            schema_version: wire.schema_version,
-            revision: wire.revision,
-            entries: wire.entries,
-        };
-        state.validate().map_err(serde::de::Error::custom)?;
-        Ok(state)
+    fn migrate(self) -> PluginStateFileV2 {
+        PluginStateFileV2 {
+            schema_version: 2,
+            revision: self.revision,
+            entries: self
+                .entries
+                .into_iter()
+                .map(|entry| PluginStateEntryV2 {
+                    id: entry.id,
+                    source: PluginSource::BuiltIn,
+                    publisher_id: entry.publisher_id,
+                    approval_fingerprint: entry.approval_fingerprint,
+                    enabled: entry.enabled,
+                })
+                .collect(),
+        }
     }
 }
 
 mod decimal_revision {
     use serde::{Deserialize, Deserializer, Serializer};
-
     pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&value.to_string())
     }
-
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
         let value = String::deserialize(deserializer)?;
         if value.is_empty()
@@ -155,23 +322,16 @@ mod decimal_revision {
     }
 }
 
-/// Inspect only a top-level schema field while still validating the entire JSON
-/// envelope. serde_json skips IgnoredAny values with an iterative stack, so an
-/// unknown future layout does not hit Value deserialization's recursion limit.
-/// The caller has already bounded the bytes, which also bounds the skip stack.
+/// Inspects only schemaVersion without materializing a future layout.
 struct StateSchema(u64);
-
 impl<'de> Deserialize<'de> for StateSchema {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct SchemaVisitor;
-
         impl<'de> serde::de::Visitor<'de> for SchemaVisitor {
             type Value = StateSchema;
-
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("a state object with one integer schemaVersion")
             }
-
             fn visit_map<M: serde::de::MapAccess<'de>>(
                 self,
                 mut map: M,
@@ -192,16 +352,19 @@ impl<'de> Deserialize<'de> for StateSchema {
                     .ok_or_else(|| serde::de::Error::missing_field("schemaVersion"))
             }
         }
-
-        // deserialize_map deliberately rejects positional arrays, unlike a
-        // derived struct visitor that may also implement visit_seq.
         deserializer.deserialize_map(SchemaVisitor)
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PluginStateLoad {
+    pub(crate) state: PluginStateFileV2,
+    pub(crate) requires_rewrite: bool,
+}
+
 pub(crate) trait PluginStatePersistence: Send + Sync {
-    fn load(&self) -> AppResult<PluginStateFileV1>;
-    fn save(&self, state: &PluginStateFileV1) -> AppResult<()>;
+    fn load(&self) -> AppResult<PluginStateLoad>;
+    fn save(&self, state: &PluginStateFileV2) -> AppResult<()>;
 }
 
 pub(crate) struct PluginStateStore {
@@ -216,7 +379,6 @@ impl PluginStateStore {
             config_dir.join(APP_NAME).join("plugins").join("state.json"),
         ))
     }
-
     fn with_path(path: PathBuf) -> Self {
         Self {
             file: AtomicFile::new(path),
@@ -224,7 +386,7 @@ impl PluginStateStore {
         }
     }
 
-    fn load_locked(&self) -> AppResult<Option<PluginStateFileV1>> {
+    fn load_locked(&self) -> AppResult<Option<PluginStateLoad>> {
         let mut invalid = false;
         for (index, path) in [&self.file.main, &self.file.temp(), &self.file.backup()]
             .into_iter()
@@ -232,19 +394,13 @@ impl PluginStateStore {
         {
             let bytes = match read_bounded(path, MAX_PLUGIN_STATE_BYTES).map_err(io_error)? {
                 CandidateBytes::Missing => continue,
-                CandidateBytes::Oversized if index == 0 => {
-                    // We cannot safely identify an oversized main's schema
-                    // without parsing beyond the bound. Never downgrade it.
-                    return Err(unavailable());
-                }
+                CandidateBytes::Oversized if index == 0 => return Err(unavailable()),
                 CandidateBytes::Oversized => {
                     invalid = true;
                     continue;
                 }
                 CandidateBytes::Bounded(bytes) => bytes,
             };
-            // from_slice also checks trailing data. Never interpret a malformed
-            // or duplicate schema header as a valid future version.
             let schema = match serde_json::from_slice::<StateSchema>(&bytes) {
                 Ok(schema) => schema.0,
                 Err(error) => {
@@ -253,14 +409,27 @@ impl PluginStateStore {
                     continue;
                 }
             };
-            if schema > 1 {
-                return Err(AppError::Plugin {
-                    code: "plugin_state_unsupported_schema",
-                    message: "插件状态版本暂不受支持",
-                    diagnostic: None,
-                });
+            if schema > 2 {
+                return Err(unsupported_schema());
             }
-            match serde_json::from_slice::<PluginStateFileV1>(&bytes) {
+            let decoded = match schema {
+                1 => serde_json::from_slice::<PluginStateFileV1Wire>(&bytes).map(|state| {
+                    PluginStateLoad {
+                        state: state.migrate(),
+                        requires_rewrite: true,
+                    }
+                }),
+                2 => serde_json::from_slice::<PluginStateFileV2>(&bytes).map(|state| {
+                    PluginStateLoad {
+                        state,
+                        requires_rewrite: false,
+                    }
+                }),
+                _ => Err(serde_json::Error::io(std::io::Error::other(
+                    "unsupported state schema",
+                ))),
+            };
+            match decoded {
                 Ok(state) => return Ok(Some(state)),
                 Err(error) => {
                     tracing::warn!(error = %error, candidate = index, "invalid plugin state candidate");
@@ -277,22 +446,23 @@ impl PluginStateStore {
 }
 
 impl PluginStatePersistence for PluginStateStore {
-    fn load(&self) -> AppResult<PluginStateFileV1> {
+    fn load(&self) -> AppResult<PluginStateLoad> {
         let _guard = self.transaction.lock().map_err(|_| unavailable())?;
-        Ok(self.load_locked()?.unwrap_or_else(PluginStateFileV1::empty))
+        Ok(self.load_locked()?.unwrap_or(PluginStateLoad {
+            state: PluginStateFileV2::empty(),
+            requires_rewrite: false,
+        }))
     }
-
-    fn save(&self, state: &PluginStateFileV1) -> AppResult<()> {
+    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
         let _guard = self.transaction.lock().map_err(|_| unavailable())?;
-        state.validate().map_err(|_| invalid_state())?;
+        state
+            .validate_for_persistence()
+            .map_err(|_| invalid_state())?;
         let bytes = serde_json::to_vec(state).map_err(|_| invalid_state())?;
-        if bytes.len() > MAX_PLUGIN_STATE_BYTES {
-            return Err(invalid_state());
-        }
-        let previous = self.load_locked()?;
-        let previous = previous
+        let previous = self
+            .load_locked()?
             .as_ref()
-            .map(serde_json::to_vec)
+            .map(|loaded| serde_json::to_vec(&loaded.state))
             .transpose()
             .map_err(|_| invalid_state())?;
         self.file
@@ -308,7 +478,13 @@ fn unavailable() -> AppError {
         diagnostic: None,
     }
 }
-
+fn unsupported_schema() -> AppError {
+    AppError::Plugin {
+        code: "plugin_state_unsupported_schema",
+        message: "插件状态版本暂不受支持",
+        diagnostic: None,
+    }
+}
 fn invalid_state() -> AppError {
     AppError::Plugin {
         code: "plugin_state_invalid",
@@ -316,7 +492,6 @@ fn invalid_state() -> AppError {
         diagnostic: None,
     }
 }
-
 fn io_error(error: std::io::Error) -> AppError {
     tracing::warn!(error = %error, "plugin state storage operation failed");
     unavailable()

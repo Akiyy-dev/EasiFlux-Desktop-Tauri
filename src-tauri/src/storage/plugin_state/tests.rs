@@ -28,6 +28,38 @@ impl Fixture {
     }
 }
 
+struct StateStoreFixture {
+    fixture: Fixture,
+    store: PluginStateStore,
+}
+
+impl StateStoreFixture {
+    fn write_primary(&self, bytes: impl AsRef<[u8]>) {
+        self.fixture.write("", bytes);
+    }
+
+    fn write_backup(&self, bytes: impl AsRef<[u8]>) {
+        self.fixture.write(".bak", bytes);
+    }
+}
+
+fn state_store_fixture() -> StateStoreFixture {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    StateStoreFixture { fixture, store }
+}
+
+fn valid_v2_document(revision: &str) -> String {
+    format!(r#"{{"schemaVersion":2,"revision":"{revision}","entries":[]}}"#)
+}
+
+fn assert_plugin_code<T>(result: AppResult<T>, expected: &str) {
+    assert!(matches!(
+        result,
+        Err(AppError::Plugin { code, .. }) if code == expected
+    ));
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -42,15 +74,15 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 
 fn document(revision: u64) -> String {
     format!(
-        r#"{{"schemaVersion":1,"revision":"{revision}","entries":[{{"id":"com.easiflux.analytics","source":"builtIn","publisherId":"com.easiflux","approvalFingerprint":"v1:none","enabled":false}}]}}"#
+        r#"{{"schemaVersion":2,"revision":"{revision}","entries":[{{"id":"com.easiflux.analytics","source":"builtIn","publisherId":"com.easiflux","approvalFingerprint":"v1:none","enabled":false}}]}}"#
     )
 }
 
-fn state(revision: u64) -> PluginStateFileV1 {
-    PluginStateFileV1 {
-        schema_version: 1,
+fn state(revision: u64) -> PluginStateFileV2 {
+    PluginStateFileV2 {
+        schema_version: 2,
         revision,
-        entries: vec![PluginStateEntryV1 {
+        entries: vec![PluginStateEntryV2 {
             id: PluginId::parse("com.easiflux.analytics").unwrap(),
             source: PluginSource::BuiltIn,
             publisher_id: PluginPublisherId::parse("com.easiflux").unwrap(),
@@ -58,6 +90,31 @@ fn state(revision: u64) -> PluginStateFileV1 {
             enabled: false,
         }],
     }
+}
+
+// Catches loading v1 into a v1 runtime state instead of canonical v2 while
+// forgetting to request a deferred migration write.
+#[test]
+fn v1_load_is_lossless_and_marks_v2_rewrite() {
+    let fixture = state_store_fixture();
+    fixture.write_primary(br#"{"schemaVersion":1,"revision":"7","entries":[{"id":"com.easiflux.alpha","source":"builtIn","publisherId":"com.easiflux","approvalFingerprint":"v1:none","enabled":true}]}"#);
+
+    let loaded = fixture.store.load().unwrap();
+
+    assert!(loaded.requires_rewrite);
+    assert_eq!(loaded.state.schema_version, 2);
+    assert_eq!(loaded.state.revision, 7);
+    assert!(loaded.state.entries[0].enabled);
+}
+
+// Catches downgrading an unknown primary schema by accepting an older backup.
+#[test]
+fn future_primary_schema_never_falls_back_to_older_backup() {
+    let fixture = state_store_fixture();
+    fixture.write_primary(br#"{"schemaVersion":3,"revision":"8","entries":[]}"#);
+    fixture.write_backup(valid_v2_document("7"));
+
+    assert_plugin_code(fixture.store.load(), "plugin_state_unsupported_schema");
 }
 
 fn assert_sanitized(error: AppError) {
@@ -77,9 +134,9 @@ fn assert_sanitized(error: AppError) {
 fn missing_candidates_load_empty_v1_without_creating_directories() {
     let fixture = Fixture::new();
     let loaded = fixture.store().load().unwrap();
-    assert_eq!(loaded.schema_version, 1);
-    assert_eq!(loaded.revision, 0);
-    assert!(loaded.entries.is_empty());
+    assert_eq!(loaded.state.schema_version, 2);
+    assert_eq!(loaded.state.revision, 0);
+    assert!(loaded.state.entries.is_empty());
     assert!(!fixture.0.exists());
 }
 
@@ -94,12 +151,12 @@ fn revisions_require_canonical_decimal_strings() {
         );
         fixture.write("", &invalid);
         assert_sanitized(fixture.store().load().unwrap_err());
-        assert!(serde_json::from_str::<PluginStateFileV1>(&invalid).is_err());
+        assert!(serde_json::from_str::<PluginStateFileV2>(&invalid).is_err());
     }
     for revision in [0, u64::MAX] {
         let fixture = Fixture::new();
         fixture.write("", document(revision));
-        assert_eq!(fixture.store().load().unwrap().revision, revision);
+        assert_eq!(fixture.store().load().unwrap().state.revision, revision);
     }
 }
 
@@ -110,7 +167,7 @@ fn deeply_nested_future_main_is_terminal_without_mutating_any_candidate() {
     for depth in [129, 4096] {
         let nested = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
         for future in [
-            format!(r#"{{"schemaVersion":2,"newLayout":{nested}}}"#),
+            format!(r#"{{"schemaVersion":3,"newLayout":{nested}}}"#),
             format!(r#"{{"newLayout":{nested},"schemaVersion":18446744073709551615}}"#),
         ] {
             let fixture = Fixture::new();
@@ -176,7 +233,11 @@ fn schema_inspection_rejects_non_object_roots_and_ambiguous_or_malformed_headers
             "{invalid}"
         );
         fixture.write(".bak", document(4));
-        assert_eq!(fixture.store().load().unwrap().revision, 4, "{invalid}");
+        assert_eq!(
+            fixture.store().load().unwrap().state.revision,
+            4,
+            "{invalid}"
+        );
     }
 }
 
@@ -185,16 +246,16 @@ fn schema_inspection_rejects_non_object_roots_and_ambiguous_or_malformed_headers
 #[test]
 fn positional_state_entry_rejects_main_and_recovers_backup_without_rewriting_evidence() {
     let fixture = Fixture::new();
-    let invalid = r#"{"schemaVersion":1,"revision":"9","entries":[["com.easiflux.analytics","builtIn","com.easiflux","v1:none",true]]}"#;
+    let invalid = r#"{"schemaVersion":2,"revision":"9","entries":[["com.easiflux.analytics","builtIn","com.easiflux","v1:none",true]]}"#;
     let backup = document(3);
     fixture.write("", invalid);
     fixture.write(".bak", &backup);
 
     let loaded = fixture.store().load().unwrap();
-    assert_eq!(loaded.revision, 3);
-    assert_eq!(loaded.entries.len(), 1);
-    assert!(!loaded.entries[0].enabled);
-    assert!(serde_json::from_str::<PluginStateFileV1>(invalid).is_err());
+    assert_eq!(loaded.state.revision, 3);
+    assert_eq!(loaded.state.entries.len(), 1);
+    assert!(!loaded.state.entries[0].enabled);
+    assert!(serde_json::from_str::<PluginStateFileV2>(invalid).is_err());
     assert_eq!(fs::read_to_string(fixture.path()).unwrap(), invalid);
     assert_eq!(
         fs::read_to_string(sidecar(&fixture.path(), ".bak")).unwrap(),
@@ -213,7 +274,7 @@ fn save_creates_parents_and_round_trips_a_bound_identity_and_string_revision() {
         raw,
         serde_json::from_str::<serde_json::Value>(&document(u64::MAX)).unwrap()
     );
-    assert_eq!(fixture.store().load().unwrap(), state(u64::MAX));
+    assert_eq!(fixture.store().load().unwrap().state, state(u64::MAX));
 }
 
 // Catches selecting newer sidecars ahead of main or skipping the temp recovery candidate.
@@ -234,7 +295,7 @@ fn recovery_prefers_main_then_temp_then_backup() {
             fixture.write(".tmp", temp);
         }
         fixture.write(".bak", document(3));
-        assert_eq!(fixture.store().load().unwrap().revision, expected);
+        assert_eq!(fixture.store().load().unwrap().state.revision, expected);
     }
 }
 
@@ -242,7 +303,7 @@ fn recovery_prefers_main_then_temp_then_backup() {
 #[test]
 fn future_main_is_terminal_and_save_never_overwrites_it_or_sidecars() {
     for future in [
-        document(8).replace("\"schemaVersion\":1", "\"schemaVersion\":2"),
+        document(8).replace("\"schemaVersion\":2", "\"schemaVersion\":3"),
         r#"{"schemaVersion":4294967296,"newLayout":{"future":true}}"#.into(),
     ] {
         let fixture = Fixture::new();
@@ -268,10 +329,10 @@ fn future_main_is_terminal_and_save_never_overwrites_it_or_sidecars() {
 fn malformed_current_documents_are_rejected_but_can_recover_from_backup() {
     let base = document(1);
     let cases = [
-        base.replace("\"schemaVersion\":1", "\"schemaVersion\":0"),
+        base.replace("\"schemaVersion\":2", "\"schemaVersion\":0"),
         base.replace(
-            "\"schemaVersion\":1",
-            "\"schemaVersion\":1,\"unknown\":true",
+            "\"schemaVersion\":2",
+            "\"schemaVersion\":2,\"unknown\":true",
         ),
         base.replace("\"enabled\":false", "\"enabled\":false,\"unknown\":true"),
         base.replace("com.easiflux.analytics", "Invalid"),
@@ -290,8 +351,8 @@ fn malformed_current_documents_are_rejected_but_can_recover_from_backup() {
         base.replace("\"revision\":\"1\"", "\"revision\":\"\""),
         base.replace("\"enabled\":false", "\"enabled\":0"),
         base.replace(
-            "\"schemaVersion\":1",
-            "\"schemaVersion\":1,\"schemaVersion\":1",
+            "\"schemaVersion\":2",
+            "\"schemaVersion\":2,\"schemaVersion\":2",
         ),
         "{raw-secret".into(),
     ];
@@ -300,7 +361,11 @@ fn malformed_current_documents_are_rejected_but_can_recover_from_backup() {
         fixture.write("", &invalid);
         assert_sanitized(fixture.store().load().unwrap_err());
         fixture.write(".bak", document(3));
-        assert_eq!(fixture.store().load().unwrap().revision, 3, "{invalid}");
+        assert_eq!(
+            fixture.store().load().unwrap().state.revision,
+            3,
+            "{invalid}"
+        );
     }
 }
 
@@ -315,7 +380,7 @@ fn duplicate_composite_identities_are_rejected_without_collapsing_other_publishe
     assert_sanitized(fixture.store().load().unwrap_err());
     value["entries"][1]["publisherId"] = "com.other".into();
     fixture.write("", serde_json::to_vec(&value).unwrap());
-    assert_eq!(fixture.store().load().unwrap().entries.len(), 2);
+    assert_eq!(fixture.store().load().unwrap().state.entries.len(), 2);
 }
 
 // Catches off-by-one limits and JSON/UTF8 parsing before the byte bound.
@@ -325,7 +390,7 @@ fn exact_byte_and_entry_limits_are_accepted_and_excess_is_rejected() {
     let mut bytes = document(1).into_bytes();
     bytes.resize(256 * 1024, b' ');
     fixture.write("", &bytes);
-    assert_eq!(fixture.store().load().unwrap().revision, 1);
+    assert_eq!(fixture.store().load().unwrap().state.revision, 1);
     bytes.push(0xff);
     fixture.write("", &bytes);
     assert_sanitized(fixture.store().load().unwrap_err());
@@ -343,7 +408,7 @@ fn exact_byte_and_entry_limits_are_accepted_and_excess_is_rejected() {
         .collect::<Vec<_>>()
         .into();
     fixture.write("", serde_json::to_vec(&value).unwrap());
-    assert_eq!(fixture.store().load().unwrap().entries.len(), 512);
+    assert_eq!(fixture.store().load().unwrap().state.entries.len(), 512);
     let mut extra = entry;
     extra["id"] = "com.plugin.extra".into();
     value["entries"].as_array_mut().unwrap().push(extra);
@@ -358,7 +423,7 @@ fn invalid_in_memory_states_cannot_replace_committed_bytes() {
     fixture.write("", document(1));
     let mut cases = Vec::new();
     let mut invalid = state(2);
-    invalid.schema_version = 2;
+    invalid.schema_version = 3;
     cases.push(invalid);
     let mut invalid = state(2);
     invalid.entries[0].approval_fingerprint = "raw-secret".into();
@@ -388,7 +453,7 @@ fn saves_preserve_previous_commit_and_recovered_state_in_backup() {
         let fixture = Fixture::new();
         fixture.write(suffix, document(4));
         fixture.store().save(&state(5)).unwrap();
-        assert_eq!(fixture.store().load().unwrap().revision, 5);
+        assert_eq!(fixture.store().load().unwrap().state.revision, 5);
         let backup: serde_json::Value =
             serde_json::from_slice(&fs::read(sidecar(&fixture.path(), ".bak")).unwrap()).unwrap();
         assert_eq!(backup["revision"], "4");
@@ -401,9 +466,9 @@ fn saves_preserve_previous_commit_and_recovered_state_in_backup() {
 fn stale_pending_is_never_read_as_current_and_does_not_block_save() {
     let fixture = Fixture::new();
     fixture.write(".pending", document(99));
-    assert_eq!(fixture.store().load().unwrap().revision, 0);
+    assert_eq!(fixture.store().load().unwrap().state.revision, 0);
     fixture.store().save(&state(1)).unwrap();
-    assert_eq!(fixture.store().load().unwrap().revision, 1);
+    assert_eq!(fixture.store().load().unwrap().state.revision, 1);
 }
 
 // Catches returning an error while leaving new staged data recoverable, including double faults.
@@ -447,11 +512,11 @@ fn injected_write_rotation_promotion_and_restore_failures_never_publish_uncommit
                 }
             }
             assert_eq!(
-                store.load().unwrap().revision,
+                store.load().unwrap().state.revision,
                 if prior.is_some() { 1 } else { 0 }
             );
             assert_eq!(
-                fixture.store().load().unwrap().revision,
+                fixture.store().load().unwrap().state.revision,
                 if prior.is_some() { 1 } else { 0 }
             );
         }
@@ -465,7 +530,7 @@ fn real_io_failure_is_sanitized_and_keeps_previous_main() {
     fixture.write("", document(1));
     fs::create_dir(sidecar(&fixture.path(), ".pending")).unwrap();
     assert_sanitized(fixture.store().save(&state(2)).unwrap_err());
-    assert_eq!(fixture.store().load().unwrap().revision, 1);
+    assert_eq!(fixture.store().load().unwrap().state.revision, 1);
 }
 
 // Catches a false rejected-save result after the rename commit point; the flag
@@ -487,7 +552,7 @@ fn post_commit_directory_sync_failure_keeps_the_save_successful() {
     }));
     store.save(&state(2)).unwrap();
     assert!(injected.load(Ordering::SeqCst));
-    assert_eq!(fixture.store().load().unwrap().revision, 2);
+    assert_eq!(fixture.store().load().unwrap().state.revision, 2);
 }
 
 // Catches moving load outside the transaction lock or allowing overlapping save transactions.
@@ -535,6 +600,6 @@ fn store_is_send_sync_and_load_and_save_share_the_full_transaction_lock() {
     let loaded = loader.join().unwrap().unwrap();
     saver.join().unwrap().unwrap();
     assert!(blocked, "a load or save escaped the in-flight transaction");
-    assert!([2, 3].contains(&loaded.revision));
-    assert_eq!(store.load().unwrap().revision, 3);
+    assert!([2, 3].contains(&loaded.state.revision));
+    assert_eq!(store.load().unwrap().state.revision, 3);
 }
