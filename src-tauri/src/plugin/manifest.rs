@@ -1,10 +1,13 @@
 use std::fmt;
 
 use semver::Version;
+use serde::de::{value::MapAccessDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const APPROVAL_FINGERPRINT_NONE: &str = "v1:none";
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V1: u32 = 1;
+
+const CATALOG_TRANSPORT_SCHEMA_VERSION: u8 = 2;
 
 const MAX_IDENTIFIER_LENGTH: usize = 128;
 const MAX_IDENTIFIER_SEGMENT_LENGTH: usize = 63;
@@ -114,8 +117,25 @@ impl<'de> Deserialize<'de> for PluginManifestV1 {
     where
         D: Deserializer<'de>,
     {
-        let wire = PluginManifestV1Wire::deserialize(deserializer)?;
-        let manifest = Self {
+        deserializer.deserialize_map(PluginManifestV1Visitor)
+    }
+}
+
+struct PluginManifestV1Visitor;
+
+impl<'de> Visitor<'de> for PluginManifestV1Visitor {
+    type Value = PluginManifestV1;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a plugin manifest object")
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let wire = PluginManifestV1Wire::deserialize(MapAccessDeserializer::new(map))?;
+        let manifest = PluginManifestV1 {
             schema_version: wire.schema_version,
             id: wire.id,
             publisher_id: wire.publisher_id,
@@ -161,10 +181,54 @@ fn validate_display_text(label: &str, value: &str, max_length: usize) -> Result<
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum PluginSource {
     BuiltIn,
+    LocalDeclarative,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum LocalDiscoveryStatus {
+    Available,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDiscoverySummary {
+    pub status: LocalDiscoveryStatus,
+    pub rejected_package_count: u32,
+}
+
+impl LocalDiscoverySummary {
+    pub fn available() -> Self {
+        Self {
+            status: LocalDiscoveryStatus::Available,
+            rejected_package_count: 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn degraded(rejected_package_count: u32) -> Result<Self, String> {
+        if !(1..=256).contains(&rejected_package_count) {
+            return Err("degraded discovery count must be between 1 and 256".to_owned());
+        }
+        Ok(Self {
+            status: LocalDiscoveryStatus::Degraded,
+            rejected_package_count,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn unavailable() -> Self {
+        Self {
+            status: LocalDiscoveryStatus::Unavailable,
+            rejected_package_count: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,25 +357,31 @@ fn validate_catalog_item_state(
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCatalogSnapshot {
-    pub schema_version: u32,
+    pub schema_version: u8,
     pub revision: String,
+    pub catalog_generation: String,
     pub availability: PluginAvailability,
     pub availability_reason_code: Option<PluginAvailabilityReason>,
+    pub local_discovery: LocalDiscoverySummary,
     pub plugins: Vec<PluginCatalogItem>,
 }
 
 impl PluginCatalogSnapshot {
     pub fn new(
-        revision: u64,
+        revision: String,
+        catalog_generation: String,
         availability: PluginAvailability,
         availability_reason_code: Option<PluginAvailabilityReason>,
+        local_discovery: LocalDiscoverySummary,
         plugins: Vec<PluginCatalogItem>,
     ) -> Self {
         Self {
-            schema_version: PLUGIN_MANIFEST_SCHEMA_VERSION_V1,
-            revision: revision.to_string(),
+            schema_version: CATALOG_TRANSPORT_SCHEMA_VERSION,
+            revision,
+            catalog_generation,
             availability,
             availability_reason_code,
+            local_discovery,
             plugins,
         }
     }
@@ -320,14 +390,18 @@ impl PluginCatalogSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCatalogMutationResult {
+    pub schema_version: u8,
     pub revision: String,
+    pub catalog_generation: String,
     pub plugin: PluginCatalogItem,
 }
 
 impl PluginCatalogMutationResult {
-    pub fn new(revision: u64, plugin: PluginCatalogItem) -> Self {
+    pub fn new(revision: String, catalog_generation: String, plugin: PluginCatalogItem) -> Self {
         Self {
-            revision: revision.to_string(),
+            schema_version: CATALOG_TRANSPORT_SCHEMA_VERSION,
+            revision,
+            catalog_generation,
             plugin,
         }
     }
@@ -464,6 +538,59 @@ mod tests {
         }
     }
 
+    // Catches accepting serde's positional struct encoding across this trust boundary.
+    #[test]
+    fn manifest_rejects_positional_struct_representation() {
+        assert!(serde_json::from_str::<PluginManifestV1>(
+            r#"[1,"com.example.alpha","com.example","Example","Alpha","Metadata","1.0.0",[],[]]"#,
+        )
+        .is_err());
+    }
+
+    // Catches a catalog transport schema tied to the manifest schema or missing discovery state.
+    #[test]
+    fn catalog_transport_v2_carries_generation_and_discovery() {
+        let snapshot = PluginCatalogSnapshot::new(
+            "9".to_owned(),
+            "3".to_owned(),
+            PluginAvailability::Available,
+            None,
+            LocalDiscoverySummary::available(),
+            Vec::new(),
+        );
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 2,
+                "revision": "9",
+                "catalogGeneration": "3",
+                "availability": "available",
+                "availabilityReasonCode": null,
+                "localDiscovery": {"status": "available", "rejectedPackageCount": 0},
+                "plugins": []
+            }),
+        );
+    }
+
+    // Catches accepting invalid degraded counts or preserving rejected packages when unavailable.
+    #[test]
+    fn local_discovery_summary_enforces_status_invariants() {
+        assert_eq!(
+            serde_json::to_value(LocalDiscoverySummary::available()).unwrap(),
+            serde_json::json!({"status": "available", "rejectedPackageCount": 0}),
+        );
+        assert_eq!(
+            serde_json::to_value(LocalDiscoverySummary::degraded(1).unwrap()).unwrap(),
+            serde_json::json!({"status": "degraded", "rejectedPackageCount": 1}),
+        );
+        assert_eq!(
+            serde_json::to_value(LocalDiscoverySummary::unavailable()).unwrap(),
+            serde_json::json!({"status": "unavailable", "rejectedPackageCount": 0}),
+        );
+        assert!(LocalDiscoverySummary::degraded(0).is_err());
+        assert!(LocalDiscoverySummary::degraded(257).is_err());
+    }
+
     #[test]
     fn catalog_transport_serializes_strict_camel_case_with_string_revisions() {
         let manifest: PluginManifestV1 = serde_json::from_str(VALID_MANIFEST).unwrap();
@@ -474,18 +601,22 @@ mod tests {
         );
 
         let snapshot = PluginCatalogSnapshot::new(
-            42,
+            "42".to_owned(),
+            "3".to_owned(),
             PluginAvailability::Unavailable,
             Some(PluginAvailabilityReason::CatalogInvalid),
+            LocalDiscoverySummary::degraded(2).unwrap(),
             vec![item.clone()],
         );
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             serde_json::json!({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "revision": "42",
+                "catalogGeneration": "3",
                 "availability": "unavailable",
                 "availabilityReasonCode": "catalogInvalid",
+                "localDiscovery": {"status": "degraded", "rejectedPackageCount": 2},
                 "plugins": [{
                     "manifest": serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap(),
                     "source": "builtIn",
@@ -497,11 +628,13 @@ mod tests {
             })
         );
 
-        let mutation = PluginCatalogMutationResult::new(43, item);
+        let mutation = PluginCatalogMutationResult::new("43".to_owned(), "3".to_owned(), item);
         assert_eq!(
             serde_json::to_value(mutation).unwrap(),
             serde_json::json!({
+                "schemaVersion": 2,
                 "revision": "43",
+                "catalogGeneration": "3",
                 "plugin": {
                     "manifest": serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap(),
                     "source": "builtIn",

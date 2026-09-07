@@ -8,9 +8,10 @@ use crate::storage::plugin_state::{
 
 use super::builtin::builtin_manifests;
 use super::manifest::{
-    PluginAvailability, PluginAvailabilityReason, PluginCatalogItem, PluginCatalogMutationResult,
-    PluginCatalogSnapshot, PluginId, PluginManifestV1, PluginSource, APPROVAL_FINGERPRINT_NONE,
+    LocalDiscoverySummary, PluginAvailability, PluginAvailabilityReason, PluginCatalogItem,
+    PluginCatalogMutationResult, PluginCatalogSnapshot, PluginId, PluginManifestV1,
 };
+use super::record::PluginRecord;
 
 enum Runtime {
     Available {
@@ -24,7 +25,7 @@ enum Runtime {
 }
 
 pub struct PluginRegistry {
-    manifests: BTreeMap<PluginId, PluginManifestV1>,
+    manifests: BTreeMap<PluginId, PluginRecord>,
     runtime: Runtime,
 }
 
@@ -61,16 +62,20 @@ impl PluginRegistry {
         let persistence: Arc<dyn PluginStatePersistence> = persistence.into();
         let mut manifests = BTreeMap::new();
         for manifest in builtins {
-            if manifest.validate().is_err() || manifests.contains_key(&manifest.id) {
-                return Self {
-                    manifests: BTreeMap::new(),
-                    runtime: Runtime::Unavailable {
-                        reason: PluginAvailabilityReason::CatalogInvalid,
-                        persistence,
-                    },
-                };
-            }
-            manifests.insert(manifest.id.clone(), manifest);
+            let record = match PluginRecord::built_in(manifest) {
+                Ok(record) if !manifests.contains_key(&record.manifest().id) => record,
+                _ => {
+                    return Self {
+                        manifests: BTreeMap::new(),
+                        runtime: Runtime::Unavailable {
+                            reason: PluginAvailabilityReason::CatalogInvalid,
+                            persistence,
+                        },
+                    };
+                }
+            };
+            let id = record.manifest().id.clone();
+            manifests.insert(id, record);
         }
         let mut registry = Self {
             manifests,
@@ -95,18 +100,23 @@ impl PluginRegistry {
         let plugins = self
             .manifests
             .values()
-            .map(|manifest| match &self.runtime {
-                Runtime::Available { state, .. } => {
-                    catalog_item(manifest, is_enabled(state, manifest))
-                }
+            .map(|record| match &self.runtime {
+                Runtime::Available { state, .. } => catalog_item(record, is_enabled(state, record)),
                 Runtime::Unavailable { reason, .. } => PluginCatalogItem::blocked(
-                    manifest.clone(),
-                    PluginSource::BuiltIn,
+                    record.manifest().clone(),
+                    record.source(),
                     reason.clone(),
                 ),
             })
             .collect();
-        PluginCatalogSnapshot::new(revision, availability, reason, plugins)
+        PluginCatalogSnapshot::new(
+            revision.to_string(),
+            "0".to_owned(),
+            availability,
+            reason,
+            LocalDiscoverySummary::available(),
+            plugins,
+        )
     }
 
     /// Call only while holding the registry's write guard, never through a read guard.
@@ -148,7 +158,7 @@ impl PluginRegistry {
         ) {
             return Err(plugin_error("plugin_catalog_invalid", "插件目录无效"));
         }
-        let manifest = self
+        let record = self
             .manifests
             .get(&id)
             .ok_or_else(|| plugin_error("plugin_not_found", "插件不存在"))?;
@@ -160,10 +170,11 @@ impl PluginRegistry {
         };
         // Every valid phase-0 built-in is toggleable; unavailable items were
         // rejected above. No executable activation or capability grants occur.
-        if is_enabled(state, manifest) == enabled {
+        if is_enabled(state, record) == enabled {
             return Ok(PluginCatalogMutationResult::new(
-                state.revision,
-                catalog_item(manifest, enabled),
+                state.revision.to_string(),
+                "0".to_owned(),
+                catalog_item(record, enabled),
             ));
         }
         let mut next = state.clone();
@@ -174,15 +185,16 @@ impl PluginRegistry {
         if let Some(entry) = next
             .entries
             .iter_mut()
-            .find(|entry| matches_identity(entry, manifest))
+            .find(|entry| matches_identity(entry, record))
         {
             entry.enabled = enabled;
         } else {
+            let identity = record.identity();
             next.entries.push(PluginStateEntryV1 {
-                id: manifest.id.clone(),
-                source: PluginSource::BuiltIn,
-                publisher_id: manifest.publisher_id.clone(),
-                approval_fingerprint: APPROVAL_FINGERPRINT_NONE.into(),
+                id: identity.id,
+                source: identity.source,
+                publisher_id: identity.publisher_id,
+                approval_fingerprint: identity.approval_fingerprint,
                 enabled,
             });
         }
@@ -191,31 +203,33 @@ impl PluginRegistry {
             .map_err(|_| plugin_error("plugin_state_persist_failed", "插件状态保存失败"))?;
         *state = next;
         Ok(PluginCatalogMutationResult::new(
-            state.revision,
-            catalog_item(manifest, enabled),
+            state.revision.to_string(),
+            "0".to_owned(),
+            catalog_item(record, enabled),
         ))
     }
 }
 
-fn matches_identity(entry: &PluginStateEntryV1, manifest: &PluginManifestV1) -> bool {
-    entry.id == manifest.id
-        && entry.source == PluginSource::BuiltIn
-        && entry.publisher_id == manifest.publisher_id
-        && entry.approval_fingerprint == APPROVAL_FINGERPRINT_NONE
+fn matches_identity(entry: &PluginStateEntryV1, record: &PluginRecord) -> bool {
+    let identity = record.identity();
+    entry.id == identity.id
+        && entry.source == identity.source
+        && entry.publisher_id == identity.publisher_id
+        && entry.approval_fingerprint == identity.approval_fingerprint
 }
 
-fn is_enabled(state: &PluginStateFileV1, manifest: &PluginManifestV1) -> bool {
+fn is_enabled(state: &PluginStateFileV1, record: &PluginRecord) -> bool {
     state
         .entries
         .iter()
-        .any(|entry| matches_identity(entry, manifest) && entry.enabled)
+        .any(|entry| matches_identity(entry, record) && entry.enabled)
 }
 
-fn catalog_item(manifest: &PluginManifestV1, enabled: bool) -> PluginCatalogItem {
+fn catalog_item(record: &PluginRecord, enabled: bool) -> PluginCatalogItem {
     if enabled {
-        PluginCatalogItem::enabled(manifest.clone(), PluginSource::BuiltIn)
+        PluginCatalogItem::enabled(record.manifest().clone(), record.source())
     } else {
-        PluginCatalogItem::disabled(manifest.clone(), PluginSource::BuiltIn)
+        PluginCatalogItem::disabled(record.manifest().clone(), record.source())
     }
 }
 

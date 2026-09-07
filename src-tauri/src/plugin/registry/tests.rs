@@ -1,5 +1,5 @@
 use super::*;
-use crate::plugin::manifest::PluginPublisherId;
+use crate::plugin::manifest::{PluginPublisherId, PluginSource};
 use crate::storage::plugin_state::{PluginStateEntryV1, PluginStateFileV1};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -101,8 +101,9 @@ fn empty_catalog_is_available_at_revision_zero() {
     assert_eq!(
         snapshot(&memory.registry(vec![])),
         json!({
-            "schemaVersion": 1, "revision": "0", "availability": "available",
-            "availabilityReasonCode": null, "plugins": []
+            "schemaVersion": 2, "revision": "0", "catalogGeneration": "0",
+            "availability": "available", "availabilityReasonCode": null,
+            "localDiscovery": {"status": "available", "rejectedPackageCount": 0}, "plugins": []
         })
     );
 }

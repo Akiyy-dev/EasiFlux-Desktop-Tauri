@@ -147,10 +147,12 @@ mod tests {
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             json!({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "revision": "7",
+                "catalogGeneration": "0",
                 "availability": "available",
                 "availabilityReasonCode": null,
+                "localDiscovery": {"status": "available", "rejectedPackageCount": 0},
                 "plugins": [{
                     "manifest": {
                         "schemaVersion": 1,
@@ -185,7 +187,9 @@ mod tests {
             .unwrap();
 
         let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["schemaVersion"], 2);
         assert_eq!(value["revision"], "1");
+        assert_eq!(value["catalogGeneration"], "0");
         assert_eq!(value["plugin"]["manifest"]["id"], "com.easiflux.alpha");
         assert_eq!(value["plugin"]["status"], "enabled");
         assert_eq!(value["plugin"]["canToggle"], true);

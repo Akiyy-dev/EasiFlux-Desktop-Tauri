@@ -341,10 +341,12 @@ mod tests {
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             serde_json::json!({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "revision": "0",
+                "catalogGeneration": "0",
                 "availability": "available",
                 "availabilityReasonCode": null,
+                "localDiscovery": {"status": "available", "rejectedPackageCount": 0},
                 "plugins": []
             })
         );
