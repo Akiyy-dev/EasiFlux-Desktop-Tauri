@@ -52,11 +52,26 @@ describe('PluginCard', () => {
     expect(wrapper.text()).toContain('展示受信任的行情摘要。')
     expect(wrapper.text()).toContain('EasiFlux 团队')
     expect(wrapper.text()).toContain('com.easiflux')
-    expect(wrapper.text()).toContain('内置')
+    expect(wrapper.text()).toContain('内置 · 随应用提供')
     expect(wrapper.get('[data-testid="requested-capabilities"]').text())
       .toContain('无需额外权限')
     expect(wrapper.get('[data-testid="granted-capabilities"]').text())
       .toContain('无需额外权限')
+  })
+
+  it('discloses local metadata-only preferences without implying verified publishing', () => {
+    const wrapper = mountCard(pluginFixture('disabled', { source: 'localDeclarative' }))
+
+    expect(wrapper.text()).toContain('本地声明式包 · 已发现，未执行')
+    expect(wrapper.text()).toContain('启用仅记录宿主偏好，不会运行插件代码')
+    expect(wrapper.text()).not.toMatch(/已认证|已验证|签名认证|可信发布者|内置 · 随应用提供/)
+    const control = wrapper.get<HTMLInputElement>('[role="switch"]')
+    expect(control.attributes('type')).toBe('checkbox')
+    expect(control.attributes('aria-label')).toBe('行情概览，当前已停用')
+    expect(control.attributes('aria-describedby')).toBe('plugin-card-com.easiflux.analytics.overview-status')
+    control.element.click()
+    expect(wrapper.emitted('toggle')).toEqual([['com.easiflux.analytics.overview', true]])
+    expect(control.element.checked).toBe(false)
   })
 
   it.each([

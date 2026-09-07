@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { PluginCatalogItem } from '../../types/plugin'
+import { pluginSourceLabel } from './pluginPresentation'
 
 const props = defineProps<{
   plugin: PluginCatalogItem
@@ -90,9 +91,13 @@ function requestToggle(): void {
       </div>
       <div>
         <dt>来源</dt>
-        <dd>内置 · 随应用提供</dd>
+        <dd>{{ pluginSourceLabel(plugin.source) }}</dd>
       </div>
     </dl>
+
+    <p v-if="plugin.source === 'localDeclarative'" class="plugin-card__local-note">
+      启用仅记录宿主偏好，不会运行插件代码
+    </p>
 
     <div class="plugin-card__permissions">
       <p data-testid="requested-capabilities">

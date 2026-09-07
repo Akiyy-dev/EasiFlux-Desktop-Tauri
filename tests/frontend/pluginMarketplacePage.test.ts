@@ -18,12 +18,14 @@ import type { PluginSection } from '../../src/types/navigation'
 
 const serviceMocks = vi.hoisted(() => ({
   getCatalog: vi.fn(),
+  reloadCatalog: vi.fn(),
   setEnabled: vi.fn(),
 }))
 
 vi.mock('../../src/services/pluginService', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../src/services/pluginService')>(),
   getPluginCatalog: serviceMocks.getCatalog,
+  reloadPluginCatalog: serviceMocks.reloadCatalog,
   setPluginEnabled: serviceMocks.setEnabled,
 }))
 
@@ -135,6 +137,133 @@ function mountPage(section: PluginSection = 'installed', attachTo?: Element) {
     global: { plugins: [pinia] },
   })
 }
+
+describe('PluginMarketplacePage local discovery', () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.reloadCatalog.mockReset()
+  })
+
+  const localPlugin: PluginCatalogItem = {
+    ...pluginItem('com.example.local', '本地声明示例'),
+    source: 'localDeclarative',
+  }
+
+  it('shows both sources in installed and manage but only built-ins in market', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([
+      pluginItem('com.easiflux.alpha', 'Alpha 研究'), localPlugin,
+    ]))
+    const wrapper = mountPage()
+    await flushPromises()
+
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+    expect(wrapper.text()).toContain('本地声明示例')
+    expect(wrapper.text()).toContain('本地声明式包 · 已发现，未执行')
+    await wrapper.setProps({ section: 'market' })
+    expect(wrapper.text()).not.toContain('本地声明示例')
+    expect(wrapper.text()).toContain('内置 · 随应用提供')
+    await wrapper.setProps({ section: 'manage' })
+    expect(wrapper.text()).toContain('本地声明示例')
+    expect(wrapper.text()).toContain('本地声明式包 · 已发现，未执行')
+    expect(wrapper.text()).toContain('内置 · 随应用提供')
+    expect(wrapper.get('[data-testid="disabled-count"]').text()).toContain('2')
+  })
+
+  it.each(['installed', 'market', 'manage'] as const)(
+    'provides a common explicit reload action in %s and disables it while loading',
+    async (section) => {
+      const initial = deferred<PluginCatalogSnapshot>()
+      const reloaded = deferred<PluginCatalogSnapshot>()
+      serviceMocks.getCatalog.mockReturnValueOnce(initial.promise)
+      serviceMocks.reloadCatalog.mockReturnValueOnce(reloaded.promise)
+      const wrapper = mountPage(section)
+      const reload = wrapper.findAll<HTMLButtonElement>('header button')
+        .find((button) => button.text() === '重新扫描本地插件')
+      expect(reload).toBeDefined()
+      expect(reload!.element.disabled).toBe(true)
+      initial.resolve(availableSnapshot())
+      await flushPromises()
+      expect(reload!.element.disabled).toBe(false)
+      const store = usePluginStore()
+      const reloadSpy = vi.spyOn(store, 'reload')
+      await reload!.trigger('click')
+      expect(reloadSpy).toHaveBeenCalledTimes(1)
+      expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(1)
+      expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(1)
+      expect(reload!.element.disabled).toBe(true)
+      expect(wrapper.get('[data-testid="plugin-reload-status"]').attributes('role')).toBe('status')
+      expect(wrapper.text()).toContain('Alpha 研究')
+      reloaded.resolve({ ...availableSnapshot([localPlugin], '2'), catalogGeneration: '2' })
+      await flushPromises()
+      expect(reload!.element.disabled).toBe(false)
+      expect(wrapper.find('[data-testid="plugin-reload-status"]').exists()).toBe(false)
+      expect(wrapper.text()).not.toContain('Alpha 研究')
+      if (section !== 'market') expect(wrapper.text()).toContain('本地声明示例')
+      expect(wrapper.findAll('button, a[href], [role="button"]').filter((control) => (
+        /安装|下载|更新|卸载/.test(`${control.text()} ${control.attributes('aria-label') ?? ''}`)
+      ))).toHaveLength(0)
+    },
+  )
+
+  it('announces only an aggregate rejected count for degraded local discovery', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...availableSnapshot(),
+      localDiscovery: { status: 'degraded', rejectedPackageCount: 3 },
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const notice = wrapper.find('[data-testid="plugin-local-discovery-status"]')
+    expect(notice.exists()).toBe(true)
+    expect(notice.attributes('role')).toBe('status')
+    expect(notice.text()).toBe('本地插件扫描已完成，已拒绝 3 个包。')
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+  })
+
+  it('announces unavailable local discovery separately from host availability', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...availableSnapshot(),
+      localDiscovery: { status: 'unavailable', rejectedPackageCount: 0 },
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const notice = wrapper.find('[data-testid="plugin-local-discovery-alert"]')
+    expect(notice.exists()).toBe(true)
+    expect(notice.attributes('role')).toBe('alert')
+    expect(notice.text()).toBe('本地插件发现暂时不可用，请重新扫描本地插件。')
+    expect(wrapper.find('[data-testid="plugin-availability-alert"]').exists()).toBe(false)
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+  })
+
+  it('preserves confirmed catalog and discovery on reload failure without exposing raw errors', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([localPlugin]))
+    serviceMocks.reloadCatalog.mockRejectedValueOnce(new Error(
+      'EACCES D:\\private\\rejected-secret-package\\manifest.json',
+    ))
+    const wrapper = mountPage()
+    await flushPromises()
+    const reload = wrapper.findAll<HTMLButtonElement>('header button')
+      .find((button) => button.text() === '重新扫描本地插件')
+    expect(reload).toBeDefined()
+    await reload!.trigger('click')
+    await flushPromises()
+
+    const alert = wrapper.get('[data-testid="plugin-reload-error"]')
+    expect(alert.attributes('role')).toBe('alert')
+    expect(alert.text()).toBe('插件操作失败，请重试。')
+    expect(wrapper.text()).toContain('本地声明示例')
+    expect(wrapper.text()).not.toMatch(/EACCES|private|rejected-secret-package|manifest.json|Error:/)
+    expect(usePluginStore().localDiscovery).toEqual({ status: 'available', rejectedPackageCount: 0 })
+    expect(reload!.element.disabled).toBe(false)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(availableSnapshot([localPlugin], '2'))
+    await reload!.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="plugin-reload-error"]').exists()).toBe(false)
+  })
+})
 
 describe('PluginMarketplacePage loading and section lifetime', () => {
   beforeEach(() => {
@@ -302,11 +431,11 @@ describe('PluginMarketplacePage catalog views', () => {
     expect(wrapper.find('[data-testid="plugin-catalog-empty"]').exists()).toBe(false)
   })
 
-  it('renders only built-in entries in a read-only Phase 0 marketplace', async () => {
-    const untrusted = {
+  it('renders only built-in entries in a read-only marketplace', async () => {
+    const untrusted: PluginCatalogItem = {
       ...pluginItem('com.example.local', '本地未受信条目'),
-      source: 'local',
-    } as unknown as PluginCatalogItem
+      source: 'localDeclarative',
+    }
     serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([
       pluginItem('com.easiflux.alpha', 'Alpha 研究'),
       untrusted,

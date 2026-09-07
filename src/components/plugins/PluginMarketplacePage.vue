@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from 'vue'
 import PluginCard from './PluginCard.vue'
+import { pluginSourceLabel } from './pluginPresentation'
 import { usePluginStore, type PluginStatusFilter } from '../../stores/plugin'
 import type { PluginSection } from '../../types/navigation'
 
@@ -14,11 +15,11 @@ const title = ref<{ focus: () => void } | null>(null)
 const sectionCopy: Record<PluginSection, { title: string; description: string }> = {
   installed: {
     title: '已安装插件',
-    description: '查看随应用提供的可信插件，并管理它们的启用状态。',
+    description: '查看内置插件与已发现的本地声明式包，并管理宿主启用偏好。',
   },
   market: {
     title: '插件市场',
-    description: '浏览当前受信任的内置目录。阶段 0 不提供在线安装。',
+    description: '浏览随应用提供的内置目录。当前版本不提供在线安装。',
   },
   manage: {
     title: '插件管理',
@@ -39,6 +40,10 @@ const refreshing = computed(() => (
 ))
 const refreshError = computed(() => (
   store.availability !== null && store.loadError !== null
+))
+const reloading = computed(() => store.reloadStatus === 'loading')
+const reloadDisabled = computed(() => (
+  initialLoading.value || store.loadStatus === 'loading' || reloading.value
 ))
 const builtInPlugins = computed(() => (
   store.catalog.filter((plugin) => plugin.source === 'builtIn')
@@ -80,6 +85,10 @@ function retry(): void {
   void store.retry()
 }
 
+function reload(): void {
+  if (!reloadDisabled.value) void store.reload()
+}
+
 function togglePlugin(id: string, enabled: boolean): void {
   void store.setEnabled(id, enabled)
 }
@@ -99,8 +108,38 @@ onMounted(() => {
       <h1 ref="title" tabindex="-1">
         {{ activeCopy.title }}
       </h1>
-      <p>{{ activeCopy.description }}</p>
+      <p class="plugin-marketplace-page__description">
+        {{ activeCopy.description }}
+      </p>
+      <div class="plugin-marketplace-page__actions">
+        <button
+          class="ef-btn ef-btn-secondary ef-btn-sm"
+          type="button"
+          :disabled="reloadDisabled"
+          @click="reload"
+        >
+          重新扫描本地插件
+        </button>
+      </div>
     </header>
+
+    <div
+      v-if="reloading"
+      class="plugin-marketplace-page__notice"
+      data-testid="plugin-reload-status"
+      role="status"
+      aria-live="polite"
+    >
+      正在重新扫描本地插件…
+    </div>
+    <div
+      v-if="store.reloadError"
+      class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
+      data-testid="plugin-reload-error"
+      role="alert"
+    >
+      {{ store.reloadError }}
+    </div>
 
     <div
       v-if="initialLoading"
@@ -124,6 +163,24 @@ onMounted(() => {
     </div>
 
     <template v-else>
+      <div
+        v-if="store.localDiscovery?.status === 'degraded'"
+        class="plugin-marketplace-page__notice"
+        data-testid="plugin-local-discovery-status"
+        role="status"
+        aria-live="polite"
+      >
+        本地插件扫描已完成，已拒绝 {{ store.localDiscovery.rejectedPackageCount }} 个包。
+      </div>
+      <div
+        v-else-if="store.localDiscovery?.status === 'unavailable'"
+        class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
+        data-testid="plugin-local-discovery-alert"
+        role="alert"
+      >
+        本地插件发现暂时不可用，请重新扫描本地插件。
+      </div>
+
       <div
         v-if="refreshing"
         class="plugin-marketplace-page__notice"
@@ -189,7 +246,7 @@ onMounted(() => {
           class="plugin-marketplace-page__empty"
           data-testid="plugin-catalog-empty"
         >
-          当前没有已安装插件。内置目录为空是正常状态。
+          当前没有已安装插件，也没有发现可用的本地声明式包。
         </p>
         <p
           v-else-if="store.visiblePlugins.length === 0"
@@ -212,7 +269,7 @@ onMounted(() => {
 
       <section v-else-if="props.section === 'market'" class="plugin-marketplace-page__section">
         <p v-if="builtInPlugins.length === 0" class="plugin-marketplace-page__empty">
-          可信插件目录当前为空。在线市场与安装流程将在后续阶段提供。
+          内置插件目录当前为空。本地声明式包可在已安装插件与插件管理中查看。
         </p>
         <div v-else class="plugin-marketplace-page__grid">
           <article
@@ -232,7 +289,7 @@ onMounted(() => {
               </div>
               <div>
                 <dt>来源</dt>
-                <dd>内置 · 随应用提供</dd>
+                <dd>{{ pluginSourceLabel(plugin.source) }}</dd>
               </div>
             </dl>
             <p class="plugin-market-entry__note">
@@ -272,6 +329,7 @@ onMounted(() => {
               <h2>{{ plugin.manifest.name }}</h2>
               <span>{{ plugin.manifest.id }}</span>
             </header>
+            <p>来源：{{ pluginSourceLabel(plugin.source) }}</p>
             <p>当前状态：{{ plugin.status === 'enabled' ? '已启用' : plugin.status === 'disabled' ? '已停用' : '已阻止' }}</p>
             <p data-testid="management-requested-capabilities">
               <strong>请求权限：</strong>无需额外权限

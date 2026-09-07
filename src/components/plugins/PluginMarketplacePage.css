@@ -37,10 +37,27 @@
   outline-offset: 4px;
 }
 
-.plugin-marketplace-page__header > p:last-child,
+.plugin-marketplace-page__description,
 .plugin-marketplace-page__eyebrow,
 .plugin-marketplace-page__empty {
   color: var(--muted-foreground);
+}
+
+.plugin-marketplace-page__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ef-space-2);
+  margin-top: var(--ef-space-2);
+}
+
+.plugin-marketplace-page__actions button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.plugin-marketplace-page__actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .plugin-marketplace-page__eyebrow {
@@ -52,6 +69,7 @@
 
 .plugin-marketplace-page__notice {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--ef-space-3);
@@ -206,6 +224,14 @@
   padding: var(--ef-space-2);
   border-radius: var(--ef-radius-md);
   background: var(--muted);
+}
+
+.plugin-card__local-note {
+  padding: var(--ef-space-2);
+  border-left: 2px solid var(--border);
+  color: var(--muted-foreground);
+  font-size: var(--ef-text-sm);
+  overflow-wrap: anywhere;
 }
 
 .plugin-card__status {
