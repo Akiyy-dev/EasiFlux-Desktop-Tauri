@@ -73,6 +73,7 @@ pub fn run() {
             clear_account_notifications,
             create_client_notification,
             get_plugin_catalog,
+            reload_plugin_catalog,
             set_plugin_enabled,
             get_risk_status,
             update_risk_config,
@@ -180,7 +181,11 @@ mod capability_tests {
             url: "https://example.invalid".parse().unwrap(),
         };
 
-        for command in ["get_plugin_catalog", "set_plugin_enabled"] {
+        for command in [
+            "get_plugin_catalog",
+            "reload_plugin_catalog",
+            "set_plugin_enabled",
+        ] {
             assert!(
                 authority
                     .resolve_access(command, "main", "main", &Origin::Local)
@@ -206,5 +211,23 @@ mod capability_tests {
                 "remote content must not resolve {command}"
             );
         }
+    }
+
+    // Catches wildcard or path-scoped grants expanding this fixed IPC surface.
+    #[test]
+    fn plugin_capability_grants_exactly_the_three_fixed_commands_without_scope() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/plugin-runtime.json")).unwrap();
+        assert_eq!(capability["webviews"], serde_json::json!(["main"]));
+        assert!(capability.get("windows").is_none());
+        assert!(capability.get("remote").is_none());
+        assert_eq!(
+            capability["permissions"],
+            serde_json::json!([
+                "allow-get-plugin-catalog",
+                "allow-reload-plugin-catalog",
+                "allow-set-plugin-enabled"
+            ])
+        );
     }
 }

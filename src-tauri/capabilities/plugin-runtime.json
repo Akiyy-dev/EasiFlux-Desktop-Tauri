@@ -5,6 +5,7 @@
   "webviews": ["main"],
   "permissions": [
     "allow-get-plugin-catalog",
+    "allow-reload-plugin-catalog",
     "allow-set-plugin-enabled"
   ]
 }

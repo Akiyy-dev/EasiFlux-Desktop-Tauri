@@ -6,7 +6,7 @@ use crate::api::ApiClient;
 use crate::events::EventEmitter;
 use crate::models::chart_workspace::ChartWorkspaceKey;
 use crate::models::config::{AppConfig, EnvironmentStatus};
-use crate::plugin::PluginRegistry;
+use crate::plugin::PluginRuntime;
 use crate::services::connection::SessionNotificationObserver;
 use crate::services::notification::{
     NotificationEmitter, NotificationRuntime, NotificationService,
@@ -37,7 +37,7 @@ pub struct AppState {
     pub account: Arc<AccountService>,
     pub risk: Arc<RwLock<RiskService>>,
     pub analytics: Arc<AnalyticsService>,
-    pub plugins: Arc<RwLock<PluginRegistry>>,
+    pub(crate) plugins: Arc<PluginRuntime>,
     pub emitter: EventEmitter,
     pub notification: Arc<NotificationRuntime>,
     pub time: Arc<TimeService>,
@@ -48,15 +48,15 @@ pub struct AppState {
     pub account_lifecycle: Arc<AccountLifecycleCoordinator>,
 }
 
-fn initialize_plugin_registry_with<F>(factory: F) -> Arc<RwLock<PluginRegistry>>
+fn initialize_plugin_runtime_with<F>(factory: F) -> Arc<PluginRuntime>
 where
-    F: FnOnce() -> PluginRegistry,
+    F: FnOnce() -> PluginRuntime,
 {
-    Arc::new(RwLock::new(factory()))
+    Arc::new(factory())
 }
 
-fn initialize_plugin_registry() -> Arc<RwLock<PluginRegistry>> {
-    initialize_plugin_registry_with(PluginRegistry::new)
+fn initialize_plugin_runtime() -> Arc<PluginRuntime> {
+    initialize_plugin_runtime_with(PluginRuntime::new)
 }
 
 fn initialize_notification_runtime(
@@ -232,7 +232,7 @@ impl AppState {
             session_notification_observer,
         ));
 
-        let plugins = initialize_plugin_registry();
+        let plugins = initialize_plugin_runtime();
 
         Ok(Self {
             order_submissions: crate::storage::OrderSubmissionStore::new(),
@@ -273,7 +273,8 @@ mod tests {
         NotificationEntity, NotificationEntityType, NotificationKind, NotificationRecord,
         NotificationScalar, NotificationScope, NotificationSeverity,
     };
-    use crate::plugin::PluginRegistry;
+    use crate::plugin::discovery::{LocalDiscoveryOutcome, LocalPluginDiscovery};
+    use crate::plugin::{PluginRegistry, PluginRuntime};
     use crate::services::notification::{
         NotificationEmitter, NotificationRuntime, NotificationStorageFailureReporter,
     };
@@ -287,7 +288,7 @@ mod tests {
 
     use super::{
         configured_notification_accounts, initialize_notification_runtime,
-        initialize_plugin_registry_with,
+        initialize_plugin_runtime_with,
     };
 
     #[derive(Clone)]
@@ -321,22 +322,37 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailingDiscovery(std::sync::atomic::AtomicUsize);
+
+    impl LocalPluginDiscovery for FailingDiscovery {
+        fn discover(&self) -> LocalDiscoveryOutcome {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            LocalDiscoveryOutcome::unavailable()
+        }
+    }
+
     // Catches startup propagating plugin path/load failure, or retry reusing a failed snapshot.
     #[tokio::test]
-    async fn plugin_startup_contains_store_failure_and_catalog_retry_resolves_again() {
+    async fn plugin_startup_is_lazy_contains_failure_and_catalog_retry_resolves_again() {
         let resolver = RetryableStoreResolver(Arc::new(Mutex::new(RetryableStoreState {
             unavailable: true,
             resolutions: 0,
         })));
-        let plugins = initialize_plugin_registry_with({
+        let discovery = Arc::new(FailingDiscovery::default());
+        let plugins = initialize_plugin_runtime_with({
             let resolver = resolver.clone();
-            move || PluginRegistry::initialize(Vec::new(), Box::new(resolver))
+            let discovery = discovery.clone();
+            move || {
+                PluginRuntime::initialize(
+                    PluginRegistry::initialize(Vec::new(), Box::new(resolver)),
+                    discovery,
+                )
+            }
         });
 
-        assert_eq!(
-            serde_json::to_value(plugins.read().await.catalog_snapshot()).unwrap()["availability"],
-            "unavailable"
-        );
+        assert_eq!(resolver.0.lock().unwrap().resolutions, 1);
+        assert_eq!(discovery.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         resolver.0.lock().unwrap().unavailable = false;
 
         let snapshot = crate::commands::plugin::get_plugin_catalog_from(&plugins)
@@ -348,14 +364,15 @@ mod tests {
             serde_json::json!({
                 "schemaVersion": 2,
                 "revision": "0",
-                "catalogGeneration": "0",
+                "catalogGeneration": "1",
                 "availability": "available",
                 "availabilityReasonCode": null,
-                "localDiscovery": {"status": "available", "rejectedPackageCount": 0},
+                "localDiscovery": {"status": "unavailable", "rejectedPackageCount": 0},
                 "plugins": []
             })
         );
         assert_eq!(resolver.0.lock().unwrap().resolutions, 2);
+        assert_eq!(discovery.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn test_path(label: &str) -> std::path::PathBuf {

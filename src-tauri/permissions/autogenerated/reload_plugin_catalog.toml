@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reload-plugin-catalog"
+description = "Enables the reload_plugin_catalog command without any pre-configured scope."
+commands.allow = ["reload_plugin_catalog"]
+
+[[permission]]
+identifier = "deny-reload-plugin-catalog"
+description = "Denies the reload_plugin_catalog command without any pre-configured scope."
+commands.deny = ["reload_plugin_catalog"]

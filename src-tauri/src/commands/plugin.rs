@@ -1,32 +1,43 @@
+use std::sync::Arc;
+
 use tauri::State;
-use tokio::sync::RwLock;
 
 use crate::error::AppResult;
 use crate::plugin::manifest::{PluginCatalogMutationResult, PluginCatalogSnapshot};
-use crate::plugin::PluginRegistry;
+use crate::plugin::PluginRuntime;
 use crate::state::AppState;
 
 pub(crate) async fn get_plugin_catalog_from(
-    registry: &RwLock<PluginRegistry>,
+    runtime: &Arc<PluginRuntime>,
 ) -> AppResult<PluginCatalogSnapshot> {
-    let mut registry = registry.write().await;
-    registry.retry_state_load();
-    Ok(registry.catalog_snapshot())
+    runtime.get_catalog().await
+}
+
+pub(crate) async fn reload_plugin_catalog_from(
+    runtime: &Arc<PluginRuntime>,
+) -> AppResult<PluginCatalogSnapshot> {
+    runtime.reload_catalog().await
 }
 
 pub(crate) async fn set_plugin_enabled_from(
-    registry: &RwLock<PluginRegistry>,
+    runtime: &PluginRuntime,
     id: &str,
     enabled: bool,
     expected_catalog_generation: &str,
 ) -> AppResult<PluginCatalogMutationResult> {
-    let mut registry = registry.write().await;
-    registry.set_enabled(id, enabled, expected_catalog_generation)
+    runtime
+        .set_enabled(id, enabled, expected_catalog_generation)
+        .await
 }
 
 #[tauri::command]
 pub async fn get_plugin_catalog(state: State<'_, AppState>) -> AppResult<PluginCatalogSnapshot> {
-    get_plugin_catalog_from(state.plugins.as_ref()).await
+    get_plugin_catalog_from(&state.plugins).await
+}
+
+#[tauri::command]
+pub async fn reload_plugin_catalog(state: State<'_, AppState>) -> AppResult<PluginCatalogSnapshot> {
+    reload_plugin_catalog_from(&state.plugins).await
 }
 
 #[tauri::command]
@@ -53,7 +64,10 @@ mod tests {
 
     use super::*;
     use crate::error::AppError;
+    use crate::plugin::discovery::{LocalDiscoveryOutcome, LocalPluginDiscovery};
     use crate::plugin::manifest::{PluginId, PluginManifestV1, PluginPublisherId, PluginSource};
+    use crate::plugin::record::PluginRecord;
+    use crate::plugin::PluginRegistry;
     use crate::storage::plugin_state::{
         PluginStateEntryV2, PluginStateFileV2, PluginStateLoad, PluginStatePersistence,
     };
@@ -137,6 +151,21 @@ mod tests {
         }
     }
 
+    struct FixedDiscovery(LocalDiscoveryOutcome);
+
+    impl LocalPluginDiscovery for FixedDiscovery {
+        fn discover(&self) -> LocalDiscoveryOutcome {
+            self.0.clone()
+        }
+    }
+
+    fn runtime_with(persistence: &MemoryPersistence) -> Arc<PluginRuntime> {
+        Arc::new(PluginRuntime::initialize(
+            persistence.registry(vec![manifest()]),
+            Arc::new(FixedDiscovery(LocalDiscoveryOutcome::available(vec![]))),
+        ))
+    }
+
     // Catches returning the stale unavailable snapshot without asking persistence again.
     #[tokio::test]
     async fn catalog_command_retries_unavailable_state_before_snapshotting() {
@@ -146,11 +175,7 @@ mod tests {
             entries: vec![enabled_entry()],
         });
         persistence.0.lock().unwrap().load_error = true;
-        let registry = RwLock::new(persistence.registry(vec![manifest()]));
-        assert_eq!(
-            serde_json::to_value(registry.read().await.catalog_snapshot()).unwrap()["availability"],
-            "unavailable"
-        );
+        let registry = runtime_with(&persistence);
 
         persistence.0.lock().unwrap().load_error = false;
         let snapshot = get_plugin_catalog_from(&registry).await.unwrap();
@@ -160,7 +185,7 @@ mod tests {
             json!({
                 "schemaVersion": 2,
                 "revision": "7",
-                "catalogGeneration": "0",
+                "catalogGeneration": "1",
                 "availability": "available",
                 "availabilityReasonCode": null,
                 "localDiscovery": {"status": "available", "rejectedPackageCount": 0},
@@ -191,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn mutation_command_rejects_stale_or_noncanonical_generation_without_storage_access() {
         let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
-        let registry = RwLock::new(persistence.registry(vec![manifest()]));
+        let registry = runtime_with(&persistence);
         for generation in ["1", "00", "+0", "", "18446744073709551616"] {
             let error = set_plugin_enabled_from(&registry, "com.easiflux.alpha", true, generation)
                 .await
@@ -203,14 +228,17 @@ mod tests {
         }
         assert_eq!(persistence.0.lock().unwrap().loads, 1);
         assert!(persistence.0.lock().unwrap().saves.is_empty());
-        assert_eq!(registry.read().await.catalog_snapshot().revision, "0");
+        assert_eq!(
+            get_plugin_catalog_from(&registry).await.unwrap().revision,
+            "0"
+        );
     }
 
     // Catches bypassing the registry transaction or discarding its committed revision/item.
     #[tokio::test]
     async fn mutation_command_returns_the_persisted_registry_result() {
         let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
-        let registry = RwLock::new(persistence.registry(vec![manifest()]));
+        let registry = runtime_with(&persistence);
 
         let result = set_plugin_enabled_from(&registry, "com.easiflux.alpha", true, "0")
             .await
@@ -229,5 +257,51 @@ mod tests {
         assert_eq!(persisted.persisted.revision, 1);
         assert_eq!(persisted.persisted.entries.len(), 1);
         assert!(persisted.persisted.entries[0].enabled);
+    }
+
+    // Catches omitting local discovery/reload at the IPC adapter or dropping the token.
+    #[tokio::test]
+    async fn mutation_command_requires_expected_catalog_generation_after_local_reload() {
+        let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+        let local = PluginRecord::local_declarative(manifest()).unwrap();
+        let runtime = Arc::new(PluginRuntime::initialize(
+            persistence.registry(vec![]),
+            Arc::new(FixedDiscovery(LocalDiscoveryOutcome::available(vec![
+                local,
+            ]))),
+        ));
+        let snapshot = reload_plugin_catalog_from(&runtime).await.unwrap();
+        assert_eq!(snapshot.catalog_generation, "1");
+        assert_eq!(snapshot.revision, "0");
+        let result = set_plugin_enabled_from(&runtime, "com.easiflux.alpha", true, "1")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({
+                "schemaVersion": 2, "catalogGeneration": "1", "revision": "1",
+                "plugin": {
+                    "manifest": {
+                        "schemaVersion": 1, "id": "com.easiflux.alpha", "name": "Alpha",
+                        "version": "1.2.3", "description": "Metadata only",
+                        "publisherId": "com.easiflux", "publisher": "EasiFlux",
+                        "contributions": [], "requestedCapabilities": []
+                    },
+                    "source": "localDeclarative", "grantedCapabilities": [],
+                    "status": "enabled", "canToggle": true, "statusReasonCode": null
+                }
+            })
+        );
+        let stale = set_plugin_enabled_from(&runtime, "com.easiflux.alpha", false, "0")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(stale).unwrap()["code"],
+            "plugin_catalog_stale"
+        );
+        let again = reload_plugin_catalog_from(&runtime).await.unwrap();
+        assert_eq!(again.catalog_generation, "1");
+        assert_eq!(again.revision, "1");
+        assert_eq!(persistence.0.lock().unwrap().saves.len(), 1);
     }
 }
