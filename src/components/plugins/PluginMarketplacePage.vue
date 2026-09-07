@@ -32,19 +32,29 @@ const initialLoading = computed(() => (
   store.availability === null
   && (store.loadStatus === 'idle' || store.loadStatus === 'loading')
 ))
-const initialError = computed(() => (
-  store.availability === null && store.loadStatus === 'error'
-))
 const refreshing = computed(() => (
   store.availability !== null && store.loadStatus === 'loading'
-))
-const refreshError = computed(() => (
-  store.availability !== null && store.loadError !== null
 ))
 const reloading = computed(() => store.reloadStatus === 'loading')
 const reloadDisabled = computed(() => (
   initialLoading.value || store.loadStatus === 'loading' || reloading.value
 ))
+// One transport failure surface: a reload failure takes precedence because only
+// a successful reload clears both error domains. Validated health stays separate.
+const transportError = computed(() => {
+  if (reloadDisabled.value) return null
+  if (store.reloadError) {
+    return { message: store.reloadError, testId: 'plugin-reload-error' }
+  }
+  if (store.loadError) {
+    return {
+      message: store.loadError,
+      testId: store.availability === null ? 'plugin-load-error' : 'plugin-refresh-error',
+    }
+  }
+  return null
+})
+const recoveryLabel = computed(() => store.reloadError ? '重新扫描并重试' : '重试')
 const builtInPlugins = computed(() => (
   store.catalog.filter((plugin) => plugin.source === 'builtIn')
 ))
@@ -81,8 +91,10 @@ function updateStatusFilter(event: unknown): void {
   }
 }
 
-function retry(): void {
-  void store.retry()
+function recover(): void {
+  if (reloadDisabled.value) return
+  if (store.reloadError) void store.reload()
+  else void store.retry()
 }
 
 function reload(): void {
@@ -133,12 +145,20 @@ onMounted(() => {
       正在重新扫描本地插件…
     </div>
     <div
-      v-if="store.reloadError"
+      v-if="transportError"
       class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
-      data-testid="plugin-reload-error"
+      :data-testid="transportError.testId"
       role="alert"
     >
-      {{ store.reloadError }}
+      <p>{{ transportError.message }}</p>
+      <button
+        class="ef-btn ef-btn-secondary ef-btn-sm"
+        type="button"
+        :disabled="reloadDisabled"
+        @click="recover"
+      >
+        {{ recoveryLabel }}
+      </button>
     </div>
 
     <div
@@ -150,19 +170,7 @@ onMounted(() => {
       正在加载插件目录…
     </div>
 
-    <div
-      v-else-if="initialError"
-      class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
-      data-testid="plugin-load-error"
-      role="alert"
-    >
-      <p>{{ store.loadError }}</p>
-      <button class="ef-btn ef-btn-secondary ef-btn-sm" type="button" @click="retry">
-        重试
-      </button>
-    </div>
-
-    <template v-else>
+    <template v-if="store.availability !== null">
       <div
         v-if="store.localDiscovery?.status === 'degraded'"
         class="plugin-marketplace-page__notice"
@@ -191,26 +199,19 @@ onMounted(() => {
       </div>
 
       <div
-        v-if="refreshError"
-        class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
-        data-testid="plugin-refresh-error"
-        role="alert"
-      >
-        <p>{{ store.loadError }}</p>
-        <button class="ef-btn ef-btn-secondary ef-btn-sm" type="button" @click="retry">
-          重试
-        </button>
-      </div>
-
-      <div
         v-if="store.availability === 'unavailable'"
         class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
         data-testid="plugin-availability-alert"
         role="alert"
       >
         <p>{{ availabilityMessage }}</p>
-        <button class="ef-btn ef-btn-secondary ef-btn-sm" type="button" @click="retry">
-          重试插件子系统
+        <button
+          class="ef-btn ef-btn-secondary ef-btn-sm"
+          type="button"
+          :disabled="reloadDisabled"
+          @click="recover"
+        >
+          {{ store.reloadError ? '重新扫描并重试' : '重试插件子系统' }}
         </button>
       </div>
 

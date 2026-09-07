@@ -253,7 +253,7 @@ describe('PluginMarketplacePage local discovery', () => {
 
     const alert = wrapper.get('[data-testid="plugin-reload-error"]')
     expect(alert.attributes('role')).toBe('alert')
-    expect(alert.text()).toBe('插件操作失败，请重试。')
+    expect(alert.text()).toContain('插件操作失败，请重试。')
     expect(wrapper.text()).toContain('本地声明示例')
     expect(wrapper.text()).not.toMatch(/EACCES|private|rejected-secret-package|manifest.json|Error:/)
     expect(usePluginStore().localDiscovery).toEqual({ status: 'available', rejectedPackageCount: 0 })
@@ -262,6 +262,140 @@ describe('PluginMarketplacePage local discovery', () => {
     await reload!.trigger('click')
     await flushPromises()
     expect(wrapper.find('[data-testid="plugin-reload-error"]').exists()).toBe(false)
+  })
+})
+
+describe('PluginMarketplacePage recovery precedence', () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.reloadCatalog.mockReset()
+  })
+
+  it.each([false, true])(
+    'deduplicates load and reload errors and recovers both domains (confirmed catalog: %s)',
+    async (confirmed) => {
+      const loadFailure = { code: 'plugin_state_unavailable', message: 'EACCES private-load-path' }
+      if (confirmed) serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot())
+      else serviceMocks.getCatalog.mockRejectedValueOnce(loadFailure)
+      const wrapper = mountPage()
+      await flushPromises()
+      const store = usePluginStore()
+      if (confirmed) {
+        serviceMocks.getCatalog.mockRejectedValueOnce(loadFailure)
+        await store.retry()
+        await nextTick()
+      }
+      expect(wrapper.findAll('[role="alert"]')).toHaveLength(1)
+      expect(wrapper.get('[role="alert"]').text()).toContain('插件状态暂不可用，请重试。')
+
+      serviceMocks.reloadCatalog.mockRejectedValueOnce(new Error('EIO private-reload-path'))
+      await wrapper.get('header button').trigger('click')
+      await flushPromises()
+
+      expect(wrapper.findAll('[role="alert"]')).toHaveLength(1)
+      const alert = wrapper.get('[role="alert"]')
+      expect(alert.get('p').text()).toBe('插件操作失败，请重试。')
+      expect(wrapper.find('[data-testid="plugin-load-error"]').exists()).toBe(false)
+      expect(wrapper.find('[data-testid="plugin-refresh-error"]').exists()).toBe(false)
+      expect(wrapper.text()).not.toMatch(/EACCES|EIO|private-load|private-reload/)
+      expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(confirmed ? 2 : 0)
+
+      const recovery = deferred<PluginCatalogSnapshot>()
+      serviceMocks.reloadCatalog.mockReturnValueOnce(recovery.promise)
+      const ordinaryLoads = serviceMocks.getCatalog.mock.calls.length
+      await alert.get('button').trigger('click')
+      expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
+      expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(ordinaryLoads)
+      expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+      expect(wrapper.findAll('[role="status"]')).toHaveLength(1)
+      expect(wrapper.get<HTMLButtonElement>('header button').element.disabled).toBe(true)
+      await wrapper.get('header button').trigger('click')
+      expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
+      recovery.resolve(availableSnapshot(undefined, '2'))
+      await flushPromises()
+
+      expect(store.loadError).toBeNull()
+      expect(store.reloadError).toBeNull()
+      expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+      expect(wrapper.findAll('[role="status"]')).toHaveLength(0)
+      expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+      expect(wrapper.get<HTMLButtonElement>('header button').element.disabled).toBe(false)
+    },
+  )
+
+  it('disables header reload throughout a deferred ordinary refresh', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot())
+    const wrapper = mountPage()
+    await flushPromises()
+    const refresh = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(refresh.promise)
+    const pending = usePluginStore().retry()
+    await nextTick()
+
+    const reload = wrapper.get<HTMLButtonElement>('header button')
+    expect(reload.text()).toBe('重新扫描本地插件')
+    expect(reload.element.disabled).toBe(true)
+    await reload.trigger('click')
+    expect(serviceMocks.reloadCatalog).not.toHaveBeenCalled()
+    refresh.resolve(availableSnapshot(undefined, '2'))
+    await pending
+    await nextTick()
+    expect(reload.element.disabled).toBe(false)
+  })
+
+  it('preserves distinct validated health alerts while deduplicating identical transport failures', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...unavailableSnapshot(),
+      localDiscovery: { status: 'unavailable', rejectedPackageCount: 0 },
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+    const failure = { code: 'plugin_state_unavailable', message: 'private-path' }
+    serviceMocks.getCatalog.mockRejectedValueOnce(failure)
+    await usePluginStore().retry()
+    serviceMocks.reloadCatalog.mockRejectedValueOnce(failure)
+    await wrapper.get('header button').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(3)
+    expect(wrapper.get('[data-testid="plugin-local-discovery-alert"]').attributes('role')).toBe('alert')
+    const subsystem = wrapper.get('[data-testid="plugin-availability-alert"]')
+    expect(subsystem.attributes('role')).toBe('alert')
+    expect(wrapper.get('[data-testid="plugin-reload-error"]').get('p').text())
+      .toBe('插件状态暂不可用，请重试。')
+    expect(wrapper.find('[data-testid="plugin-refresh-error"]').exists()).toBe(false)
+
+    const recovery = deferred<PluginCatalogSnapshot>()
+    serviceMocks.reloadCatalog.mockReturnValueOnce(recovery.promise)
+    await subsystem.get('button').trigger('click')
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(2)
+    expect(subsystem.get<HTMLButtonElement>('button').element.disabled).toBe(true)
+    await subsystem.get('button').trigger('click')
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(2)
+    recovery.resolve(availableSnapshot(undefined, '4'))
+    await flushPromises()
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+  })
+
+  it('disables subsystem recovery during an ordinary retry without starting a second load', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(unavailableSnapshot())
+    const wrapper = mountPage()
+    await flushPromises()
+    const retry = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(retry.promise)
+    const recovery = wrapper.get<HTMLButtonElement>('[data-testid="plugin-availability-alert"] button')
+    await recovery.trigger('click')
+    expect(recovery.element.disabled).toBe(true)
+    await recovery.trigger('click')
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(2)
+    expect(serviceMocks.reloadCatalog).not.toHaveBeenCalled()
+    retry.resolve(availableSnapshot(undefined, '4'))
+    await flushPromises()
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
   })
 })
 
