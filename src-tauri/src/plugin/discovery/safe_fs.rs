@@ -72,6 +72,51 @@ pub(super) struct PackageScan {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) struct RootReadError;
 
+/// Deliberately carries neither paths nor underlying platform error details.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct SourceReadError;
+
+pub(crate) fn read_manifest_source(path: &Path) -> Result<Vec<u8>, SourceReadError> {
+    // Components normalizes interior dots on ordinary paths. Inspect the raw
+    // spelling first so no current/parent component disappears before opening.
+    let is_separator = |byte: &u8| *byte == b'/' || (cfg!(windows) && *byte == b'\\');
+    if !path.is_absolute()
+        || path
+            .as_os_str()
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(is_separator)
+        || path
+            .as_os_str()
+            .as_encoded_bytes()
+            .split(is_separator)
+            .any(|part| part == b"." || part == b"..")
+        || path.components().any(|component| match component {
+            Component::ParentDir | Component::CurDir => true,
+            // A drive-prefix colon is not a Normal component. Reject ADS in
+            // every other component before any ancestor is opened.
+            Component::Normal(name) => cfg!(windows) && name.as_encoded_bytes().contains(&b':'),
+            _ => false,
+        })
+    {
+        return Err(SourceReadError);
+    }
+    let parent = path.parent().ok_or(SourceReadError)?;
+    let name = path.file_name().ok_or(SourceReadError)?;
+    let directory = platform::Directory::open_root(parent)
+        .map_err(|_| SourceReadError)?
+        .ok_or(SourceReadError)?;
+    let mut file = directory
+        .open_regular_file(name)
+        .map_err(|_| SourceReadError)?;
+    // The existing loop reads at most 16,385 bytes, including the probe byte.
+    let bytes =
+        read_bounded(&mut file, ScanLimits::production(), &mut 0).map_err(|_| SourceReadError);
+    drop(file);
+    drop(directory);
+    bytes
+}
+
 enum ReadFailure {
     Package,
     Root,
@@ -235,9 +280,13 @@ mod platform {
         }
 
         pub(super) fn open_manifest(&self) -> Result<File, ()> {
+            self.open_regular_file(OsStr::new("manifest.json"))
+        }
+
+        pub(super) fn open_regular_file(&self, name: &OsStr) -> Result<File, ()> {
             let fd = openat(
                 &self.0,
-                "manifest.json",
+                name,
                 OFlags::RDONLY
                     | OFlags::NOFOLLOW
                     | OFlags::CLOEXEC
@@ -379,7 +428,11 @@ mod platform {
         }
 
         pub(super) fn open_manifest(&self) -> Result<File, ()> {
-            open_manifest(&self.path.join("manifest.json"))
+            self.open_regular_file(OsStr::new("manifest.json"))
+        }
+
+        pub(super) fn open_regular_file(&self, name: &OsStr) -> Result<File, ()> {
+            open_manifest(&self.path.join(name))
         }
     }
 }

@@ -9,6 +9,7 @@ use crate::plugin::{
 };
 
 mod session;
+pub(crate) mod source;
 pub(crate) use session::{CommitLease, ImportSessions, PrepareLease};
 
 /// Only captured, validated content survives source selection. No path is retained.

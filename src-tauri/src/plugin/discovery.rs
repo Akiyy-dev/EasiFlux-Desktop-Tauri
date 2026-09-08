@@ -5,7 +5,7 @@ use super::manifest::{LocalDiscoverySummary, PluginManifestV1};
 use super::record::PluginRecord;
 use crate::models::config::APP_NAME;
 
-mod safe_fs;
+pub(crate) mod safe_fs;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LocalDiscoveryOutcome {
