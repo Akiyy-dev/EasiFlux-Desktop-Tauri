@@ -11,8 +11,15 @@ const props = defineProps<{
   section: PluginSection
 }>()
 
+interface FocusControl {
+  readonly isConnected: boolean
+  focus: () => void
+}
+
 const store = usePluginStore()
 const title = ref<{ focus: () => void } | null>(null)
+const importTrigger = ref<FocusControl | null>(null)
+const importDialogOpener = ref<FocusControl | null>(null)
 
 const importFailureCopy: Record<LocalManifestImportCommitFailure, string> = {
   plugin_catalog_stale: '插件目录已更新，请刷新后重试。',
@@ -149,7 +156,9 @@ function reload(): void {
 }
 
 function prepareImport(): void {
-  if (props.section !== 'market' && !importEntryDisabled.value) void store.prepareImport()
+  if (props.section === 'market' || importEntryDisabled.value) return
+  importDialogOpener.value = importTrigger.value?.isConnected ? importTrigger.value : null
+  void store.prepareImport()
 }
 
 function cancelImport(): void {
@@ -205,6 +214,7 @@ onBeforeUnmount(() => {
         </button>
         <button
           v-if="props.section !== 'market'"
+          ref="importTrigger"
           class="ef-btn ef-btn-primary ef-btn-sm"
           data-testid="plugin-import-button"
           type="button"
@@ -223,6 +233,7 @@ onBeforeUnmount(() => {
       :preview="store.importPreview"
       :committing="store.importStatus === 'committing'"
       :stale="store.importPreviewStale"
+      :opener="importDialogOpener"
       @confirm="commitImport"
       @cancel="cancelImport"
     />

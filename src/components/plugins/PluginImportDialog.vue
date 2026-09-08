@@ -2,17 +2,6 @@
 import { nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { ReadyLocalManifestImport } from '../../types/plugin'
 
-const props = defineProps<{
-  preview: ReadyLocalManifestImport
-  committing: boolean
-  stale: boolean
-}>()
-
-const emit = defineEmits<{
-  confirm: []
-  cancel: []
-}>()
-
 interface DialogControl {
   readonly open: boolean
   showModal: () => void
@@ -24,10 +13,22 @@ interface FocusControl {
   focus: () => void
 }
 
+const props = defineProps<{
+  preview: ReadyLocalManifestImport
+  committing: boolean
+  stale: boolean
+  opener?: FocusControl | null
+}>()
+
+const emit = defineEmits<{
+  confirm: []
+  cancel: []
+}>()
+
 const dialog = ref<DialogControl | null>(null)
 const cancelButton = ref<FocusControl | null>(null)
 const actionRequested = ref(false)
-let opener: FocusControl | null = null
+let returnFocusTarget: FocusControl | null = null
 
 function requestCancel(event?: { preventDefault: () => void }): void {
   event?.preventDefault()
@@ -48,7 +49,9 @@ watch(() => props.preview.token, () => {
 
 onMounted(async () => {
   const active = globalThis.document.activeElement
-  opener = active instanceof globalThis.HTMLElement ? active : null
+  returnFocusTarget = props.opener?.isConnected
+    ? props.opener
+    : active instanceof globalThis.HTMLElement ? active : null
   dialog.value?.showModal()
   await nextTick()
   cancelButton.value?.focus()
@@ -59,7 +62,7 @@ onBeforeUnmount(() => {
 })
 
 onUnmounted(() => {
-  if (opener?.isConnected) opener.focus()
+  if (returnFocusTarget?.isConnected) returnFocusTarget.focus()
 })
 </script>
 

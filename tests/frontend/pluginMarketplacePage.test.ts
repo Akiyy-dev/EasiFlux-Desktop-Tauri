@@ -792,6 +792,7 @@ describe('PluginMarketplacePage local manifest import', () => {
     } else {
       delete HTMLDialogElement.prototype.close
     }
+    document.body.removeAttribute('tabindex')
     document.body.replaceChildren()
   })
 
@@ -839,6 +840,36 @@ describe('PluginMarketplacePage local manifest import', () => {
     expect(entry.element.disabled).toBe(false)
     expect(wrapper.find('[data-testid="plugin-import-choosing"]').exists()).toBe(false)
     expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+    wrapper.unmount()
+  })
+
+  it('restores the connected import trigger after the native picker blurred it', async () => {
+    const choice = deferred<PrepareLocalManifestImportResult>()
+    serviceMocks.prepareImport.mockReturnValueOnce(choice.promise)
+    const wrapper = await mountLoaded()
+    const entry = wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-button"]')
+    entry.element.focus()
+
+    await entry.trigger('click')
+    await nextTick()
+    expect(entry.element.disabled).toBe(true)
+    document.body.tabIndex = -1
+    document.body.focus()
+    expect(document.activeElement).toBe(document.body)
+
+    choice.resolve(readyPreview)
+    await flushPromises()
+    const dialog = wrapper.get('dialog')
+    expect(document.activeElement).toBe(
+      dialog.get('[data-testid="plugin-import-cancel"]').element,
+    )
+
+    dialog.element.dispatchEvent(new Event('cancel', { cancelable: true }))
+    await flushPromises()
+
+    expect(entry.element.isConnected).toBe(true)
+    expect(entry.element.disabled).toBe(false)
+    expect(document.activeElement).toBe(entry.element)
     wrapper.unmount()
   })
 
