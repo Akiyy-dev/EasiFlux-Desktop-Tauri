@@ -129,6 +129,9 @@ pub(crate) enum ImportCommitFailure {
     StatePersistFailed,
     StateCapacityExceeded,
     RevisionExhausted,
+    OwnershipUnavailable,
+    OwnershipCapacityExceeded,
+    OwnershipRevisionExhausted,
     IdConflict,
     DiscoveryUnavailable,
     CapacityExceeded,
@@ -146,11 +149,29 @@ impl ImportCommitFailure {
             Self::StatePersistFailed => "plugin_state_persist_failed",
             Self::StateCapacityExceeded => "plugin_state_capacity_exceeded",
             Self::RevisionExhausted => "plugin_revision_exhausted",
+            Self::OwnershipUnavailable => "plugin_ownership_unavailable",
+            Self::OwnershipCapacityExceeded => "plugin_ownership_capacity_exceeded",
+            Self::OwnershipRevisionExhausted => "plugin_ownership_revision_exhausted",
             Self::IdConflict => "plugin_import_id_conflict",
             Self::DiscoveryUnavailable => "plugin_import_discovery_unavailable",
             Self::CapacityExceeded => "plugin_import_capacity_exceeded",
             Self::StagingCapacityExceeded => "plugin_import_staging_capacity_exceeded",
             Self::WriteFailed => "plugin_import_write_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImportPostCommitReason {
+    OwnershipNotRegistered,
+    PublicationUnconfirmed,
+}
+
+impl ImportPostCommitReason {
+    fn as_code(self) -> &'static str {
+        match self {
+            Self::OwnershipNotRegistered => "plugin_import_ownership_not_registered",
+            Self::PublicationUnconfirmed => "plugin_import_publication_unconfirmed",
         }
     }
 }
@@ -169,9 +190,19 @@ pub(crate) enum CommitImportResult {
         plugin_id: String,
         snapshot: PluginCatalogSnapshot,
     },
+    ImportedExternal {
+        plugin_id: String,
+        snapshot: PluginCatalogSnapshot,
+    },
 }
 
 impl CommitImportResult {
+    pub(crate) fn imported_external(plugin_id: String, snapshot: PluginCatalogSnapshot) -> Self {
+        Self::ImportedExternal {
+            plugin_id,
+            snapshot,
+        }
+    }
     pub(crate) fn imported(plugin_id: String, snapshot: PluginCatalogSnapshot) -> Self {
         Self::Imported {
             plugin_id,
@@ -208,7 +239,7 @@ impl Serialize for CommitImportResult {
             5
         };
         let mut map = serializer.serialize_map(Some(fields))?;
-        map.serialize_entry("schemaVersion", &1u8)?;
+        map.serialize_entry("schemaVersion", &2u8)?;
         match self {
             Self::Imported {
                 plugin_id,
@@ -234,7 +265,22 @@ impl Serialize for CommitImportResult {
             } => {
                 map.serialize_entry("status", "importedNotVisible")?;
                 map.serialize_entry("pluginId", plugin_id)?;
-                map.serialize_entry("reasonCode", "plugin_import_publication_unconfirmed")?;
+                map.serialize_entry(
+                    "reasonCode",
+                    ImportPostCommitReason::PublicationUnconfirmed.as_code(),
+                )?;
+                map.serialize_entry("snapshot", snapshot)?;
+            }
+            Self::ImportedExternal {
+                plugin_id,
+                snapshot,
+            } => {
+                map.serialize_entry("status", "importedExternal")?;
+                map.serialize_entry("pluginId", plugin_id)?;
+                map.serialize_entry(
+                    "reasonCode",
+                    ImportPostCommitReason::OwnershipNotRegistered.as_code(),
+                )?;
                 map.serialize_entry("snapshot", snapshot)?;
             }
         }

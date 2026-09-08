@@ -17,11 +17,16 @@ use super::manifest::{
     PluginManifestV1, PluginSource,
 };
 use super::manifest::{ManagedOwnershipSummary, PluginManagement};
-use super::ownership::OwnershipRuntime;
+use super::ownership::{
+    FileIdentity, ManagedOwnershipEntryV1, ManagedOwnershipIndexV1, OwnershipFailure,
+    OwnershipReceiptV1, OwnershipRuntime, PackageSlot, ReceiptId, VerifiedPackageReceipt,
+    MAX_MANAGED_OWNERSHIP_BYTES, MAX_MANAGED_OWNERSHIP_ENTRIES,
+};
 use super::record::PluginRecord;
 use crate::storage::managed_plugin_ownership::{
     ManagedOwnershipPersistence, ManagedOwnershipStore,
 };
+use crate::storage::safe_plugin_document::{persist_outcome_committed, PersistOutcome};
 
 #[derive(Clone)]
 enum Runtime {
@@ -50,9 +55,16 @@ pub(crate) struct CatalogPublicationCandidate {
     snapshot: PluginCatalogSnapshot,
 }
 
+#[derive(Clone)]
 pub struct PluginRegistry {
     builtins: BTreeMap<PluginId, PluginRecord>,
     publication: CatalogPublicationCandidate,
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnershipMutationFailure {
+    pub(crate) failure: OwnershipFailure,
+    pub(crate) persist_outcome: PersistOutcome,
 }
 
 // Resolve the production store for each operation, so failure to resolve the
@@ -219,6 +231,182 @@ impl PluginRegistry {
             return Err(ImportCommitFailure::CatalogGenerationExhausted);
         }
         Ok(())
+    }
+
+    /// Pure preflight: reserve the complete two-file package and both documents
+    /// before storage is allowed to create even the staging parent.
+    pub(crate) fn validate_managed_import(
+        &self,
+        record: &PluginRecord,
+        usage: ScanUsage,
+        expected_generation: &str,
+    ) -> Result<(), ImportCommitFailure> {
+        if expected_generation != self.catalog_generation().to_string() {
+            return Err(ImportCommitFailure::CatalogStale);
+        }
+        self.validate_import(record, usage)?;
+        let OwnershipRuntime::Available {
+            index,
+            requires_rewrite: false,
+            ..
+        } = &self.publication.ownership
+        else {
+            return Err(ImportCommitFailure::OwnershipUnavailable);
+        };
+        if self.publication.ownership_summary.status == LocalDiscoveryStatus::Unavailable {
+            return Err(ImportCommitFailure::OwnershipUnavailable);
+        }
+        if index.entries().len() >= MAX_MANAGED_OWNERSHIP_ENTRIES {
+            return Err(ImportCommitFailure::OwnershipCapacityExceeded);
+        }
+        index
+            .require_revision_headroom(1)
+            .map_err(|_| ImportCommitFailure::OwnershipRevisionExhausted)?;
+        // Slot/UUID/OS identities all have fixed serialized widths. This sizing
+        // receipt is never staged or registered and contains no deletion authority.
+        let receipt = OwnershipReceiptV1::new(
+            ReceiptId::parse("550e8400e29b41d4a716446655440000").unwrap(),
+            PackageSlot::parse("pkg-00000000000000000000000000000000").unwrap(),
+            record,
+        )
+        .map_err(|_| ImportCommitFailure::CatalogInvalid)?;
+        let receipt_bytes = receipt
+            .canonical_bytes()
+            .map_err(|_| ImportCommitFailure::CapacityExceeded)?;
+        let manifest_bytes = record
+            .canonical_manifest_bytes()
+            .map_err(|_| ImportCommitFailure::CapacityExceeded)?;
+        if usage
+            .bytes_read
+            .checked_add(manifest_bytes.len())
+            .and_then(|bytes| bytes.checked_add(receipt_bytes.len()))
+            .is_none_or(|bytes| bytes > 2_097_152)
+        {
+            return Err(ImportCommitFailure::CapacityExceeded);
+        }
+        let sizing_entry = ManagedOwnershipEntryV1::managed(
+            VerifiedPackageReceipt {
+                canonical_sha256: receipt.canonical_sha256(),
+                model: receipt,
+                file_identity: FileIdentity {
+                    volume: 0,
+                    object: 3,
+                },
+            },
+            record,
+            FileIdentity {
+                volume: 0,
+                object: 1,
+            },
+            FileIdentity {
+                volume: 0,
+                object: 2,
+            },
+        )
+        .map_err(|_| ImportCommitFailure::CatalogInvalid)?;
+        let empty = ManagedOwnershipIndexV1::empty();
+        let added_bytes = empty
+            .register(sizing_entry)
+            .and_then(|index| index.canonical_bytes())
+            .map_err(|_| ImportCommitFailure::OwnershipCapacityExceeded)?
+            .len()
+            - empty.canonical_bytes().unwrap().len();
+        let current_bytes = index
+            .canonical_bytes()
+            .map_err(|_| ImportCommitFailure::OwnershipCapacityExceeded)?
+            .len();
+        // One optional entry separator and one checked revision digit of reserve.
+        if current_bytes + added_bytes + usize::from(!index.entries().is_empty()) + 1
+            > MAX_MANAGED_OWNERSHIP_BYTES
+        {
+            return Err(ImportCommitFailure::OwnershipCapacityExceeded);
+        }
+        let Runtime::Available { state, .. } = &self.publication.runtime else {
+            unreachable!()
+        };
+        let identity = record.identity();
+        let mut next = state.clone();
+        next.entries
+            .retain(|entry| entry.id != identity.id || entry.source != identity.source);
+        next.entries.push(PluginStateEntryV2 {
+            id: identity.id,
+            source: identity.source,
+            publisher_id: identity.publisher_id,
+            approval_fingerprint: identity.approval_fingerprint,
+            enabled: false,
+        });
+        if next.entries.len() > MAX_PLUGIN_STATE_ENTRIES {
+            return Err(ImportCommitFailure::StateCapacityExceeded);
+        }
+        sort_state_entries(&mut next.entries);
+        let mut previous_entries = state.entries.clone();
+        sort_state_entries(&mut previous_entries);
+        if next.entries != previous_entries {
+            next.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(ImportCommitFailure::RevisionExhausted)?;
+        }
+        next.validate_for_persistence()
+            .map_err(|_| ImportCommitFailure::StatePersistFailed)?;
+        Ok(())
+    }
+
+    /// Register only proven promotion evidence. This adopts committed document
+    /// outcomes, including errors, without inventing any catalog member.
+    pub(crate) fn register_managed_import(
+        &mut self,
+        entry: ManagedOwnershipEntryV1,
+    ) -> Result<PersistOutcome, OwnershipMutationFailure> {
+        let failure = |failure| OwnershipMutationFailure {
+            failure,
+            persist_outcome: PersistOutcome::NotCommitted,
+        };
+        let OwnershipRuntime::Available {
+            index,
+            requires_rewrite: false,
+            persistence,
+        } = &mut self.publication.ownership
+        else {
+            return Err(failure(OwnershipFailure::Unavailable));
+        };
+        let next = index.register(entry).map_err(failure)?;
+        let result = persistence.save(&next);
+        let outcome = match &result {
+            Ok(outcome) => *outcome,
+            Err(failure) => failure.outcome,
+        };
+        if persist_outcome_committed(outcome) {
+            *index = next;
+        }
+        match result {
+            Ok(outcome) if persist_outcome_committed(outcome) => Ok(outcome),
+            _ => Err(OwnershipMutationFailure {
+                failure: OwnershipFailure::PersistFailed,
+                persist_outcome: outcome,
+            }),
+        }
+    }
+
+    /// Persisted documents survive a failed/uncertain publication. The previous
+    /// complete DTO remains authoritative until a complete candidate can replace it.
+    pub(crate) fn adopt_import_documents(&mut self, candidate: &Self) {
+        self.publication.runtime = candidate.publication.runtime.clone();
+        self.publication.ownership = candidate.publication.ownership.clone();
+    }
+
+    pub(crate) fn publish_import_candidate(&mut self, candidate: Self) -> AppResult<()> {
+        self.publish_candidate(candidate.publication, false)
+            .map(|_| ())
+    }
+
+    pub(crate) fn confirms_import_locator(
+        &self,
+        record: &PluginRecord,
+        locator: &LocalPackageLocator,
+    ) -> bool {
+        self.publication.locals.get(&record.manifest().id) == Some(record)
+            && self.publication.locators.get(&record.manifest().id) == Some(locator)
     }
 
     /// Record only the disabled decision; authoritative discovery owns membership.

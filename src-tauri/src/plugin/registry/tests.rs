@@ -2186,3 +2186,112 @@ fn validate_import_rejects_max_generation_and_accepts_max_minus_one() {
     );
     assert!(memory.0.lock().unwrap().saves.is_empty());
 }
+
+#[test]
+fn managed_import_registration_adopts_all_committed_outcomes_without_membership() {
+    use crate::storage::managed_plugin_ownership::{
+        ManagedOwnershipLoad, ManagedOwnershipPersistence,
+    };
+    use crate::storage::safe_plugin_document::{PersistFailure, PersistOutcome, PersistResult};
+    struct OutcomeOwnership(PersistOutcome, bool);
+    impl ManagedOwnershipPersistence for OutcomeOwnership {
+        fn load(&self) -> AppResult<ManagedOwnershipLoad> {
+            Ok(ManagedOwnershipLoad {
+                index: ManagedOwnershipIndexV1::empty(),
+                requires_rewrite: false,
+            })
+        }
+        fn save(&self, _: &ManagedOwnershipIndexV1) -> PersistResult {
+            if self.1 {
+                Err(PersistFailure { outcome: self.0 })
+            } else {
+                Ok(self.0)
+            }
+        }
+    }
+    let fixture = OwnershipFixture::new();
+    let (_, registered) = fixture.package();
+    let entry = registered.entries()[0].clone();
+    for outcome in [
+        PersistOutcome::NotCommitted,
+        PersistOutcome::CommittedProcessCrashSafe,
+        PersistOutcome::CommittedDurable,
+    ] {
+        for error in [false, true] {
+            let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+            let mut registry = PluginRegistry::initialize(
+                vec![],
+                Box::new(memory),
+                Box::new(OutcomeOwnership(outcome, error)),
+            );
+            let before = registry.catalog_snapshot();
+            let result = registry.register_managed_import(entry.clone());
+            let committed = outcome != PersistOutcome::NotCommitted;
+            assert_eq!(result.is_ok(), committed && !error);
+            if let Err(failure) = result {
+                assert_eq!(failure.persist_outcome, outcome);
+            }
+            assert_eq!(
+                registry.publication.ownership.entries().unwrap(),
+                if committed {
+                    std::slice::from_ref(&entry)
+                } else {
+                    &[]
+                }
+            );
+            assert_eq!(registry.catalog_snapshot(), before);
+            assert!(registry.publication.locals.is_empty());
+        }
+    }
+}
+
+#[test]
+fn managed_import_preflight_reserves_actual_receipt_and_state_without_writes() {
+    let record = local("com.new", "New");
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = memory.registry(vec![]);
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![]))
+        .unwrap();
+    let receipt = OwnershipReceiptV1::new(
+        ReceiptId::parse("550e8400e29b41d4a716446655440000").unwrap(),
+        PackageSlot::parse("pkg-00000000000000000000000000000000").unwrap(),
+        &record,
+    )
+    .unwrap();
+    let package_bytes =
+        record.canonical_manifest_bytes().unwrap().len() + receipt.canonical_bytes().unwrap().len();
+    let usage = ScanUsage {
+        root_entries: 255,
+        packages: 127,
+        bytes_read: 2_097_152 - package_bytes,
+    };
+    assert_eq!(
+        registry.validate_managed_import(&record, usage, "1"),
+        Ok(())
+    );
+    assert_eq!(
+        registry.validate_managed_import(
+            &record,
+            ScanUsage {
+                bytes_read: usage.bytes_read + 1,
+                ..usage
+            },
+            "1"
+        ),
+        Err(ImportCommitFailure::CapacityExceeded)
+    );
+    assert_eq!(
+        registry.validate_managed_import(&record, usage, "01"),
+        Err(ImportCommitFailure::CatalogStale)
+    );
+    let Runtime::Available { state, .. } = &mut registry.publication.runtime else {
+        unreachable!()
+    };
+    state.revision = u64::MAX;
+    assert_eq!(
+        registry.validate_managed_import(&record, usage, "1"),
+        Err(ImportCommitFailure::RevisionExhausted)
+    );
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
