@@ -11,6 +11,7 @@ use crate::plugin::{
 mod session;
 pub(crate) mod source;
 pub(crate) use session::{CommitLease, ImportSessions, PrepareLease};
+pub(crate) use source::{LocalManifestReader, SystemLocalManifestReader};
 
 /// Only captured, validated content survives source selection. No path is retained.
 #[derive(Clone)]

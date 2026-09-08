@@ -9,14 +9,21 @@ use futures_util::FutureExt;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::error::{AppError, AppResult};
+use crate::storage::local_plugin_import::{
+    LocalManifestImportStorage, SystemLocalManifestImportStorage,
+};
 
 use super::discovery::{LocalDiscoveryOutcome, LocalPluginDiscovery, SystemLocalPluginDiscovery};
+use super::import::{ImportSessions, LocalManifestReader, SystemLocalManifestReader};
 use super::manifest::{PluginCatalogMutationResult, PluginCatalogSnapshot};
 use super::PluginRegistry;
 
 pub(crate) struct PluginRuntime {
     registry: RwLock<PluginRegistry>,
     discovery: Arc<dyn LocalPluginDiscovery>,
+    reader: Arc<dyn LocalManifestReader>,
+    storage: Arc<dyn LocalManifestImportStorage>,
+    import_sessions: Arc<ImportSessions>,
     operation_gate: Arc<Mutex<()>>,
     initial_discovery_attempted: AtomicBool,
 }
@@ -46,9 +53,26 @@ impl PluginRuntime {
         registry: PluginRegistry,
         discovery: Arc<dyn LocalPluginDiscovery>,
     ) -> Self {
+        Self::with_import_services(
+            registry,
+            discovery,
+            Arc::new(SystemLocalManifestReader),
+            Arc::new(SystemLocalManifestImportStorage::new()),
+        )
+    }
+
+    pub(crate) fn with_import_services(
+        registry: PluginRegistry,
+        discovery: Arc<dyn LocalPluginDiscovery>,
+        reader: Arc<dyn LocalManifestReader>,
+        storage: Arc<dyn LocalManifestImportStorage>,
+    ) -> Self {
         Self {
             registry: RwLock::new(registry),
             discovery,
+            reader,
+            storage,
+            import_sessions: ImportSessions::new(),
             operation_gate: Arc::new(Mutex::new(())),
             initial_discovery_attempted: AtomicBool::new(false),
         }
@@ -222,6 +246,8 @@ impl PluginRuntime {
 fn runtime_error() -> AppError {
     AppError::Internal("插件目录请求暂不可用".into())
 }
+
+mod import;
 
 #[cfg(test)]
 mod tests;

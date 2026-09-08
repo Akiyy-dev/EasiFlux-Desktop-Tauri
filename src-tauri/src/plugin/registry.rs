@@ -106,6 +106,11 @@ impl PluginRegistry {
         self.catalog_generation
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_catalog_generation_for_test(&mut self, generation: u64) {
+        self.catalog_generation = generation;
+    }
+
     pub(crate) fn state_requires_retry(&self) -> bool {
         matches!(
             self.runtime,
