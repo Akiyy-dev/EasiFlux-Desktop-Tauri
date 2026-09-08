@@ -70,10 +70,10 @@ fn validate_prefixed_slot(value: &str, prefix: &str) -> Result<(), OwnershipFail
     let suffix = value
         .strip_prefix(prefix)
         .ok_or(OwnershipFailure::Conflict)?;
-    validate_uuid_v4_simple(suffix)
+    validate_lower_hex_32(suffix)
 }
 
-fn validate_uuid_v4_simple(value: &str) -> Result<(), OwnershipFailure> {
+fn validate_lower_hex_32(value: &str) -> Result<(), OwnershipFailure> {
     if value.len() != RECEIPT_ID_HEX_LEN
         || !value
             .bytes()
@@ -81,6 +81,11 @@ fn validate_uuid_v4_simple(value: &str) -> Result<(), OwnershipFailure> {
     {
         return Err(OwnershipFailure::Conflict);
     }
+    Ok(())
+}
+
+fn validate_uuid_v4_simple(value: &str) -> Result<(), OwnershipFailure> {
+    validate_lower_hex_32(value)?;
     let parsed = Uuid::parse_str(value).map_err(|_| OwnershipFailure::Conflict)?;
     if parsed.get_version() != Some(Version::Random) || parsed.get_variant() != Variant::RFC4122 {
         return Err(OwnershipFailure::Conflict);

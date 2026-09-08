@@ -187,11 +187,9 @@ fn slot_and_receipt_id_require_exact_lower_hex() {
 
     for invalid in [
         "91A76DCF6DFB4D44A61B34B876AE486D",
-        "91a76dcf-6dfb-4d44-a61b-34b876ae486d",
         "91a76dcf6dfb4d44a61b34b876ae486",
         "91a76dcf6dfb4d44a61b34b876ae486dd",
-        "00000000000000000000000000000000",
-        "../91a76dcf6dfb4d44a61b34b876ae486d",
+        "g1a76dcf6dfb4d44a61b34b876ae486d",
     ] {
         assert!(ReceiptId::parse(invalid).is_err());
         assert!(PackageSlot::parse(&format!("pkg-{invalid}")).is_err());
@@ -199,6 +197,25 @@ fn slot_and_receipt_id_require_exact_lower_hex() {
     }
     assert!(PackageSlot::parse(&format!("remove-{valid}")).is_err());
     assert!(RemovalSlot::parse(&format!("pkg-{valid}")).is_err());
+}
+
+#[test]
+fn slots_accept_non_uuid_lower_hex_while_receipts_require_uuid_v4() {
+    const NON_UUID_HEX: &str = "00000000000000000000000000000000";
+
+    assert_eq!(
+        PackageSlot::parse("pkg-00000000000000000000000000000000")
+            .unwrap()
+            .as_str(),
+        "pkg-00000000000000000000000000000000"
+    );
+    assert_eq!(
+        RemovalSlot::parse("remove-00000000000000000000000000000000")
+            .unwrap()
+            .as_str(),
+        "remove-00000000000000000000000000000000"
+    );
+    assert!(ReceiptId::parse(NON_UUID_HEX).is_err());
 }
 
 #[test]
