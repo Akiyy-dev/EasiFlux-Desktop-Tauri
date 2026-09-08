@@ -156,7 +156,11 @@ mod tests {
         }
 
         fn registry(&self, manifests: Vec<PluginManifestV1>) -> PluginRegistry {
-            PluginRegistry::initialize(manifests, Box::new(self.clone()))
+            PluginRegistry::initialize(
+                manifests,
+                Box::new(self.clone()),
+                crate::plugin::ownership::empty_test_persistence(),
+            )
         }
     }
 
@@ -300,12 +304,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             json!({
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "revision": "7",
                 "catalogGeneration": "1",
                 "availability": "available",
                 "availabilityReasonCode": null,
                 "localDiscovery": {"status": "available", "rejectedPackageCount": 0},
+                "managedOwnership": {"status":"available","conflictingEntryCount":0,"rollbackPendingCount":0,"cleanupPendingCount":0},
                 "plugins": [{
                     "manifest": {
                         "schemaVersion": 1,
@@ -319,6 +324,7 @@ mod tests {
                         "requestedCapabilities": []
                     },
                     "source": "builtIn",
+                    "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null,
                     "grantedCapabilities": [],
                     "status": "enabled",
                     "canToggle": true,
@@ -417,7 +423,7 @@ mod tests {
             .unwrap();
 
         let value = serde_json::to_value(result).unwrap();
-        assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(value["schemaVersion"], 3);
         assert_eq!(value["revision"], "1");
         assert_eq!(value["catalogGeneration"], "0");
         assert_eq!(value["plugin"]["manifest"]["id"], "com.easiflux.alpha");
@@ -451,7 +457,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(result).unwrap(),
             json!({
-                "schemaVersion": 2, "catalogGeneration": "1", "revision": "1",
+                "schemaVersion": 3, "catalogGeneration": "1", "revision": "1",
                 "plugin": {
                     "manifest": {
                         "schemaVersion": 1, "id": "com.easiflux.alpha", "name": "Alpha",
@@ -460,6 +466,7 @@ mod tests {
                         "contributions": [], "requestedCapabilities": []
                     },
                     "source": "localDeclarative", "grantedCapabilities": [],
+                    "management": "external", "canRemove": false, "toggleBlockReasonCode": null,
                     "status": "enabled", "canToggle": true, "statusReasonCode": null
                 }
             })

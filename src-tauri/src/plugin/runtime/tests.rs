@@ -14,6 +14,66 @@ use tokio::sync::oneshot;
 
 const WATCHDOG: Duration = Duration::from_secs(10);
 
+#[tokio::test]
+async fn ownership_retry_is_independent_and_legacy_and_builtins_remain_toggleable() {
+    use crate::storage::managed_plugin_ownership::{
+        ManagedOwnershipLoad, ManagedOwnershipPersistence,
+    };
+    struct Ownership(Arc<std::sync::atomic::AtomicBool>);
+    impl ManagedOwnershipPersistence for Ownership {
+        fn load(&self) -> AppResult<ManagedOwnershipLoad> {
+            if self.0.load(Ordering::SeqCst) {
+                return Err(AppError::Internal("unavailable".into()));
+            }
+            Ok(ManagedOwnershipLoad {
+                index: crate::plugin::ownership::ManagedOwnershipIndexV1::empty(),
+                requires_rewrite: false,
+            })
+        }
+        fn save(
+            &self,
+            _: &crate::plugin::ownership::ManagedOwnershipIndexV1,
+        ) -> crate::storage::safe_plugin_document::PersistResult {
+            panic!("empty retry must not write");
+        }
+    }
+    struct Discovery(AtomicUsize);
+    impl LocalPluginDiscovery for Discovery {
+        fn discover(&self) -> LocalDiscoveryOutcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            local("1.0.0")
+        }
+    }
+    let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let discovery = Arc::new(Discovery(AtomicUsize::new(0)));
+    let runtime = Arc::new(PluginRuntime::initialize(
+        PluginRegistry::initialize(
+            vec![manifest("com.example.builtin", "1.0.0")],
+            Box::new(MemoryPersistence::default()),
+            Box::new(Ownership(unavailable.clone())),
+        ),
+        discovery.clone(),
+    ));
+    let first = serde_json::to_value(runtime.get_catalog().await.unwrap()).unwrap();
+    assert_eq!(first["availability"], "available");
+    assert_eq!(first["managedOwnership"]["status"], "unavailable");
+    assert_eq!(item(&first, "com.example.alpha")["management"], "external");
+    assert!(runtime
+        .set_enabled("com.example.alpha", true, "1")
+        .await
+        .is_ok());
+    assert!(runtime
+        .set_enabled("com.example.builtin", true, "1")
+        .await
+        .is_ok());
+    unavailable.store(false, Ordering::SeqCst);
+    let recovered = serde_json::to_value(runtime.get_catalog().await.unwrap()).unwrap();
+    assert_eq!(recovered["managedOwnership"]["status"], "available");
+    assert_eq!(recovered["catalogGeneration"], "2");
+    assert_eq!(item(&recovered, "com.example.alpha")["status"], "enabled");
+    assert_eq!(discovery.0.load(Ordering::SeqCst), 2);
+}
+
 #[derive(Clone, Default)]
 struct MemoryPersistence(Arc<Mutex<MemoryState>>);
 
@@ -161,6 +221,7 @@ fn runtime_with(
         PluginRegistry::initialize(
             vec![manifest("com.example.builtin", "1.0.0")],
             Box::new(persistence.clone()),
+            crate::plugin::ownership::empty_test_persistence(),
         ),
         discovery,
     ))
@@ -483,7 +544,7 @@ async fn later_get_recovers_state_without_rescanning_or_mutation_retry() {
     assert_eq!(persistence.0.lock().unwrap().loads, 2);
     let recovered = serde_json::to_value(runtime.get_catalog().await.unwrap()).unwrap();
     assert_eq!(recovered["availability"], "available");
-    assert_eq!(recovered["catalogGeneration"], "1");
+    assert_eq!(recovered["catalogGeneration"], "2");
     assert_eq!(recovered["revision"], "0");
     runtime.get_catalog().await.unwrap();
     assert_eq!(persistence.0.lock().unwrap().loads, 3);
@@ -702,6 +763,7 @@ async fn post_discovery_recovery_panic_is_safe_releases_gate_and_remains_retryab
         PluginRegistry::initialize(
             vec![],
             Box::new(RecoveryPanicPersistence(AtomicUsize::new(0))),
+            crate::plugin::ownership::empty_test_persistence(),
         ),
         discovery.clone(),
     ));
@@ -715,13 +777,13 @@ async fn post_discovery_recovery_panic_is_safe_releases_gate_and_remains_retryab
     );
     assert!(runtime.operation_gate.try_lock().is_ok());
     let recovered = serde_json::to_value(runtime.get_catalog().await.unwrap()).unwrap();
-    assert_eq!(recovered["catalogGeneration"], "1");
+    assert_eq!(recovered["catalogGeneration"], "2");
     assert_eq!(recovered["availability"], "available");
     assert_eq!(discovery.calls.load(Ordering::SeqCst), 1);
     scans[1].release();
     assert_eq!(
         runtime.reload_catalog().await.unwrap().catalog_generation,
-        "2"
+        "3"
     );
     scans[1].wait_started().await;
     assert!(runtime.operation_gate.try_lock().is_ok());
@@ -736,6 +798,7 @@ async fn cancelled_waiter_recovery_panic_releases_gate_and_remains_usable() {
         PluginRegistry::initialize(
             vec![],
             Box::new(RecoveryPanicPersistence(AtomicUsize::new(0))),
+            crate::plugin::ownership::empty_test_persistence(),
         ),
         discovery.clone(),
     ));
@@ -749,12 +812,12 @@ async fn cancelled_waiter_recovery_panic_releases_gate_and_remains_usable() {
         .await
         .unwrap();
     drop(finished);
-    assert_eq!(runtime.get_catalog().await.unwrap().catalog_generation, "1");
+    assert_eq!(runtime.get_catalog().await.unwrap().catalog_generation, "2");
     assert_eq!(discovery.calls.load(Ordering::SeqCst), 1);
     scans[1].release();
     assert_eq!(
         runtime.reload_catalog().await.unwrap().catalog_generation,
-        "2"
+        "3"
     );
     scans[1].wait_started().await;
 }

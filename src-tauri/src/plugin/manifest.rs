@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub const APPROVAL_FINGERPRINT_NONE: &str = "v1:none";
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V1: u32 = 1;
 
-const CATALOG_TRANSPORT_SCHEMA_VERSION: u8 = 2;
+const CATALOG_TRANSPORT_SCHEMA_VERSION: u8 = 3;
 
 const MAX_IDENTIFIER_LENGTH: usize = 128;
 const MAX_IDENTIFIER_SEGMENT_LENGTH: usize = 63;
@@ -202,7 +202,7 @@ pub enum LocalDiscoveryStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocalDiscoverySummary {
     pub status: LocalDiscoveryStatus,
     pub rejected_package_count: u32,
@@ -267,6 +267,119 @@ pub enum PluginAvailabilityReason {
     CatalogInvalid,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginManagement {
+    BuiltIn,
+    Managed,
+    External,
+    RemovalPending,
+    OwnershipConflict,
+    OwnershipUnavailable,
+}
+
+impl PluginManagement {
+    fn for_source(source: PluginSource) -> Self {
+        match source {
+            PluginSource::BuiltIn => Self::BuiltIn,
+            PluginSource::LocalDeclarative => Self::External,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginToggleBlockReason {
+    RemovalPending,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ManagedOwnershipSummary {
+    pub status: LocalDiscoveryStatus,
+    pub conflicting_entry_count: u32,
+    pub rollback_pending_count: u32,
+    pub cleanup_pending_count: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedOwnershipSummaryWire {
+    status: LocalDiscoveryStatus,
+    conflicting_entry_count: u32,
+    rollback_pending_count: u32,
+    cleanup_pending_count: u32,
+}
+impl TryFrom<ManagedOwnershipSummaryWire> for ManagedOwnershipSummary {
+    type Error = &'static str;
+    fn try_from(wire: ManagedOwnershipSummaryWire) -> Result<Self, Self::Error> {
+        let summary = Self {
+            status: wire.status,
+            conflicting_entry_count: wire.conflicting_entry_count,
+            rollback_pending_count: wire.rollback_pending_count,
+            cleanup_pending_count: wire.cleanup_pending_count,
+        };
+        summary.validate()?;
+        Ok(summary)
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedOwnershipSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_object::<D, ManagedOwnershipSummaryWire>(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+impl ManagedOwnershipSummary {
+    pub fn available() -> Self {
+        Self {
+            status: LocalDiscoveryStatus::Available,
+            conflicting_entry_count: 0,
+            rollback_pending_count: 0,
+            cleanup_pending_count: 0,
+        }
+    }
+    pub fn unavailable() -> Self {
+        Self {
+            status: LocalDiscoveryStatus::Unavailable,
+            ..Self::available()
+        }
+    }
+    pub(crate) fn counts(conflicts: u32, rollback: u32, cleanup: u32) -> Self {
+        let result = Self {
+            status: if conflicts == 0 && rollback == 0 && cleanup == 0 {
+                LocalDiscoveryStatus::Available
+            } else {
+                LocalDiscoveryStatus::Degraded
+            },
+            conflicting_entry_count: conflicts,
+            rollback_pending_count: rollback,
+            cleanup_pending_count: cleanup,
+        };
+        debug_assert!(result.validate().is_ok());
+        result
+    }
+    fn validate(&self) -> Result<(), &'static str> {
+        let total = self
+            .conflicting_entry_count
+            .checked_add(self.rollback_pending_count)
+            .and_then(|n| n.checked_add(self.cleanup_pending_count))
+            .ok_or("ownership count overflow")?;
+        if total > 176
+            || self.rollback_pending_count > 160
+            || self.cleanup_pending_count > 160
+            || (self.status == LocalDiscoveryStatus::Degraded) != (total > 0)
+        {
+            return Err("invalid ownership summary");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCatalogItem {
@@ -276,6 +389,35 @@ pub struct PluginCatalogItem {
     status_reason_code: Option<PluginAvailabilityReason>,
     can_toggle: bool,
     granted_capabilities: Vec<String>,
+    management: PluginManagement,
+    can_remove: bool,
+    toggle_block_reason_code: Option<PluginToggleBlockReason>,
+}
+
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+        type Value = T;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an exact catalog object")
+        }
+        fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<T, M::Error> {
+            T::deserialize(MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
 }
 
 #[derive(Deserialize)]
@@ -284,9 +426,14 @@ struct PluginCatalogItemWire {
     manifest: PluginManifestV1,
     source: PluginSource,
     status: PluginStatus,
+    #[serde(deserialize_with = "required_option")]
     status_reason_code: Option<PluginAvailabilityReason>,
     can_toggle: bool,
     granted_capabilities: Vec<String>,
+    management: PluginManagement,
+    can_remove: bool,
+    #[serde(deserialize_with = "required_option")]
+    toggle_block_reason_code: Option<PluginToggleBlockReason>,
 }
 
 impl<'de> Deserialize<'de> for PluginCatalogItem {
@@ -294,81 +441,115 @@ impl<'de> Deserialize<'de> for PluginCatalogItem {
     where
         D: Deserializer<'de>,
     {
-        let wire = PluginCatalogItemWire::deserialize(deserializer)?;
-        validate_catalog_item_state(&wire.status, wire.can_toggle, &wire.status_reason_code)
-            .map_err(serde::de::Error::custom)?;
-        Ok(Self {
+        let wire = deserialize_object::<D, PluginCatalogItemWire>(deserializer)?;
+        let item = Self {
             manifest: wire.manifest,
             source: wire.source,
             status: wire.status,
             status_reason_code: wire.status_reason_code,
             can_toggle: wire.can_toggle,
             granted_capabilities: wire.granted_capabilities,
-        })
+            management: wire.management,
+            can_remove: wire.can_remove,
+            toggle_block_reason_code: wire.toggle_block_reason_code,
+        };
+        item.validate().map_err(serde::de::Error::custom)?;
+        Ok(item)
     }
 }
-
 impl PluginCatalogItem {
     pub fn enabled(manifest: PluginManifestV1, source: PluginSource) -> Self {
-        Self {
+        Self::project(
             manifest,
             source,
-            status: PluginStatus::Enabled,
-            status_reason_code: None,
-            can_toggle: true,
-            granted_capabilities: Vec::new(),
-        }
+            PluginStatus::Enabled,
+            None,
+            PluginManagement::for_source(source),
+        )
     }
-
     pub fn disabled(manifest: PluginManifestV1, source: PluginSource) -> Self {
-        Self {
+        Self::project(
             manifest,
             source,
-            status: PluginStatus::Disabled,
-            status_reason_code: None,
-            can_toggle: true,
-            granted_capabilities: Vec::new(),
-        }
+            PluginStatus::Disabled,
+            None,
+            PluginManagement::for_source(source),
+        )
     }
-
     pub fn blocked(
         manifest: PluginManifestV1,
         source: PluginSource,
-        status_reason_code: PluginAvailabilityReason,
+        reason: PluginAvailabilityReason,
     ) -> Self {
+        Self::project(
+            manifest,
+            source,
+            PluginStatus::Blocked,
+            Some(reason),
+            PluginManagement::for_source(source),
+        )
+    }
+    pub(crate) fn with_management(self, management: PluginManagement) -> Self {
+        Self::project(
+            self.manifest,
+            self.source,
+            self.status,
+            self.status_reason_code,
+            management,
+        )
+    }
+    fn project(
+        manifest: PluginManifestV1,
+        source: PluginSource,
+        mut status: PluginStatus,
+        mut reason: Option<PluginAvailabilityReason>,
+        management: PluginManagement,
+    ) -> Self {
+        let pending = management == PluginManagement::RemovalPending;
+        if pending {
+            status = PluginStatus::Disabled;
+            reason = None;
+        }
         Self {
             manifest,
             source,
-            status: PluginStatus::Blocked,
-            status_reason_code: Some(status_reason_code),
-            can_toggle: false,
-            granted_capabilities: Vec::new(),
+            can_toggle: status != PluginStatus::Blocked && !pending,
+            can_remove: management == PluginManagement::Managed && status == PluginStatus::Disabled,
+            status,
+            status_reason_code: reason,
+            granted_capabilities: vec![],
+            management,
+            toggle_block_reason_code: pending.then_some(PluginToggleBlockReason::RemovalPending),
         }
     }
-}
-
-fn validate_catalog_item_state(
-    status: &PluginStatus,
-    can_toggle: bool,
-    status_reason_code: &Option<PluginAvailabilityReason>,
-) -> Result<(), &'static str> {
-    match status {
-        PluginStatus::Enabled | PluginStatus::Disabled
-            if can_toggle && status_reason_code.is_none() =>
+    fn validate(&self) -> Result<(), &'static str> {
+        if (self.source == PluginSource::BuiltIn) != (self.management == PluginManagement::BuiltIn)
+            || (self.status == PluginStatus::Blocked) != self.status_reason_code.is_some()
+            || self.can_toggle
+                != (self.status != PluginStatus::Blocked && self.toggle_block_reason_code.is_none())
+            || (self.management == PluginManagement::RemovalPending)
+                != self.toggle_block_reason_code.is_some()
+            || (self.management == PluginManagement::RemovalPending
+                && self.status != PluginStatus::Disabled)
+            || self.can_remove
+                != (self.management == PluginManagement::Managed
+                    && self.status == PluginStatus::Disabled)
+            || !self.granted_capabilities.is_empty()
         {
-            Ok(())
+            return Err("invalid catalog management or status");
         }
-        PluginStatus::Blocked if !can_toggle && status_reason_code.is_some() => Ok(()),
-        PluginStatus::Enabled | PluginStatus::Disabled => {
-            Err("toggleable plugin items must not have a status reason code")
-        }
-        PluginStatus::Blocked => {
-            Err("blocked plugin items must be non-toggleable with a reason code")
-        }
+        Ok(())
+    }
+    pub(crate) fn same_structure(&self, other: &Self) -> bool {
+        self.manifest == other.manifest
+            && self.source == other.source
+            && self.management == other.management
+            && self.toggle_block_reason_code == other.toggle_block_reason_code
+            && self.granted_capabilities == other.granted_capabilities
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCatalogSnapshot {
     pub schema_version: u8,
@@ -377,9 +558,82 @@ pub struct PluginCatalogSnapshot {
     pub availability: PluginAvailability,
     pub availability_reason_code: Option<PluginAvailabilityReason>,
     pub local_discovery: LocalDiscoverySummary,
+    pub managed_ownership: ManagedOwnershipSummary,
     pub plugins: Vec<PluginCatalogItem>,
 }
-
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginCatalogSnapshotWire {
+    schema_version: u8,
+    revision: String,
+    catalog_generation: String,
+    availability: PluginAvailability,
+    #[serde(deserialize_with = "required_option")]
+    availability_reason_code: Option<PluginAvailabilityReason>,
+    local_discovery: LocalDiscoverySummary,
+    managed_ownership: ManagedOwnershipSummary,
+    plugins: Vec<PluginCatalogItem>,
+}
+fn valid_version(value: &str) -> bool {
+    value.parse::<u64>().is_ok_and(|n| n.to_string() == value)
+}
+impl<'de> Deserialize<'de> for PluginCatalogSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_object::<D, PluginCatalogSnapshotWire>(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+impl TryFrom<PluginCatalogSnapshotWire> for PluginCatalogSnapshot {
+    type Error = &'static str;
+    fn try_from(w: PluginCatalogSnapshotWire) -> Result<Self, Self::Error> {
+        if w.schema_version != 3
+            || !valid_version(&w.revision)
+            || !valid_version(&w.catalog_generation)
+            || (w.availability == PluginAvailability::Unavailable)
+                != w.availability_reason_code.is_some()
+            || w.local_discovery.rejected_package_count > 256
+            || (w.local_discovery.status == LocalDiscoveryStatus::Degraded)
+                != (w.local_discovery.rejected_package_count > 0)
+            || w.plugins.iter().any(|item| {
+                (w.availability == PluginAvailability::Available
+                    && item.status == PluginStatus::Blocked)
+                    || (w.availability == PluginAvailability::Unavailable
+                        && item.management != PluginManagement::RemovalPending
+                        && (item.status != PluginStatus::Blocked
+                            || item.status_reason_code != w.availability_reason_code))
+                    || (w.managed_ownership.status == LocalDiscoveryStatus::Unavailable
+                        && item.management == PluginManagement::Managed)
+                    || (w.managed_ownership.status != LocalDiscoveryStatus::Unavailable
+                        && item.management == PluginManagement::OwnershipUnavailable)
+                    || (item.management == PluginManagement::RemovalPending
+                        && w.managed_ownership.rollback_pending_count == 0)
+                    || (item.management == PluginManagement::OwnershipConflict
+                        && w.managed_ownership.conflicting_entry_count == 0)
+                    || (w.local_discovery.status == LocalDiscoveryStatus::Unavailable
+                        && item.source == PluginSource::LocalDeclarative)
+            })
+            || w.plugins
+                .windows(2)
+                .any(|items| items[0].manifest.id >= items[1].manifest.id)
+        {
+            return Err("invalid catalog snapshot");
+        }
+        Ok(Self {
+            schema_version: w.schema_version,
+            revision: w.revision,
+            catalog_generation: w.catalog_generation,
+            availability: w.availability,
+            availability_reason_code: w.availability_reason_code,
+            local_discovery: w.local_discovery,
+            managed_ownership: w.managed_ownership,
+            plugins: w.plugins,
+        })
+    }
+}
 impl PluginCatalogSnapshot {
     pub fn new(
         revision: String,
@@ -387,6 +641,7 @@ impl PluginCatalogSnapshot {
         availability: PluginAvailability,
         availability_reason_code: Option<PluginAvailabilityReason>,
         local_discovery: LocalDiscoverySummary,
+        managed_ownership: ManagedOwnershipSummary,
         plugins: Vec<PluginCatalogItem>,
     ) -> Self {
         Self {
@@ -396,12 +651,13 @@ impl PluginCatalogSnapshot {
             availability,
             availability_reason_code,
             local_discovery,
+            managed_ownership,
             plugins,
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCatalogMutationResult {
     pub schema_version: u8,
@@ -409,7 +665,36 @@ pub struct PluginCatalogMutationResult {
     pub catalog_generation: String,
     pub plugin: PluginCatalogItem,
 }
-
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginCatalogMutationWire {
+    schema_version: u8,
+    revision: String,
+    catalog_generation: String,
+    plugin: PluginCatalogItem,
+}
+impl TryFrom<PluginCatalogMutationWire> for PluginCatalogMutationResult {
+    type Error = &'static str;
+    fn try_from(w: PluginCatalogMutationWire) -> Result<Self, Self::Error> {
+        if w.schema_version != 3
+            || !valid_version(&w.revision)
+            || !valid_version(&w.catalog_generation)
+        {
+            return Err("invalid catalog mutation");
+        }
+        Ok(Self::new(w.revision, w.catalog_generation, w.plugin))
+    }
+}
+impl<'de> Deserialize<'de> for PluginCatalogMutationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_object::<D, PluginCatalogMutationWire>(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
 impl PluginCatalogMutationResult {
     pub fn new(revision: String, catalog_generation: String, plugin: PluginCatalogItem) -> Self {
         Self {
@@ -423,6 +708,170 @@ impl PluginCatalogMutationResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catalog_v3_enforces_management_toggle_and_summary_cross_fields() {
+        let snapshot = super::PluginCatalogSnapshot::new(
+            "0".into(),
+            "0".into(),
+            super::PluginAvailability::Available,
+            None,
+            super::LocalDiscoverySummary::available(),
+            crate::plugin::manifest::ManagedOwnershipSummary::available(),
+            vec![],
+        );
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["schemaVersion"], 3);
+        assert_eq!(value["managedOwnership"]["status"], "available");
+        let manifest: PluginManifestV1 = serde_json::from_str(VALID_MANIFEST).unwrap();
+        for management in [
+            PluginManagement::BuiltIn,
+            PluginManagement::Managed,
+            PluginManagement::External,
+            PluginManagement::RemovalPending,
+            PluginManagement::OwnershipConflict,
+            PluginManagement::OwnershipUnavailable,
+        ] {
+            let source = if management == PluginManagement::BuiltIn {
+                PluginSource::BuiltIn
+            } else {
+                PluginSource::LocalDeclarative
+            };
+            for item in [
+                PluginCatalogItem::disabled(manifest.clone(), source),
+                PluginCatalogItem::enabled(manifest.clone(), source),
+                PluginCatalogItem::blocked(
+                    manifest.clone(),
+                    source,
+                    PluginAvailabilityReason::StateUnavailable,
+                ),
+            ] {
+                let item = item.with_management(management);
+                let value = serde_json::to_value(&item).unwrap();
+                assert_eq!(
+                    serde_json::from_value::<PluginCatalogItem>(value.clone()).unwrap(),
+                    item
+                );
+                for field in ["canToggle", "canRemove"] {
+                    let mut invalid = value.clone();
+                    invalid[field] = serde_json::json!(!invalid[field].as_bool().unwrap());
+                    assert!(
+                        serde_json::from_value::<PluginCatalogItem>(invalid).is_err(),
+                        "{management:?}/{field}"
+                    );
+                }
+                let mut invalid = value.clone();
+                invalid["toggleBlockReasonCode"] = if management == PluginManagement::RemovalPending
+                {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!("removalPending")
+                };
+                assert!(serde_json::from_value::<PluginCatalogItem>(invalid).is_err());
+                let mut invalid = value;
+                invalid["source"] = if source == PluginSource::BuiltIn {
+                    serde_json::json!("localDeclarative")
+                } else {
+                    serde_json::json!("builtIn")
+                };
+                assert!(serde_json::from_value::<PluginCatalogItem>(invalid).is_err());
+            }
+        }
+        for (status, counts, valid) in [
+            ("available", [0, 0, 0], true),
+            ("available", [1, 0, 0], false),
+            ("degraded", [0, 0, 0], false),
+            ("degraded", [1, 0, 0], true),
+            ("unavailable", [0, 0, 0], true),
+            ("unavailable", [0, 0, 1], false),
+            ("degraded", [177, 0, 0], false),
+            ("degraded", [1, 160, 16], false),
+        ] {
+            let value = serde_json::json!({"status":status,"conflictingEntryCount":counts[0],"rollbackPendingCount":counts[1],"cleanupPendingCount":counts[2]});
+            assert_eq!(
+                serde_json::from_value::<ManagedOwnershipSummary>(value).is_ok(),
+                valid
+            );
+        }
+        for schema in [1, 2, 4] {
+            let mut invalid = value.clone();
+            invalid["schemaVersion"] = serde_json::json!(schema);
+            assert!(serde_json::from_value::<PluginCatalogSnapshot>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn transport_never_contains_locator_receipt_slot_fingerprint_or_object_identity() {
+        let item = PluginCatalogItem::disabled(
+            serde_json::from_str(VALID_MANIFEST).unwrap(),
+            PluginSource::LocalDeclarative,
+        )
+        .with_management(PluginManagement::Managed);
+        let snapshot = PluginCatalogSnapshot::new(
+            "9".into(),
+            "7".into(),
+            PluginAvailability::Available,
+            None,
+            LocalDiscoverySummary::available(),
+            ManagedOwnershipSummary::available(),
+            vec![item.clone()],
+        );
+        let mutation = PluginCatalogMutationResult::new("10".into(), "7".into(), item);
+        for value in [
+            serde_json::to_value(&snapshot).unwrap(),
+            serde_json::to_value(&mutation).unwrap(),
+        ] {
+            let text = serde_json::to_string(&value).unwrap().to_lowercase();
+            for secret in [
+                "receipt",
+                "slot",
+                "fingerprint",
+                "identity",
+                "locator",
+                "path",
+            ] {
+                assert!(!text.contains(secret));
+            }
+        }
+        assert_eq!(
+            serde_json::from_value::<PluginCatalogSnapshot>(
+                serde_json::to_value(&snapshot).unwrap()
+            )
+            .unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn v3_transport_rejects_positional_objects_at_every_envelope() {
+        let manifest: serde_json::Value = serde_json::from_str(VALID_MANIFEST).unwrap();
+        let item = serde_json::json!([
+            manifest,
+            "localDeclarative",
+            "disabled",
+            null,
+            true,
+            [],
+            "external",
+            false,
+            null
+        ]);
+        assert!(serde_json::from_value::<PluginCatalogItem>(item).is_err());
+        assert!(
+            serde_json::from_value::<ManagedOwnershipSummary>(serde_json::json!([
+                "available",
+                0,
+                0,
+                0
+            ]))
+            .is_err()
+        );
+        let summary = serde_json::json!({"status":"available","conflictingEntryCount":0,"rollbackPendingCount":0,"cleanupPendingCount":0});
+        assert!(serde_json::from_value::<PluginCatalogSnapshot>(
+            serde_json::json!([3,"0","1","available",null,
+            {"status":"available","rejectedPackageCount":0},summary,[]])
+        )
+        .is_err());
+    }
     use super::*;
     use crate::plugin::builtin::builtin_manifests;
 
@@ -589,24 +1038,26 @@ mod tests {
 
     // Catches a catalog transport schema tied to the manifest schema or missing discovery state.
     #[test]
-    fn catalog_transport_v2_carries_generation_and_discovery() {
+    fn catalog_transport_v3_carries_generation_and_discovery() {
         let snapshot = PluginCatalogSnapshot::new(
             "9".to_owned(),
             "3".to_owned(),
             PluginAvailability::Available,
             None,
             LocalDiscoverySummary::available(),
+            crate::plugin::manifest::ManagedOwnershipSummary::available(),
             Vec::new(),
         );
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             serde_json::json!({
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "revision": "9",
                 "catalogGeneration": "3",
                 "availability": "available",
                 "availabilityReasonCode": null,
                 "localDiscovery": {"status": "available", "rejectedPackageCount": 0},
+                "managedOwnership": {"status":"available","conflictingEntryCount":0,"rollbackPendingCount":0,"cleanupPendingCount":0},
                 "plugins": []
             }),
         );
@@ -646,24 +1097,26 @@ mod tests {
             PluginAvailability::Unavailable,
             Some(PluginAvailabilityReason::CatalogInvalid),
             LocalDiscoverySummary::degraded(2).unwrap(),
+            crate::plugin::manifest::ManagedOwnershipSummary::available(),
             vec![item.clone()],
         );
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             serde_json::json!({
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "revision": "42",
                 "catalogGeneration": "3",
                 "availability": "unavailable",
                 "availabilityReasonCode": "catalogInvalid",
                 "localDiscovery": {"status": "degraded", "rejectedPackageCount": 2},
+                "managedOwnership": {"status":"available","conflictingEntryCount":0,"rollbackPendingCount":0,"cleanupPendingCount":0},
                 "plugins": [{
                     "manifest": serde_json::from_str::<serde_json::Value>(VALID_MANIFEST).unwrap(),
                     "source": "builtIn",
                     "status": "blocked",
                     "statusReasonCode": "catalogInvalid",
                     "canToggle": false,
-                    "grantedCapabilities": []
+                    "grantedCapabilities": [], "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null
                 }]
             })
         );
@@ -672,7 +1125,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(mutation).unwrap(),
             serde_json::json!({
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "revision": "43",
                 "catalogGeneration": "3",
                 "plugin": {
@@ -681,7 +1134,7 @@ mod tests {
                     "status": "blocked",
                     "statusReasonCode": "catalogInvalid",
                     "canToggle": false,
-                    "grantedCapabilities": []
+                    "grantedCapabilities": [], "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null
                 }
             })
         );
@@ -700,7 +1153,7 @@ mod tests {
                 "status": "enabled",
                 "statusReasonCode": null,
                 "canToggle": true,
-                "grantedCapabilities": []
+                "grantedCapabilities": [], "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null
             })
         );
     }
@@ -718,7 +1171,7 @@ mod tests {
                 "status": "disabled",
                 "statusReasonCode": null,
                 "canToggle": true,
-                "grantedCapabilities": []
+                "grantedCapabilities": [], "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null
             })
         );
     }
@@ -733,7 +1186,7 @@ mod tests {
                 "status": "blocked",
                 "statusReasonCode": "catalogInvalid",
                 "canToggle": true,
-                "grantedCapabilities": []
+                "grantedCapabilities": [], "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null
             }),
             serde_json::json!({
                 "manifest": manifest.clone(),
@@ -741,7 +1194,7 @@ mod tests {
                 "status": "blocked",
                 "statusReasonCode": null,
                 "canToggle": false,
-                "grantedCapabilities": []
+                "grantedCapabilities": [], "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null
             }),
             serde_json::json!({
                 "manifest": manifest.clone(),
@@ -749,7 +1202,7 @@ mod tests {
                 "status": "disabled",
                 "statusReasonCode": "stateUnavailable",
                 "canToggle": true,
-                "grantedCapabilities": []
+                "grantedCapabilities": [], "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null
             }),
             serde_json::json!({
                 "manifest": manifest,
@@ -757,7 +1210,7 @@ mod tests {
                 "status": "blocked",
                 "statusReasonCode": "policyBlocked",
                 "canToggle": false,
-                "grantedCapabilities": []
+                "grantedCapabilities": [], "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null
             }),
         ] {
             assert!(serde_json::from_value::<PluginCatalogItem>(invalid).is_err());

@@ -410,6 +410,7 @@ impl ImportFixture {
         let registry = PluginRegistry::initialize(
             vec![manifest_from_bytes(builtin_manifest())],
             Box::new(persistence.clone()),
+            crate::plugin::ownership::empty_test_persistence(),
         );
         let runtime = Arc::new(PluginRuntime::with_import_services(
             registry,
@@ -486,6 +487,7 @@ impl ImportFixture {
         let registry = PluginRegistry::initialize(
             vec![manifest_from_bytes(builtin_manifest())],
             Box::new(PluginStateStore::with_path(self.state_path())),
+            crate::plugin::ownership::empty_test_persistence(),
         );
         Arc::new(PluginRuntime::with_import_services(
             registry,
@@ -528,6 +530,7 @@ fn crash_runtime(root: &Path, checkpoint: &str) -> Arc<PluginRuntime> {
             inner: PluginStateStore::with_path(plugins_root.join("state.json")),
             checkpoint: checkpoint.to_owned(),
         }),
+        crate::plugin::ownership::empty_test_persistence(),
     );
     Arc::new(PluginRuntime::with_import_services(
         registry,

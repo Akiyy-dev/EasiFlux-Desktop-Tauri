@@ -84,6 +84,10 @@ impl PluginRuntime {
         }
         {
             let registry = self.registry.read().await;
+            if registry.ownership_requires_retry() {
+                drop(registry);
+                return self.request_discovery(true).await;
+            }
             if !registry.state_requires_retry() {
                 return Ok(registry.catalog_snapshot());
             }
@@ -230,16 +234,21 @@ impl PluginRuntime {
                 tracing::warn!("local plugin discovery worker unavailable");
                 LocalDiscoveryOutcome::unavailable()
             });
-        let publication = {
-            let mut registry = self.registry.write().await;
-            let publication = registry.apply_local_discovery(outcome);
-            // Any completed scan counts, even an unavailable result or failed publish.
-            self.initial_discovery_attempted
-                .store(true, Ordering::Release);
-            publication
-        };
+        let runtime = Arc::clone(self);
+        // Reconciliation may safely rewrite an index; keep synchronous storage
+        // work off the async executor and publish under one write guard.
+        self.initial_discovery_attempted
+            .store(true, Ordering::Release);
+        let publication = tokio::task::spawn_blocking(move || {
+            runtime
+                .registry
+                .blocking_write()
+                .apply_local_discovery(outcome)
+        })
+        .await
+        .map_err(|_| runtime_error())?;
         publication?;
-        self.retry_state_and_snapshot().await
+        Ok(self.registry.read().await.catalog_snapshot())
     }
 }
 

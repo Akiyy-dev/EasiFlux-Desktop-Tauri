@@ -34,6 +34,113 @@ fn valid_manifest(id: &str) -> Vec<u8> {
     format!(r#"{{"schemaVersion":1,"id":"{id}","publisherId":"com.example","publisher":"Example","name":"Example","description":"Metadata","version":"1.0.0","contributions":[],"requestedCapabilities":[]}}"#).into_bytes()
 }
 
+// Rejecting the exact two-file shape loses a valid external candidate.
+#[test]
+fn scanner_returns_external_and_receipted_candidates_with_internal_identity() {
+    use crate::plugin::ownership::{OwnershipReceiptV1, PackageSlot, ReceiptId};
+    let fixture = Fixture::new();
+    let first = valid_manifest("com.example.first");
+    let second = valid_manifest("com.example.second");
+    fixture.scan(&[first.clone(), second.clone()]);
+    let record = PluginRecord::local_declarative(serde_json::from_slice(&second).unwrap()).unwrap();
+    let slot = PackageSlot::parse("pkg-00000000000000000000000000000001").unwrap();
+    let receipt = OwnershipReceiptV1::new(
+        ReceiptId::parse("550e8400e29b41d4a716446655440000").unwrap(),
+        slot,
+        &record,
+    )
+    .unwrap()
+    .canonical_bytes()
+    .unwrap();
+    fs::write(
+        fixture
+            .0
+            .join("pkg-00000000000000000000000000000001/ownership-receipt.json"),
+        &receipt,
+    )
+    .unwrap();
+    let outcome = discover_from_root(&fixture.0);
+    assert_eq!(outcome.plugins.len(), 2);
+    assert!(outcome.plugins[0].locator.receipt.is_none());
+    assert!(outcome.plugins[1].locator.receipt.is_some());
+    assert_eq!(
+        outcome.usage.unwrap().bytes_read,
+        first.len() + second.len() + receipt.len()
+    );
+}
+
+#[test]
+fn malformed_receipt_rejects_entire_double_file_package() {
+    let fixture = Fixture::new();
+    fixture.scan(&[valid_manifest("com.example.a")]);
+    fs::write(
+        fixture
+            .0
+            .join("pkg-00000000000000000000000000000000/ownership-receipt.json"),
+        b"{}",
+    )
+    .unwrap();
+    let outcome = discover_from_root(&fixture.0);
+    assert!(outcome.plugins.is_empty());
+    assert_eq!(outcome.summary, LocalDiscoverySummary::degraded(1).unwrap());
+}
+
+#[test]
+fn removal_unknown_shape_keeps_directory_evidence_without_reading_unknown_data() {
+    let fixture = Fixture::new();
+    let target = fixture
+        .0
+        .join("removal-staging/remove-00000000000000000000000000000001");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("extra"), b"private unknown data").unwrap();
+    let outcome = discover_from_plugins_root(&fixture.0);
+    assert_eq!(outcome.removals.observations.len(), 1);
+    assert_eq!(
+        outcome.removals.observations[0].shape,
+        RemovalObservationShape::Unknown
+    );
+    assert_eq!(outcome.removals.bytes_read, 0);
+    assert_eq!(
+        fs::read(target.join("extra")).unwrap(),
+        b"private unknown data"
+    );
+}
+
+#[test]
+fn local_2mib_and_removal_328kib_budgets_are_independent() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.0.join("local")).unwrap();
+    let local = fixture.0.join("local/pkg-00000000000000000000000000000001");
+    fs::create_dir(&local).unwrap();
+    let manifest = valid_manifest("com.example.local");
+    fs::write(local.join("manifest.json"), &manifest).unwrap();
+    let staging = fixture.0.join("removal-staging");
+    fs::create_dir(&staging).unwrap();
+    for n in 0..16 {
+        let target = staging.join(format!("remove-{n:032x}"));
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("manifest.json"), vec![b'x'; 16385]).unwrap();
+        fs::write(target.join("ownership-receipt.json"), vec![b'x'; 4097]).unwrap();
+    }
+    let full = discover_from_plugins_root(&fixture.0);
+    assert_eq!(full.removals.bytes_read, 327_712);
+    assert_eq!(full.usage.unwrap().bytes_read, manifest.len());
+    assert_eq!(
+        full.removals.status,
+        super::super::manifest::LocalDiscoveryStatus::Available
+    );
+    // 16*(16385+4097) cannot reach 335873. A lower injected ceiling exercises
+    // exactly the same aggregate guard without relaxing any production cap.
+    let limited = discover_bounded(&fixture.0, 20_000);
+    assert_eq!(
+        limited.removals.status,
+        super::super::manifest::LocalDiscoveryStatus::Unavailable
+    );
+    assert_eq!(limited.summary, full.summary);
+    assert_eq!(limited.plugins, full.plugins);
+    assert_eq!(limited.usage, full.usage);
+}
+
 // Catches one bad package poisoning siblings or a duplicate group selecting a winner.
 #[test]
 fn invalid_package_is_isolated_and_duplicate_ids_have_no_winner() {
@@ -46,9 +153,9 @@ fn invalid_package_is_isolated_and_duplicate_ids_have_no_winner() {
         valid_manifest("com.example.dup"),
     ]);
     let outcome = parse_package_scan(scan);
-    assert_eq!(outcome.records.len(), 1);
+    assert_eq!(outcome.plugins.len(), 1);
     assert_eq!(
-        outcome.records[0].manifest().id.as_str(),
+        outcome.plugins[0].record.manifest().id.as_str(),
         "com.example.good"
     );
     assert_eq!(outcome.summary, LocalDiscoverySummary::degraded(4).unwrap());
@@ -66,9 +173,9 @@ fn feff_only_display_text_rejects_each_bad_package_without_poisoning_siblings() 
             serde_json::to_vec(&bad).unwrap(),
             valid_manifest("com.example.good"),
         ]));
-        assert_eq!(outcome.records.len(), 1, "blank {field} package survived");
+        assert_eq!(outcome.plugins.len(), 1, "blank {field} package survived");
         assert_eq!(
-            outcome.records[0].manifest().id.as_str(),
+            outcome.plugins[0].record.manifest().id.as_str(),
             "com.example.good"
         );
         assert_eq!(outcome.summary, LocalDiscoverySummary::degraded(1).unwrap());
@@ -100,9 +207,9 @@ fn strict_package_errors_are_isolated_and_counted() {
     {
         let fixture = Fixture::new();
         let outcome = parse_package_scan(fixture.scan(&[bytes, good.as_bytes().to_vec()]));
-        assert_eq!(outcome.records.len(), 1);
+        assert_eq!(outcome.plugins.len(), 1);
         assert_eq!(
-            outcome.records[0].manifest().id.as_str(),
+            outcome.plugins[0].record.manifest().id.as_str(),
             "com.example.good"
         );
         assert_eq!(outcome.summary, LocalDiscoverySummary::degraded(1).unwrap());
@@ -118,15 +225,15 @@ fn canonical_ids_and_trust_records_preserve_scan_rejections() {
     let outcome = parse_package_scan(scan);
     assert_eq!(
         outcome
-            .records
+            .plugins
             .iter()
-            .map(|r| r.manifest().id.as_str())
+            .map(|r| r.record.manifest().id.as_str())
             .collect::<Vec<_>>(),
         ["com.alpha", "com.zeta"]
     );
-    assert!(outcome.records.iter().all(|r| r.source()
+    assert!(outcome.plugins.iter().all(|r| r.record.source()
         == super::super::manifest::PluginSource::LocalDeclarative
-        && r.approval_fingerprint().starts_with("v1:sha256:")));
+        && r.record.approval_fingerprint().starts_with("v1:sha256:")));
     assert_eq!(outcome.summary, LocalDiscoverySummary::degraded(2).unwrap());
 }
 
@@ -209,7 +316,7 @@ fn unavailable_never_reports_zero_usage_as_authoritative() {
 fn malformed_packages_and_rejected_probes_remain_in_discovery_usage() {
     let fixture = Fixture::new();
     let outcome = parse_package_scan(fixture.scan(&[b"bad".to_vec(), vec![0; 16_400]]));
-    assert!(outcome.records.is_empty());
+    assert!(outcome.plugins.is_empty());
     assert_eq!(outcome.summary, LocalDiscoverySummary::degraded(2).unwrap());
     assert_eq!(
         outcome.usage,

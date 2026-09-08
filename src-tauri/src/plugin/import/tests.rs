@@ -364,6 +364,7 @@ fn import_result_wire_keys_match_spec() {
         PluginAvailability::Available,
         None,
         LocalDiscoverySummary::available(),
+        crate::plugin::manifest::ManagedOwnershipSummary::available(),
         vec![],
     );
     assert_eq!(

@@ -6,6 +6,57 @@ use crate::plugin::ownership::{
 };
 use crate::plugin::record::PluginRecord;
 
+#[test]
+fn ownership_runtime_committed_outcomes_adopt_no_delete_convergence_even_on_error() {
+    use super::OwnershipRuntime;
+    use crate::storage::managed_plugin_ownership::{
+        ManagedOwnershipLoad, ManagedOwnershipPersistence,
+    };
+    use crate::storage::safe_plugin_document::{PersistFailure, PersistOutcome, PersistResult};
+    struct Persistence(ManagedOwnershipIndexV1, PersistOutcome, bool);
+    impl ManagedOwnershipPersistence for Persistence {
+        fn load(&self) -> crate::error::AppResult<ManagedOwnershipLoad> {
+            Ok(ManagedOwnershipLoad {
+                index: self.0.clone(),
+                requires_rewrite: false,
+            })
+        }
+        fn save(&self, _: &ManagedOwnershipIndexV1) -> PersistResult {
+            if self.2 {
+                Err(PersistFailure { outcome: self.1 })
+            } else {
+                Ok(self.1)
+            }
+        }
+    }
+    let entry = managed_entry("com.example.a", 1);
+    let index = ManagedOwnershipIndexV1::empty()
+        .register(entry.clone())
+        .unwrap()
+        .begin_removal(entry.receipt_id(), removal_slot(1))
+        .unwrap();
+    for outcome in [
+        PersistOutcome::NotCommitted,
+        PersistOutcome::CommittedProcessCrashSafe,
+        PersistOutcome::CommittedDurable,
+    ] {
+        for error in [false, true] {
+            let runtime = OwnershipRuntime::initialize(std::sync::Arc::new(Persistence(
+                index.clone(),
+                outcome,
+                error,
+            )));
+            let (next, _, summary) = runtime.reconcile(
+                &crate::plugin::discovery::LocalDiscoveryOutcome::available(vec![]),
+                true,
+            );
+            let committed = outcome != PersistOutcome::NotCommitted;
+            assert_eq!(next.entries().unwrap().is_empty(), committed);
+            assert_eq!(summary.cleanup_pending_count, u32::from(!committed));
+        }
+    }
+}
+
 const MANIFEST_TEMPLATE: &str = r#"{
     "schemaVersion": 1,
     "id": "PLUGIN_ID",

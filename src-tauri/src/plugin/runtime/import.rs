@@ -292,14 +292,17 @@ async fn publish_import_outcome(
     runtime: &Arc<PluginRuntime>,
     outcome: LocalDiscoveryOutcome,
 ) -> AppResult<PluginCatalogSnapshot> {
-    let publication = {
-        let mut registry = runtime.registry.write().await;
+    let owned_runtime = Arc::clone(runtime);
+    let publication = tokio::task::spawn_blocking(move || {
+        let mut registry = owned_runtime.registry.blocking_write();
         let publication = registry.apply_local_discovery(outcome);
-        runtime
+        owned_runtime
             .initial_discovery_attempted
             .store(true, Ordering::Release);
         publication.map(|_| registry.catalog_snapshot())
-    };
+    })
+    .await
+    .map_err(|_| runtime_error())?;
     publication
 }
 

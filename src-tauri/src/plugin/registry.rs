@@ -8,6 +8,7 @@ use crate::storage::plugin_state::{
 };
 
 use super::builtin::builtin_manifests;
+use super::discovery::LocalPackageLocator;
 use super::discovery::{LocalDiscoveryOutcome, ScanUsage};
 use super::import::ImportCommitFailure;
 use super::manifest::{
@@ -15,8 +16,14 @@ use super::manifest::{
     PluginCatalogItem, PluginCatalogMutationResult, PluginCatalogSnapshot, PluginId,
     PluginManifestV1, PluginSource,
 };
+use super::manifest::{ManagedOwnershipSummary, PluginManagement};
+use super::ownership::OwnershipRuntime;
 use super::record::PluginRecord;
+use crate::storage::managed_plugin_ownership::{
+    ManagedOwnershipPersistence, ManagedOwnershipStore,
+};
 
+#[derive(Clone)]
 enum Runtime {
     Available {
         state: PluginStateFileV2,
@@ -29,12 +36,23 @@ enum Runtime {
     },
 }
 
-pub struct PluginRegistry {
-    builtins: BTreeMap<PluginId, PluginRecord>,
+#[derive(Clone)]
+pub(crate) struct CatalogPublicationCandidate {
     locals: BTreeMap<PluginId, PluginRecord>,
+    locators: BTreeMap<PluginId, LocalPackageLocator>,
+    management: BTreeMap<PluginId, PluginManagement>,
     local_summary: LocalDiscoverySummary,
+    ownership_summary: ManagedOwnershipSummary,
+    discovery: LocalDiscoveryOutcome,
     catalog_generation: u64,
     runtime: Runtime,
+    ownership: OwnershipRuntime,
+    snapshot: PluginCatalogSnapshot,
+}
+
+pub struct PluginRegistry {
+    builtins: BTreeMap<PluginId, PluginRecord>,
+    publication: CatalogPublicationCandidate,
 }
 
 // Resolve the production store for each operation, so failure to resolve the
@@ -62,61 +80,105 @@ impl Default for PluginRegistry {
 
 impl PluginRegistry {
     pub fn new() -> Self {
-        Self::initialize(builtin_manifests(), Box::new(SystemPersistence))
+        Self::initialize(
+            builtin_manifests(),
+            Box::new(SystemPersistence),
+            Box::new(ManagedOwnershipStore::new()),
+        )
     }
 
-    /// Plugin failures are represented in the snapshot, never returned to startup.
+    /// Each persistence subsystem fails independently, without aborting startup.
     pub(crate) fn initialize(
         builtins: Vec<PluginManifestV1>,
         persistence: Box<dyn PluginStatePersistence>,
+        ownership_persistence: Box<dyn ManagedOwnershipPersistence>,
     ) -> Self {
         let persistence: Arc<dyn PluginStatePersistence> = persistence.into();
+        let ownership = OwnershipRuntime::initialize(ownership_persistence.into());
         let mut manifests = BTreeMap::new();
+        let mut invalid = false;
         for manifest in builtins {
-            let record = match PluginRecord::built_in(manifest) {
-                Ok(record) if !manifests.contains_key(&record.manifest().id) => record,
-                _ => {
-                    return Self {
-                        builtins: BTreeMap::new(),
-                        locals: BTreeMap::new(),
-                        local_summary: LocalDiscoverySummary::available(),
-                        catalog_generation: 0,
-                        runtime: Runtime::Unavailable {
-                            reason: PluginAvailabilityReason::CatalogInvalid,
-                            persistence,
-                        },
-                    };
+            match PluginRecord::built_in(manifest) {
+                Ok(record) if !manifests.contains_key(&record.manifest().id) => {
+                    manifests.insert(record.manifest().id.clone(), record);
                 }
-            };
-            let id = record.manifest().id.clone();
-            manifests.insert(id, record);
+                _ => {
+                    invalid = true;
+                    manifests.clear();
+                    break;
+                }
+            }
         }
+        let runtime = if invalid {
+            Runtime::Unavailable {
+                reason: PluginAvailabilityReason::CatalogInvalid,
+                persistence,
+            }
+        } else {
+            match persistence.load() {
+                Ok(loaded) if loaded.state.validate().is_ok() => Runtime::Available {
+                    state: loaded.state,
+                    requires_rewrite: loaded.requires_rewrite,
+                    persistence,
+                },
+                _ => Runtime::Unavailable {
+                    reason: PluginAvailabilityReason::StateUnavailable,
+                    persistence,
+                },
+            }
+        };
+        let ownership_summary = if ownership.requires_retry() {
+            ManagedOwnershipSummary::unavailable()
+        } else {
+            ManagedOwnershipSummary::available()
+        };
+        let snapshot = PluginCatalogSnapshot::new(
+            "0".into(),
+            "0".into(),
+            PluginAvailability::Available,
+            None,
+            LocalDiscoverySummary::available(),
+            ownership_summary.clone(),
+            vec![],
+        );
         let mut registry = Self {
             builtins: manifests,
-            locals: BTreeMap::new(),
-            local_summary: LocalDiscoverySummary::available(),
-            catalog_generation: 0,
-            runtime: Runtime::Unavailable {
-                reason: PluginAvailabilityReason::StateUnavailable,
-                persistence,
+            publication: CatalogPublicationCandidate {
+                locals: BTreeMap::new(),
+                locators: BTreeMap::new(),
+                management: BTreeMap::new(),
+                local_summary: LocalDiscoverySummary::available(),
+                ownership_summary,
+                discovery: LocalDiscoveryOutcome {
+                    plugins: vec![],
+                    occupied_slots: vec![],
+                    removals: super::discovery::RemovalDiscoveryOutcome::available(),
+                    summary: LocalDiscoverySummary::available(),
+                    usage: None,
+                },
+                catalog_generation: 0,
+                runtime,
+                ownership,
+                snapshot,
             },
         };
-        registry.retry_state_load();
+        registry.publication.snapshot = registry.derive_snapshot(&registry.publication);
         registry
     }
 
     pub(crate) fn catalog_generation(&self) -> u64 {
-        self.catalog_generation
+        self.publication.catalog_generation
     }
 
     #[cfg(test)]
     pub(crate) fn set_catalog_generation_for_test(&mut self, generation: u64) {
-        self.catalog_generation = generation;
+        self.publication.catalog_generation = generation;
+        self.publication.snapshot.catalog_generation = generation.to_string();
     }
 
     pub(crate) fn state_requires_retry(&self) -> bool {
         matches!(
-            self.runtime,
+            self.publication.runtime,
             Runtime::Unavailable {
                 reason: PluginAvailabilityReason::StateUnavailable,
                 ..
@@ -129,7 +191,7 @@ impl PluginRegistry {
         record: &PluginRecord,
         usage: ScanUsage,
     ) -> Result<(), ImportCommitFailure> {
-        match &self.runtime {
+        match &self.publication.runtime {
             Runtime::Unavailable {
                 reason: PluginAvailabilityReason::CatalogInvalid,
                 ..
@@ -139,11 +201,11 @@ impl PluginRegistry {
             Runtime::Unavailable { .. } => return Err(ImportCommitFailure::StateUnavailable),
             Runtime::Available { .. } => {}
         }
-        if self.local_summary.status != LocalDiscoveryStatus::Available {
+        if self.publication.local_summary.status != LocalDiscoveryStatus::Available {
             return Err(ImportCommitFailure::DiscoveryUnavailable);
         }
         if self.builtins.contains_key(&record.manifest().id)
-            || self.locals.contains_key(&record.manifest().id)
+            || self.publication.locals.contains_key(&record.manifest().id)
         {
             return Err(ImportCommitFailure::IdConflict);
         }
@@ -153,7 +215,7 @@ impl PluginRegistry {
         if !usage.can_add_manifest(bytes.len()) {
             return Err(ImportCommitFailure::CapacityExceeded);
         }
-        if self.catalog_generation == u64::MAX {
+        if self.publication.catalog_generation == u64::MAX {
             return Err(ImportCommitFailure::CatalogGenerationExhausted);
         }
         Ok(())
@@ -163,7 +225,7 @@ impl PluginRegistry {
     pub(crate) fn persist_import_disabled(&mut self, record: &PluginRecord) -> AppResult<()> {
         if record.source() != PluginSource::LocalDeclarative
             || matches!(
-                self.runtime,
+                self.publication.runtime,
                 Runtime::Unavailable {
                     reason: PluginAvailabilityReason::CatalogInvalid,
                     ..
@@ -179,33 +241,92 @@ impl PluginRegistry {
         &mut self,
         outcome: LocalDiscoveryOutcome,
     ) -> AppResult<bool> {
-        let mut locals = BTreeMap::new();
+        let mut next = self.publication.clone();
+        let (ownership, management, summary) = next
+            .ownership
+            .reconcile(&outcome, next.catalog_generation != u64::MAX);
+        next.ownership = ownership;
+        next.management = management;
+        next.ownership_summary = summary;
+        next.locals.clear();
+        next.locators.clear();
         let mut collisions = 0;
-        for record in outcome.records {
-            if self.builtins.contains_key(&record.manifest().id) {
+        for package in &outcome.plugins {
+            if self.builtins.contains_key(&package.record.manifest().id) {
                 collisions += 1;
             } else {
-                locals.insert(record.manifest().id.clone(), record);
+                next.locals
+                    .insert(package.record.manifest().id.clone(), package.record.clone());
+                next.locators.insert(
+                    package.record.manifest().id.clone(),
+                    package.locator.clone(),
+                );
             }
         }
-        let summary = outcome.summary.with_additional_rejections(collisions);
-        if self.catalog_generation != 0 && self.locals == locals && self.local_summary == summary {
-            return Ok(false);
+        next.local_summary = outcome
+            .summary
+            .clone()
+            .with_additional_rejections(collisions);
+        next.discovery = outcome;
+        let state_retry = Self::load_state_if_needed(&mut next);
+        let published = self.publish_candidate(next, true)?;
+        state_retry?;
+        Ok(published)
+    }
+
+    pub(crate) fn ownership_requires_retry(&self) -> bool {
+        self.publication.ownership.requires_retry()
+    }
+
+    /// Compare the complete semantic basis before assigning a checked generation.
+    /// No intermediate ownership/state/index classification can be observed.
+    fn publish_candidate(
+        &mut self,
+        mut next: CatalogPublicationCandidate,
+        first_scan: bool,
+    ) -> AppResult<bool> {
+        next.snapshot = self.derive_snapshot(&next);
+        let old = &self.publication;
+        let structural = next.locals != old.locals
+            || next.locators != old.locators
+            || next.management != old.management
+            || next.local_summary != old.local_summary
+            || next.ownership_summary != old.ownership_summary
+            || next.ownership.entries() != old.ownership.entries()
+            || next.discovery.occupied_slots != old.discovery.occupied_slots
+            || next.discovery.removals.observations != old.discovery.removals.observations
+            || next.discovery.removals.occupied_slots != old.discovery.removals.occupied_slots
+            || next.snapshot.availability != old.snapshot.availability
+            || next.snapshot.availability_reason_code != old.snapshot.availability_reason_code
+            || next.snapshot.plugins.len() != old.snapshot.plugins.len()
+            || next
+                .snapshot
+                .plugins
+                .iter()
+                .zip(&old.snapshot.plugins)
+                .any(|(next, old)| !next.same_structure(old))
+            || (next.snapshot.revision == old.snapshot.revision && next.snapshot != old.snapshot)
+            || (first_scan && old.catalog_generation == 0);
+        if structural {
+            next.catalog_generation = old.catalog_generation.checked_add(1).ok_or_else(|| {
+                plugin_error(
+                    "plugin_catalog_generation_exhausted",
+                    "插件目录版本已达上限",
+                )
+            })?;
+            next.snapshot.catalog_generation = next.catalog_generation.to_string();
         }
-        let generation = self.catalog_generation.checked_add(1).ok_or_else(|| {
-            plugin_error(
-                "plugin_catalog_generation_exhausted",
-                "插件目录版本已达上限",
-            )
-        })?;
-        self.locals = locals;
-        self.local_summary = summary;
-        self.catalog_generation = generation;
-        Ok(true)
+        let changed = next.snapshot != old.snapshot;
+        self.publication = next;
+        Ok(changed)
     }
 
     pub fn catalog_snapshot(&self) -> PluginCatalogSnapshot {
-        let (revision, availability, reason) = match &self.runtime {
+        self.publication.snapshot.clone()
+    }
+
+    fn derive_snapshot(&self, next: &CatalogPublicationCandidate) -> PluginCatalogSnapshot {
+        let (revision, availability, reason) = match &next.runtime {
             Runtime::Available { state, .. } => {
                 (state.revision, PluginAvailability::Available, None)
             }
@@ -213,47 +334,71 @@ impl PluginRegistry {
                 (0, PluginAvailability::Unavailable, Some(reason.clone()))
             }
         };
-        let records: BTreeMap<_, _> = self.builtins.iter().chain(self.locals.iter()).collect();
+        let records: BTreeMap<_, _> = self.builtins.iter().chain(next.locals.iter()).collect();
         let plugins = records
-            .into_values()
-            .map(|record| match &self.runtime {
-                Runtime::Available { state, .. } => catalog_item(record, is_enabled(state, record)),
-                Runtime::Unavailable { reason, .. } => PluginCatalogItem::blocked(
-                    record.manifest().clone(),
-                    record.source(),
-                    reason.clone(),
-                ),
+            .into_iter()
+            .map(|(id, record)| {
+                let item = match &next.runtime {
+                    Runtime::Available { state, .. } => {
+                        catalog_item(record, is_enabled(state, record))
+                    }
+                    Runtime::Unavailable { reason, .. } => PluginCatalogItem::blocked(
+                        record.manifest().clone(),
+                        record.source(),
+                        reason.clone(),
+                    ),
+                };
+                item.with_management(if record.source() == PluginSource::BuiltIn {
+                    PluginManagement::BuiltIn
+                } else {
+                    next.management
+                        .get(id)
+                        .copied()
+                        .unwrap_or(PluginManagement::External)
+                })
             })
             .collect();
         PluginCatalogSnapshot::new(
             revision.to_string(),
-            self.catalog_generation().to_string(),
+            next.catalog_generation.to_string(),
             availability,
             reason,
-            self.local_summary.clone(),
+            next.local_summary.clone(),
+            next.ownership_summary.clone(),
             plugins,
         )
     }
 
-    /// Call only while holding the registry's write guard, never through a read guard.
-    pub fn retry_state_load(&mut self) {
+    fn load_state_if_needed(next: &mut CatalogPublicationCandidate) -> AppResult<()> {
         let Runtime::Unavailable {
             reason: PluginAvailabilityReason::StateUnavailable,
             persistence,
-        } = &self.runtime
+        } = &next.runtime
         else {
-            return;
+            return Ok(());
         };
-        match persistence.load() {
-            Ok(loaded) if loaded.state.validate().is_ok() => {
-                self.runtime = Runtime::Available {
+        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| persistence.load()))
+            .map_err(|_| AppError::Internal("插件目录请求暂不可用".into()))?;
+        if let Ok(loaded) = loaded {
+            if loaded.state.validate().is_ok() {
+                next.runtime = Runtime::Available {
                     state: loaded.state,
                     requires_rewrite: loaded.requires_rewrite,
                     persistence: Arc::clone(persistence),
                 };
             }
-            Ok(_) => tracing::warn!("invalid loaded plugin state"),
-            Err(_) => tracing::warn!("plugin state load unavailable"),
+        }
+        Ok(())
+    }
+
+    /// Retry cannot publish a different DTO with the same revision/generation pair.
+    pub fn retry_state_load(&mut self) {
+        let mut next = self.publication.clone();
+        if Self::load_state_if_needed(&mut next).is_err() {
+            return;
+        }
+        if self.publish_candidate(next, false).is_err() {
+            tracing::warn!("plugin catalog generation exhausted during state recovery");
         }
     }
 
@@ -265,8 +410,9 @@ impl PluginRegistry {
         enabled: bool,
         expected_catalog_generation: &str,
     ) -> AppResult<PluginCatalogMutationResult> {
-        if expected_catalog_generation.parse::<u64>().ok() != Some(self.catalog_generation)
-            || expected_catalog_generation != self.catalog_generation.to_string()
+        if expected_catalog_generation.parse::<u64>().ok()
+            != Some(self.publication.catalog_generation)
+            || expected_catalog_generation != self.publication.catalog_generation.to_string()
         {
             return Err(plugin_error(
                 "plugin_catalog_stale",
@@ -276,7 +422,7 @@ impl PluginRegistry {
         let id =
             PluginId::parse(id).map_err(|_| plugin_error("plugin_invalid_id", "插件标识无效"))?;
         if matches!(
-            self.runtime,
+            self.publication.runtime,
             Runtime::Unavailable {
                 reason: PluginAvailabilityReason::CatalogInvalid,
                 ..
@@ -287,26 +433,36 @@ impl PluginRegistry {
         let record = self
             .builtins
             .get(&id)
-            .or_else(|| self.locals.get(&id))
+            .or_else(|| self.publication.locals.get(&id))
             .cloned()
             .ok_or_else(|| plugin_error("plugin_not_found", "插件不存在"))?;
+        if self.publication.management.get(&id) == Some(&PluginManagement::RemovalPending) {
+            return Err(plugin_error("plugin_removal_pending", "插件移除回退待处理"));
+        }
         self.persist_decision(&record, enabled)?;
-        let Runtime::Available { state, .. } = &self.runtime else {
+        let Runtime::Available { state, .. } = &self.publication.runtime else {
             unreachable!("a successful decision requires available state");
         };
         Ok(PluginCatalogMutationResult::new(
             state.revision.to_string(),
-            self.catalog_generation.to_string(),
-            catalog_item(&record, enabled),
+            self.publication.catalog_generation.to_string(),
+            catalog_item(&record, enabled).with_management(
+                self.publication
+                    .management
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(PluginManagement::BuiltIn),
+            ),
         ))
     }
 
     fn persist_decision(&mut self, record: &PluginRecord, enabled: bool) -> AppResult<()> {
+        let mut candidate = self.publication.clone();
         let Runtime::Available {
             state,
             requires_rewrite,
             persistence,
-        } = &mut self.runtime
+        } = &mut candidate.runtime
         else {
             return Err(plugin_error(
                 "plugin_state_unavailable",
@@ -359,6 +515,8 @@ impl PluginRegistry {
         if crate::storage::safe_plugin_document::persist_outcome_committed(outcome) {
             *state = next;
             *requires_rewrite = false;
+            candidate.snapshot = self.derive_snapshot(&candidate);
+            self.publication = candidate;
         }
         match result {
             Ok(outcome)

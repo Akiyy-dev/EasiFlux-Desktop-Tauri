@@ -288,6 +288,40 @@ pub(crate) struct ManagedOwnershipEntryV1 {
 }
 
 impl ManagedOwnershipEntryV1 {
+    pub(crate) fn matches_receipt(&self, receipt: &OwnershipReceiptV1, digest: [u8; 32]) -> bool {
+        self.receipt_id == receipt.receipt_id
+            && self.package_slot == *receipt.package_slot()
+            && self.plugin_id == receipt.plugin_id
+            && self.source == receipt.source
+            && self.publisher_id == receipt.publisher_id
+            && self.approval_fingerprint == receipt.approval_fingerprint
+            && self.receipt_sha256 == digest
+    }
+
+    pub(crate) fn matches_locator(&self, locator: &super::discovery::LocalPackageLocator) -> bool {
+        self.package_slot == locator.package_slot
+            && self.directory_identity == locator.directory_identity
+            && self.manifest_identity == locator.manifest_identity
+            && locator
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| self.receipt_identity == receipt.file_identity)
+    }
+
+    pub(crate) fn matches_package(
+        &self,
+        package: &super::discovery::DiscoveredLocalPlugin,
+    ) -> bool {
+        package.locator.receipt.as_ref().is_some_and(|receipt| {
+            self.matches_receipt(&receipt.model, receipt.canonical_sha256)
+                && self.matches_locator(&package.locator)
+                && receipt.model.matches_record(&package.record)
+        })
+    }
+
+    pub(crate) fn proves_managed(&self, package: &super::discovery::DiscoveredLocalPlugin) -> bool {
+        self.removal_slot().is_none() && self.matches_package(package)
+    }
     pub(crate) fn managed(
         receipt: VerifiedPackageReceipt,
         record: &PluginRecord,
@@ -367,6 +401,9 @@ pub(crate) struct ManagedOwnershipIndexV1 {
 }
 
 impl ManagedOwnershipIndexV1 {
+    pub(crate) fn entries(&self) -> &[ManagedOwnershipEntryV1] {
+        &self.entries
+    }
     pub(crate) fn empty() -> Self {
         Self {
             schema_version: OWNERSHIP_SCHEMA_VERSION_V1,
@@ -855,5 +892,327 @@ impl OwnershipFailure {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum OwnershipRuntime {
+    Available {
+        index: ManagedOwnershipIndexV1,
+        requires_rewrite: bool,
+        persistence: std::sync::Arc<
+            dyn crate::storage::managed_plugin_ownership::ManagedOwnershipPersistence,
+        >,
+    },
+    Unavailable {
+        persistence: std::sync::Arc<
+            dyn crate::storage::managed_plugin_ownership::ManagedOwnershipPersistence,
+        >,
+    },
+}
+
+impl OwnershipRuntime {
+    pub(crate) fn initialize(
+        persistence: std::sync::Arc<
+            dyn crate::storage::managed_plugin_ownership::ManagedOwnershipPersistence,
+        >,
+    ) -> Self {
+        match persistence.load() {
+            Ok(load) if load.index.validate_for_persistence().is_ok() => Self::Available {
+                index: load.index,
+                requires_rewrite: load.requires_rewrite,
+                persistence,
+            },
+            _ => Self::Unavailable { persistence },
+        }
+    }
+
+    pub(crate) fn requires_retry(&self) -> bool {
+        !matches!(
+            self,
+            Self::Available {
+                requires_rewrite: false,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn entries(&self) -> Option<&[ManagedOwnershipEntryV1]> {
+        match self {
+            Self::Available { index, .. } => Some(index.entries()),
+            _ => None,
+        }
+    }
+
+    /// Clone/persist/adopt; a post-commit error must not resurrect the old index.
+    fn save(&mut self, next: ManagedOwnershipIndexV1) -> bool {
+        let Self::Available {
+            index,
+            requires_rewrite,
+            persistence,
+        } = self
+        else {
+            return false;
+        };
+        let result = persistence.save(&next);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(failure) => failure.outcome,
+        };
+        if crate::storage::safe_plugin_document::persist_outcome_committed(outcome) {
+            *index = next;
+            *requires_rewrite = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn reconcile(
+        &self,
+        outcome: &super::discovery::LocalDiscoveryOutcome,
+        allow_writes: bool,
+    ) -> (
+        Self,
+        std::collections::BTreeMap<PluginId, super::manifest::PluginManagement>,
+        super::manifest::ManagedOwnershipSummary,
+    ) {
+        let persistence = match self {
+            Self::Available { persistence, .. } | Self::Unavailable { persistence } => persistence,
+        };
+        // Each authoritative scan reloads the index too. A formerly healthy
+        // in-memory index cannot conceal later loss or damage to disk authority.
+        Self::initialize(std::sync::Arc::clone(persistence)).reconcile_loaded(outcome, allow_writes)
+    }
+
+    fn reconcile_loaded(
+        &self,
+        outcome: &super::discovery::LocalDiscoveryOutcome,
+        allow_writes: bool,
+    ) -> (
+        Self,
+        std::collections::BTreeMap<PluginId, super::manifest::PluginManagement>,
+        super::manifest::ManagedOwnershipSummary,
+    ) {
+        use super::discovery::RemovalObservationShape;
+        use super::manifest::{LocalDiscoveryStatus, ManagedOwnershipSummary, PluginManagement};
+        let mut runtime = self.clone();
+        let unavailable = |runtime| {
+            let classes = outcome
+                .plugins
+                .iter()
+                .map(|package| {
+                    (
+                        package.record.manifest().id.clone(),
+                        if package.locator.receipt.is_some() {
+                            PluginManagement::OwnershipUnavailable
+                        } else {
+                            PluginManagement::External
+                        },
+                    )
+                })
+                .collect();
+            (runtime, classes, ManagedOwnershipSummary::unavailable())
+        };
+        if outcome.removals.status == LocalDiscoveryStatus::Unavailable
+            || outcome.summary.status == LocalDiscoveryStatus::Unavailable
+        {
+            return unavailable(runtime);
+        }
+        let Self::Available {
+            index,
+            requires_rewrite,
+            persistence,
+        } = &runtime
+        else {
+            return unavailable(runtime);
+        };
+        let mut index = index.clone();
+        let persistence = std::sync::Arc::clone(persistence);
+        if *requires_rewrite {
+            // Classify recovered evidence without any convergence writes first.
+            // Its classifications stay private until the equivalent rewrite commits.
+            let recovered = Self::Available {
+                index: index.clone(),
+                requires_rewrite: false,
+                persistence: persistence.clone(),
+            };
+            let (mut observed, _, _) = recovered.reconcile_loaded(outcome, false);
+            if !allow_writes || !observed.save(index) {
+                return unavailable(Self::Unavailable { persistence });
+            }
+            return observed.reconcile_loaded(outcome, allow_writes);
+        }
+        let mut conflicts = 0u32;
+        let mut rollback = 0u32;
+        let mut cleanup = 0u32;
+        let mut classes = std::collections::BTreeMap::new();
+        for entry in index.entries().to_vec() {
+            let claimants: Vec<_> =
+                outcome
+                    .plugins
+                    .iter()
+                    .filter(|package| {
+                        package.locator.package_slot == entry.package_slot
+                            || package.record.manifest().id == entry.plugin_id
+                            || package.locator.receipt.as_ref().is_some_and(|receipt| {
+                                receipt.model.receipt_id() == entry.receipt_id()
+                            })
+                    })
+                    .collect();
+            if claimants.len() > 1 {
+                conflicts += 1;
+                for package in claimants {
+                    classes.insert(
+                        package.record.manifest().id.clone(),
+                        PluginManagement::OwnershipConflict,
+                    );
+                }
+                continue;
+            }
+            let source = outcome
+                .plugins
+                .iter()
+                .find(|package| package.locator.package_slot == entry.package_slot);
+            let source_present =
+                source.is_some() || outcome.occupied_slots.contains(&entry.package_slot);
+            let Some(target_slot) = entry.removal_slot() else {
+                if !source.is_some_and(|package| entry.proves_managed(package)) {
+                    conflicts += 1;
+                }
+                continue;
+            };
+            let target_present = outcome.removals.occupied_slots.contains(target_slot);
+            let target = outcome
+                .removals
+                .observations
+                .iter()
+                .find(|object| &object.removal_slot == target_slot);
+            if source_present
+                && !target_present
+                && source.is_some_and(|package| entry.matches_package(package))
+            {
+                let next = index.restore_managed(entry.receipt_id());
+                if allow_writes && next.as_ref().is_ok_and(|next| runtime.save(next.clone())) {
+                    index = next.unwrap();
+                } else {
+                    rollback += 1;
+                    classes.insert(
+                        source.unwrap().record.manifest().id.clone(),
+                        PluginManagement::RemovalPending,
+                    );
+                }
+            } else if !source_present && !target_present {
+                let next = index.remove(entry.receipt_id());
+                if allow_writes && next.as_ref().is_ok_and(|next| runtime.save(next.clone())) {
+                    index = next.unwrap();
+                } else {
+                    cleanup += 1;
+                }
+            } else if !source_present
+                && target.is_some_and(|target| {
+                    if target.directory_identity != entry.directory_identity {
+                        return false;
+                    }
+                    let receipt_matches = target.receipt.as_ref().is_some_and(|receipt| {
+                        receipt.file_identity == entry.receipt_identity
+                            && entry.matches_receipt(&receipt.model, receipt.canonical_sha256)
+                    });
+                    match target.shape {
+                        RemovalObservationShape::Full => {
+                            receipt_matches
+                                && target.manifest.as_ref().is_some_and(|(record, identity)| {
+                                    *identity == entry.manifest_identity
+                                        && target
+                                            .receipt
+                                            .as_ref()
+                                            .unwrap()
+                                            .model
+                                            .matches_record(record)
+                                })
+                        }
+                        RemovalObservationShape::ReceiptOnly => receipt_matches,
+                        RemovalObservationShape::EmptyDirectory => true,
+                        _ => false,
+                    }
+                })
+            {
+                cleanup += 1;
+            } else {
+                conflicts += 1;
+            }
+        }
+        // An occupied quarantine is counted once: its matching entry already
+        // contributed exactly one class above, even when its bytes are unreadable.
+        let orphan_count = outcome
+            .removals
+            .occupied_slots
+            .iter()
+            .filter(|slot| {
+                !index
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.removal_slot() == Some(*slot))
+            })
+            .count();
+        let Ok(orphan_count) = u32::try_from(orphan_count) else {
+            return unavailable(runtime);
+        };
+        let Some(conflicts) = conflicts
+            .checked_add(outcome.removals.unknown_entry_count)
+            .and_then(|count| count.checked_add(orphan_count))
+        else {
+            return unavailable(runtime);
+        };
+        for package in &outcome.plugins {
+            let management = match (
+                package.locator.receipt.as_ref(),
+                classes.get(&package.record.manifest().id),
+            ) {
+                (None, _) => PluginManagement::External,
+                (Some(_), Some(classification)) => *classification,
+                (Some(receipt), None) => match index.entries().iter().find(|entry| {
+                    entry.package_slot == package.locator.package_slot
+                        || entry.receipt_id == *receipt.model.receipt_id()
+                        || entry.plugin_id == package.record.manifest().id
+                }) {
+                    None => PluginManagement::External,
+                    Some(entry) if entry.proves_managed(package) => PluginManagement::Managed,
+                    Some(_) => PluginManagement::OwnershipConflict,
+                },
+            };
+            classes.insert(package.record.manifest().id.clone(), management);
+        }
+        (
+            runtime,
+            classes,
+            ManagedOwnershipSummary::counts(conflicts, rollback, cleanup),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn empty_test_persistence(
+) -> Box<dyn crate::storage::managed_plugin_ownership::ManagedOwnershipPersistence> {
+    struct Empty;
+    impl crate::storage::managed_plugin_ownership::ManagedOwnershipPersistence for Empty {
+        fn load(
+            &self,
+        ) -> crate::error::AppResult<crate::storage::managed_plugin_ownership::ManagedOwnershipLoad>
+        {
+            Ok(
+                crate::storage::managed_plugin_ownership::ManagedOwnershipLoad {
+                    index: ManagedOwnershipIndexV1::empty(),
+                    requires_rewrite: false,
+                },
+            )
+        }
+        fn save(
+            &self,
+            _: &ManagedOwnershipIndexV1,
+        ) -> crate::storage::safe_plugin_document::PersistResult {
+            Ok(crate::storage::safe_plugin_document::PersistOutcome::CommittedProcessCrashSafe)
+        }
+    }
+    Box::new(Empty)
+}

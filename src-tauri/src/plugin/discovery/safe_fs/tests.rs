@@ -3,6 +3,71 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 struct Fixture(PathBuf);
+
+#[test]
+fn post_read_shape_and_identity_replacements_fail_closed_with_handles_held() {
+    for swap in [false, true] {
+        let f = Fixture::new();
+        let package = f.package(0, b"{}");
+        fs::write(package.join("ownership-receipt.json"), b"{}").unwrap();
+        POST_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if swap {
+                    let result = fs::rename(package.join("manifest.json"), package.join("old"));
+                    #[cfg(windows)]
+                    assert_eq!(result.unwrap_err().raw_os_error(), Some(32));
+                    #[cfg(unix)]
+                    {
+                        result.unwrap();
+                        fs::write(package.join("manifest.json"), b"{}").unwrap();
+                        fs::remove_file(package.join("old")).unwrap();
+                    }
+                } else {
+                    fs::write(package.join("extra"), b"keep").unwrap();
+                }
+            }))
+        });
+        let scan = f.scan().unwrap();
+        if cfg!(windows) && swap {
+            assert_eq!(scan.packages.len(), 1);
+        } else {
+            assert!(scan.packages.is_empty());
+        }
+    }
+}
+
+#[test]
+fn rejected_manifest_does_not_mask_receipt_aggregate_overflow() {
+    let f = Fixture::new();
+    let package = f.package(0, &vec![b'x'; 16_385]);
+    fs::write(package.join("ownership-receipt.json"), vec![b'x'; 4097]).unwrap();
+    let limits = ScanLimits {
+        max_total_bytes: 20_000,
+        ..ScanLimits::production()
+    };
+    assert!(read_package_candidates(f.root(), limits).is_err());
+}
+
+#[test]
+fn two_file_probe_bytes_and_wrong_case_extra_hardlink_are_bounded() {
+    let f = Fixture::new();
+    let package = f.package(0, b"{}");
+    fs::write(package.join("ownership-receipt.json"), vec![b'x'; 4097]).unwrap();
+    let scan = f.scan().unwrap();
+    assert!(scan.packages.is_empty());
+    assert_eq!(scan.usage.bytes_read, 4099);
+    fs::remove_file(package.join("ownership-receipt.json")).unwrap();
+    fs::write(package.join("Ownership-Receipt.json"), b"{}").unwrap();
+    assert!(f.scan().unwrap().packages.is_empty());
+    fs::remove_file(package.join("Ownership-Receipt.json")).unwrap();
+    fs::write(f.root().join("receipt-source"), b"{}").unwrap();
+    fs::hard_link(
+        f.root().join("receipt-source"),
+        package.join("ownership-receipt.json"),
+    )
+    .unwrap();
+    assert!(f.scan().unwrap().packages.is_empty());
+}
 impl Fixture {
     fn new() -> Self {
         // Keep fixtures beneath the checkout: sandboxed Windows processes may
@@ -378,6 +443,24 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ,
     };
+
+    #[test]
+    fn named_alternate_streams_on_package_or_known_files_are_rejected() {
+        for object in ["directory", "manifest.json", "ownership-receipt.json"] {
+            let fixture = Fixture::new();
+            let package = fixture.package(0, b"{}");
+            fs::write(package.join("ownership-receipt.json"), b"{}").unwrap();
+            let stream = if object == "directory" {
+                PathBuf::from(format!("{}:private", package.display()))
+            } else {
+                package.join(format!("{object}:private"))
+            };
+            fs::write(&stream, b"must not be implicitly removed").unwrap();
+            let scan = fixture.scan().unwrap();
+            assert!(scan.packages.is_empty(), "accepted ADS on {object}");
+            assert_eq!(fs::read(stream).unwrap(), b"must not be implicitly removed");
+        }
+    }
 
     #[test]
     fn reparse_attribute_is_always_rejected() {

@@ -6,6 +6,676 @@ use crate::storage::plugin_state::{PluginStateEntryV2, PluginStateFileV2, Plugin
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
+struct OwnershipMemory(
+    Arc<
+        Mutex<(
+            crate::storage::managed_plugin_ownership::ManagedOwnershipLoad,
+            bool,
+            bool,
+        )>,
+    >,
+);
+impl OwnershipMemory {
+    fn new(index: crate::plugin::ownership::ManagedOwnershipIndexV1) -> Self {
+        Self(Arc::new(Mutex::new((
+            crate::storage::managed_plugin_ownership::ManagedOwnershipLoad {
+                index,
+                requires_rewrite: false,
+            },
+            false,
+            false,
+        ))))
+    }
+}
+impl crate::storage::managed_plugin_ownership::ManagedOwnershipPersistence for OwnershipMemory {
+    fn load(&self) -> AppResult<crate::storage::managed_plugin_ownership::ManagedOwnershipLoad> {
+        let state = self.0.lock().unwrap();
+        if state.1 {
+            Err(plugin_error("plugin_ownership_unavailable", "unavailable"))
+        } else {
+            Ok(state.0.clone())
+        }
+    }
+    fn save(
+        &self,
+        index: &crate::plugin::ownership::ManagedOwnershipIndexV1,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
+        use crate::storage::safe_plugin_document::{PersistFailure, PersistOutcome};
+        let mut state = self.0.lock().unwrap();
+        if state.2 {
+            return Err(PersistFailure {
+                outcome: PersistOutcome::NotCommitted,
+            });
+        }
+        state.0.index = index.clone();
+        state.0.requires_rewrite = false;
+        Ok(PersistOutcome::CommittedProcessCrashSafe)
+    }
+}
+
+struct OwnershipFixture(std::path::PathBuf);
+impl OwnershipFixture {
+    fn new() -> Self {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("ownership-discovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("local")).unwrap();
+        std::fs::create_dir(root.join("removal-staging")).unwrap();
+        Self(root.canonicalize().unwrap())
+    }
+    fn package(
+        &self,
+    ) -> (
+        LocalDiscoveryOutcome,
+        crate::plugin::ownership::ManagedOwnershipIndexV1,
+    ) {
+        use crate::plugin::ownership::*;
+        let record = local("com.example.managed", "Managed");
+        let slot = PackageSlot::parse("pkg-00000000000000000000000000000001").unwrap();
+        let package = self.0.join("local").join(slot.as_str());
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("manifest.json"),
+            record.canonical_manifest_bytes().unwrap(),
+        )
+        .unwrap();
+        let receipt = OwnershipReceiptV1::new(
+            ReceiptId::parse("550e8400e29b41d4a716446655440000").unwrap(),
+            slot,
+            &record,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("ownership-receipt.json"),
+            receipt.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let outcome = self.scan();
+        let locator = &outcome.plugins[0].locator;
+        let entry = ManagedOwnershipEntryV1::managed(
+            locator.receipt.clone().unwrap(),
+            &record,
+            locator.directory_identity,
+            locator.manifest_identity,
+        )
+        .unwrap();
+        (
+            outcome,
+            ManagedOwnershipIndexV1::empty().register(entry).unwrap(),
+        )
+    }
+    fn scan(&self) -> LocalDiscoveryOutcome {
+        crate::plugin::discovery::discover_from_plugins_root(&self.0)
+    }
+}
+impl Drop for OwnershipFixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
+#[test]
+fn exact_receipt_and_index_and_three_objects_is_managed() {
+    let fixture = OwnershipFixture::new();
+    let (outcome, index) = fixture.package();
+    let mut registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(OwnershipMemory::new(index)),
+    );
+    registry.apply_local_discovery(outcome).unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["management"], "managed");
+    assert_eq!(snapshot(&registry)["plugins"][0]["canRemove"], true);
+    let before = snapshot(&registry);
+    let mutation = serde_json::to_value(
+        registry
+            .set_enabled("com.example.managed", true, "1")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mutation["plugin"]["canRemove"], false);
+    assert_eq!(mutation["plugin"]["management"], "managed");
+    assert_eq!(mutation["catalogGeneration"], before["catalogGeneration"]);
+}
+
+#[test]
+fn receipt_without_index_is_external() {
+    let fixture = OwnershipFixture::new();
+    let (outcome, _) = fixture.package();
+    let mut registry = MemoryPersistence::new(PluginStateFileV2::empty()).registry(vec![]);
+    registry.apply_local_discovery(outcome).unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["management"], "external");
+    assert_eq!(snapshot(&registry)["plugins"][0]["canRemove"], false);
+}
+
+#[test]
+fn reload_reloads_previously_available_ownership_instead_of_reusing_stale_authority() {
+    let fixture = OwnershipFixture::new();
+    let (outcome, index) = fixture.package();
+    let memory = OwnershipMemory::new(index);
+    let mut registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(memory.clone()),
+    );
+    registry.apply_local_discovery(outcome.clone()).unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["management"], "managed");
+    memory.0.lock().unwrap().0.index = crate::plugin::ownership::ManagedOwnershipIndexV1::empty();
+    registry.apply_local_discovery(outcome.clone()).unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["management"], "external");
+    assert_eq!(snapshot(&registry)["catalogGeneration"], "2");
+    memory.0.lock().unwrap().1 = true;
+    registry.apply_local_discovery(outcome).unwrap();
+    assert_eq!(
+        snapshot(&registry)["plugins"][0]["management"],
+        "ownershipUnavailable"
+    );
+    assert_eq!(snapshot(&registry)["catalogGeneration"], "3");
+}
+
+#[test]
+fn two_distinct_packages_claiming_one_receipt_are_one_conflict_not_managed() {
+    let fixture = OwnershipFixture::new();
+    let (_, index) = fixture.package();
+    let second = fixture.0.join("local/pkg-00000000000000000000000000000002");
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(
+        second.join("manifest.json"),
+        local("com.example.copy", "Copy")
+            .canonical_manifest_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixture
+            .0
+            .join("local/pkg-00000000000000000000000000000001/ownership-receipt.json"),
+        second.join("ownership-receipt.json"),
+    )
+    .unwrap();
+    let mut registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(OwnershipMemory::new(index)),
+    );
+    registry.apply_local_discovery(fixture.scan()).unwrap();
+    let value = snapshot(&registry);
+    assert_eq!(value["managedOwnership"]["conflictingEntryCount"], 1);
+    for item in value["plugins"].as_array().unwrap() {
+        assert_eq!(item["management"], "ownershipConflict");
+        assert_eq!(item["canRemove"], false);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn wrong_case_occupied_source_or_target_never_means_both_absent() {
+    for target in [false, true] {
+        let (fixture, memory, mut registry) = pending_fixture(false);
+        let source = fixture.0.join("local/pkg-00000000000000000000000000000001");
+        let destination = if target {
+            fixture
+                .0
+                .join("removal-staging/REMOVE-00000000000000000000000000000001")
+        } else {
+            fixture.0.join("local/PKG-00000000000000000000000000000001")
+        };
+        std::fs::rename(source, &destination).unwrap();
+        registry.apply_local_discovery(fixture.scan()).unwrap();
+        assert_eq!(memory.0.lock().unwrap().0.index.entries().len(), 1);
+        assert_eq!(
+            snapshot(&registry)["managedOwnership"]["conflictingEntryCount"],
+            1
+        );
+        assert!(destination.is_dir());
+    }
+}
+
+#[test]
+fn recovered_index_does_not_authorize_until_safe_rewrite() {
+    let fixture = OwnershipFixture::new();
+    let (outcome, index) = fixture.package();
+    let memory = OwnershipMemory::new(index);
+    {
+        let mut state = memory.0.lock().unwrap();
+        state.0.requires_rewrite = true;
+        state.2 = true;
+    }
+    let mut registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(memory.clone()),
+    );
+    registry.apply_local_discovery(outcome.clone()).unwrap();
+    assert_eq!(
+        snapshot(&registry)["plugins"][0]["management"],
+        "ownershipUnavailable"
+    );
+    memory.0.lock().unwrap().2 = false;
+    registry.apply_local_discovery(outcome).unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["management"], "managed");
+    assert_eq!(snapshot(&registry)["catalogGeneration"], "2");
+}
+
+#[test]
+fn removal_shapes_are_complete_and_mutually_exclusive() {
+    use crate::plugin::ownership::{ManagedOwnershipIndexV1, RemovalSlot};
+    for (shape, failed_save, want) in [
+        ("full", false, [0, 0, 1]),
+        ("receipt", false, [0, 0, 1]),
+        ("empty", false, [0, 0, 1]),
+        ("absent", true, [0, 0, 1]),
+        ("absent", false, [0, 0, 0]),
+        ("source", true, [0, 1, 0]),
+        ("source", false, [0, 0, 0]),
+        ("manifest", false, [1, 0, 0]),
+        ("extra", false, [1, 0, 0]),
+        ("both", false, [1, 0, 0]),
+        ("identity", false, [1, 0, 0]),
+        ("orphan", false, [1, 0, 0]),
+        ("unconfirmed", false, [1, 0, 0]),
+    ] {
+        let fixture = OwnershipFixture::new();
+        let (_, mut index) = fixture.package();
+        let receipt = index.entries()[0].receipt_id().clone();
+        index = index
+            .begin_removal(
+                &receipt,
+                RemovalSlot::parse("remove-00000000000000000000000000000001").unwrap(),
+            )
+            .unwrap();
+        let source = fixture.0.join("local/pkg-00000000000000000000000000000001");
+        let target = fixture
+            .0
+            .join("removal-staging/remove-00000000000000000000000000000001");
+        if shape != "source" {
+            std::fs::rename(&source, &target).unwrap();
+        }
+        match shape {
+            "receipt" => std::fs::remove_file(target.join("manifest.json")).unwrap(),
+            "manifest" => std::fs::remove_file(target.join("ownership-receipt.json")).unwrap(),
+            "empty" | "absent" => {
+                std::fs::remove_file(target.join("manifest.json")).unwrap();
+                std::fs::remove_file(target.join("ownership-receipt.json")).unwrap();
+                if shape == "absent" {
+                    std::fs::remove_dir(&target).unwrap();
+                }
+            }
+            "extra" => std::fs::write(target.join("extra"), b"preserve").unwrap(),
+            "both" => {
+                std::fs::create_dir(&source).unwrap();
+            }
+            "identity" => {
+                let bytes = std::fs::read(target.join("manifest.json")).unwrap();
+                std::fs::rename(target.join("manifest.json"), fixture.0.join("old-manifest"))
+                    .unwrap();
+                std::fs::write(target.join("manifest.json"), bytes).unwrap();
+            }
+            "orphan" => index = ManagedOwnershipIndexV1::empty(),
+            "unconfirmed" => std::fs::write(target.join("ownership-receipt.json"), b"{}").unwrap(),
+            _ => {}
+        }
+        let memory = OwnershipMemory::new(index);
+        memory.0.lock().unwrap().2 = failed_save;
+        let mut registry = PluginRegistry::initialize(
+            vec![],
+            Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+            Box::new(memory),
+        );
+        registry.apply_local_discovery(fixture.scan()).unwrap();
+        let snapshot = snapshot(&registry);
+        let summary = &snapshot["managedOwnership"];
+        assert_eq!(
+            [
+                summary["conflictingEntryCount"].as_u64().unwrap(),
+                summary["rollbackPendingCount"].as_u64().unwrap(),
+                summary["cleanupPendingCount"].as_u64().unwrap()
+            ],
+            want,
+            "{shape}/{failed_save}"
+        );
+        assert_eq!(
+            summary["status"],
+            if want == [0, 0, 0] {
+                "available"
+            } else {
+                "degraded"
+            }
+        );
+        if shape != "source" && shape != "absent" {
+            assert!(target.is_dir(), "scanner deleted {shape}");
+        }
+        if shape == "source" && failed_save {
+            assert_eq!(snapshot["plugins"][0]["management"], "removalPending");
+            assert_eq!(
+                snapshot["plugins"][0]["toggleBlockReasonCode"],
+                "removalPending"
+            );
+            assert!(registry
+                .set_enabled("com.example.managed", true, "1")
+                .is_err());
+        }
+    }
+}
+
+#[test]
+fn legacy_manifest_stays_external_when_index_is_unavailable() {
+    ownership_unavailable_case(false);
+}
+#[test]
+fn receipted_candidate_becomes_ownership_unavailable_when_index_is_unavailable() {
+    ownership_unavailable_case(true);
+}
+fn ownership_unavailable_case(receipted: bool) {
+    let fixture = OwnershipFixture::new();
+    let (_, index) = fixture.package();
+    if !receipted {
+        std::fs::remove_file(
+            fixture
+                .0
+                .join("local/pkg-00000000000000000000000000000001/ownership-receipt.json"),
+        )
+        .unwrap();
+    }
+    let memory = OwnershipMemory::new(index);
+    memory.0.lock().unwrap().1 = true;
+    let mut registry = PluginRegistry::initialize(
+        vec![manifest("com.alpha")],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(memory),
+    );
+    registry.apply_local_discovery(fixture.scan()).unwrap();
+    let value = snapshot(&registry);
+    assert_eq!(value["availability"], "available");
+    assert_eq!(value["plugins"][0]["management"], "builtIn");
+    assert_eq!(
+        value["plugins"][1]["management"],
+        if receipted {
+            "ownershipUnavailable"
+        } else {
+            "external"
+        }
+    );
+    assert_eq!(
+        value["managedOwnership"],
+        json!({"status":"unavailable", "conflictingEntryCount":0, "rollbackPendingCount":0, "cleanupPendingCount":0})
+    );
+    assert!(registry
+        .set_enabled("com.example.managed", true, "1")
+        .is_ok());
+}
+
+#[test]
+fn index_without_matching_package_is_conflict() {
+    let fixture = OwnershipFixture::new();
+    let (_, index) = fixture.package();
+    std::fs::rename(
+        fixture.0.join("local/pkg-00000000000000000000000000000001"),
+        fixture.0.join("kept-external"),
+    )
+    .unwrap();
+    let mut registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(OwnershipMemory::new(index)),
+    );
+    registry.apply_local_discovery(fixture.scan()).unwrap();
+    assert_eq!(
+        snapshot(&registry)["managedOwnership"]["conflictingEntryCount"],
+        1
+    );
+}
+
+#[test]
+fn managed_disabled_only_is_removable() {
+    let fixture = OwnershipFixture::new();
+    let (outcome, index) = fixture.package();
+    let state = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(state.clone()),
+        Box::new(OwnershipMemory::new(index)),
+    );
+    registry.apply_local_discovery(outcome).unwrap();
+    for (enabled, expected) in [(false, true), (true, false), (false, true)] {
+        let mutation = serde_json::to_value(
+            registry
+                .set_enabled("com.example.managed", enabled, "1")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mutation["plugin"]["canRemove"], expected);
+        assert_eq!(mutation["catalogGeneration"], "1");
+    }
+}
+
+#[test]
+fn mutation_keeps_generation_and_every_structural_ownership_field() {
+    let fixture = OwnershipFixture::new();
+    let (outcome, index) = fixture.package();
+    let mut registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(OwnershipMemory::new(index)),
+    );
+    registry.apply_local_discovery(outcome).unwrap();
+    let before = registry.catalog_snapshot();
+    let mutation = registry
+        .set_enabled("com.example.managed", true, "1")
+        .unwrap();
+    assert!(mutation.plugin.same_structure(&before.plugins[0]));
+    assert_eq!(mutation.catalog_generation, before.catalog_generation);
+    assert_eq!(
+        registry.catalog_snapshot().managed_ownership,
+        before.managed_ownership
+    );
+    assert_ne!(mutation.revision, before.revision);
+}
+
+#[test]
+fn management_eligibility_toggle_block_or_summary_change_advances_generation() {
+    let record = local("com.example.local", "Local");
+    for management in [
+        PluginManagement::Managed,
+        PluginManagement::RemovalPending,
+        PluginManagement::OwnershipConflict,
+    ] {
+        let mut registry = MemoryPersistence::new(PluginStateFileV2::empty()).registry(vec![]);
+        registry
+            .apply_local_discovery(LocalDiscoveryOutcome::available(vec![record.clone()]))
+            .unwrap();
+        let mut candidate = registry.publication.clone();
+        candidate
+            .management
+            .insert(record.manifest().id.clone(), management);
+        registry.publish_candidate(candidate, false).unwrap();
+        assert_eq!(registry.catalog_generation(), 2);
+    }
+    let mut registry = MemoryPersistence::new(PluginStateFileV2::empty()).registry(vec![]);
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![]))
+        .unwrap();
+    let mut candidate = registry.publication.clone();
+    candidate.ownership_summary = ManagedOwnershipSummary::counts(1, 0, 0);
+    registry.publish_candidate(candidate, false).unwrap();
+    assert_eq!(registry.catalog_generation(), 2);
+}
+
+fn pending_fixture(fail_save: bool) -> (OwnershipFixture, OwnershipMemory, PluginRegistry) {
+    let fixture = OwnershipFixture::new();
+    let (_, mut index) = fixture.package();
+    let receipt = index.entries()[0].receipt_id().clone();
+    index = index
+        .begin_removal(
+            &receipt,
+            crate::plugin::ownership::RemovalSlot::parse("remove-00000000000000000000000000000001")
+                .unwrap(),
+        )
+        .unwrap();
+    let memory = OwnershipMemory::new(index);
+    memory.0.lock().unwrap().2 = fail_save;
+    let registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(memory.clone()),
+    );
+    (fixture, memory, registry)
+}
+
+#[test]
+fn removing_exact_source_without_target_is_rollback_pending() {
+    let (fixture, memory, mut registry) = pending_fixture(true);
+    registry.apply_local_discovery(fixture.scan()).unwrap();
+    let value = snapshot(&registry);
+    assert_eq!(value["managedOwnership"]["rollbackPendingCount"], 1);
+    assert_eq!(value["plugins"][0]["status"], "disabled");
+    assert_eq!(value["plugins"][0]["canToggle"], false);
+    assert!(memory.0.lock().unwrap().0.index.entries()[0]
+        .removal_slot()
+        .is_some());
+}
+
+#[test]
+fn no_delete_reconcile_rolls_back_exact_source_or_deletes_both_absent_entry() {
+    for absent in [false, true] {
+        let (fixture, memory, mut registry) = pending_fixture(false);
+        let source = fixture.0.join("local/pkg-00000000000000000000000000000001");
+        if absent {
+            std::fs::rename(&source, fixture.0.join("kept-test-evidence")).unwrap();
+        }
+        registry.apply_local_discovery(fixture.scan()).unwrap();
+        let persisted = memory.0.lock().unwrap().0.index.clone();
+        if absent {
+            assert!(persisted.entries().is_empty());
+            assert!(fixture.0.join("kept-test-evidence/manifest.json").is_file());
+        } else {
+            assert!(persisted.entries()[0].removal_slot().is_none());
+            assert!(source.join("ownership-receipt.json").is_file());
+        }
+        assert_eq!(
+            snapshot(&registry)["managedOwnership"]["status"],
+            "available"
+        );
+    }
+}
+
+#[test]
+fn one_reconcile_swaps_once_without_observable_intermediate_summary() {
+    let (fixture, memory, mut registry) = pending_fixture(true);
+    registry.apply_local_discovery(fixture.scan()).unwrap();
+    let before = registry.catalog_snapshot();
+    assert_eq!(before.managed_ownership.rollback_pending_count, 1);
+    memory.0.lock().unwrap().2 = false;
+    registry.apply_local_discovery(fixture.scan()).unwrap();
+    let after = registry.catalog_snapshot();
+    assert_eq!(after.catalog_generation, "2");
+    assert_eq!(
+        after.managed_ownership,
+        ManagedOwnershipSummary::available()
+    );
+    assert_eq!(
+        serde_json::to_value(&after).unwrap()["plugins"][0]["management"],
+        "managed"
+    );
+    assert_eq!(before.catalog_generation, "1");
+    assert_eq!(before.managed_ownership.rollback_pending_count, 1);
+}
+
+#[test]
+fn slot_receipt_or_object_change_advances_generation() {
+    let fixture = OwnershipFixture::new();
+    let (original, _) = fixture.package();
+    for which in ["slot", "receipt", "directory", "manifest"] {
+        let mut registry = PluginRegistry::initialize(
+            vec![],
+            Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+            crate::plugin::ownership::empty_test_persistence(),
+        );
+        registry.apply_local_discovery(original.clone()).unwrap();
+        let before = snapshot(&registry);
+        let mut changed = original.clone();
+        let locator = &mut changed.plugins[0].locator;
+        match which {
+            "slot" => {
+                locator.package_slot = crate::plugin::ownership::PackageSlot::parse(
+                    "pkg-00000000000000000000000000000002",
+                )
+                .unwrap()
+            }
+            "receipt" => locator.receipt = None,
+            "directory" => locator.directory_identity.object += 1,
+            _ => locator.manifest_identity.object += 1,
+        }
+        registry.apply_local_discovery(changed).unwrap();
+        assert_eq!(snapshot(&registry)["catalogGeneration"], "2", "{which}");
+        assert_eq!(
+            snapshot(&registry)["plugins"],
+            before["plugins"],
+            "hidden locator change must still advance generation"
+        );
+    }
+}
+
+#[test]
+fn candidate_generation_overflow_preserves_the_entire_old_snapshot() {
+    let fixture = OwnershipFixture::new();
+    let (original, index) = fixture.package();
+    let mut registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(OwnershipMemory::new(index)),
+    );
+    registry.apply_local_discovery(original.clone()).unwrap();
+    registry.set_catalog_generation_for_test(u64::MAX);
+    let previous = registry.publication.clone();
+    let mut changed = original;
+    changed.plugins[0].locator.receipt = None;
+    assert!(registry.apply_local_discovery(changed).is_err());
+    assert_eq!(registry.catalog_snapshot(), previous.snapshot);
+    assert_eq!(registry.publication.locals, previous.locals);
+    assert_eq!(registry.publication.locators, previous.locators);
+    assert_eq!(registry.publication.management, previous.management);
+    assert_eq!(
+        registry.publication.ownership.entries(),
+        previous.ownership.entries()
+    );
+}
+
+#[test]
+fn equal_revision_and_generation_imply_equal_complete_dto() {
+    let mut registry =
+        MemoryPersistence::new(PluginStateFileV2::empty()).registry(vec![manifest("com.alpha")]);
+    let mut published = BTreeMap::new();
+    for enabled in [false, false, true, true, false] {
+        let generation = registry.catalog_generation().to_string();
+        registry
+            .set_enabled("com.alpha", enabled, &generation)
+            .unwrap();
+        let snapshot = registry.catalog_snapshot();
+        let key = (
+            snapshot.revision.clone(),
+            snapshot.catalog_generation.clone(),
+        );
+        if let Some(previous) = published.insert(key, snapshot.clone()) {
+            assert_eq!(previous, snapshot);
+        }
+    }
+}
+
+#[test]
+fn status_only_toggle_changes_can_remove_with_revision_only() {
+    let mut registry =
+        MemoryPersistence::new(PluginStateFileV2::empty()).registry(vec![manifest("com.alpha")]);
+    let before = snapshot(&registry);
+    let result =
+        serde_json::to_value(registry.set_enabled("com.alpha", true, "0").unwrap()).unwrap();
+    assert_eq!(result["catalogGeneration"], before["catalogGeneration"]);
+    assert_eq!(result["plugin"]["canRemove"], false);
+    assert_eq!(result["plugin"]["management"], "builtIn");
+}
+
 #[test]
 fn postcommit_save_failure_adopts_the_committed_decision() {
     let memory = MemoryPersistence::new(PluginStateFileV2::empty());
@@ -44,6 +714,7 @@ fn every_persistence_outcome_controls_memory_adoption_independently_of_error() {
             let mut registry = PluginRegistry::initialize(
                 vec![manifest("com.alpha")],
                 Box::new(OutcomePersistence(outcome, failure)),
+                crate::plugin::ownership::empty_test_persistence(),
             );
             let result = registry.set_enabled("com.alpha", true, "0");
             let committed = outcome != PersistOutcome::NotCommitted;
@@ -92,7 +763,11 @@ impl MemoryPersistence {
     }
 
     fn registry(&self, builtins: Vec<PluginManifestV1>) -> PluginRegistry {
-        PluginRegistry::initialize(builtins, Box::new(self.clone()))
+        PluginRegistry::initialize(
+            builtins,
+            Box::new(self.clone()),
+            crate::plugin::ownership::empty_test_persistence(),
+        )
     }
 
     fn loaded_from_v1(state: PluginStateFileV2) -> Self {
@@ -215,9 +890,10 @@ fn empty_catalog_is_available_at_revision_zero() {
     assert_eq!(
         snapshot(&memory.registry(vec![])),
         json!({
-            "schemaVersion": 2, "revision": "0", "catalogGeneration": "0",
+            "schemaVersion": 3, "revision": "0", "catalogGeneration": "0",
             "availability": "available", "availabilityReasonCode": null,
-            "localDiscovery": {"status": "available", "rejectedPackageCount": 0}, "plugins": []
+            "localDiscovery": {"status": "available", "rejectedPackageCount": 0}, "plugins": [],
+            "managedOwnership": {"status":"available","conflictingEntryCount":0,"rollbackPendingCount":0,"cleanupPendingCount":0}
         })
     );
 }
@@ -435,7 +1111,7 @@ fn canonical_order_rewrite_preserves_revision_and_is_copy_on_write() {
         assert_eq!(registry.catalog_snapshot(), before);
         assert_eq!(persistence.0.lock().unwrap().persisted, original);
         assert!(
-            matches!(registry.runtime, Runtime::Available { requires_rewrite, .. } if requires_rewrite == migrated)
+            matches!(registry.publication.runtime, Runtime::Available { requires_rewrite, .. } if requires_rewrite == migrated)
         );
         persistence.allow_saves();
         assert_eq!(
@@ -623,7 +1299,7 @@ fn assert_capacity_transaction_is_atomic(revision: u64) {
             state,
             requires_rewrite: marker,
             ..
-        } = &registry.runtime
+        } = &registry.publication.runtime
         else {
             panic!("capacity rejection must not disable the registry");
         };
@@ -774,7 +1450,7 @@ fn generation_overflow_is_atomic_but_identical_reload_still_succeeds() {
     let mut registry = persistence.registry(vec![]);
     let outcome = LocalDiscoveryOutcome::available(vec![local("com.alpha", "Alpha")]);
     registry.apply_local_discovery(outcome.clone()).unwrap();
-    registry.catalog_generation = u64::MAX;
+    registry.set_catalog_generation_for_test(u64::MAX);
     let before = registry.catalog_snapshot();
     assert!(!registry.apply_local_discovery(outcome).unwrap());
     let error = registry
@@ -908,7 +1584,7 @@ fn failed_identity_cleanup_preserves_memory_revision_and_rewrite_marker() {
     );
     assert_eq!(registry.catalog_snapshot(), before);
     assert!(matches!(
-        registry.runtime,
+        registry.publication.runtime,
         Runtime::Available {
             requires_rewrite: true,
             ..
@@ -931,7 +1607,7 @@ fn failed_identity_cleanup_preserves_memory_revision_and_rewrite_marker() {
         vec![local_entry(&new, false)]
     );
     assert!(matches!(
-        registry.runtime,
+        registry.publication.runtime,
         Runtime::Available {
             requires_rewrite: false,
             ..
@@ -1033,7 +1709,7 @@ fn import_disabled_save_failure_preserves_all_identities_revision_and_rewrite() 
         "plugin_state_persist_failed"
     );
     assert_eq!(registry.catalog_snapshot(), before);
-    match &registry.runtime {
+    match &registry.publication.runtime {
         Runtime::Available {
             state: current,
             requires_rewrite,
@@ -1049,7 +1725,7 @@ fn import_disabled_save_failure_preserves_all_identities_revision_and_rewrite() 
     registry.persist_import_disabled(&record).unwrap();
     assert_eq!(memory.last_save().unwrap().revision, 8);
     assert!(matches!(
-        registry.runtime,
+        registry.publication.runtime,
         Runtime::Available {
             requires_rewrite: false,
             ..
@@ -1077,7 +1753,7 @@ fn import_disabled_rejects_513th_retained_identity_before_revision_exhaustion() 
         "plugin_state_capacity_exceeded"
     );
     assert!(
-        matches!(&registry.runtime, Runtime::Available { state: current, .. } if current == &state)
+        matches!(&registry.publication.runtime, Runtime::Available { state: current, .. } if current == &state)
     );
     assert!(memory.0.lock().unwrap().saves.is_empty());
 }
@@ -1133,13 +1809,13 @@ fn import_disabled_same_disabled_rewrites_at_max_and_retains_marker_on_failure()
     let mut registry = memory.registry(vec![]);
     assert!(registry.persist_import_disabled(&record).is_err());
     assert!(
-        matches!(&registry.runtime, Runtime::Available { state: current, requires_rewrite: true, .. } if current == &state)
+        matches!(&registry.publication.runtime, Runtime::Available { state: current, requires_rewrite: true, .. } if current == &state)
     );
     memory.allow_saves();
     registry.persist_import_disabled(&record).unwrap();
     assert_eq!(memory.last_save().unwrap(), state);
     assert!(matches!(
-        registry.runtime,
+        registry.publication.runtime,
         Runtime::Available {
             requires_rewrite: false,
             ..
@@ -1319,12 +1995,12 @@ fn validate_import_rejects_max_generation_and_accepts_max_minus_one() {
         .apply_local_discovery(LocalDiscoveryOutcome::available(vec![]))
         .unwrap();
     let record = local("com.new", "New");
-    registry.catalog_generation = u64::MAX - 1;
+    registry.set_catalog_generation_for_test(u64::MAX - 1);
     assert_eq!(
         registry.validate_import(&record, ScanUsage::default()),
         Ok(())
     );
-    registry.catalog_generation = u64::MAX;
+    registry.set_catalog_generation_for_test(u64::MAX);
     assert_eq!(
         registry.validate_import(&record, ScanUsage::default()),
         Err(ImportCommitFailure::CatalogGenerationExhausted)
