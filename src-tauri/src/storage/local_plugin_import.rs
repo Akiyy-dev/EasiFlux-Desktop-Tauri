@@ -59,6 +59,16 @@ impl LocalManifestImportStorage for SystemLocalManifestImportStorage {
         record: &PluginRecord,
         bytes: &[u8],
     ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
+        self.packages.prepare_stage(record, bytes)
+    }
+}
+
+impl LocalManifestImportStorage for SystemLocalPluginPackageStorage {
+    fn prepare_stage(
+        &self,
+        record: &PluginRecord,
+        bytes: &[u8],
+    ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
         if record.source() != crate::plugin::manifest::PluginSource::LocalDeclarative
             || bytes.len() > 16_384
             || record
@@ -68,7 +78,7 @@ impl LocalManifestImportStorage for SystemLocalManifestImportStorage {
         {
             return Err(ImportCommitFailure::WriteFailed);
         }
-        let parents = self.packages.open().map_err(write_failed)?;
+        let parents = self.open().map_err(write_failed)?;
         if parents.staging_count(17).map_err(write_failed)? >= 16 {
             return Err(ImportCommitFailure::StagingCapacityExceeded);
         }

@@ -9,8 +9,9 @@ use futures_util::FutureExt;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::error::{AppError, AppResult};
-use crate::storage::local_plugin_import::{
-    LocalManifestImportStorage, SystemLocalManifestImportStorage,
+use crate::storage::local_plugin_import::LocalManifestImportStorage;
+use crate::storage::local_plugin_package::{
+    ManagedLocalPluginRemovalStorage, SystemLocalPluginPackageStorage,
 };
 
 use super::discovery::{LocalDiscoveryOutcome, LocalPluginDiscovery, SystemLocalPluginDiscovery};
@@ -23,6 +24,7 @@ pub(crate) struct PluginRuntime {
     discovery: Arc<dyn LocalPluginDiscovery>,
     reader: Arc<dyn LocalManifestReader>,
     storage: Arc<dyn LocalManifestImportStorage>,
+    removal_storage: Arc<dyn ManagedLocalPluginRemovalStorage>,
     import_sessions: Arc<ImportSessions>,
     operation_gate: Arc<Mutex<()>>,
     initial_discovery_attempted: AtomicBool,
@@ -53,11 +55,13 @@ impl PluginRuntime {
         registry: PluginRegistry,
         discovery: Arc<dyn LocalPluginDiscovery>,
     ) -> Self {
-        Self::with_import_services(
+        let packages = Arc::new(SystemLocalPluginPackageStorage::new());
+        Self::with_lifecycle_services(
             registry,
             discovery,
             Arc::new(SystemLocalManifestReader),
-            Arc::new(SystemLocalManifestImportStorage::new()),
+            packages.clone(),
+            packages,
         )
     }
 
@@ -67,11 +71,28 @@ impl PluginRuntime {
         reader: Arc<dyn LocalManifestReader>,
         storage: Arc<dyn LocalManifestImportStorage>,
     ) -> Self {
+        Self::with_lifecycle_services(
+            registry,
+            discovery,
+            reader,
+            storage,
+            Arc::new(SystemLocalPluginPackageStorage::new()),
+        )
+    }
+
+    pub(crate) fn with_lifecycle_services(
+        registry: PluginRegistry,
+        discovery: Arc<dyn LocalPluginDiscovery>,
+        reader: Arc<dyn LocalManifestReader>,
+        storage: Arc<dyn LocalManifestImportStorage>,
+        removal_storage: Arc<dyn ManagedLocalPluginRemovalStorage>,
+    ) -> Self {
         Self {
             registry: RwLock::new(registry),
             discovery,
             reader,
             storage,
+            removal_storage,
             import_sessions: ImportSessions::new(),
             operation_gate: Arc::new(Mutex::new(())),
             initial_discovery_attempted: AtomicBool::new(false),
@@ -257,6 +278,8 @@ fn runtime_error() -> AppError {
 }
 
 mod import;
+
+mod removal;
 
 #[cfg(test)]
 mod tests;

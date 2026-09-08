@@ -2297,3 +2297,335 @@ fn managed_import_preflight_reserves_actual_receipt_and_state_without_writes() {
     );
     assert!(memory.0.lock().unwrap().saves.is_empty());
 }
+
+fn removal_registry_fixture() -> (PluginRegistry, MemoryPersistence, OwnershipMemory) {
+    let record = local("com.example.managed", "Managed");
+    let receipt = OwnershipReceiptV1::new(
+        ReceiptId::parse("550e8400e29b41d4a716446655440000").unwrap(),
+        PackageSlot::parse("pkg-00000000000000000000000000000001").unwrap(),
+        &record,
+    )
+    .unwrap();
+    let verified = VerifiedPackageReceipt {
+        canonical_sha256: receipt.canonical_sha256(),
+        model: receipt,
+        file_identity: FileIdentity {
+            volume: 1,
+            object: 3,
+        },
+    };
+    let locator = LocalPackageLocator {
+        package_slot: verified.model.package_slot().clone(),
+        directory_identity: FileIdentity {
+            volume: 1,
+            object: 1,
+        },
+        manifest_identity: FileIdentity {
+            volume: 1,
+            object: 2,
+        },
+        receipt: Some(verified.clone()),
+    };
+    let entry = ManagedOwnershipEntryV1::managed(
+        verified,
+        &record,
+        locator.directory_identity,
+        locator.manifest_identity,
+    )
+    .unwrap();
+    let index = OwnershipMemory::new(ManagedOwnershipIndexV1::empty().register(entry).unwrap());
+    let state = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry =
+        PluginRegistry::initialize(vec![], Box::new(state.clone()), Box::new(index.clone()));
+    let mut outcome = LocalDiscoveryOutcome::available(vec![]);
+    outcome
+        .plugins
+        .push(super::super::discovery::DiscoveredLocalPlugin { record, locator });
+    registry.apply_local_discovery(outcome).unwrap();
+    (registry, state, index)
+}
+
+#[test]
+fn removal_preflight_rejects_every_ineligible_snapshot_without_io() {
+    use BeforeDisabledFailure as F;
+    for (case, expected) in [
+        ("builtin", F::NotManaged),
+        ("external", F::NotManaged),
+        ("missing", F::NotManaged),
+        ("pending", F::NotManaged),
+        ("conflict", F::OwnershipConflict),
+        ("duplicate", F::OwnershipConflict),
+        ("enabled", F::RequiresDisabled),
+        ("state", F::StateUnavailable),
+        ("ownership", F::OwnershipUnavailable),
+        ("discovery", F::DiscoveryUnavailable),
+        ("quarantine", F::DiscoveryUnavailable),
+    ] {
+        let (mut registry, state, ownership) = removal_registry_fixture();
+        let id = PluginId::parse("com.example.managed").unwrap();
+        match case {
+            "builtin" => {
+                registry.builtins.insert(
+                    id.clone(),
+                    PluginRecord::built_in(manifest(id.as_str())).unwrap(),
+                );
+            }
+            "external" => {
+                registry
+                    .publication
+                    .management
+                    .insert(id.clone(), PluginManagement::External);
+            }
+            "missing" => {
+                registry.publication.locals.clear();
+            }
+            "pending" => {
+                registry
+                    .publication
+                    .management
+                    .insert(id.clone(), PluginManagement::RemovalPending);
+            }
+            "conflict" => {
+                registry
+                    .publication
+                    .management
+                    .insert(id.clone(), PluginManagement::OwnershipConflict);
+            }
+            "duplicate" => {
+                let package = registry.publication.discovery.plugins[0].clone();
+                registry.publication.discovery.plugins.push(package);
+            }
+            "enabled" => {
+                registry.set_enabled(id.as_str(), true, "1").unwrap();
+            }
+            "state" => {
+                registry.publication.runtime = Runtime::Unavailable {
+                    reason: PluginAvailabilityReason::StateUnavailable,
+                    persistence: Arc::new(state.clone()),
+                };
+            }
+            "ownership" => {
+                registry.publication.ownership = OwnershipRuntime::Unavailable {
+                    persistence: Arc::new(ownership.clone()),
+                };
+            }
+            "discovery" => {
+                registry.publication.discovery.summary = LocalDiscoverySummary::unavailable();
+            }
+            "quarantine" => {
+                registry.publication.discovery.removals =
+                    super::super::discovery::RemovalDiscoveryOutcome::unavailable();
+            }
+            _ => unreachable!(),
+        }
+        state.0.lock().unwrap().saves.clear();
+        let loads = state.0.lock().unwrap().loads;
+        let before_index = ownership.0.lock().unwrap().0.index.clone();
+        assert!(
+            matches!(registry.preflight_removal(&id, "1"), Err(reason) if reason == expected),
+            "{case}"
+        );
+        assert!(state.0.lock().unwrap().saves.is_empty());
+        assert_eq!(state.0.lock().unwrap().loads, loads);
+        assert_eq!(ownership.0.lock().unwrap().0.index, before_index);
+    }
+}
+
+#[test]
+fn removal_state_entry_capacity_wins_over_all_exhausted_revisions() {
+    let (mut registry, memory, _) = removal_registry_fixture();
+    let Runtime::Available { state, .. } = &mut registry.publication.runtime else {
+        unreachable!()
+    };
+    state.entries = (0..512)
+        .map(|i| entry(&format!("com.other.p{i}"), "com.other", false))
+        .collect();
+    state.revision = u64::MAX;
+    registry.set_catalog_generation_for_test(u64::MAX);
+    let OwnershipRuntime::Available { index, .. } = &mut registry.publication.ownership else {
+        unreachable!()
+    };
+    let mut wire: Value = serde_json::from_slice(&index.canonical_bytes().unwrap()).unwrap();
+    wire["revision"] = u64::MAX.to_string().into();
+    *index = ManagedOwnershipIndexV1::parse(&serde_json::to_vec(&wire).unwrap()).unwrap();
+    assert!(matches!(
+        registry.preflight_removal(
+            &PluginId::parse("com.example.managed").unwrap(),
+            &u64::MAX.to_string()
+        ),
+        Err(BeforeDisabledFailure::StateCapacityExceeded)
+    ));
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+#[test]
+fn removal_capacity_limits_include_next_revision_digits_and_precede_exhaustion() {
+    let id = PluginId::parse("com.example.managed").unwrap();
+    let (mut registry, memory, _) = removal_registry_fixture();
+    let record = registry.publication.locals[&id].clone();
+    let Runtime::Available { state, .. } = &mut registry.publication.runtime else {
+        unreachable!()
+    };
+    state.entries.push(local_entry(&record, false));
+    state.revision = 9;
+    let before_bytes = serde_json::to_vec(state).unwrap().len();
+    assert!(matches!(
+        registry.preflight_removal_with_limits(&id, "1", before_bytes, MAX_MANAGED_OWNERSHIP_BYTES),
+        Err(BeforeDisabledFailure::StateCapacityExceeded)
+    ));
+    assert!(registry
+        .preflight_removal_with_limits(&id, "1", before_bytes + 1, MAX_MANAGED_OWNERSHIP_BYTES)
+        .is_ok());
+    let Runtime::Available { state, .. } = &mut registry.publication.runtime else {
+        unreachable!()
+    };
+    state.revision = u64::MAX;
+    registry.set_catalog_generation_for_test(u64::MAX);
+    assert!(matches!(
+        registry.preflight_removal_with_limits(
+            &id,
+            &u64::MAX.to_string(),
+            1,
+            MAX_MANAGED_OWNERSHIP_BYTES
+        ),
+        Err(BeforeDisabledFailure::StateCapacityExceeded)
+    ));
+    let OwnershipRuntime::Available { index, .. } = &mut registry.publication.ownership else {
+        unreachable!()
+    };
+    let mut wire: Value = serde_json::from_slice(&index.canonical_bytes().unwrap()).unwrap();
+    wire["revision"] = u64::MAX.to_string().into();
+    *index = ManagedOwnershipIndexV1::parse(&serde_json::to_vec(&wire).unwrap()).unwrap();
+    assert!(matches!(
+        registry.preflight_removal_with_limits(&id, &u64::MAX.to_string(), usize::MAX, 1),
+        Err(BeforeDisabledFailure::OwnershipCapacityExceeded)
+    ));
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+#[test]
+fn removal_ownership_size_checks_include_incremented_revision_digits() {
+    let id = PluginId::parse("com.example.managed").unwrap();
+    let (mut registry, _, _) = removal_registry_fixture();
+    let OwnershipRuntime::Available { index, .. } = &mut registry.publication.ownership else {
+        unreachable!()
+    };
+    let entry = index.entries()[0].clone();
+    let mut wire: Value = serde_json::from_slice(&index.canonical_bytes().unwrap()).unwrap();
+    wire["revision"] = "9".into();
+    *index = ManagedOwnershipIndexV1::parse(&serde_json::to_vec(&wire).unwrap()).unwrap();
+    let removing = index
+        .begin_removal(
+            entry.receipt_id(),
+            RemovalSlot::parse("remove-00000000000000000000000000000001").unwrap(),
+        )
+        .unwrap();
+    let next_bytes = removing.canonical_bytes().unwrap().len();
+    assert!(matches!(
+        registry.preflight_removal_with_limits(&id, "1", usize::MAX, next_bytes - 1),
+        Err(BeforeDisabledFailure::OwnershipCapacityExceeded)
+    ));
+    assert!(registry
+        .preflight_removal_with_limits(&id, "1", usize::MAX, next_bytes)
+        .is_ok());
+}
+
+#[test]
+fn removal_full_ownership_index_replaces_one_entry_and_stays_below_byte_cap() {
+    let (mut registry, _, _) = removal_registry_fixture();
+    let OwnershipRuntime::Available { index, .. } = &mut registry.publication.ownership else {
+        unreachable!()
+    };
+    for i in 1..160u128 {
+        // Both reverse-domain fields at the maximum 128 bytes, all fixed-size
+        // identity fields at their canonical widths, all other entries removing.
+        let id = format!("{i:012x}{}.{}.a", "x".repeat(51), "y".repeat(62));
+        assert_eq!(id.len(), 128);
+        let mut manifest = manifest(&id);
+        manifest.publisher_id = PluginPublisherId::parse(&id).unwrap();
+        let record = PluginRecord::local_declarative(manifest).unwrap();
+        let receipt = OwnershipReceiptV1::new(
+            ReceiptId::parse(&format!("{i:012x}40008000{i:012x}")).unwrap(),
+            PackageSlot::parse(&format!("pkg-{:032x}", i + 1)).unwrap(),
+            &record,
+        )
+        .unwrap();
+        let verified = VerifiedPackageReceipt {
+            canonical_sha256: receipt.canonical_sha256(),
+            model: receipt,
+            file_identity: FileIdentity {
+                volume: u64::MAX,
+                object: i * 3 + 3,
+            },
+        };
+        let entry = ManagedOwnershipEntryV1::managed(
+            verified,
+            &record,
+            FileIdentity {
+                volume: u64::MAX,
+                object: i * 3 + 1,
+            },
+            FileIdentity {
+                volume: u64::MAX,
+                object: i * 3 + 2,
+            },
+        )
+        .unwrap()
+        .begin_removal(RemovalSlot::parse(&format!("remove-{i:032x}")).unwrap());
+        *index = index.register(entry).unwrap();
+    }
+    let bytes = index.canonical_bytes().unwrap().len();
+    let wire: Value = serde_json::from_slice(&index.canonical_bytes().unwrap()).unwrap();
+    let max_entry_bytes = wire["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| serde_json::to_vec(entry).unwrap().len())
+        .max()
+        .unwrap();
+    // Every variable-length field in the largest entries is maximal; all
+    // remaining fields have fixed canonical widths. This is the exact bound
+    // for 160 removing entries and a 20-digit revision, not a guessed reserve.
+    let upper_bound = max_entry_bytes * 160
+        + 159
+        + br#"{"schemaVersion":1,"revision":"18446744073709551615","entries":[]}"#.len();
+    assert!(upper_bound < 262_144, "{upper_bound}");
+    println!("160-entry maximal-field ownership fixture: {bytes} bytes; exact all-removing max: {upper_bound} bytes");
+    assert!(registry
+        .preflight_removal(&PluginId::parse("com.example.managed").unwrap(), "1")
+        .is_ok());
+}
+
+#[test]
+fn removal_disabled_barrier_prunes_historical_enabled_fingerprints_without_publication() {
+    let (mut registry, memory, _) = removal_registry_fixture();
+    let record =
+        registry.publication.locals[&PluginId::parse("com.example.managed").unwrap()].clone();
+    let Runtime::Available { state, .. } = &mut registry.publication.runtime else {
+        unreachable!()
+    };
+    let mut old = local_entry(&record, true);
+    old.approval_fingerprint = format!("v1:sha256:{}", "e".repeat(64));
+    state.entries = vec![old, entry("com.other.kept", "com.other", true)];
+    let baseline = registry.catalog_snapshot();
+    assert!(registry
+        .preflight_removal(&record.manifest().id, "1")
+        .is_ok());
+    registry.persist_disabled_before_removal(&record).unwrap();
+    let persisted = memory.last_save().unwrap();
+    assert_eq!(persisted.revision, 1);
+    assert_eq!(persisted.entries.len(), 2);
+    assert_eq!(
+        persisted
+            .entries
+            .iter()
+            .filter(|entry| entry.id == record.manifest().id)
+            .collect::<Vec<_>>(),
+        vec![&local_entry(&record, false)]
+    );
+    assert!(persisted
+        .entries
+        .iter()
+        .any(|entry| entry.id.as_str() == "com.other.kept" && entry.enabled));
+    assert_eq!(registry.catalog_snapshot(), baseline);
+}

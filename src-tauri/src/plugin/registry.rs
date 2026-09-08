@@ -17,16 +17,19 @@ use super::manifest::{
     PluginManifestV1, PluginSource,
 };
 use super::manifest::{ManagedOwnershipSummary, PluginManagement};
+use super::ownership::RemovalSlot;
 use super::ownership::{
     FileIdentity, ManagedOwnershipEntryV1, ManagedOwnershipIndexV1, OwnershipFailure,
     OwnershipReceiptV1, OwnershipRuntime, PackageSlot, ReceiptId, VerifiedPackageReceipt,
     MAX_MANAGED_OWNERSHIP_BYTES, MAX_MANAGED_OWNERSHIP_ENTRIES,
 };
 use super::record::PluginRecord;
+use super::removal::BeforeDisabledFailure;
 use crate::storage::managed_plugin_ownership::{
     ManagedOwnershipPersistence, ManagedOwnershipStore,
 };
 use crate::storage::safe_plugin_document::{persist_outcome_committed, PersistOutcome};
+use crate::storage::safe_plugin_document::{PersistFailure, PersistResult};
 
 #[derive(Clone)]
 enum Runtime {
@@ -71,6 +74,12 @@ pub(crate) struct OwnershipMutationFailure {
 pub(crate) struct StateDecisionFailure {
     pub(crate) error: AppError,
     pub(crate) persist_outcome: PersistOutcome,
+}
+
+pub(crate) struct RemovalPreflight {
+    pub(crate) record: PluginRecord,
+    pub(crate) locator: LocalPackageLocator,
+    pub(crate) entry: ManagedOwnershipEntryV1,
 }
 
 impl From<AppError> for StateDecisionFailure {
@@ -195,6 +204,244 @@ impl PluginRegistry {
 
     pub(crate) fn catalog_generation(&self) -> u64 {
         self.publication.catalog_generation
+    }
+
+    /// Pure admission against the complete current publication. No recovery,
+    /// discovery, persistence, root access, or random slot allocation is allowed.
+    pub(crate) fn preflight_removal(
+        &self,
+        id: &PluginId,
+        expected_generation: &str,
+    ) -> Result<RemovalPreflight, BeforeDisabledFailure> {
+        self.preflight_removal_with_limits(
+            id,
+            expected_generation,
+            #[cfg(test)]
+            crate::storage::plugin_state::MAX_PLUGIN_STATE_BYTES,
+            #[cfg(test)]
+            MAX_MANAGED_OWNERSHIP_BYTES,
+        )
+    }
+
+    fn preflight_removal_with_limits(
+        &self,
+        id: &PluginId,
+        expected_generation: &str,
+        #[cfg(test)] state_byte_limit: usize,
+        #[cfg(test)] ownership_byte_limit: usize,
+    ) -> Result<RemovalPreflight, BeforeDisabledFailure> {
+        #[cfg(not(test))]
+        let state_byte_limit = crate::storage::plugin_state::MAX_PLUGIN_STATE_BYTES;
+        use BeforeDisabledFailure as Failure;
+        let published = &self.publication;
+        if expected_generation != published.catalog_generation.to_string() {
+            return Err(Failure::CatalogStale);
+        }
+        let state = match &published.runtime {
+            Runtime::Available { state, .. } => state,
+            Runtime::Unavailable {
+                reason: PluginAvailabilityReason::CatalogInvalid,
+                ..
+            } => return Err(Failure::CatalogInvalid),
+            _ => return Err(Failure::StateUnavailable),
+        };
+        if published.catalog_generation == 0
+            || published.discovery.summary.status == LocalDiscoveryStatus::Unavailable
+            || published.discovery.removals.status == LocalDiscoveryStatus::Unavailable
+        {
+            return Err(Failure::DiscoveryUnavailable);
+        }
+        let OwnershipRuntime::Available {
+            index,
+            requires_rewrite: false,
+            ..
+        } = &published.ownership
+        else {
+            return Err(Failure::OwnershipUnavailable);
+        };
+        if self.builtins.contains_key(id) {
+            return Err(Failure::NotManaged);
+        }
+        let record = published.locals.get(id).ok_or(Failure::NotManaged)?;
+        match Self::management_for_record(published, record) {
+            PluginManagement::Managed => (),
+            PluginManagement::OwnershipConflict => return Err(Failure::OwnershipConflict),
+            PluginManagement::OwnershipUnavailable => return Err(Failure::OwnershipUnavailable),
+            _ => return Err(Failure::NotManaged),
+        }
+        let packages: Vec<_> = published
+            .discovery
+            .plugins
+            .iter()
+            .filter(|package| &package.record.manifest().id == id)
+            .collect();
+        if packages.len() != 1 {
+            return Err(Failure::OwnershipConflict);
+        }
+        let package = packages[0];
+        let entry = index
+            .entries()
+            .iter()
+            .find(|entry| entry.proves_managed(package))
+            .ok_or(Failure::OwnershipConflict)?;
+        if is_enabled(state, record) {
+            return Err(Failure::RequiresDisabled);
+        }
+
+        let next_state = removal_disabled_candidate(state, record);
+        if next_state.entries.len() > MAX_PLUGIN_STATE_ENTRIES
+            || serde_json::to_vec(&next_state)
+                .map_err(|_| Failure::StateCapacityExceeded)?
+                .len()
+                > state_byte_limit
+        {
+            return Err(Failure::StateCapacityExceeded);
+        }
+        index
+            .preflight_removal_capacity(
+                entry.receipt_id(),
+                #[cfg(test)]
+                ownership_byte_limit,
+            )
+            .map_err(|_| Failure::OwnershipCapacityExceeded)?;
+        published
+            .catalog_generation
+            .checked_add(1)
+            .ok_or(Failure::CatalogGenerationExhausted)?;
+        state
+            .revision
+            .checked_add(1)
+            .ok_or(Failure::RevisionExhausted)?;
+        index
+            .require_revision_headroom(2)
+            .map_err(|_| Failure::OwnershipRevisionExhausted)?;
+        Ok(RemovalPreflight {
+            record: record.clone(),
+            locator: package.locator.clone(),
+            entry: entry.clone(),
+        })
+    }
+
+    /// Called on the task-owned document candidate, never under a registry guard.
+    /// Even an already-canonical disabled identity must cross this save barrier.
+    pub(crate) fn persist_disabled_before_removal(
+        &mut self,
+        record: &PluginRecord,
+    ) -> PersistResult {
+        let Runtime::Available {
+            state,
+            requires_rewrite,
+            persistence,
+        } = &mut self.publication.runtime
+        else {
+            return Err(PersistFailure {
+                outcome: PersistOutcome::NotCommitted,
+            });
+        };
+        let next = removal_disabled_candidate(state, record);
+        let result = persistence.save_before_destructive_rename(&next);
+        if persist_outcome_committed(persistence_outcome(&result)) {
+            *state = next;
+            *requires_rewrite = false;
+        }
+        result
+    }
+
+    pub(crate) fn persist_removing(
+        &mut self,
+        receipt: &ReceiptId,
+        slot: &RemovalSlot,
+    ) -> PersistResult {
+        self.mutate_removal_index(|index| index.begin_removal(receipt, slot.clone()))
+    }
+
+    pub(crate) fn rollback_removing(&mut self, receipt: &ReceiptId) -> PersistResult {
+        self.mutate_removal_index(|index| index.restore_managed(receipt))
+    }
+
+    pub(crate) fn delete_removed_entry(&mut self, receipt: &ReceiptId) -> PersistResult {
+        self.mutate_removal_index(|index| index.remove(receipt))
+    }
+
+    fn mutate_removal_index(
+        &mut self,
+        mutation: impl FnOnce(
+            &ManagedOwnershipIndexV1,
+        ) -> Result<ManagedOwnershipIndexV1, OwnershipFailure>,
+    ) -> PersistResult {
+        let OwnershipRuntime::Available {
+            index,
+            requires_rewrite,
+            persistence,
+        } = &mut self.publication.ownership
+        else {
+            return Err(PersistFailure {
+                outcome: PersistOutcome::NotCommitted,
+            });
+        };
+        let next = mutation(index).map_err(|_| PersistFailure {
+            outcome: PersistOutcome::NotCommitted,
+        })?;
+        let result = persistence.save(&next);
+        if persist_outcome_committed(persistence_outcome(&result)) {
+            *index = next;
+            *requires_rewrite = false;
+        }
+        result
+    }
+
+    pub(crate) fn removal_discovery_baseline(&self) -> LocalDiscoveryOutcome {
+        self.publication.discovery.clone()
+    }
+
+    /// The only final reconciliation used by an owned remove: deterministic,
+    /// no-load/no-write, and not published until the complete result is known.
+    pub(crate) fn build_reconciled_candidate(&mut self, outcome: LocalDiscoveryOutcome) {
+        let next = &mut self.publication;
+        let (ownership, management, summary) = next.ownership.reconcile_loaded_without_io(&outcome);
+        next.ownership = ownership;
+        next.management = management;
+        next.ownership_summary = summary;
+        next.locals.clear();
+        next.locators.clear();
+        let mut collisions = 0;
+        for package in &outcome.plugins {
+            if self.builtins.contains_key(&package.record.manifest().id) {
+                collisions += 1;
+            } else {
+                next.locals
+                    .insert(package.record.manifest().id.clone(), package.record.clone());
+                next.locators.insert(
+                    package.record.manifest().id.clone(),
+                    package.locator.clone(),
+                );
+            }
+        }
+        next.management.retain(|id, _| next.locals.contains_key(id));
+        next.local_summary = outcome
+            .summary
+            .clone()
+            .with_additional_rejections(collisions);
+        next.discovery = outcome;
+        self.publication.snapshot = self.derive_snapshot(&self.publication);
+    }
+
+    /// Adopt documents immediately, but compare publication against the frozen
+    /// complete baseline, not against those already-adopted document revisions.
+    pub(crate) fn adopt_removal_documents(&mut self, candidate: &Self) {
+        self.publication.runtime = candidate.publication.runtime.clone();
+        self.publication.ownership = candidate.publication.ownership.clone();
+    }
+
+    pub(crate) fn publish_candidate_once(
+        &mut self,
+        candidate: Self,
+        baseline: &Self,
+    ) -> AppResult<PluginCatalogSnapshot> {
+        let mut publisher = baseline.clone();
+        publisher.publish_candidate(candidate.publication, false)?;
+        *self = publisher;
+        Ok(self.catalog_snapshot())
     }
 
     #[cfg(test)]
@@ -755,6 +1002,33 @@ fn sort_state_entries(entries: &mut [PluginStateEntryV2]) {
             &b.approval_fingerprint,
         ))
     });
+}
+
+fn removal_disabled_candidate(
+    state: &PluginStateFileV2,
+    record: &PluginRecord,
+) -> PluginStateFileV2 {
+    let identity = record.identity();
+    let mut next = state.clone();
+    next.entries
+        .retain(|entry| entry.id != identity.id || entry.source != identity.source);
+    next.entries.push(PluginStateEntryV2 {
+        id: identity.id,
+        source: identity.source,
+        publisher_id: identity.publisher_id,
+        approval_fingerprint: identity.approval_fingerprint,
+        enabled: false,
+    });
+    sort_state_entries(&mut next.entries);
+    next.revision = state.revision.saturating_add(1);
+    next
+}
+
+pub(crate) fn persistence_outcome(result: &PersistResult) -> PersistOutcome {
+    result
+        .as_ref()
+        .copied()
+        .unwrap_or_else(|failure| failure.outcome)
 }
 
 fn matches_identity(entry: &PluginStateEntryV2, record: &PluginRecord) -> bool {

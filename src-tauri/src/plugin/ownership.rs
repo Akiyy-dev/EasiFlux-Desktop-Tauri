@@ -491,6 +491,40 @@ impl ManagedOwnershipIndexV1 {
             .ok_or(OwnershipFailure::RevisionExhausted)
     }
 
+    /// Pure replacement sizing, including the next revision's decimal digits.
+    /// Saturation is for sizing only: revision admission is checked separately.
+    pub(crate) fn preflight_removal_capacity(
+        &self,
+        receipt: &ReceiptId,
+        #[cfg(test)] byte_limit: usize,
+    ) -> Result<(), OwnershipFailure> {
+        #[cfg(not(test))]
+        let byte_limit = MAX_MANAGED_OWNERSHIP_BYTES;
+        let mut next = self.clone();
+        let entry = next
+            .entries
+            .iter_mut()
+            .find(|entry| entry.receipt_id() == receipt)
+            .ok_or(OwnershipFailure::Conflict)?;
+        *entry = entry.begin_removal(RemovalSlot::parse(
+            "remove-00000000000040008000000000000000",
+        )?);
+        next.revision = self.revision.saturating_add(1);
+        // All generated slots have the same width. Do not allocate a real slot,
+        // or reject a full 160-entry index when this operation replaces one.
+        if next.entries.len() > MAX_MANAGED_OWNERSHIP_ENTRIES
+            || next.serialize_unchecked()?.len() > byte_limit
+        {
+            return Err(OwnershipFailure::CapacityExceeded);
+        }
+        let mut rollback = self.clone();
+        rollback.revision = self.revision.saturating_add(2);
+        if rollback.serialize_unchecked()?.len() > byte_limit {
+            return Err(OwnershipFailure::CapacityExceeded);
+        }
+        Ok(())
+    }
+
     pub(crate) fn register(
         &self,
         entry: ManagedOwnershipEntryV1,
@@ -980,6 +1014,19 @@ impl OwnershipRuntime {
         // Each authoritative scan reloads the index too. A formerly healthy
         // in-memory index cannot conceal later loss or damage to disk authority.
         Self::initialize(std::sync::Arc::clone(persistence)).reconcile_loaded(outcome, allow_writes)
+    }
+
+    /// Removal owns the accepted documents. Final reconciliation must neither
+    /// reload disk authority nor perform an implicit convergence write.
+    pub(crate) fn reconcile_loaded_without_io(
+        &self,
+        outcome: &super::discovery::LocalDiscoveryOutcome,
+    ) -> (
+        Self,
+        std::collections::BTreeMap<PluginId, super::manifest::PluginManagement>,
+        super::manifest::ManagedOwnershipSummary,
+    ) {
+        self.reconcile_loaded(outcome, false)
     }
 
     fn reconcile_loaded(
