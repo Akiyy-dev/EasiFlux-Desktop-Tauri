@@ -20,6 +20,9 @@ function pluginFixture(
       requestedCapabilities: [],
     },
     source: 'builtIn',
+    management: 'builtIn',
+    canRemove: false,
+    toggleBlockReasonCode: null,
     grantedCapabilities: [],
     status,
     canToggle: status !== 'blocked',
@@ -60,7 +63,7 @@ describe('PluginCard', () => {
   })
 
   it('discloses local metadata-only preferences without implying verified publishing', () => {
-    const wrapper = mountCard(pluginFixture('disabled', { source: 'localDeclarative' }))
+    const wrapper = mountCard(pluginFixture('disabled', { source: 'localDeclarative', management: 'external' }))
 
     expect(wrapper.text()).toContain('本地声明式包 · 已发现，未执行')
     expect(wrapper.text()).toContain('启用仅记录宿主偏好，不会运行插件代码')

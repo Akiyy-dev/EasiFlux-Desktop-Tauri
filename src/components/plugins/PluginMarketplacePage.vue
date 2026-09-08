@@ -34,6 +34,9 @@ const importFailureCopy: Record<LocalManifestImportCommitFailure, string> = {
   plugin_import_capacity_exceeded: '本地插件数量或读取预算已达上限。',
   plugin_import_staging_capacity_exceeded: '导入暂存区需要人工检查和清理。',
   plugin_import_write_failed: '无法完成清单写入，请检查后重试。',
+  plugin_ownership_unavailable: '所有权记录暂不可用，不能受管导入或移除。',
+  plugin_ownership_capacity_exceeded: '受管所有权记录已达上限。',
+  plugin_ownership_revision_exhausted: '受管所有权记录版本已达到上限，请联系支持。',
 }
 
 const sectionCopy: Record<PluginSection, { title: string; description: string }> = {

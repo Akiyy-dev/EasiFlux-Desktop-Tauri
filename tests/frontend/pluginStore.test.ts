@@ -66,6 +66,9 @@ function item(
       ...overrides,
     },
     source: 'builtIn',
+    management: 'builtIn',
+    canRemove: false,
+    toggleBlockReasonCode: null,
     status,
     statusReasonCode: reason,
     canToggle: status !== 'blocked',
@@ -82,10 +85,11 @@ function snapshot(
   catalogGeneration = '1',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision,
     catalogGeneration,
     localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
     availability: 'available',
     availabilityReasonCode: null,
     plugins,
@@ -97,10 +101,11 @@ function unavailableSnapshot(
   reason: PluginAvailabilityReason = 'stateUnavailable',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision,
     catalogGeneration: '1',
     localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
     availability: 'unavailable',
     availabilityReasonCode: reason,
     plugins: [
@@ -117,7 +122,7 @@ function mutation(
   catalogGeneration = '1',
 ): PluginCatalogMutationResult {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision,
     catalogGeneration,
     plugin: item(id, enabled ? 'enabled' : 'disabled'),
@@ -139,6 +144,8 @@ function importedItem(
   return {
     ...item(sourcePreview.manifest.id, 'disabled', sourcePreview.manifest),
     source: 'localDeclarative',
+    management: 'managed',
+    canRemove: true,
   }
 }
 
@@ -147,7 +154,7 @@ function importedResult(
   sourcePreview: ReadyLocalManifestImport = preview,
 ): CommitLocalManifestImportResult {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: 'imported',
     pluginId: sourcePreview.manifest.id,
     snapshot: returnedSnapshot,
@@ -401,7 +408,7 @@ describe('plugin store manifest import ownership and arbitration', () => {
     serviceMocks.prepareImport.mockResolvedValueOnce(preview)
     await store.prepareImport()
     const result = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: 'notImported',
       disabledDecisionSaved: true,
       reasonCode: 'plugin_import_write_failed',
@@ -527,7 +534,7 @@ describe('plugin store catalog generations', () => {
 
   it('new generation replaces metadata, source, discovery and item revisions even with a lower state revision', async () => {
     const store = await loadedStore('9')
-    const replacement = { ...item('com.easiflux.alpha', 'disabled', { name: 'Replacement', version: '2.0.0' }), source: 'localDeclarative' as const }
+    const replacement: PluginCatalogItem = { ...item('com.easiflux.alpha', 'disabled', { name: 'Replacement', version: '2.0.0' }), source: 'localDeclarative', management: 'external' }
     serviceMocks.reloadCatalog.mockResolvedValueOnce({
       ...snapshot('2', [replacement], '2'),
       localDiscovery: { status: 'degraded', rejectedPackageCount: 2 },
@@ -1009,7 +1016,7 @@ describe('plugin store mutation ownership and revisions', () => {
   })
 
   it.each([
-    ['source', 'item', { source: 'localDeclarative' }],
+    ['source', 'item', { source: 'localDeclarative', management: 'external' }],
     ['id', 'manifest', { id: 'com.easiflux.beta' }],
     ['schema', 'manifest', { schemaVersion: 2 }],
     ['publisher identity', 'manifest', { publisherId: 'com.other' }],

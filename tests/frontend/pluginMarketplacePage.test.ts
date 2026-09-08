@@ -85,6 +85,9 @@ function pluginItem(
       requestedCapabilities: [],
     },
     source: 'builtIn',
+    management: 'builtIn',
+    canRemove: false,
+    toggleBlockReasonCode: null,
     grantedCapabilities: [],
     status,
     canToggle: status !== 'blocked',
@@ -100,10 +103,11 @@ function availableSnapshot(
   revision = '1',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision,
     catalogGeneration: '1',
     localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
     availability: 'available',
     availabilityReasonCode: null,
     plugins,
@@ -115,10 +119,11 @@ function unavailableSnapshot(
   reason: PluginAvailabilityReason = 'stateUnavailable',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision: '3',
     catalogGeneration: '1',
     localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
     availability: 'unavailable',
     availabilityReasonCode: reason,
     plugins,
@@ -130,7 +135,7 @@ function mutation(
   enabled: boolean,
 ): PluginCatalogMutationResult {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision: '2',
     catalogGeneration: '1',
     plugin: pluginItem(id, 'Beta 交易', enabled ? 'enabled' : 'disabled'),
@@ -162,6 +167,9 @@ function importedSnapshot(): PluginCatalogSnapshot {
       {
         manifest: readyPreview.manifest,
         source: 'localDeclarative',
+        management: 'managed',
+        canRemove: true,
+        toggleBlockReasonCode: null,
         grantedCapabilities: [],
         status: 'disabled',
         canToggle: true,
@@ -192,7 +200,7 @@ describe('PluginMarketplacePage local discovery', () => {
 
   const localPlugin: PluginCatalogItem = {
     ...pluginItem('com.example.local', '本地声明示例'),
-    source: 'localDeclarative',
+    source: 'localDeclarative', management: 'external',
   }
 
   it('shows both sources in installed and manage but only built-ins in market', async () => {
@@ -649,7 +657,7 @@ describe('PluginMarketplacePage catalog views', () => {
   it('renders only built-in entries in a read-only marketplace', async () => {
     const untrusted: PluginCatalogItem = {
       ...pluginItem('com.example.local', '本地未受信条目'),
-      source: 'localDeclarative',
+      source: 'localDeclarative', management: 'external',
     }
     serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([
       pluginItem('com.easiflux.alpha', 'Alpha 研究'),
@@ -897,7 +905,7 @@ describe('PluginMarketplacePage local manifest import', () => {
 
   it('announces a completed import as status and keeps the entry disabled until dismissal', async () => {
     const imported: CommitLocalManifestImportResult = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: 'imported',
       pluginId: readyPreview.manifest.id,
       snapshot: importedSnapshot(),
@@ -921,9 +929,29 @@ describe('PluginMarketplacePage local manifest import', () => {
     wrapper.unmount()
   })
 
+  it.each([
+    ['plugin_ownership_unavailable', '所有权记录暂不可用，不能受管导入或移除。'],
+    ['plugin_ownership_capacity_exceeded', '受管所有权记录已达上限。'],
+    ['plugin_ownership_revision_exhausted', '受管所有权记录版本已达到上限，请联系支持。'],
+  ])('shows local preflight ownership copy for %s', async (reasonCode, expected) => {
+    serviceMocks.commitImport.mockResolvedValueOnce({
+      schemaVersion: 2,
+      status: 'notImported',
+      disabledDecisionSaved: false,
+      reasonCode,
+      snapshot: availableSnapshot(),
+    })
+    const wrapper = await mountLoaded()
+    await openReadyPreview(wrapper)
+    await wrapper.get('[data-testid="plugin-import-confirm"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="plugin-import-alert"]').text()).toContain(expected)
+    wrapper.unmount()
+  })
+
   it('uses the exact partial-failure warning and requires explicit dismissal', async () => {
     serviceMocks.commitImport.mockResolvedValueOnce({
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: 'notImported',
       disabledDecisionSaved: true,
       reasonCode: 'plugin_import_write_failed',
@@ -963,7 +991,7 @@ describe('PluginMarketplacePage local manifest import', () => {
     await alert.get('[data-testid="plugin-import-dismiss"]').trigger('click')
 
     serviceMocks.commitImport.mockResolvedValueOnce({
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: 'notImported',
       disabledDecisionSaved: false,
       reasonCode: 'plugin_import_id_conflict',
@@ -980,7 +1008,7 @@ describe('PluginMarketplacePage local manifest import', () => {
 
   it('offers reload rather than retry-import when publication is unconfirmed', async () => {
     serviceMocks.commitImport.mockResolvedValueOnce({
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: 'importedNotVisible',
       pluginId: readyPreview.manifest.id,
       reasonCode: 'plugin_import_publication_unconfirmed',
