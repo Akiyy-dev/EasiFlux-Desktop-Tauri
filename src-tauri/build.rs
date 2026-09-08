@@ -4,6 +4,9 @@ fn main() {
             "get_plugin_catalog",
             "reload_plugin_catalog",
             "set_plugin_enabled",
+            "prepare_local_manifest_import",
+            "cancel_local_manifest_import",
+            "commit_local_manifest_import",
         ]),
     ))
     .expect("error while building Tauri application resources")

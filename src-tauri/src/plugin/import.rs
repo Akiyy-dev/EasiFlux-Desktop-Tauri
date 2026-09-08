@@ -8,6 +8,7 @@ use crate::plugin::{
     record::PluginRecord,
 };
 
+pub(crate) mod dialog;
 mod session;
 pub(crate) mod source;
 pub(crate) use session::{CommitLease, ImportSessions, PrepareLease};
