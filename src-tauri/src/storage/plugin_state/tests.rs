@@ -107,6 +107,86 @@ fn local_entry(id: &str, fingerprint: &str) -> PluginStateEntryV2 {
     }
 }
 
+// Catches secondary recovery resurrecting a local authorization while preserving
+// a valid built-in decision, revision, and damaged primary evidence.
+#[test]
+fn secondary_recovery_disables_local_but_preserves_builtin_and_revision() {
+    for suffix in [".tmp", ".bak"] {
+        let fixture = Fixture::new();
+        let mut saved = state(u64::MAX);
+        saved.entries[0].enabled = true;
+        saved
+            .entries
+            .push(local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A));
+        fixture.write("", b"broken primary");
+        fixture.write(suffix, serde_json::to_vec(&saved).unwrap());
+
+        let loaded = fixture.store().load().unwrap();
+
+        assert!(loaded.state.entries[0].enabled);
+        assert!(!loaded.state.entries[1].enabled);
+        assert_eq!(loaded.state.revision, u64::MAX);
+        assert!(loaded.requires_rewrite);
+        assert_eq!(fs::read(fixture.path()).unwrap(), b"broken primary");
+    }
+}
+
+// Catches applying fail-closed recovery semantics to a valid primary document.
+#[test]
+fn primary_recovery_retains_local_enabled() {
+    let fixture = Fixture::new();
+    let mut saved = state(7);
+    saved
+        .entries
+        .push(local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A));
+    fixture.write("", serde_json::to_vec(&saved).unwrap());
+
+    let loaded = fixture.store().load().unwrap();
+
+    assert!(loaded.state.entries[1].enabled);
+    assert!(!loaded.requires_rewrite);
+}
+
+// Catches skipping a required recovery rewrite only because all local entries
+// were already disabled in the selected secondary candidate.
+#[test]
+fn secondary_with_already_disabled_locals_still_requires_rewrite() {
+    let fixture = Fixture::new();
+    let mut saved = state(7);
+    let mut local = local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A);
+    local.enabled = false;
+    saved.entries.push(local);
+    fixture.write("", b"broken primary");
+    fixture.write(".bak", serde_json::to_vec(&saved).unwrap());
+
+    let loaded = fixture.store().load().unwrap();
+
+    assert!(!loaded.state.entries[1].enabled);
+    assert!(loaded.requires_rewrite);
+}
+
+// Catches falling back from terminal primary candidates to a valid sidecar.
+#[test]
+fn future_or_oversized_primary_never_falls_back() {
+    for (primary, code) in [
+        (
+            br#"{"schemaVersion":3,"revision":"8","entries":[]}"#.to_vec(),
+            "plugin_state_unsupported_schema",
+        ),
+        (
+            vec![b' '; MAX_PLUGIN_STATE_BYTES + 1],
+            "plugin_state_unavailable",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.write("", &primary);
+        fixture.write(".tmp", document(1));
+        fixture.write(".bak", document(2));
+
+        assert_plugin_code(fixture.store().load(), code);
+    }
+}
+
 // Catches loading v1 into a v1 runtime state instead of canonical v2 while
 // forgetting to request a deferred migration write.
 #[test]

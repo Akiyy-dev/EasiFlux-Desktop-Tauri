@@ -402,6 +402,41 @@ fn failed_migration_rewrite_keeps_state_and_rewrite_marker() {
     assert_eq!(persistence.last_save().unwrap().schema_version, 2);
 }
 
+// Catches clearing a recovered rewrite marker after a failed retry at the
+// maximum revision, where no revision increment is permitted.
+#[test]
+fn recovered_disabled_identity_rewrites_at_max_revision_after_save_failure() {
+    let local = PluginRecord::local_declarative(manifest("com.easiflux.local")).unwrap();
+    let identity = local.identity();
+    let persisted = PluginStateFileV2 {
+        schema_version: 2,
+        revision: u64::MAX,
+        entries: vec![PluginStateEntryV2 {
+            id: identity.id,
+            source: identity.source,
+            publisher_id: identity.publisher_id,
+            approval_fingerprint: identity.approval_fingerprint,
+            enabled: false,
+        }],
+    };
+    let memory = MemoryPersistence::failing_loaded_from_v1(persisted.clone());
+    let mut registry = memory.registry(vec![]);
+
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![local]))
+        .unwrap();
+    assert!(registry
+        .set_enabled("com.easiflux.local", false, "1")
+        .is_err());
+    assert_eq!(registry.catalog_snapshot().revision, u64::MAX.to_string());
+
+    memory.allow_saves();
+    registry
+        .set_enabled("com.easiflux.local", false, "1")
+        .unwrap();
+    assert_eq!(memory.last_save().unwrap(), persisted);
+}
+
 // Catches failing to persist the exact next revision/identity before publishing it.
 #[test]
 fn successful_update_persists_next_state_and_returns_updated_item() {

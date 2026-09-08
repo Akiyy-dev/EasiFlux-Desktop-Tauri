@@ -379,7 +379,7 @@ impl PluginStateStore {
             config_dir.join(APP_NAME).join("plugins").join("state.json"),
         ))
     }
-    fn with_path(path: PathBuf) -> Self {
+    pub(crate) fn with_path(path: PathBuf) -> Self {
         Self {
             file: AtomicFile::new(path),
             transaction: Mutex::new(()),
@@ -430,7 +430,17 @@ impl PluginStateStore {
                 ))),
             };
             match decoded {
-                Ok(state) => return Ok(Some(state)),
+                Ok(mut state) => {
+                    if index != 0 {
+                        for entry in &mut state.state.entries {
+                            if entry.source == PluginSource::LocalDeclarative {
+                                entry.enabled = false;
+                            }
+                        }
+                        state.requires_rewrite = true;
+                    }
+                    return Ok(Some(state));
+                }
                 Err(error) => {
                     tracing::warn!(error = %error, candidate = index, "invalid plugin state candidate");
                     invalid = true;
