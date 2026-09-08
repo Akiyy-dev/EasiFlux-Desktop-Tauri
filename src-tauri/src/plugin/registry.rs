@@ -263,6 +263,7 @@ impl PluginRegistry {
                 );
             }
         }
+        next.management.retain(|id, _| next.locals.contains_key(id));
         next.local_summary = outcome
             .summary
             .clone()
@@ -336,8 +337,8 @@ impl PluginRegistry {
         };
         let records: BTreeMap<_, _> = self.builtins.iter().chain(next.locals.iter()).collect();
         let plugins = records
-            .into_iter()
-            .map(|(id, record)| {
+            .into_values()
+            .map(|record| {
                 let item = match &next.runtime {
                     Runtime::Available { state, .. } => {
                         catalog_item(record, is_enabled(state, record))
@@ -348,14 +349,7 @@ impl PluginRegistry {
                         reason.clone(),
                     ),
                 };
-                item.with_management(if record.source() == PluginSource::BuiltIn {
-                    PluginManagement::BuiltIn
-                } else {
-                    next.management
-                        .get(id)
-                        .copied()
-                        .unwrap_or(PluginManagement::External)
-                })
+                item.with_management(Self::management_for_record(next, record))
             })
             .collect();
         PluginCatalogSnapshot::new(
@@ -367,6 +361,20 @@ impl PluginRegistry {
             next.ownership_summary.clone(),
             plugins,
         )
+    }
+
+    fn management_for_record(
+        publication: &CatalogPublicationCandidate,
+        record: &PluginRecord,
+    ) -> PluginManagement {
+        match record.source() {
+            PluginSource::BuiltIn => PluginManagement::BuiltIn,
+            PluginSource::LocalDeclarative => publication
+                .management
+                .get(&record.manifest().id)
+                .copied()
+                .unwrap_or(PluginManagement::External),
+        }
     }
 
     fn load_state_if_needed(next: &mut CatalogPublicationCandidate) -> AppResult<()> {
@@ -436,7 +444,8 @@ impl PluginRegistry {
             .or_else(|| self.publication.locals.get(&id))
             .cloned()
             .ok_or_else(|| plugin_error("plugin_not_found", "插件不存在"))?;
-        if self.publication.management.get(&id) == Some(&PluginManagement::RemovalPending) {
+        let management = Self::management_for_record(&self.publication, &record);
+        if management == PluginManagement::RemovalPending {
             return Err(plugin_error("plugin_removal_pending", "插件移除回退待处理"));
         }
         self.persist_decision(&record, enabled)?;
@@ -446,13 +455,7 @@ impl PluginRegistry {
         Ok(PluginCatalogMutationResult::new(
             state.revision.to_string(),
             self.publication.catalog_generation.to_string(),
-            catalog_item(&record, enabled).with_management(
-                self.publication
-                    .management
-                    .get(&id)
-                    .copied()
-                    .unwrap_or(PluginManagement::BuiltIn),
-            ),
+            catalog_item(&record, enabled).with_management(management),
         ))
     }
 

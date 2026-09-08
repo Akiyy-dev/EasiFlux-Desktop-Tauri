@@ -201,11 +201,30 @@ pub enum LocalDiscoveryStatus {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocalDiscoverySummary {
     pub status: LocalDiscoveryStatus,
     pub rejected_package_count: u32,
+}
+
+impl<'de> Deserialize<'de> for LocalDiscoverySummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            status: LocalDiscoveryStatus,
+            rejected_package_count: u32,
+        }
+        let wire = deserialize_object::<D, Wire>(deserializer)?;
+        Ok(Self {
+            status: wire.status,
+            rejected_package_count: wire.rejected_package_count,
+        })
+    }
 }
 
 impl LocalDiscoverySummary {
@@ -708,6 +727,32 @@ impl PluginCatalogMutationResult {
 
 #[cfg(test)]
 mod tests {
+    // Catches derived nested struct decoding accepting positional arrays.
+    #[test]
+    fn catalog_rejects_non_object_or_inexact_local_discovery() {
+        let valid = serde_json::json!({
+            "schemaVersion": 3, "revision": "0", "catalogGeneration": "0",
+            "availability": "available", "availabilityReasonCode": null,
+            "localDiscovery": {"status": "available", "rejectedPackageCount": 0},
+            "managedOwnership": {"status": "available", "conflictingEntryCount": 0,
+                "rollbackPendingCount": 0, "cleanupPendingCount": 0}, "plugins": []
+        });
+        serde_json::from_value::<super::PluginCatalogSnapshot>(valid.clone()).unwrap();
+        for invalid in [
+            serde_json::json!(["available", 0]),
+            serde_json::json!({"status": "available"}),
+            serde_json::json!({"rejectedPackageCount": 0}),
+            serde_json::json!({"status": "available", "rejectedPackageCount": 0, "extra": 0}),
+        ] {
+            let mut value = valid.clone();
+            value["localDiscovery"] = invalid;
+            assert!(
+                serde_json::from_value::<super::PluginCatalogSnapshot>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+    }
+
     #[test]
     fn catalog_v3_enforces_management_toggle_and_summary_cross_fields() {
         let snapshot = super::PluginCatalogSnapshot::new(

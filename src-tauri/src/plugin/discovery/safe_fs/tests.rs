@@ -4,6 +4,42 @@ use std::path::{Path, PathBuf};
 
 struct Fixture(PathBuf);
 
+// Catches Unix alias occupancy being omitted, without accepting alias locators.
+#[cfg(unix)]
+#[test]
+fn unix_alias_occupancy_matches_canonical_presence_without_reading_content() {
+    let f = Fixture::new();
+    fs::create_dir(f.root().join("PKG-00000000000000000000000000000000")).unwrap();
+    let canonical_exists = f
+        .root()
+        .join("pkg-00000000000000000000000000000000")
+        .exists();
+    let scan = f.scan().unwrap();
+    assert_eq!(
+        scan.occupied_slots.len(),
+        if canonical_exists { 1 } else { 0 }
+    );
+    assert_eq!(scan.rejected_package_count, 1);
+    assert!(scan.packages.is_empty());
+    assert_eq!(scan.usage.bytes_read, 0);
+
+    fs::remove_dir(f.root().join("PKG-00000000000000000000000000000000")).unwrap();
+    fs::create_dir(f.root().join("REMOVE-00000000000000000000000000000000")).unwrap();
+    let canonical_exists = f
+        .root()
+        .join("remove-00000000000000000000000000000000")
+        .exists();
+    let held = platform::Directory::open_root(f.root()).unwrap().unwrap();
+    let scan = read_removal_directory(&held, REMOVAL_BYTE_LIMIT).unwrap();
+    assert_eq!(
+        scan.occupied_slots.len(),
+        if canonical_exists { 1 } else { 0 }
+    );
+    assert_eq!(scan.unknown_count, if canonical_exists { 0 } else { 1 });
+    assert!(scan.objects.is_empty());
+    assert_eq!(scan.bytes_read, 0);
+}
+
 #[test]
 fn post_read_shape_and_identity_replacements_fail_closed_with_handles_held() {
     for swap in [false, true] {

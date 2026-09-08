@@ -140,6 +140,80 @@ fn exact_receipt_and_index_and_three_objects_is_managed() {
     assert_eq!(mutation["catalogGeneration"], before["catalogGeneration"]);
 }
 
+// Catches local ownership leaking into the selected built-in's mutation or gate.
+fn assert_builtin_collision_isolated(kind: &str) {
+    use crate::plugin::ownership::{ManagedOwnershipIndexV1, RemovalSlot};
+    let fixture = OwnershipFixture::new();
+    let (_, mut index) = fixture.package();
+    if kind == "legacy" {
+        std::fs::remove_file(
+            fixture
+                .0
+                .join("local/pkg-00000000000000000000000000000001/ownership-receipt.json"),
+        )
+        .unwrap();
+        index = ManagedOwnershipIndexV1::empty();
+    } else if kind == "pending" {
+        index = index
+            .begin_removal(
+                index.entries()[0].receipt_id(),
+                RemovalSlot::parse("remove-00000000000000000000000000000001").unwrap(),
+            )
+            .unwrap();
+    }
+    let memory = OwnershipMemory::new(index);
+    memory.0.lock().unwrap().1 = kind == "unavailable";
+    memory.0.lock().unwrap().2 = kind == "pending";
+    let mut registry = PluginRegistry::initialize(
+        vec![manifest("com.example.managed")],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(memory),
+    );
+    registry.apply_local_discovery(fixture.scan()).unwrap();
+    for enabled in [false, true] {
+        let generation = registry.catalog_snapshot().catalog_generation;
+        let mutation = serde_json::to_value(
+            registry
+                .set_enabled("com.example.managed", enabled, &generation)
+                .unwrap(),
+        )
+        .unwrap();
+        let catalog = snapshot(&registry);
+        assert_eq!(mutation["plugin"]["management"], "builtIn");
+        assert_eq!(mutation["plugin"]["source"], "builtIn");
+        assert_eq!(mutation["plugin"]["canToggle"], true);
+        assert_eq!(mutation["plugin"]["canRemove"], false);
+        assert_eq!(
+            mutation["plugin"]["status"],
+            if enabled { "enabled" } else { "disabled" }
+        );
+        assert_eq!(mutation["plugin"], catalog["plugins"][0]);
+        assert_eq!(mutation["revision"], catalog["revision"]);
+        assert_eq!(mutation["catalogGeneration"], catalog["catalogGeneration"]);
+        serde_json::from_value::<PluginCatalogMutationResult>(mutation).unwrap();
+    }
+    assert!(registry.publication.locals.is_empty());
+    assert!(registry.publication.locators.is_empty());
+    assert!(registry.publication.management.is_empty());
+}
+
+#[test]
+fn legacy_collision_cannot_taint_builtin_toggle() {
+    assert_builtin_collision_isolated("legacy");
+}
+#[test]
+fn managed_collision_cannot_taint_builtin_toggle() {
+    assert_builtin_collision_isolated("managed");
+}
+#[test]
+fn pending_collision_cannot_block_builtin_toggle() {
+    assert_builtin_collision_isolated("pending");
+}
+#[test]
+fn unavailable_collision_cannot_taint_builtin_toggle() {
+    assert_builtin_collision_isolated("unavailable");
+}
+
 #[test]
 fn receipt_without_index_is_external() {
     let fixture = OwnershipFixture::new();
@@ -209,7 +283,7 @@ fn two_distinct_packages_claiming_one_receipt_are_one_conflict_not_managed() {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn wrong_case_occupied_source_or_target_never_means_both_absent() {
     for target in [false, true] {
@@ -223,12 +297,81 @@ fn wrong_case_occupied_source_or_target_never_means_both_absent() {
             fixture.0.join("local/PKG-00000000000000000000000000000001")
         };
         std::fs::rename(source, &destination).unwrap();
+        #[cfg(target_os = "macos")]
+        if !destination
+            .with_file_name(
+                destination
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_ascii_lowercase(),
+            )
+            .exists()
+        {
+            // This fixture volume is case-sensitive; the Unix test below covers absence.
+            continue;
+        }
         registry.apply_local_discovery(fixture.scan()).unwrap();
         assert_eq!(memory.0.lock().unwrap().0.index.entries().len(), 1);
         assert_eq!(
             snapshot(&registry)["managedOwnership"]["conflictingEntryCount"],
             1
         );
+        assert!(destination.is_dir());
+    }
+}
+
+// Catches alias-only target presence permitting an exact-source rollback on macOS.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_target_alias_prevents_removing_to_managed_rollback() {
+    let (fixture, memory, mut registry) = pending_fixture(false);
+    let staging = fixture.0.join("removal-staging");
+    std::fs::create_dir(staging.join("REMOVE-00000000000000000000000000000001")).unwrap();
+    if !staging
+        .join("remove-00000000000000000000000000000001")
+        .exists()
+    {
+        return; // Requires a case-insensitive fixture volume.
+    }
+    let before = memory.0.lock().unwrap().0.index.clone();
+    registry.apply_local_discovery(fixture.scan()).unwrap();
+    assert_eq!(memory.0.lock().unwrap().0.index, before);
+    assert_eq!(
+        snapshot(&registry)["managedOwnership"]["conflictingEntryCount"],
+        1
+    );
+}
+
+// Catches conservatively folding unrelated names even when Unix proves canonical absence.
+#[cfg(unix)]
+#[test]
+fn case_sensitive_unix_alias_does_not_prevent_confirmed_absent_cleanup() {
+    for target in [false, true] {
+        let (fixture, memory, mut registry) = pending_fixture(false);
+        let source = fixture.0.join("local/pkg-00000000000000000000000000000001");
+        let destination = if target {
+            fixture
+                .0
+                .join("removal-staging/REMOVE-00000000000000000000000000000001")
+        } else {
+            fixture.0.join("local/PKG-00000000000000000000000000000001")
+        };
+        std::fs::rename(source, &destination).unwrap();
+        let canonical = destination.with_file_name(
+            destination
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase(),
+        );
+        if canonical.exists() {
+            continue; // This volume is case-insensitive, so absence is not confirmed.
+        }
+        registry.apply_local_discovery(fixture.scan()).unwrap();
+        assert!(memory.0.lock().unwrap().0.index.entries().is_empty());
         assert!(destination.is_dir());
     }
 }

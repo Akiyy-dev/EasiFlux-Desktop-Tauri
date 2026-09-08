@@ -226,12 +226,12 @@ fn read_local_directory(
             Some(slot) => slots.push(slot),
             None => {
                 result.rejected_package_count += 1;
-                // Windows case-insensitive aliases are occupied, not absent.
-                // This is presence-only evidence and can never create a locator.
-                #[cfg(windows)]
+                // Case aliases are presence-only evidence, never locator authority.
+                // Unix proves canonical absence relative to the held directory.
                 if let Some(slot) = name
                     .to_str()
                     .and_then(|name| PackageSlot::parse(&name.to_ascii_lowercase()).ok())
+                    .filter(|slot| root.canonical_may_be_occupied(slot.as_str()))
                 {
                     result.occupied_slots.push(slot);
                 }
@@ -481,10 +481,10 @@ fn read_removal_directory(
     let mut result = empty_removal_scan();
     for name in names {
         let Some(slot) = name.to_str().and_then(|name| RemovalSlot::parse(name).ok()) else {
-            #[cfg(windows)]
             if let Some(slot) = name
                 .to_str()
                 .and_then(|name| RemovalSlot::parse(&name.to_ascii_lowercase()).ok())
+                .filter(|slot| root.canonical_may_be_occupied(slot.as_str()))
             {
                 result.occupied_slots.push(slot);
                 continue;
@@ -550,7 +550,7 @@ pub(crate) fn is_single_link_regular_file(
 #[cfg(unix)]
 mod platform {
     use super::*;
-    use rustix::fs::{fstat, open, openat, Dir, Mode, OFlags};
+    use rustix::fs::{fstat, open, openat, statat, AtFlags, Dir, Mode, OFlags};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
@@ -564,6 +564,15 @@ mod platform {
     pub(super) type SourceDirectory = Directory;
 
     impl Directory {
+        // Called only with a strictly parsed ASCII slot. This no-follow metadata
+        // probe grants no identity authority and reads no unknown file contents.
+        pub(super) fn canonical_may_be_occupied(&self, slot: &str) -> bool {
+            !matches!(
+                statat(&self.0, slot, AtFlags::SYMLINK_NOFOLLOW),
+                Err(rustix::io::Errno::NOENT)
+            )
+        }
+
         pub(super) fn identity(&self) -> Result<FileIdentity, ()> {
             let metadata = self.0.metadata().map_err(|_| ())?;
             Ok(FileIdentity {
@@ -987,6 +996,11 @@ mod platform {
 
         pub(super) fn identity(&self) -> Result<FileIdentity, ()> {
             object_identity(self._held.last().ok_or(())?)
+        }
+
+        pub(super) fn canonical_may_be_occupied(&self, _slot: &str) -> bool {
+            // Preserve Windows' conservative case-alias occupancy rule.
+            true
         }
 
         pub(super) fn optional_child(&self, name: &str) -> Result<Option<Self>, ()> {
