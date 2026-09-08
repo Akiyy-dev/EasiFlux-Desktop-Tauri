@@ -140,6 +140,42 @@ fn exact_receipt_and_index_and_three_objects_is_managed() {
     assert_eq!(mutation["catalogGeneration"], before["catalogGeneration"]);
 }
 
+// Catches deduplication hiding an invalid sibling or the canonical orphan's conflict.
+#[cfg(unix)]
+#[test]
+fn unix_coexisting_aliases_preserve_managed_local_and_each_quarantine_conflict() {
+    let fixture = OwnershipFixture::new();
+    let (_, index) = fixture.package();
+    match std::fs::create_dir(fixture.0.join("local/PKG-00000000000000000000000000000001")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(error) => panic!("create distinct case-sensitive sibling: {error}"),
+    }
+    let staging = fixture.0.join("removal-staging");
+    std::fs::create_dir(staging.join("remove-00000000000000000000000000000001")).unwrap();
+    std::fs::create_dir(staging.join("REMOVE-00000000000000000000000000000001")).unwrap();
+    let outcome = fixture.scan();
+    assert_eq!(outcome.plugins.len(), 1);
+    assert_eq!(outcome.removals.observations.len(), 1);
+    assert_eq!(outcome.occupied_slots.len(), 1);
+    assert_eq!(outcome.removals.occupied_slots.len(), 1);
+    assert_eq!(outcome.removals.unknown_entry_count, 1);
+    let mut registry = PluginRegistry::initialize(
+        vec![],
+        Box::new(MemoryPersistence::new(PluginStateFileV2::empty())),
+        Box::new(OwnershipMemory::new(index)),
+    );
+    registry.apply_local_discovery(outcome).unwrap();
+    let value = snapshot(&registry);
+    assert_eq!(value["plugins"][0]["management"], "managed");
+    assert_eq!(
+        value["localDiscovery"],
+        json!({"status": "degraded", "rejectedPackageCount": 1})
+    );
+    assert_eq!(value["managedOwnership"]["status"], "degraded");
+    assert_eq!(value["managedOwnership"]["conflictingEntryCount"], 2);
+}
+
 // Catches local ownership leaking into the selected built-in's mutation or gate.
 fn assert_builtin_collision_isolated(kind: &str) {
     use crate::plugin::ownership::{ManagedOwnershipIndexV1, RemovalSlot};

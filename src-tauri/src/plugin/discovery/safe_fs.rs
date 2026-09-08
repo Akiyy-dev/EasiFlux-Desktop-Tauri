@@ -272,15 +272,17 @@ fn read_local_directory(
             _ => result.rejected_package_count += 1,
         }
     }
-    result.occupied_slots.sort();
-    if result
-        .occupied_slots
-        .windows(2)
-        .any(|slots| slots[0] == slots[1])
-    {
-        return Err(RootReadError);
-    }
+    finalize_occupied_slots(&mut result.occupied_slots)?;
     Ok(result)
+}
+
+// Presence is set-like, unlike candidates/observations. Return the extra names
+// so removal conflict accounting still counts coexisting invalid siblings.
+fn finalize_occupied_slots<T: Ord>(slots: &mut Vec<T>) -> Result<u32, RootReadError> {
+    let count = slots.len();
+    slots.sort();
+    slots.dedup();
+    u32::try_from(count - slots.len()).map_err(|_| RootReadError)
 }
 
 pub(super) struct ObjectBytes {
@@ -527,14 +529,11 @@ fn read_removal_directory(
             }
         }
     }
-    result.occupied_slots.sort();
-    if result
-        .occupied_slots
-        .windows(2)
-        .any(|slots| slots[0] == slots[1])
-    {
-        return Err(RootReadError);
-    }
+    let duplicate_names = finalize_occupied_slots(&mut result.occupied_slots)?;
+    result.unknown_count = result
+        .unknown_count
+        .checked_add(duplicate_names)
+        .ok_or(RootReadError)?;
     Ok(result)
 }
 

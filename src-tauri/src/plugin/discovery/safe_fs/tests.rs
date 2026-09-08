@@ -4,6 +4,72 @@ use std::path::{Path, PathBuf};
 
 struct Fixture(PathBuf);
 
+// Catches rejecting repeated presence evidence instead of consolidating it.
+#[test]
+fn repeated_package_occupancy_is_one_presence_not_a_root_failure() {
+    let first = PackageSlot::parse("pkg-00000000000000000000000000000001").unwrap();
+    let second = PackageSlot::parse("pkg-00000000000000000000000000000002").unwrap();
+    let mut slots = vec![second.clone(), first.clone(), second.clone(), first.clone()];
+    assert_eq!(finalize_occupied_slots(&mut slots).unwrap(), 2);
+    assert_eq!(slots, vec![first, second]);
+}
+
+#[test]
+fn repeated_removal_occupancy_is_one_presence_not_a_root_failure() {
+    let first = RemovalSlot::parse("remove-00000000000000000000000000000001").unwrap();
+    let second = RemovalSlot::parse("remove-00000000000000000000000000000002").unwrap();
+    let mut slots = vec![second.clone(), first.clone(), second.clone(), first.clone()];
+    assert_eq!(finalize_occupied_slots(&mut slots).unwrap(), 2);
+    assert_eq!(slots, vec![first, second]);
+}
+
+// Catches canonical+alias coexistence making an otherwise valid local root unavailable.
+#[cfg(unix)]
+#[test]
+fn unix_local_canonical_and_alias_coexist_without_losing_candidate_or_rejection() {
+    let f = Fixture::new();
+    f.package(0, b"{}");
+    match fs::create_dir(f.root().join("PKG-00000000000000000000000000000000")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(error) => panic!("create distinct case-sensitive sibling: {error}"),
+    }
+    let scan = f.scan().unwrap();
+    assert_eq!(scan.packages.len(), 1);
+    assert_eq!(
+        scan.packages[0].package_slot.as_str(),
+        "pkg-00000000000000000000000000000000"
+    );
+    assert_eq!(scan.occupied_slots.len(), 1);
+    assert_eq!(scan.rejected_package_count, 1);
+    assert_eq!(scan.usage.root_entries, 2);
+    assert_eq!(scan.usage.packages, 1);
+    assert_eq!(scan.usage.bytes_read, 2);
+}
+
+// Catches losing the canonical observation or invalid sibling's orphan/conflict count.
+#[cfg(unix)]
+#[test]
+fn unix_removal_canonical_and_alias_coexist_without_losing_observation_or_unknown() {
+    let f = Fixture::new();
+    fs::create_dir(f.root().join("remove-00000000000000000000000000000000")).unwrap();
+    match fs::create_dir(f.root().join("REMOVE-00000000000000000000000000000000")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(error) => panic!("create distinct case-sensitive sibling: {error}"),
+    }
+    let held = platform::Directory::open_root(f.root()).unwrap().unwrap();
+    let scan = read_removal_directory(&held, REMOVAL_BYTE_LIMIT).unwrap();
+    assert_eq!(scan.objects.len(), 1);
+    assert_eq!(
+        scan.objects[0].0.as_str(),
+        "remove-00000000000000000000000000000000"
+    );
+    assert_eq!(scan.occupied_slots.len(), 1);
+    assert_eq!(scan.unknown_count, 1);
+    assert_eq!(scan.bytes_read, 0);
+}
+
 // Catches Unix alias occupancy being omitted, without accepting alias locators.
 #[cfg(unix)]
 #[test]
