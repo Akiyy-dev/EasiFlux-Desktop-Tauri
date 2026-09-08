@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import PluginCard from './PluginCard.vue'
+import PluginImportDialog from './PluginImportDialog.vue'
 import { pluginSourceLabel } from './pluginPresentation'
 import { usePluginStore, type PluginStatusFilter } from '../../stores/plugin'
+import type { LocalManifestImportCommitFailure } from '../../types/plugin'
 import type { PluginSection } from '../../types/navigation'
 
 const props = defineProps<{
@@ -11,6 +13,21 @@ const props = defineProps<{
 
 const store = usePluginStore()
 const title = ref<{ focus: () => void } | null>(null)
+
+const importFailureCopy: Record<LocalManifestImportCommitFailure, string> = {
+  plugin_catalog_stale: '插件目录已更新，请刷新后重试。',
+  plugin_catalog_invalid: '插件目录不可用，请稍后重试。',
+  plugin_catalog_generation_exhausted: '插件目录版本已达到上限，请联系支持。',
+  plugin_state_unavailable: '插件状态暂不可用，请重试。',
+  plugin_state_persist_failed: '保存插件状态失败，请重试。',
+  plugin_state_capacity_exceeded: '插件状态容量已达到上限，请联系支持。',
+  plugin_revision_exhausted: '插件状态版本已达到上限，请联系支持。',
+  plugin_import_id_conflict: '已存在相同插件 ID；当前不支持覆盖或更新。',
+  plugin_import_discovery_unavailable: '请先修复本地插件发现问题，再导入清单。',
+  plugin_import_capacity_exceeded: '本地插件数量或读取预算已达上限。',
+  plugin_import_staging_capacity_exceeded: '导入暂存区需要人工检查和清理。',
+  plugin_import_write_failed: '无法完成清单写入，请检查后重试。',
+}
 
 const sectionCopy: Record<PluginSection, { title: string; description: string }> = {
   installed: {
@@ -36,6 +53,33 @@ const refreshing = computed(() => (
   store.availability !== null && store.loadStatus === 'loading'
 ))
 const reloading = computed(() => store.reloadStatus === 'loading')
+const importEntryDisabled = computed(() => store.importStatus !== 'idle')
+const importedMessage = computed(() => (
+  store.importStatus === 'result' && store.importResult?.status === 'imported'
+    ? '清单已导入，默认停用。'
+    : null
+))
+const importAlertMessage = computed(() => {
+  if (store.importStatus !== 'result') return null
+  if (store.importOutcomeUnknown) {
+    return store.importError ?? '结果尚未确认，请重新扫描。'
+  }
+  if (store.importError) return store.importError
+  const result = store.importResult
+  if (result?.status === 'notImported') {
+    if (result.disabledDecisionSaved) {
+      return '导入未完成；该清单的停用偏好已保存，旧启用不会恢复'
+    }
+    return importFailureCopy[result.reasonCode]
+  }
+  if (result?.status === 'importedNotVisible') {
+    return '清单已写入，但目录结果尚未确认，请重新扫描。'
+  }
+  return null
+})
+const importNeedsReload = computed(() => (
+  store.importOutcomeUnknown || store.importResult?.status === 'importedNotVisible'
+))
 const reloadDisabled = computed(() => (
   initialLoading.value || store.loadStatus === 'loading' || reloading.value
 ))
@@ -104,6 +148,26 @@ function reload(): void {
   if (!reloadDisabled.value) void store.reload()
 }
 
+function prepareImport(): void {
+  if (props.section !== 'market' && !importEntryDisabled.value) void store.prepareImport()
+}
+
+function cancelImport(): void {
+  void store.cancelImport()
+}
+
+function commitImport(): void {
+  void store.commitImport()
+}
+
+function clearImportResult(): void {
+  store.clearImportResult()
+}
+
+function reloadImportResult(): void {
+  if (!reloadDisabled.value) void store.reload()
+}
+
 function togglePlugin(id: string, enabled: boolean): void {
   void store.setEnabled(id, enabled)
 }
@@ -111,6 +175,10 @@ function togglePlugin(id: string, enabled: boolean): void {
 onMounted(() => {
   void store.load()
   void nextTick(() => title.value?.focus())
+})
+
+onBeforeUnmount(() => {
+  store.releaseImportView()
 })
 </script>
 
@@ -135,8 +203,84 @@ onMounted(() => {
         >
           重新扫描本地插件
         </button>
+        <button
+          v-if="props.section !== 'market'"
+          class="ef-btn ef-btn-primary ef-btn-sm"
+          data-testid="plugin-import-button"
+          type="button"
+          :disabled="importEntryDisabled"
+          @click="prepareImport"
+        >
+          导入本地清单
+        </button>
       </div>
     </header>
+
+    <PluginImportDialog
+      v-if="store.importPreview && (
+        store.importStatus === 'preview' || store.importStatus === 'committing'
+      )"
+      :preview="store.importPreview"
+      :committing="store.importStatus === 'committing'"
+      :stale="store.importPreviewStale"
+      @confirm="commitImport"
+      @cancel="cancelImport"
+    />
+
+    <div
+      v-if="store.importStatus === 'choosing'"
+      class="plugin-marketplace-page__notice"
+      data-testid="plugin-import-choosing"
+      role="status"
+      aria-live="polite"
+    >
+      正在选择插件清单…
+    </div>
+    <div
+      v-if="importedMessage"
+      class="plugin-marketplace-page__notice plugin-marketplace-page__notice--success"
+      data-testid="plugin-import-status"
+      role="status"
+      aria-live="polite"
+    >
+      <p>{{ importedMessage }}</p>
+      <button
+        class="ef-btn ef-btn-secondary ef-btn-sm"
+        data-testid="plugin-import-dismiss"
+        type="button"
+        @click="clearImportResult"
+      >
+        关闭提示
+      </button>
+    </div>
+    <div
+      v-else-if="importAlertMessage"
+      class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
+      data-testid="plugin-import-alert"
+      role="alert"
+    >
+      <p>{{ importAlertMessage }}</p>
+      <div class="plugin-marketplace-page__notice-actions">
+        <button
+          v-if="importNeedsReload"
+          class="ef-btn ef-btn-secondary ef-btn-sm"
+          data-testid="plugin-import-result-reload"
+          type="button"
+          :disabled="reloadDisabled"
+          @click="reloadImportResult"
+        >
+          重新扫描本地插件
+        </button>
+        <button
+          class="ef-btn ef-btn-secondary ef-btn-sm"
+          data-testid="plugin-import-dismiss"
+          type="button"
+          @click="clearImportResult"
+        >
+          关闭提示
+        </button>
+      </div>
+    </div>
 
     <div
       v-if="reloading"
