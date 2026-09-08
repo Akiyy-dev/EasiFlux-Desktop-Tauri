@@ -81,12 +81,15 @@ fn semantic_change_changes_identity() {
 #[test]
 fn invalid_utf8_bom_duplicate_fields_and_nonempty_contributions_are_rejected() {
     let valid = std::str::from_utf8(test_support::VALID).unwrap();
+    let mut invalid_utf8 = test_support::VALID.to_vec();
+    // Lossy decoding would turn this into a valid name, so JSON syntax cannot mask the bug.
+    invalid_utf8[valid.find("Notes").unwrap()] = 0xff;
     let mut bom = vec![0xef, 0xbb, 0xbf];
     bom.extend_from_slice(test_support::VALID);
     let mut oversized = test_support::VALID.to_vec();
     oversized.resize(16_385, b' ');
     let cases = vec![
-        vec![0xff],
+        invalid_utf8,
         bom,
         oversized,
         valid
@@ -279,6 +282,7 @@ fn prepare_and_cancel_expire_ready_at_the_publication_deadline() {
         let deadline = published + Duration::from_secs(300);
         if cancel_first {
             sessions.cancel("unknown", deadline).unwrap();
+            assert!(session::test_support::is_idle(&sessions));
         }
         let next = sessions.reserve_prepare(deadline).unwrap();
         assert_code(

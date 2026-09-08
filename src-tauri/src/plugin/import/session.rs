@@ -209,6 +209,10 @@ fn invalid_token() -> AppError {
 pub(super) mod test_support {
     use super::*;
 
+    pub(crate) fn is_idle(sessions: &ImportSessions) -> bool {
+        matches!(*sessions.state.lock().unwrap(), SessionState::Idle)
+    }
+
     pub(crate) fn duplicate_prepare(lease: &PrepareLease) -> PrepareLease {
         PrepareLease {
             sessions: Arc::clone(&lease.sessions),
