@@ -65,9 +65,7 @@ impl PluginRecord {
 
     pub(crate) fn local_declarative(manifest: PluginManifestV1) -> Result<Self, String> {
         manifest.validate()?;
-        let canonical = CanonicalManifestV1::from(&manifest);
-        let bytes =
-            serde_json::to_vec(&canonical).map_err(|_| "manifest fingerprint failed".to_owned())?;
+        let bytes = canonical_manifest_bytes(&manifest)?;
         let mut digest = Sha256::new();
         digest.update(LOCAL_FINGERPRINT_DOMAIN);
         digest.update(bytes);
@@ -80,6 +78,10 @@ impl PluginRecord {
 
     pub(crate) fn manifest(&self) -> &PluginManifestV1 {
         &self.manifest
+    }
+
+    pub(crate) fn canonical_manifest_bytes(&self) -> Result<Vec<u8>, String> {
+        canonical_manifest_bytes(&self.manifest)
     }
 
     pub(crate) fn source(&self) -> PluginSource {
@@ -99,6 +101,11 @@ impl PluginRecord {
             approval_fingerprint: self.approval_fingerprint.clone(),
         }
     }
+}
+
+fn canonical_manifest_bytes(manifest: &PluginManifestV1) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&CanonicalManifestV1::from(manifest))
+        .map_err(|_| "manifest fingerprint failed".to_owned())
 }
 
 #[cfg(test)]
