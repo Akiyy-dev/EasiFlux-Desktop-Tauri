@@ -917,3 +917,44 @@ async fn generation_max_rejects_before_stage() {
     assert_eq!(result["disabledDecisionSaved"], false);
     assert_eq!(*fixture.events.lock().unwrap(), ["scan"]);
 }
+
+#[tokio::test]
+async fn generation_max_with_changed_prescan_returns_structured_failure_before_writes() {
+    let fixture = ImportFixture::new().await;
+    fixture
+        .runtime
+        .registry
+        .write()
+        .await
+        .set_catalog_generation_for_test(u64::MAX);
+    let preview = fixture.prepare_valid().await;
+    write_package(
+        &fixture.local_root,
+        "pkg-00000000000000000000000000000002",
+        unrelated_manifest(),
+    );
+    fixture.clear_events();
+
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(result["status"], "notImported");
+    assert_eq!(result["reasonCode"], "plugin_catalog_generation_exhausted");
+    assert_eq!(result["disabledDecisionSaved"], false);
+    assert_eq!(
+        result["snapshot"]["catalogGeneration"],
+        u64::MAX.to_string()
+    );
+    assert_eq!(result["snapshot"]["plugins"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["snapshot"]["plugins"][0]["manifest"]["id"],
+        "com.example.builtin"
+    );
+    assert_eq!(*fixture.events.lock().unwrap(), ["scan"]);
+    assert_eq!(fixture.persistence.saves.load(Ordering::SeqCst), 0);
+}

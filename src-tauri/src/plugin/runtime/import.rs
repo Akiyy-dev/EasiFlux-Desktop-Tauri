@@ -130,7 +130,24 @@ async fn run_commit(
 
     let prescan = scan_for_import(&runtime).await;
     let usage = prescan.usage;
-    publish_import_outcome(&runtime, prescan).await?;
+    if let Err(error) = publish_import_outcome(&runtime, prescan).await {
+        if matches!(
+            error,
+            AppError::Plugin {
+                code: "plugin_catalog_generation_exhausted",
+                ..
+            }
+        ) {
+            return Ok(snapshot_after_failure(
+                &runtime,
+                ImportCommitFailure::CatalogGenerationExhausted,
+                false,
+            )
+            .await);
+        }
+        tracing::error!("plugin import prescan publication failed");
+        return Err(runtime_error());
+    }
     let current_generation = runtime.registry.read().await.catalog_generation();
     if !matches_generation(
         &expected_catalog_generation,
