@@ -1657,9 +1657,10 @@ async fn postscan_failure_reports_imported_not_visible() {
 }
 
 #[tokio::test]
-async fn unverified_promoted_identity_is_imported_not_visible() {
+async fn committed_promotion_error_preserves_last_complete_snapshot() {
     let fixture = ImportFixture::new().await;
     let preview = fixture.prepare_valid().await;
+    let before = serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
     fixture.storage_controls.make_next_promotion_unverified();
     fixture.clear_events();
     let result = wire(
@@ -1671,17 +1672,53 @@ async fn unverified_promoted_identity_is_imported_not_visible() {
     );
     assert_eq!(result["status"], "importedNotVisible");
     assert_eq!(
-        imported_item(&result["snapshot"], "com.example.notes")["status"],
-        "disabled"
+        result["reasonCode"],
+        "plugin_import_publication_unconfirmed"
+    );
+    assert_eq!(result["snapshot"], before);
+    assert_eq!(
+        serde_json::to_value(fixture.runtime.registry.read().await.catalog_snapshot()).unwrap(),
+        before
     );
     assert_eq!(fixture.target_manifests().len(), 1);
-    assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+    assert_eq!(
+        *fixture.events.lock().unwrap(),
+        [
+            "scan",
+            "stage",
+            "disable",
+            "promote",
+            "verify-target",
+            "scan"
+        ]
+    );
+    assert!(!fixture.plugins_root.join("managed-ownership.json").exists());
+    let state = fixture.persistence.inner.load().unwrap().state;
+    assert_eq!(state.revision, 1);
+    assert_eq!(state.entries.len(), 1);
+    assert_eq!(state.entries[0].id.to_string(), "com.example.notes");
+    assert!(!state.entries[0].enabled);
+    let replay = expect_commit_error(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await,
+    );
+    assert_eq!(error_code(replay), "plugin_import_token_invalid");
+    assert_eq!(
+        fixture
+            .storage_controls
+            .promote_calls
+            .load(Ordering::SeqCst),
+        1
+    );
 }
 
 #[tokio::test]
-async fn unconfirmed_promotion_error_never_claims_not_imported_or_cleans_stage() {
+async fn unconfirmed_promotion_error_preserves_last_complete_snapshot() {
     let fixture = ImportFixture::new().await;
     let preview = fixture.prepare_valid().await;
+    let before = serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
     fixture
         .storage_controls
         .unconfirmed_promotion
@@ -1696,13 +1733,38 @@ async fn unconfirmed_promotion_error_never_claims_not_imported_or_cleans_stage()
     );
     assert_eq!(result["status"], "importedNotVisible");
     assert_eq!(
+        result["reasonCode"],
+        "plugin_import_publication_unconfirmed"
+    );
+    assert_eq!(result["snapshot"], before);
+    assert_eq!(
+        serde_json::to_value(fixture.runtime.registry.read().await.catalog_snapshot()).unwrap(),
+        before
+    );
+    assert_eq!(
         fs::read_dir(fixture.plugins_root.join("import-staging"))
             .unwrap()
             .count(),
         1
     );
     assert!(fixture.target_manifests().is_empty());
-    assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+    assert_eq!(
+        *fixture.events.lock().unwrap(),
+        ["scan", "stage", "disable", "promote", "scan"]
+    );
+    assert!(!fixture.plugins_root.join("managed-ownership.json").exists());
+    let state = fixture.persistence.inner.load().unwrap().state;
+    assert_eq!(state.revision, 1);
+    assert_eq!(state.entries.len(), 1);
+    assert_eq!(state.entries[0].id.to_string(), "com.example.notes");
+    assert!(!state.entries[0].enabled);
+    let replay = expect_commit_error(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await,
+    );
+    assert_eq!(error_code(replay), "plugin_import_token_invalid");
     assert_eq!(
         fixture
             .storage_controls

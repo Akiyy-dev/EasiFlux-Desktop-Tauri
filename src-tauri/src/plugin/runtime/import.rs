@@ -253,7 +253,9 @@ fn run_commit_blocking(
                 true,
             ));
         }
-        Ok(Err(_)) => (None, false),
+        // A returned error after a committed or unconfirmed promotion cannot
+        // authorize publication any more than a worker panic can.
+        Ok(Err(_)) => (None, true),
         Err(_) => (None, true),
     };
     // No path below this point cleans the stage/package or says notImported.
