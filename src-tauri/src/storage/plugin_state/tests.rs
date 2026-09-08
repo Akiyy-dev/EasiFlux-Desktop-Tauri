@@ -770,6 +770,76 @@ fn injected_write_rotation_promotion_and_restore_failures_never_publish_uncommit
     }
 }
 
+// Catches any atomic-write checkpoint reviving a local authorization that was
+// normalized while the save transaction recovered from a secondary candidate.
+#[test]
+fn every_write_checkpoint_preserves_secondary_recovery_normalization() {
+    for suffix in [".tmp", ".bak"] {
+        for (failures, committed) in [
+            (vec![WriteStep::TempWrite], false),
+            (vec![WriteStep::BackupRotation], false),
+            (vec![WriteStep::Promotion], false),
+            (vec![WriteStep::Promotion, WriteStep::Restore], false),
+            (vec![WriteStep::PostCommitSync], true),
+        ] {
+            let fixture = Fixture::new();
+            let mut recovered = state(41);
+            recovered.entries[0].enabled = true;
+            recovered
+                .entries
+                .push(local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A));
+            fixture.write("", b"broken primary");
+            fixture.write(suffix, serde_json::to_vec(&recovered).unwrap());
+
+            let mut requested = recovered.clone();
+            requested.revision = 42;
+            requested.entries[1].enabled = false;
+            let requested_failures = failures.clone();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&observed);
+            let mut store = fixture.store();
+            store.file.hook = Some(Arc::new(move |step| {
+                recorded.lock().unwrap().push(step);
+                if failures.contains(&step) {
+                    Err(std::io::Error::other("raw-secret recovery fault"))
+                } else {
+                    Ok(())
+                }
+            }));
+
+            let saved = store.save(&requested);
+            if committed {
+                saved.unwrap();
+            } else {
+                assert_sanitized(saved.unwrap_err());
+            }
+            for failure in requested_failures {
+                assert!(
+                    observed.lock().unwrap().contains(&failure),
+                    "requested secondary-recovery fault {failure:?} did not run"
+                );
+            }
+
+            let loaded = fixture.store().load().unwrap();
+            assert_eq!(loaded.state.revision, if committed { 42 } else { 41 });
+            let builtin = loaded
+                .state
+                .entries
+                .iter()
+                .find(|entry| entry.source == PluginSource::BuiltIn)
+                .unwrap();
+            assert!(builtin.enabled);
+            let local = loaded
+                .state
+                .entries
+                .iter()
+                .find(|entry| entry.source == PluginSource::LocalDeclarative)
+                .unwrap();
+            assert!(!local.enabled);
+        }
+    }
+}
+
 // Catches ignoring real filesystem failures and leaking private paths in error contracts.
 #[test]
 fn real_io_failure_is_sanitized_and_keeps_previous_main() {

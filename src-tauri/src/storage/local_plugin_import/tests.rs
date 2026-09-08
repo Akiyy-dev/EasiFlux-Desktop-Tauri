@@ -267,6 +267,101 @@ fn prepromotion_failure_preserves_stage_and_no_target() {
 }
 
 #[test]
+fn every_filesystem_checkpoint_respects_the_directory_commit_boundary() {
+    let prepare_steps = [
+        ImportFsStep::CreateStage,
+        ImportFsStep::WriteManifest,
+        ImportFsStep::SyncManifest,
+        #[cfg(unix)]
+        ImportFsStep::SyncStageDirectory,
+        #[cfg(unix)]
+        ImportFsStep::SyncStagingParent,
+    ];
+
+    for step in prepare_steps {
+        let (_temp, root) = root();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&observed);
+        let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
+            .with_controls(TestControls {
+                hook: Some(Arc::new(move |actual| {
+                    recorded.lock().unwrap().push(actual);
+                    if actual == step {
+                        Err(io::ErrorKind::PermissionDenied.into())
+                    } else {
+                        Ok(())
+                    }
+                })),
+                ..Default::default()
+            });
+        assert_eq!(
+            storage.prepare_stage(VALID).err(),
+            Some(ImportCommitFailure::WriteFailed)
+        );
+        assert!(observed.lock().unwrap().contains(&step));
+        assert!(children(&root.join("local")).is_empty());
+        assert!(children(&root.join("import-staging")).is_empty());
+    }
+
+    let (_temp, before_root) = root();
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&observed);
+    let storage = SystemLocalManifestImportStorage::with_plugins_root(before_root.clone())
+        .with_controls(TestControls {
+            hook: Some(Arc::new(move |actual| {
+                recorded.lock().unwrap().push(actual);
+                if actual == ImportFsStep::BeforePromotion {
+                    Err(io::ErrorKind::PermissionDenied.into())
+                } else {
+                    Ok(())
+                }
+            })),
+            ..Default::default()
+        });
+    let mut stage = storage.prepare_stage(VALID).unwrap();
+    assert_eq!(
+        stage.promote().err(),
+        Some(ImportCommitFailure::WriteFailed)
+    );
+    assert!(observed
+        .lock()
+        .unwrap()
+        .contains(&ImportFsStep::BeforePromotion));
+    assert!(children(&before_root.join("local")).is_empty());
+    assert_eq!(children(&before_root.join("import-staging")).len(), 1);
+    stage.cleanup().unwrap();
+
+    for (step, identity_verified) in [
+        (ImportFsStep::AfterPromotion, false),
+        (ImportFsStep::SyncDestinationDirectory, true),
+    ] {
+        let (_temp, root) = root();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&observed);
+        let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
+            .with_controls(TestControls {
+                hook: Some(Arc::new(move |actual| {
+                    recorded.lock().unwrap().push(actual);
+                    if actual == step {
+                        Err(io::ErrorKind::PermissionDenied.into())
+                    } else {
+                        Ok(())
+                    }
+                })),
+                ..Default::default()
+            });
+        let mut stage = storage.prepare_stage(VALID).unwrap();
+        let promotion = stage.promote().unwrap();
+        assert!(observed.lock().unwrap().contains(&step));
+        assert_eq!(promotion.object_identity_verified, identity_verified);
+        let target = children(&root.join("local")).pop().unwrap();
+        assert_eq!(fs::read(target.join("manifest.json")).unwrap(), VALID);
+        assert!(children(&root.join("import-staging")).is_empty());
+        assert!(stage.cleanup().is_err());
+    }
+}
+
+#[test]
 fn prepare_failures_clean_only_created_objects() {
     for step in [
         ImportFsStep::CreateStage,

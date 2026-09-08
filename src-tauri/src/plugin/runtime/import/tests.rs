@@ -1,9 +1,12 @@
 use std::fs;
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -18,17 +21,25 @@ use crate::plugin::import::{
     test_support::VALID, CommitImportResult, ImportCommitFailure, ImportPreview,
     LocalManifestSelector, PrepareImportResult, PreparedManifest, SelectedManifestSource,
 };
-use crate::plugin::manifest::PluginManifestV1;
+use crate::plugin::manifest::{PluginManifestV1, PluginSource};
+use crate::plugin::record::PluginRecord;
 use crate::plugin::PluginRegistry;
 use crate::storage::local_plugin_import::{
     LocalManifestImportStorage, OwnedImportStage, Promotion, SystemLocalManifestImportStorage,
 };
 use crate::storage::plugin_state::{
-    PluginStateFileV2, PluginStateLoad, PluginStatePersistence, PluginStateStore,
+    PluginStateEntryV2, PluginStateFileV2, PluginStateLoad, PluginStatePersistence,
+    PluginStateStore,
 };
 
 const WATCHDOG: Duration = Duration::from_secs(10);
 const NEVER: usize = usize::MAX;
+const CRASH_EXIT_CODE: i32 = 73;
+const CRASH_ROOT_ENV: &str = "EASIFLUX_IMPORT_TEST_ROOT";
+const CRASH_CHECKPOINT_ENV: &str = "EASIFLUX_IMPORT_TEST_CHECKPOINT";
+const CRASH_CHILD_TEST: &str = "plugin::runtime::import::tests::import_crash_child";
+const VALID_FINGERPRINT: &str =
+    "v1:sha256:71bb47f19cd31329579e843b621a87085d3e1346a9e354d7f60b1393ee10deee";
 
 type Events = Arc<Mutex<Vec<&'static str>>>;
 
@@ -87,6 +98,23 @@ impl PluginStatePersistence for RecordingPersistence {
             });
         }
         self.inner.save(state)
+    }
+}
+
+struct CrashPersistence {
+    inner: PluginStateStore,
+    checkpoint: String,
+}
+
+impl PluginStatePersistence for CrashPersistence {
+    fn load(&self) -> AppResult<PluginStateLoad> {
+        self.inner.load()
+    }
+
+    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
+        self.inner.save(state)?;
+        exit_at_checkpoint(&self.checkpoint, "disabled-saved");
+        Ok(())
     }
 }
 
@@ -180,7 +208,6 @@ struct StorageControls {
 }
 
 impl StorageControls {
-    #[cfg(unix)]
     fn fail_next_prepare(&self) {
         self.fail_prepare.store(true, Ordering::SeqCst);
     }
@@ -281,6 +308,48 @@ impl OwnedImportStage for RecordingStage {
     }
 }
 
+struct CrashStorage {
+    inner: SystemLocalManifestImportStorage,
+    checkpoint: String,
+}
+
+impl LocalManifestImportStorage for CrashStorage {
+    fn prepare_stage(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
+        let inner = self.inner.prepare_stage(bytes)?;
+        exit_at_checkpoint(&self.checkpoint, "stage-ready");
+        Ok(Box::new(CrashStage {
+            inner,
+            checkpoint: self.checkpoint.clone(),
+        }))
+    }
+}
+
+struct CrashStage {
+    inner: Box<dyn OwnedImportStage>,
+    checkpoint: String,
+}
+
+impl OwnedImportStage for CrashStage {
+    fn promote(&mut self) -> Result<Promotion, ImportCommitFailure> {
+        let promotion = self.inner.promote()?;
+        exit_at_checkpoint(&self.checkpoint, "promoted");
+        Ok(promotion)
+    }
+
+    fn cleanup(&mut self) -> Result<(), ImportCommitFailure> {
+        self.inner.cleanup()
+    }
+}
+
+fn exit_at_checkpoint(configured: &str, actual: &str) {
+    if configured == actual {
+        std::process::exit(CRASH_EXIT_CODE);
+    }
+}
+
 struct ImportFixture {
     runtime: Arc<PluginRuntime>,
     events: Events,
@@ -295,6 +364,10 @@ struct ImportFixture {
 
 impl ImportFixture {
     async fn new() -> Self {
+        Self::with_existing_manifest(None).await
+    }
+
+    async fn with_real_disk() -> Self {
         Self::with_existing_manifest(None).await
     }
 
@@ -363,6 +436,64 @@ impl ImportFixture {
         }
     }
 
+    fn state_path(&self) -> PathBuf {
+        self.plugins_root.join("state.json")
+    }
+
+    fn seed_enabled_orphan(&self) -> io::Result<()> {
+        let builtin = PluginRecord::built_in(manifest_from_bytes(builtin_manifest()))
+            .unwrap()
+            .identity();
+        let local = PreparedManifest::parse(VALID).unwrap().record().identity();
+        assert_eq!(local.approval_fingerprint, VALID_FINGERPRINT);
+        let state = PluginStateFileV2 {
+            schema_version: 2,
+            revision: 7,
+            entries: vec![
+                PluginStateEntryV2 {
+                    id: builtin.id,
+                    source: builtin.source,
+                    publisher_id: builtin.publisher_id,
+                    approval_fingerprint: builtin.approval_fingerprint,
+                    enabled: true,
+                },
+                PluginStateEntryV2 {
+                    id: local.id,
+                    source: local.source,
+                    publisher_id: local.publisher_id,
+                    approval_fingerprint: VALID_FINGERPRINT.to_owned(),
+                    enabled: true,
+                },
+            ],
+        };
+        fs::create_dir_all(&self.plugins_root)?;
+        fs::write(self.state_path(), serde_json::to_vec(&state).unwrap())
+    }
+
+    fn corrupt_primary(&self) -> io::Result<()> {
+        fs::write(self.state_path(), b"broken")
+    }
+
+    fn restart_runtime(&self) -> Arc<PluginRuntime> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let registry = PluginRegistry::initialize(
+            vec![manifest_from_bytes(builtin_manifest())],
+            Box::new(PluginStateStore::with_path(self.state_path())),
+        );
+        Arc::new(PluginRuntime::with_import_services(
+            registry,
+            Arc::new(RecordingDiscovery::new(self.local_root.clone(), events)),
+            Arc::new(SystemLocalManifestReader),
+            Arc::new(SystemLocalManifestImportStorage::with_plugins_root(
+                self.plugins_root.clone(),
+            )),
+        ))
+    }
+
+    fn root(&self) -> &Path {
+        self.source.parent().unwrap()
+    }
+
     fn clear_events(&self) {
         self.events.lock().unwrap().clear();
     }
@@ -377,6 +508,114 @@ impl ImportFixture {
             .collect::<Vec<_>>();
         manifests.sort();
         manifests
+    }
+}
+
+fn crash_runtime(root: &Path, checkpoint: &str) -> Arc<PluginRuntime> {
+    let plugins_root = root.join("plugins");
+    let local_root = plugins_root.join("local");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let registry = PluginRegistry::initialize(
+        vec![manifest_from_bytes(builtin_manifest())],
+        Box::new(CrashPersistence {
+            inner: PluginStateStore::with_path(plugins_root.join("state.json")),
+            checkpoint: checkpoint.to_owned(),
+        }),
+    );
+    Arc::new(PluginRuntime::with_import_services(
+        registry,
+        Arc::new(RecordingDiscovery::new(local_root, events)),
+        Arc::new(SystemLocalManifestReader),
+        Arc::new(CrashStorage {
+            inner: SystemLocalManifestImportStorage::with_plugins_root(plugins_root),
+            checkpoint: checkpoint.to_owned(),
+        }),
+    ))
+}
+
+fn run_crash_child(root: &Path, checkpoint: &str) -> ExitStatus {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", CRASH_CHILD_TEST, "--nocapture"])
+        .env_clear()
+        .env(CRASH_ROOT_ENV, root)
+        .env(CRASH_CHECKPOINT_ENV, checkpoint)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + WATCHDOG;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("import crash child timed out at {checkpoint}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn persisted_enabled(plugins_root: &Path, id: &str, source: PluginSource) -> bool {
+    let state = PluginStateStore::with_path(plugins_root.join("state.json"))
+        .load()
+        .unwrap()
+        .state;
+    state_enabled(&state, id, source)
+}
+
+fn state_enabled(state: &PluginStateFileV2, id: &str, source: PluginSource) -> bool {
+    state
+        .entries
+        .iter()
+        .find(|entry| entry.id.as_str() == id && entry.source == source)
+        .expect("persisted plugin decision")
+        .enabled
+}
+
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    value.into()
+}
+
+fn direct_entry_count(path: &Path) -> usize {
+    fs::read_dir(path).unwrap().count()
+}
+
+fn assert_abandoned_stage_fills_capacity(plugins_root: &Path) {
+    let staging = plugins_root.join("import-staging");
+    assert_eq!(direct_entry_count(&staging), 1);
+    let abandoned_stage = fs::read_dir(&staging)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    for index in 0..15 {
+        fs::write(staging.join(format!("unknown-{index}")), b"preserve").unwrap();
+    }
+    let mut before = fs::read_dir(&staging)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    before.sort();
+    let storage = SystemLocalManifestImportStorage::with_plugins_root(plugins_root.to_owned());
+    assert_eq!(
+        storage.prepare_stage(VALID).err(),
+        Some(ImportCommitFailure::StagingCapacityExceeded)
+    );
+    let mut after = fs::read_dir(&staging)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    after.sort();
+    assert_eq!(after, before);
+    assert!(abandoned_stage.is_dir());
+    for index in 0..15 {
+        assert_eq!(
+            fs::read(staging.join(format!("unknown-{index}"))).unwrap(),
+            b"preserve"
+        );
     }
 }
 
@@ -424,6 +663,157 @@ fn imported_item<'a>(snapshot: &'a Value, id: &str) -> &'a Value {
         .iter()
         .find(|item| item["manifest"]["id"] == id)
         .expect("catalog item")
+}
+
+#[tokio::test]
+async fn imported_package_stays_disabled_after_primary_corruption_and_backup_recovery() {
+    let mut fixture = ImportFixture::with_real_disk().await;
+    fixture.seed_enabled_orphan().unwrap();
+    fixture.runtime = fixture.restart_runtime();
+
+    let preview = fixture.prepare_valid().await;
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["status"], "imported");
+
+    let backup: PluginStateFileV2 =
+        serde_json::from_slice(&fs::read(sidecar(&fixture.state_path(), ".bak")).unwrap()).unwrap();
+    assert!(state_enabled(
+        &backup,
+        "com.example.notes",
+        PluginSource::LocalDeclarative
+    ));
+    assert!(state_enabled(
+        &backup,
+        "com.example.builtin",
+        PluginSource::BuiltIn
+    ));
+
+    fixture.corrupt_primary().unwrap();
+    let restarted = fixture.restart_runtime();
+    let snapshot = serde_json::to_value(restarted.get_catalog().await.unwrap()).unwrap();
+
+    let local = imported_item(&snapshot, "com.example.notes");
+    assert_eq!(local["source"], "localDeclarative");
+    assert_eq!(local["status"], "disabled");
+    let builtin = imported_item(&snapshot, "com.example.builtin");
+    assert_eq!(builtin["source"], "builtIn");
+    assert_eq!(builtin["status"], "enabled");
+}
+
+#[tokio::test]
+async fn process_crash_checkpoints_reconstruct_only_committed_disk_state() {
+    for checkpoint in ["stage-ready", "disabled-saved", "promoted", "published"] {
+        let mut fixture = ImportFixture::with_real_disk().await;
+        fixture.seed_enabled_orphan().unwrap();
+        fixture.runtime = fixture.restart_runtime();
+        let old_preview = fixture.prepare_valid().await;
+        let root = fixture.root().to_owned();
+        let owned_checkpoint = checkpoint.to_owned();
+
+        let status = tokio::task::spawn_blocking(move || run_crash_child(&root, &owned_checkpoint))
+            .await
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(CRASH_EXIT_CODE),
+            "checkpoint {checkpoint}"
+        );
+
+        if matches!(checkpoint, "promoted" | "published") {
+            fixture.corrupt_primary().unwrap();
+        }
+        fixture.runtime = fixture.restart_runtime();
+        let before_targets = fixture.target_manifests();
+        let before_stages = direct_entry_count(&fixture.plugins_root.join("import-staging"));
+        let replay = expect_commit_error(
+            fixture
+                .runtime
+                .commit_import(&old_preview.token, &old_preview.catalog_generation)
+                .await,
+        );
+        assert_eq!(error_code(replay), "plugin_import_token_invalid");
+        assert_eq!(fixture.target_manifests(), before_targets);
+        assert_eq!(
+            direct_entry_count(&fixture.plugins_root.join("import-staging")),
+            before_stages
+        );
+
+        let snapshot = serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
+        let builtin = imported_item(&snapshot, "com.example.builtin");
+        assert_eq!(builtin["source"], "builtIn");
+        assert_eq!(builtin["status"], "enabled");
+
+        if matches!(checkpoint, "stage-ready" | "disabled-saved") {
+            assert!(snapshot["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["manifest"]["id"] != "com.example.notes"));
+            assert!(fixture.target_manifests().is_empty());
+            assert_eq!(
+                persisted_enabled(
+                    &fixture.plugins_root,
+                    "com.example.notes",
+                    PluginSource::LocalDeclarative
+                ),
+                checkpoint == "stage-ready"
+            );
+            assert_abandoned_stage_fills_capacity(&fixture.plugins_root);
+        } else {
+            let local = imported_item(&snapshot, "com.example.notes");
+            assert_eq!(local["source"], "localDeclarative");
+            assert_eq!(local["status"], "disabled");
+            assert_eq!(fixture.target_manifests().len(), 1);
+            assert!(!persisted_enabled(
+                &fixture.plugins_root,
+                "com.example.notes",
+                PluginSource::LocalDeclarative
+            ));
+            assert_eq!(
+                direct_entry_count(&fixture.plugins_root.join("import-staging")),
+                0
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "launched only by process_crash_checkpoints_reconstruct_only_committed_disk_state"]
+async fn import_crash_child() {
+    let Some(root) = std::env::var_os(CRASH_ROOT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let Some(checkpoint) =
+        std::env::var_os(CRASH_CHECKPOINT_ENV).and_then(|value| value.into_string().ok())
+    else {
+        return;
+    };
+    assert!(matches!(
+        checkpoint.as_str(),
+        "stage-ready" | "disabled-saved" | "promoted" | "published"
+    ));
+    let runtime = crash_runtime(&root, &checkpoint);
+    let preview = match runtime
+        .prepare_import(Arc::new(FixedSelector(Some(root.join("selected.json")))))
+        .await
+        .unwrap()
+    {
+        PrepareImportResult::Ready(preview) => preview,
+        PrepareImportResult::Cancelled(_) => panic!("ready preview required"),
+    };
+    let result = runtime
+        .commit_import(&preview.token, &preview.catalog_generation)
+        .await
+        .unwrap();
+    assert_eq!(wire(result)["status"], "imported");
+    exit_at_checkpoint(&checkpoint, "published");
+    panic!("checkpoint {checkpoint} was not reached");
 }
 
 #[test]
@@ -648,6 +1038,39 @@ async fn state_failure_prevents_promotion() {
         *fixture.events.lock().unwrap(),
         ["scan", "stage", "disable", "cleanup"]
     );
+}
+
+#[tokio::test]
+async fn stage_preparation_failure_never_saves_state_or_promotes() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    fixture.storage_controls.fail_next_prepare();
+    fixture.clear_events();
+    let before_saves = fixture.persistence.saves.load(Ordering::SeqCst);
+
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(result["status"], "notImported");
+    assert_eq!(result["reasonCode"], "plugin_import_write_failed");
+    assert_eq!(result["disabledDecisionSaved"], false);
+    assert_eq!(
+        fixture.persistence.saves.load(Ordering::SeqCst),
+        before_saves
+    );
+    assert_eq!(
+        fixture
+            .storage_controls
+            .promote_calls
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(*fixture.events.lock().unwrap(), ["scan", "stage"]);
 }
 
 #[cfg(unix)]
