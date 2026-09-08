@@ -6,6 +6,60 @@ use crate::storage::plugin_state::{PluginStateEntryV2, PluginStateFileV2, Plugin
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
+#[test]
+fn postcommit_save_failure_adopts_the_committed_decision() {
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    memory.0.lock().unwrap().postcommit_error = true;
+    let mut registry = memory.registry(vec![manifest("com.alpha")]);
+    assert!(registry.set_enabled("com.alpha", true, "0").is_err());
+    assert_eq!(snapshot(&registry)["revision"], "1");
+    assert_eq!(snapshot(&registry)["plugins"][0]["status"], "enabled");
+}
+
+#[test]
+fn every_persistence_outcome_controls_memory_adoption_independently_of_error() {
+    use crate::storage::safe_plugin_document::{PersistFailure, PersistOutcome, PersistResult};
+    struct OutcomePersistence(PersistOutcome, bool);
+    impl PluginStatePersistence for OutcomePersistence {
+        fn load(&self) -> AppResult<PluginStateLoad> {
+            Ok(PluginStateLoad {
+                state: PluginStateFileV2::empty(),
+                requires_rewrite: false,
+            })
+        }
+        fn save(&self, _: &PluginStateFileV2) -> PersistResult {
+            if self.1 {
+                Err(PersistFailure { outcome: self.0 })
+            } else {
+                Ok(self.0)
+            }
+        }
+    }
+    for outcome in [
+        PersistOutcome::NotCommitted,
+        PersistOutcome::CommittedProcessCrashSafe,
+        PersistOutcome::CommittedDurable,
+    ] {
+        for failure in [false, true] {
+            let mut registry = PluginRegistry::initialize(
+                vec![manifest("com.alpha")],
+                Box::new(OutcomePersistence(outcome, failure)),
+            );
+            let result = registry.set_enabled("com.alpha", true, "0");
+            let committed = outcome != PersistOutcome::NotCommitted;
+            assert_eq!(result.is_err(), failure || !committed);
+            assert_eq!(
+                snapshot(&registry)["revision"],
+                if committed { "1" } else { "0" }
+            );
+            assert_eq!(
+                snapshot(&registry)["plugins"][0]["status"],
+                if committed { "enabled" } else { "disabled" }
+            );
+        }
+    }
+}
+
 // Only the external storage boundary is replaced: registry derivation,
 // validation, cloning and committing remain real production behavior.
 #[derive(Clone)]
@@ -16,6 +70,7 @@ struct MemoryState {
     loaded: PluginStateLoad,
     load_error: bool,
     save_error: bool,
+    postcommit_error: bool,
     loads: usize,
     saves: Vec<PluginStateFileV2>,
 }
@@ -30,6 +85,7 @@ impl MemoryPersistence {
             },
             load_error: false,
             save_error: false,
+            postcommit_error: false,
             loads: 0,
             saves: vec![],
         })))
@@ -83,11 +139,14 @@ impl PluginStatePersistence for MemoryPersistence {
         }
     }
 
-    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
+    fn save(
+        &self,
+        state: &PluginStateFileV2,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
         let mut memory = self.0.lock().unwrap();
         memory.saves.push(state.clone());
         if memory.save_error {
-            return Err(storage_error());
+            return Err(storage_error().into());
         }
         state
             .validate_for_persistence()
@@ -97,7 +156,17 @@ impl PluginStatePersistence for MemoryPersistence {
             state: state.clone(),
             requires_rewrite: false,
         };
-        Ok(())
+        if memory.postcommit_error {
+            return Err(crate::storage::safe_plugin_document::PersistFailure {
+                outcome:
+                    crate::storage::safe_plugin_document::PersistOutcome::CommittedProcessCrashSafe,
+            });
+        }
+        Ok(if cfg!(windows) {
+            crate::storage::safe_plugin_document::PersistOutcome::CommittedProcessCrashSafe
+        } else {
+            crate::storage::safe_plugin_document::PersistOutcome::CommittedDurable
+        })
     }
 }
 

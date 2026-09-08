@@ -317,8 +317,15 @@ mod tests {
             }
         }
 
-        fn save(&self, _state: &PluginStateFileV2) -> AppResult<()> {
-            Ok(())
+        fn save(
+            &self,
+            _state: &PluginStateFileV2,
+        ) -> crate::storage::safe_plugin_document::PersistResult {
+            Ok(if cfg!(windows) {
+                crate::storage::safe_plugin_document::PersistOutcome::CommittedProcessCrashSafe
+            } else {
+                crate::storage::safe_plugin_document::PersistOutcome::CommittedDurable
+            })
         }
     }
 

@@ -87,7 +87,10 @@ impl PluginStatePersistence for RecordingPersistence {
         self.inner.load()
     }
 
-    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
+    fn save(
+        &self,
+        state: &PluginStateFileV2,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
         self.events.lock().unwrap().push("disable");
         self.saves.fetch_add(1, Ordering::SeqCst);
         if self.fail_save.swap(false, Ordering::SeqCst) {
@@ -95,7 +98,8 @@ impl PluginStatePersistence for RecordingPersistence {
                 code: "plugin_state_persist_failed",
                 message: "插件状态保存失败",
                 diagnostic: None,
-            });
+            }
+            .into());
         }
         self.inner.save(state)
     }
@@ -111,10 +115,13 @@ impl PluginStatePersistence for CrashPersistence {
         self.inner.load()
     }
 
-    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
-        self.inner.save(state)?;
+    fn save(
+        &self,
+        state: &PluginStateFileV2,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
+        let outcome = self.inner.save(state)?;
         exit_at_checkpoint(&self.checkpoint, "disabled-saved");
-        Ok(())
+        Ok(outcome)
     }
 }
 

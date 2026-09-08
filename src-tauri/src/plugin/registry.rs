@@ -46,7 +46,10 @@ impl PluginStatePersistence for SystemPersistence {
         PluginStateStore::try_new()?.load()
     }
 
-    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
+    fn save(
+        &self,
+        state: &PluginStateFileV2,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
         PluginStateStore::try_new()?.save(state)
     }
 }
@@ -348,12 +351,26 @@ impl PluginRegistry {
         }
         next.validate_for_persistence()
             .map_err(|_| plugin_error("plugin_state_persist_failed", "插件状态保存失败"))?;
-        persistence
-            .save(&next)
-            .map_err(|_| plugin_error("plugin_state_persist_failed", "插件状态保存失败"))?;
-        *state = next;
-        *requires_rewrite = false;
-        Ok(())
+        let result = persistence.save(&next);
+        let outcome = match &result {
+            Ok(outcome) => *outcome,
+            Err(failure) => failure.outcome,
+        };
+        if crate::storage::safe_plugin_document::persist_outcome_committed(outcome) {
+            *state = next;
+            *requires_rewrite = false;
+        }
+        match result {
+            Ok(outcome)
+                if crate::storage::safe_plugin_document::persist_outcome_committed(outcome) =>
+            {
+                Ok(())
+            }
+            _ => Err(plugin_error(
+                "plugin_state_persist_failed",
+                "插件状态保存失败",
+            )),
+        }
     }
 }
 

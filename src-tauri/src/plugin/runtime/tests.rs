@@ -41,11 +41,18 @@ impl PluginStatePersistence for MemoryPersistence {
         })
     }
 
-    fn save(&self, next: &PluginStateFileV2) -> AppResult<()> {
+    fn save(
+        &self,
+        next: &PluginStateFileV2,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
         let mut memory = self.0.lock().unwrap();
         memory.saves += 1;
         memory.state = Some(next.clone());
-        Ok(())
+        Ok(if cfg!(windows) {
+            crate::storage::safe_plugin_document::PersistOutcome::CommittedProcessCrashSafe
+        } else {
+            crate::storage::safe_plugin_document::PersistOutcome::CommittedDurable
+        })
     }
 }
 
@@ -674,8 +681,15 @@ impl PluginStatePersistence for RecoveryPanicPersistence {
         }
     }
 
-    fn save(&self, _next: &PluginStateFileV2) -> AppResult<()> {
-        Ok(())
+    fn save(
+        &self,
+        _next: &PluginStateFileV2,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
+        Ok(if cfg!(windows) {
+            crate::storage::safe_plugin_document::PersistOutcome::CommittedProcessCrashSafe
+        } else {
+            crate::storage::safe_plugin_document::PersistOutcome::CommittedDurable
+        })
     }
 }
 

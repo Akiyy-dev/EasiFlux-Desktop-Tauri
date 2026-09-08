@@ -173,11 +173,18 @@ mod tests {
             })
         }
 
-        fn save(&self, next: &PluginStateFileV2) -> AppResult<()> {
+        fn save(
+            &self,
+            next: &PluginStateFileV2,
+        ) -> crate::storage::safe_plugin_document::PersistResult {
             let mut state = self.0.lock().unwrap();
             state.saves.push(next.clone());
             state.persisted = next.clone();
-            Ok(())
+            Ok(if cfg!(windows) {
+                crate::storage::safe_plugin_document::PersistOutcome::CommittedProcessCrashSafe
+            } else {
+                crate::storage::safe_plugin_document::PersistOutcome::CommittedDurable
+            })
         }
     }
 

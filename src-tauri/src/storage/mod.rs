@@ -6,10 +6,12 @@ mod config_persistence;
 pub mod credentials;
 pub mod kline_store;
 pub(crate) mod local_plugin_import;
+pub(crate) mod managed_plugin_ownership;
 pub mod notification_store;
 pub mod order_submissions;
 pub(crate) mod plugin_state;
 pub mod risk_usage;
+pub(crate) mod safe_plugin_document;
 pub mod trade_log;
 
 pub use cache::CacheStore;
