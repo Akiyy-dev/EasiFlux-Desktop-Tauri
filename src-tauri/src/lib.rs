@@ -161,7 +161,7 @@ mod capability_tests {
 
     #[test]
     fn main_window_can_force_close_after_chart_workspace_flush() {
-        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
 
         let access = context.runtime_authority_mut().resolve_access(
             "plugin:window|destroy",
@@ -179,7 +179,7 @@ mod capability_tests {
     // Catches granting the plugin control surface to another window or remote content.
     #[test]
     fn plugin_commands_are_available_only_to_the_local_main_webview() {
-        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
         let authority = context.runtime_authority_mut();
         let remote = Origin::Remote {
             url: "https://example.invalid".parse().unwrap(),
