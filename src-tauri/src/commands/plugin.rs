@@ -20,7 +20,7 @@ pub(crate) async fn reload_plugin_catalog_from(
 }
 
 pub(crate) async fn set_plugin_enabled_from(
-    runtime: &PluginRuntime,
+    runtime: &Arc<PluginRuntime>,
     id: &str,
     enabled: bool,
     expected_catalog_generation: &str,
@@ -47,13 +47,7 @@ pub async fn set_plugin_enabled(
     enabled: bool,
     expected_catalog_generation: String,
 ) -> AppResult<PluginCatalogMutationResult> {
-    set_plugin_enabled_from(
-        state.plugins.as_ref(),
-        &id,
-        enabled,
-        &expected_catalog_generation,
-    )
-    .await
+    set_plugin_enabled_from(&state.plugins, &id, enabled, &expected_catalog_generation).await
 }
 
 #[cfg(test)]

@@ -205,27 +205,31 @@ async fn scan_does_not_hold_registry_locks_and_prepublication_toggle_survives() 
     scans[0].wait_started().await;
     assert_eq!(runtime.registry.try_read().unwrap().catalog_generation(), 0);
     assert!(runtime.registry.try_write().is_ok());
-    assert!(runtime.reload_gate.try_lock().is_err());
-    let toggled = tokio::time::timeout(
-        WATCHDOG,
-        runtime.set_enabled("com.example.builtin", true, "0"),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(toggled.revision, "1");
-    assert_eq!(toggled.catalog_generation, "0");
+    assert!(runtime.operation_gate.try_lock().is_err());
+    let toggled = runtime.set_enabled("com.example.builtin", true, "0");
+    tokio::pin!(toggled);
+    assert!(futures_util::poll!(&mut toggled).is_pending());
+    assert_eq!(persistence.0.lock().unwrap().saves, 0);
     scans[0].release();
     let published = serde_json::to_value(reload.await.unwrap().unwrap()).unwrap();
     assert_eq!(published["catalogGeneration"], "1");
-    assert_eq!(published["revision"], "1");
-    assert_eq!(item(&published, "com.example.builtin")["status"], "enabled");
+    assert_eq!(published["revision"], "0");
+    assert_eq!(
+        item(&published, "com.example.builtin")["status"],
+        "disabled"
+    );
     assert_eq!(item(&published, "com.example.alpha")["status"], "disabled");
+    let error = toggled.await.unwrap_err();
+    assert_eq!(
+        serde_json::to_value(error).unwrap()["code"],
+        "plugin_catalog_stale"
+    );
+    assert_eq!(persistence.0.lock().unwrap().saves, 0);
     let enabled = runtime
         .set_enabled("com.example.alpha", true, "1")
         .await
         .unwrap();
-    assert_eq!(enabled.revision, "2");
+    assert_eq!(enabled.revision, "1");
     assert_eq!(enabled.catalog_generation, "1");
     let error = runtime
         .set_enabled("com.example.alpha", false, "0")
@@ -235,7 +239,149 @@ async fn scan_does_not_hold_registry_locks_and_prepublication_toggle_survives() 
         serde_json::to_value(error).unwrap()["code"],
         "plugin_catalog_stale"
     );
-    assert_eq!(persistence.0.lock().unwrap().saves, 2);
+    assert_eq!(persistence.0.lock().unwrap().saves, 1);
+}
+
+// Catches set_enabled bypassing an already accepted catalog operation.
+#[tokio::test]
+async fn toggle_waits_behind_accepted_reload() {
+    let persistence = MemoryPersistence::default();
+    let (discovery, mut scans) = ControlledDiscovery::new(vec![local("1.0.0"), local("1.0.0")]);
+    let runtime = runtime_with(discovery, &persistence);
+    let initial = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.get_catalog().await }
+    });
+    scans[0].wait_started().await;
+    scans[0].release();
+    initial.await.unwrap().unwrap();
+    let reload = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.reload_catalog().await }
+    });
+    scans[1].wait_started().await;
+    let before = persistence.0.lock().unwrap().saves;
+    {
+        let toggle = runtime.set_enabled("com.example.alpha", true, "1");
+        tokio::pin!(toggle);
+        assert!(futures_util::poll!(&mut toggle).is_pending());
+        assert_eq!(persistence.0.lock().unwrap().saves, before);
+    }
+    scans[1].release();
+    reload.await.unwrap().unwrap();
+    let _after_toggle = runtime.operation_gate.lock().await;
+    assert_eq!(persistence.0.lock().unwrap().saves, before + 1);
+}
+
+// Catches cancellation of the command caller cancelling an accepted mutation.
+#[tokio::test]
+async fn cancelled_toggle_caller_does_not_drop_reserved_operation() {
+    let persistence = MemoryPersistence::default();
+    let (discovery, mut scans) = ControlledDiscovery::new(vec![local("1.0.0"), local("1.0.0")]);
+    let runtime = runtime_with(discovery, &persistence);
+    let initial = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.get_catalog().await }
+    });
+    scans[0].wait_started().await;
+    scans[0].release();
+    initial.await.unwrap().unwrap();
+
+    let reload = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.reload_catalog().await }
+    });
+    scans[1].wait_started().await;
+    let before = persistence.0.lock().unwrap().saves;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let caller = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            let toggle = runtime.set_enabled("com.example.alpha", true, "1");
+            tokio::pin!(toggle);
+            assert!(futures_util::poll!(&mut toggle).is_pending());
+            accepted_tx.send(()).unwrap();
+            toggle.await
+        }
+    });
+    tokio::time::timeout(WATCHDOG, accepted_rx)
+        .await
+        .expect("toggle must be accepted")
+        .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert_eq!(persistence.0.lock().unwrap().saves, before);
+
+    scans[1].release();
+    reload.await.unwrap().unwrap();
+    let _after_toggle = runtime.operation_gate.lock().await;
+    assert_eq!(persistence.0.lock().unwrap().saves, before + 1);
+}
+
+// Catches routing an initialized, healthy read through the operation queue.
+#[tokio::test]
+async fn ordinary_get_reads_while_operation_gate_is_held() {
+    let persistence = MemoryPersistence::default();
+    let (discovery, mut scans) = ControlledDiscovery::new(vec![local("1.0.0"), local("1.0.0")]);
+    let runtime = runtime_with(discovery, &persistence);
+    let initial = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.get_catalog().await }
+    });
+    scans[0].wait_started().await;
+    scans[0].release();
+    initial.await.unwrap().unwrap();
+
+    let reload = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.reload_catalog().await }
+    });
+    scans[1].wait_started().await;
+    assert!(runtime.operation_gate.try_lock().is_err());
+    let snapshot = tokio::time::timeout(WATCHDOG, runtime.get_catalog())
+        .await
+        .expect("ordinary get must not wait for the operation gate")
+        .unwrap();
+    assert_eq!(snapshot.catalog_generation, "1");
+    scans[1].release();
+    reload.await.unwrap().unwrap();
+}
+
+// Catches state recovery overtaking a catalog operation or loading twice after
+// the operation ahead of it already recovered the shared registry.
+#[tokio::test]
+async fn unavailable_state_retry_waits_behind_operation_gate_and_rechecks() {
+    let persistence = MemoryPersistence::default();
+    persistence.0.lock().unwrap().unavailable = true;
+    let (discovery, mut scans) = ControlledDiscovery::new(vec![local("1.0.0"), local("1.0.0")]);
+    let runtime = runtime_with(discovery, &persistence);
+    let initial = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.get_catalog().await }
+    });
+    scans[0].wait_started().await;
+    scans[0].release();
+    let unavailable = serde_json::to_value(initial.await.unwrap().unwrap()).unwrap();
+    assert_eq!(unavailable["availabilityReasonCode"], "stateUnavailable");
+    assert_eq!(persistence.0.lock().unwrap().loads, 2);
+
+    let reload = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.reload_catalog().await }
+    });
+    scans[1].wait_started().await;
+    persistence.0.lock().unwrap().unavailable = false;
+    let retry = runtime.get_catalog();
+    tokio::pin!(retry);
+    assert!(futures_util::poll!(&mut retry).is_pending());
+    assert_eq!(persistence.0.lock().unwrap().loads, 2);
+
+    scans[1].release();
+    let reloaded = serde_json::to_value(reload.await.unwrap().unwrap()).unwrap();
+    assert_eq!(reloaded["availability"], "available");
+    let retried = serde_json::to_value(retry.await.unwrap()).unwrap();
+    assert_eq!(retried["availability"], "available");
+    assert_eq!(persistence.0.lock().unwrap().loads, 3);
 }
 
 // Catches overlapping scans, lost publication order, or unchanged generation churn.
@@ -252,7 +398,7 @@ async fn reloads_are_serialized_and_publish_in_scan_order() {
     let second = runtime.reload_catalog();
     tokio::pin!(second);
     assert!(futures_util::poll!(&mut second).is_pending());
-    assert!(runtime.reload_gate.try_lock().is_err());
+    assert!(runtime.operation_gate.try_lock().is_err());
     scans[0].release();
     scans[1].wait_started().await;
     let first = serde_json::to_value(first.await.unwrap().unwrap()).unwrap();
@@ -357,7 +503,7 @@ async fn cancelling_initial_get_or_reload_does_not_cancel_publication_or_release
         cancelled.abort();
         assert!(cancelled.await.unwrap_err().is_cancelled());
         assert!(
-            runtime.reload_gate.try_lock().is_err(),
+            runtime.operation_gate.try_lock().is_err(),
             "scan owns the gate after caller cancellation"
         );
         let later = runtime.reload_catalog();
@@ -455,7 +601,7 @@ async fn reload_acceptance_order_survives_lifo_and_caller_cancellation() {
         // Both the active caller and an already accepted queued caller disappear.
         drop(active);
         drop(queued);
-        assert!(runtime.reload_gate.try_lock().is_err());
+        assert!(runtime.operation_gate.try_lock().is_err());
         scans[2].release();
         scans[3].wait_started().await;
         assert_eq!(runtime.registry.try_read().unwrap().catalog_generation(), 3);
@@ -553,7 +699,7 @@ async fn post_discovery_recovery_panic_is_safe_releases_gate_and_remains_retryab
         serde_json::to_value(error).unwrap(),
         json!("内部错误: 插件目录请求暂不可用")
     );
-    assert!(runtime.reload_gate.try_lock().is_ok());
+    assert!(runtime.operation_gate.try_lock().is_ok());
     let recovered = serde_json::to_value(runtime.get_catalog().await.unwrap()).unwrap();
     assert_eq!(recovered["catalogGeneration"], "1");
     assert_eq!(recovered["availability"], "available");
@@ -564,7 +710,7 @@ async fn post_discovery_recovery_panic_is_safe_releases_gate_and_remains_retryab
         "2"
     );
     scans[1].wait_started().await;
-    assert!(runtime.reload_gate.try_lock().is_ok());
+    assert!(runtime.operation_gate.try_lock().is_ok());
 }
 
 // Catches a detached request retaining its gate or losing the attempted marker
@@ -583,9 +729,9 @@ async fn cancelled_waiter_recovery_panic_releases_gate_and_remains_usable() {
     assert!(futures_util::poll!(&mut waiter).is_pending());
     scans[0].wait_started().await;
     drop(waiter);
-    assert!(runtime.reload_gate.try_lock().is_err());
+    assert!(runtime.operation_gate.try_lock().is_err());
     scans[0].release();
-    let finished = tokio::time::timeout(WATCHDOG, runtime.reload_gate.lock())
+    let finished = tokio::time::timeout(WATCHDOG, runtime.operation_gate.lock())
         .await
         .unwrap();
     drop(finished);
