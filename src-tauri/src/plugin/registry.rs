@@ -62,6 +62,9 @@ pub(crate) struct CatalogPublicationCandidate {
 pub struct PluginRegistry {
     builtins: BTreeMap<PluginId, PluginRecord>,
     publication: CatalogPublicationCandidate,
+    // Presentation may remain frozen after an uncertain remove, but it cannot
+    // authorize another mutation against newer adopted lifecycle documents.
+    removal_authority_unreconciled: bool,
 }
 
 #[derive(Debug)]
@@ -179,6 +182,7 @@ impl PluginRegistry {
         );
         let mut registry = Self {
             builtins: manifests,
+            removal_authority_unreconciled: false,
             publication: CatalogPublicationCandidate {
                 locals: BTreeMap::new(),
                 locators: BTreeMap::new(),
@@ -234,7 +238,9 @@ impl PluginRegistry {
         let state_byte_limit = crate::storage::plugin_state::MAX_PLUGIN_STATE_BYTES;
         use BeforeDisabledFailure as Failure;
         let published = &self.publication;
-        if expected_generation != published.catalog_generation.to_string() {
+        if self.removal_authority_unreconciled
+            || expected_generation != published.catalog_generation.to_string()
+        {
             return Err(Failure::CatalogStale);
         }
         let state = match &published.runtime {
@@ -429,6 +435,8 @@ impl PluginRegistry {
     /// Adopt documents immediately, but compare publication against the frozen
     /// complete baseline, not against those already-adopted document revisions.
     pub(crate) fn adopt_removal_documents(&mut self, candidate: &Self) {
+        self.removal_authority_unreconciled |=
+            self.publication.ownership.entries() != candidate.publication.ownership.entries();
         self.publication.runtime = candidate.publication.runtime.clone();
         self.publication.ownership = candidate.publication.ownership.clone();
     }
@@ -465,6 +473,9 @@ impl PluginRegistry {
         record: &PluginRecord,
         usage: ScanUsage,
     ) -> Result<(), ImportCommitFailure> {
+        if self.removal_authority_unreconciled {
+            return Err(ImportCommitFailure::CatalogStale);
+        }
         match &self.publication.runtime {
             Runtime::Unavailable {
                 reason: PluginAvailabilityReason::CatalogInvalid,
@@ -658,8 +669,12 @@ impl PluginRegistry {
     }
 
     pub(crate) fn publish_import_candidate(&mut self, candidate: Self) -> AppResult<()> {
-        self.publish_candidate(candidate.publication, false)
-            .map(|_| ())
+        let unreconciled = candidate.removal_authority_unreconciled;
+        self.publish_candidate(candidate.publication, false)?;
+        // Import's private authoritative scan is also a valid reconciliation,
+        // but a failed or unavailable scan must not clear the safety barrier.
+        self.removal_authority_unreconciled = unreconciled;
+        Ok(())
     }
 
     pub(crate) fn confirms_import_locator(
@@ -701,6 +716,9 @@ impl PluginRegistry {
         next.ownership = ownership;
         next.management = management;
         next.ownership_summary = summary;
+        let authority_reconciled = outcome.summary.status != LocalDiscoveryStatus::Unavailable
+            && outcome.removals.status != LocalDiscoveryStatus::Unavailable
+            && !next.ownership.requires_retry();
         next.locals.clear();
         next.locators.clear();
         let mut collisions = 0;
@@ -724,6 +742,9 @@ impl PluginRegistry {
         next.discovery = outcome;
         let state_retry = Self::load_state_if_needed(&mut next);
         let published = self.publish_candidate(next, true)?;
+        if authority_reconciled {
+            self.removal_authority_unreconciled = false;
+        }
         state_retry?;
         Ok(published)
     }
@@ -871,8 +892,9 @@ impl PluginRegistry {
         enabled: bool,
         expected_catalog_generation: &str,
     ) -> AppResult<PluginCatalogMutationResult> {
-        if expected_catalog_generation.parse::<u64>().ok()
-            != Some(self.publication.catalog_generation)
+        if self.removal_authority_unreconciled
+            || expected_catalog_generation.parse::<u64>().ok()
+                != Some(self.publication.catalog_generation)
             || expected_catalog_generation != self.publication.catalog_generation.to_string()
         {
             return Err(plugin_error(
@@ -922,6 +944,11 @@ impl PluginRegistry {
         record: &PluginRecord,
         enabled: bool,
     ) -> Result<(), StateDecisionFailure> {
+        if self.removal_authority_unreconciled {
+            return Err(
+                plugin_error("plugin_catalog_stale", "插件目录已更新，请刷新后重试").into(),
+            );
+        }
         let mut candidate = self.publication.clone();
         let Runtime::Available {
             state,

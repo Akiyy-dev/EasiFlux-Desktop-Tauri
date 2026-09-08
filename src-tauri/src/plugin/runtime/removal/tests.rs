@@ -1090,6 +1090,207 @@ async fn ambiguous_rename_with_unchanged_source_preserves_baseline() {
 }
 
 #[tokio::test]
+async fn ambiguous_removal_rejects_same_generation_queued_enable_until_reload() {
+    let fixture = Fixture::new().await;
+    *fixture.package.rename.lock().unwrap() = Rename::AmbiguousUnchanged;
+    *fixture.package.cleanup.lock().unwrap() = CleanupOutcome::Conflict;
+    let baseline = fixture.runtime.registry.read().await.catalog_snapshot();
+    let guard = fixture.runtime.operation_gate.clone().lock_owned().await;
+    let mut remove = Box::pin(
+        fixture
+            .runtime
+            .remove_managed_local_plugin("com.example.notes", "1"),
+    );
+    let mut toggle = Box::pin(fixture.runtime.set_enabled("com.example.notes", true, "1"));
+    assert!(futures_util::poll!(&mut remove).is_pending());
+    assert!(futures_util::poll!(&mut toggle).is_pending());
+    drop(guard);
+    let removed = serde_json::to_value(remove.await.unwrap()).unwrap();
+    assert_eq!(removed["status"], "removedCatalogUnconfirmed");
+    assert_eq!(
+        removed["snapshot"],
+        serde_json::to_value(&baseline).unwrap()
+    );
+    let toggled = toggle.await;
+    assert!(
+        matches!(
+            toggled,
+            Err(crate::error::AppError::Plugin {
+                code: "plugin_catalog_stale",
+                ..
+            })
+        ),
+        "an adopted removing entry must not be enabled from the frozen catalog: {toggled:?}"
+    );
+    assert_eq!(
+        fixture.runtime.registry.read().await.catalog_snapshot(),
+        baseline
+    );
+    assert!(fixture.index.index.lock().unwrap().entries()[0]
+        .removal_slot()
+        .is_some());
+    assert!(fixture
+        .state
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .all(|entry| !entry.enabled));
+    assert_eq!(
+        fixture
+            .events()
+            .iter()
+            .filter(|&&event| event == "save-disabled-barrier")
+            .count(),
+        1
+    );
+
+    fixture.package.events.lock().unwrap().clear();
+    Fixture::reject(&fixture.remove().await, "plugin_catalog_stale", false);
+    assert!(fixture.events().is_empty());
+    let reloaded = fixture.runtime.reload_catalog().await.unwrap();
+    assert!(fixture.index.index.lock().unwrap().entries()[0]
+        .removal_slot()
+        .is_none());
+    fixture
+        .runtime
+        .set_enabled("com.example.notes", true, &reloaded.catalog_generation)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deleted_owned_identity_cannot_be_enabled_from_unconfirmed_frozen_catalog() {
+    let fixture = Fixture::new().await;
+    *fixture.package.scan_failure.lock().unwrap() = true;
+    let baseline = fixture.runtime.registry.read().await.catalog_snapshot();
+    let guard = fixture.runtime.operation_gate.clone().lock_owned().await;
+    let mut remove = Box::pin(
+        fixture
+            .runtime
+            .remove_managed_local_plugin("com.example.notes", "1"),
+    );
+    let mut toggle = Box::pin(fixture.runtime.set_enabled("com.example.notes", true, "1"));
+    assert!(futures_util::poll!(&mut remove).is_pending());
+    assert!(futures_util::poll!(&mut toggle).is_pending());
+    drop(guard);
+    assert_eq!(
+        serde_json::to_value(remove.await.unwrap()).unwrap()["status"],
+        "removedCatalogUnconfirmed"
+    );
+    assert!(fixture.index.index.lock().unwrap().entries().is_empty());
+    let toggled = toggle.await;
+    assert!(
+        matches!(
+            toggled,
+            Err(crate::error::AppError::Plugin {
+                code: "plugin_catalog_stale",
+                ..
+            })
+        ),
+        "a deleted ownership entry must not be enabled from the frozen catalog: {toggled:?}"
+    );
+    assert_eq!(
+        fixture.runtime.registry.read().await.catalog_snapshot(),
+        baseline
+    );
+    assert_eq!(fixture.state.state.lock().unwrap().revision, 1);
+
+    let mut replacement = record().manifest().clone();
+    replacement.id = crate::plugin::manifest::PluginId::parse("com.example.replacement").unwrap();
+    let replacement = PluginRecord::local_declarative(replacement).unwrap();
+    let unavailable = fixture.runtime.reload_catalog().await.unwrap();
+    assert_eq!(
+        unavailable.local_discovery.status,
+        crate::plugin::manifest::LocalDiscoveryStatus::Unavailable
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .registry
+            .read()
+            .await
+            .validate_import(&replacement, ScanUsage::default()),
+        Err(crate::plugin::import::ImportCommitFailure::CatalogStale)
+    );
+    *fixture.package.discovery.outcome.lock().unwrap() = LocalDiscoveryOutcome::available(vec![]);
+    fixture.runtime.reload_catalog().await.unwrap();
+    assert_eq!(
+        fixture
+            .runtime
+            .registry
+            .read()
+            .await
+            .validate_import(&replacement, ScanUsage::default()),
+        Ok(())
+    );
+}
+
+#[tokio::test]
+async fn confirmed_rollback_does_not_leave_mutation_authority_blocked() {
+    let fixture = Fixture::new().await;
+    *fixture.package.final_failure.lock().unwrap() = true;
+    Fixture::reject(
+        &fixture.remove().await,
+        "plugin_remove_identity_changed",
+        true,
+    );
+    fixture
+        .runtime
+        .set_enabled("com.example.notes", true, "1")
+        .await
+        .unwrap();
+    assert!(fixture
+        .state
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .any(|entry| entry.enabled));
+}
+
+#[tokio::test]
+async fn authoritative_import_prescan_can_reconcile_unresolved_removal_authority() {
+    use crate::plugin::import::PreparedManifest;
+    let fixture = Fixture::new().await;
+    *fixture.package.rename.lock().unwrap() = Rename::AmbiguousUnchanged;
+    *fixture.package.cleanup.lock().unwrap() = CleanupOutcome::Conflict;
+    let now = std::time::Instant::now();
+    let preview = fixture
+        .runtime
+        .import_sessions
+        .reserve_prepare(now)
+        .unwrap()
+        .publish(PreparedManifest::parse(VALID).unwrap(), 1, now)
+        .unwrap();
+    assert_eq!(
+        fixture.remove().await["status"],
+        "removedCatalogUnconfirmed"
+    );
+    let result = serde_json::to_value(
+        fixture
+            .runtime
+            .commit_import(&preview.token, "1")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["reasonCode"], "plugin_catalog_stale");
+    let reconciled = fixture.runtime.registry.read().await.catalog_snapshot();
+    assert_eq!(reconciled.catalog_generation, "2");
+    fixture
+        .runtime
+        .set_enabled("com.example.notes", true, &reconciled.catalog_generation)
+        .await
+        .unwrap();
+    assert!(fixture.index.index.lock().unwrap().entries()[0]
+        .removal_slot()
+        .is_none());
+}
+
+#[tokio::test]
 async fn fully_clean_result_returns_removed_with_real_shared_package_storage() {
     use crate::storage::local_plugin_import::LocalManifestImportStorage;
     struct DiskDiscovery(std::path::PathBuf);
