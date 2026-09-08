@@ -63,6 +63,29 @@ fn missing_root_is_empty_success() {
         read_package_candidates(&f.root().join("missing/local"), ScanLimits::production()).unwrap();
     assert!(result.packages.is_empty());
     assert_eq!(result.rejected_package_count, 0);
+    assert_eq!(result.usage, super::super::ScanUsage::default());
+}
+
+// Catches counting only accepted bytes/packages or ignoring non-package root entries.
+#[test]
+fn scan_usage_counts_junk_structural_packages_and_over_limit_probe() {
+    let f = Fixture::new();
+    f.package(0, b"ok");
+    f.package(1, &vec![0; 20_000]);
+    let malformed = f.package(2, b"never read");
+    fs::write(malformed.join("extra"), b"").unwrap();
+    fs::write(f.root().join("junk"), b"never read").unwrap();
+    let result = f.scan().unwrap();
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(result.rejected_package_count, 3);
+    assert_eq!(
+        result.usage,
+        super::super::ScanUsage {
+            root_entries: 4,
+            packages: 2,
+            bytes_read: 16_387,
+        }
+    );
 }
 
 #[test]

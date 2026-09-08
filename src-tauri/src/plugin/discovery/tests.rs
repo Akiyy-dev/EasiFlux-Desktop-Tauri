@@ -155,3 +155,68 @@ fn each_discovery_resolves_again_and_root_failures_are_unavailable() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+
+// Catches off-by-one admission and overflowing arithmetic in the add-one budget.
+#[test]
+fn import_budget_accepts_exact_limits_and_rejects_each_excess() {
+    let usage = ScanUsage {
+        root_entries: 255,
+        packages: 127,
+        bytes_read: 2_097_151,
+    };
+    assert!(usage.can_add_manifest(1));
+    assert!(!ScanUsage {
+        root_entries: 256,
+        ..usage
+    }
+    .can_add_manifest(1));
+    assert!(!ScanUsage {
+        packages: 128,
+        ..usage
+    }
+    .can_add_manifest(1));
+    assert!(!usage.can_add_manifest(2));
+    assert!(ScanUsage::default().can_add_manifest(16_384));
+    assert!(!ScanUsage::default().can_add_manifest(16_385));
+    assert!(!ScanUsage {
+        bytes_read: usize::MAX,
+        ..usage
+    }
+    .can_add_manifest(1));
+    assert!(!usage.can_add_manifest(usize::MAX));
+}
+
+// Catches conflating unknown root usage with authoritative empty-root capacity.
+#[test]
+fn unavailable_never_reports_zero_usage_as_authoritative() {
+    let fixture = Fixture::new();
+    let missing = discover_from_root(&fixture.0.join("missing"));
+    assert_eq!(missing.summary, LocalDiscoverySummary::available());
+    assert_eq!(missing.usage, Some(ScanUsage::default()));
+    fs::write(fixture.0.join("file"), b"{}").unwrap();
+    for outcome in [
+        discover_from_root(&fixture.0.join("file")),
+        discover_with_root(|| None),
+        LocalDiscoveryOutcome::unavailable(),
+    ] {
+        assert_eq!(outcome.summary, LocalDiscoverySummary::unavailable());
+        assert_eq!(outcome.usage, None);
+    }
+}
+
+// Catches reconstructing usage from accepted records after strict parsing.
+#[test]
+fn malformed_packages_and_rejected_probes_remain_in_discovery_usage() {
+    let fixture = Fixture::new();
+    let outcome = parse_package_scan(fixture.scan(&[b"bad".to_vec(), vec![0; 16_400]]));
+    assert!(outcome.records.is_empty());
+    assert_eq!(outcome.summary, LocalDiscoverySummary::degraded(2).unwrap());
+    assert_eq!(
+        outcome.usage,
+        Some(ScanUsage {
+            root_entries: 2,
+            packages: 2,
+            bytes_read: 16_388,
+        })
+    );
+}

@@ -1,5 +1,6 @@
 use super::*;
-use crate::plugin::discovery::LocalDiscoveryOutcome;
+use crate::plugin::discovery::{LocalDiscoveryOutcome, ScanUsage};
+use crate::plugin::import::ImportCommitFailure;
 use crate::plugin::manifest::{PluginPublisherId, PluginSource};
 use crate::storage::plugin_state::{PluginStateEntryV2, PluginStateFileV2, PluginStateLoad};
 use serde_json::{json, Value};
@@ -867,4 +868,397 @@ fn failed_identity_cleanup_preserves_memory_revision_and_rewrite_marker() {
             ..
         }
     ));
+}
+
+// Catches orphan enabled decisions surviving an import, or optimistic catalog insertion.
+#[test]
+fn import_disabled_replaces_orphan_authorization_without_adding_catalog_item() {
+    let local = local("com.easiflux.local", "Local");
+    let memory = MemoryPersistence::new(PluginStateFileV2 {
+        schema_version: 2,
+        revision: 7,
+        entries: vec![local_entry(&local, true)],
+    });
+    let mut registry = memory.registry(vec![]);
+    registry.persist_import_disabled(&local).unwrap();
+    assert!(registry.catalog_snapshot().plugins.is_empty());
+    assert_eq!(registry.catalog_generation(), 0);
+    assert_eq!(snapshot(&registry)["revision"], "8");
+    let saved = memory.last_save().unwrap();
+    assert_eq!(saved.revision, 8);
+    assert_eq!(saved.entries, vec![local_entry(&local, false)]);
+    assert_eq!(
+        error_code(registry.set_enabled("com.easiflux.local", true, "0")),
+        "plugin_not_found"
+    );
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![local]))
+        .unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["status"], "disabled");
+}
+
+// Catches missing explicit decisions for fresh imports.
+#[test]
+fn import_disabled_records_fresh_identity_without_membership() {
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = memory.registry(vec![]);
+    let record = local("com.fresh", "Fresh");
+    registry.persist_import_disabled(&record).unwrap();
+    assert_eq!(
+        memory.last_save().unwrap().entries,
+        vec![local_entry(&record, false)]
+    );
+    assert_eq!(snapshot(&registry)["revision"], "1");
+    assert!(registry.catalog_snapshot().plugins.is_empty());
+}
+
+fn historical_import_state(revision: u64) -> (PluginRecord, PluginStateFileV2) {
+    let old = local("com.alpha", "Old");
+    let mut older = manifest("com.alpha");
+    older.publisher_id = PluginPublisherId::parse("com.other").unwrap();
+    let older = PluginRecord::local_declarative(older).unwrap();
+    (
+        local("com.alpha", "New"),
+        PluginStateFileV2 {
+            schema_version: 2,
+            revision,
+            entries: vec![
+                local_entry(&old, true),
+                local_entry(&older, true),
+                entry("com.alpha", "com.easiflux", true),
+                entry("com.orphan", "com.other", true),
+            ],
+        },
+    )
+}
+
+// Catches retaining historical publisher/fingerprint authorizations or deleting other sources.
+#[test]
+fn import_disabled_cleans_all_historical_local_identities_and_sorts() {
+    let (record, state) = historical_import_state(9);
+    let memory = MemoryPersistence::new(state);
+    let mut registry = memory.registry(vec![]);
+    registry.persist_import_disabled(&record).unwrap();
+    let saved = memory.last_save().unwrap();
+    assert_eq!(saved.revision, 10);
+    assert_eq!(
+        saved.entries,
+        vec![
+            entry("com.alpha", "com.easiflux", true),
+            local_entry(&record, false),
+            entry("com.orphan", "com.other", true),
+        ]
+    );
+}
+
+// Catches committing cleanup, revision, or recovery marker before the save succeeds.
+#[test]
+fn import_disabled_save_failure_preserves_all_identities_revision_and_rewrite() {
+    let (record, state) = historical_import_state(7);
+    let memory = MemoryPersistence::failing_loaded_from_v1(state.clone());
+    let mut registry = memory.registry(vec![]);
+    let before = registry.catalog_snapshot();
+    let error = registry.persist_import_disabled(&record).unwrap_err();
+    assert_eq!(
+        serde_json::to_value(error).unwrap()["code"],
+        "plugin_state_persist_failed"
+    );
+    assert_eq!(registry.catalog_snapshot(), before);
+    match &registry.runtime {
+        Runtime::Available {
+            state: current,
+            requires_rewrite,
+            ..
+        } => {
+            assert_eq!(current, &state);
+            assert!(*requires_rewrite);
+        }
+        _ => panic!("available state must survive failure"),
+    }
+    assert_eq!(memory.0.lock().unwrap().persisted, state);
+    memory.allow_saves();
+    registry.persist_import_disabled(&record).unwrap();
+    assert_eq!(memory.last_save().unwrap().revision, 8);
+    assert!(matches!(
+        registry.runtime,
+        Runtime::Available {
+            requires_rewrite: false,
+            ..
+        }
+    ));
+}
+
+// Catches revision exhaustion masking capacity, pruning unrelated identities, or partial commit.
+#[test]
+fn import_disabled_rejects_513th_retained_identity_before_revision_exhaustion() {
+    let state = PluginStateFileV2 {
+        schema_version: 2,
+        revision: u64::MAX,
+        entries: (0..512)
+            .map(|n| entry(&format!("com.retained{n}"), "com.easiflux", true))
+            .collect(),
+    };
+    let memory = MemoryPersistence::new(state.clone());
+    let mut registry = memory.registry(vec![]);
+    let error = registry
+        .persist_import_disabled(&local("com.new", "New"))
+        .unwrap_err();
+    assert_eq!(
+        serde_json::to_value(error).unwrap()["code"],
+        "plugin_state_capacity_exceeded"
+    );
+    assert!(
+        matches!(&registry.runtime, Runtime::Available { state: current, .. } if current == &state)
+    );
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+// Catches checking capacity before replacing same-ID/source history.
+#[test]
+fn import_disabled_cleanup_frees_identity_capacity() {
+    let (record, mut state) = historical_import_state(7);
+    state
+        .entries
+        .extend((0..508).map(|n| entry(&format!("com.retained{n}"), "com.easiflux", true)));
+    let memory = MemoryPersistence::new(state);
+    let mut registry = memory.registry(vec![]);
+    registry.persist_import_disabled(&record).unwrap();
+    let saved = memory.last_save().unwrap();
+    assert_eq!(saved.entries.len(), 511);
+    assert_eq!(saved.revision, 8);
+    assert_eq!(
+        saved
+            .entries
+            .iter()
+            .filter(|entry| entry.source == PluginSource::LocalDeclarative)
+            .collect::<Vec<_>>(),
+        vec![&local_entry(&record, false)]
+    );
+}
+
+// Catches redundant saves and revision increments for an already durable disabled identity.
+#[test]
+fn import_disabled_same_disabled_is_noop_even_at_max_revision() {
+    let record = local("com.alpha", "Alpha");
+    let memory = MemoryPersistence::new(PluginStateFileV2 {
+        schema_version: 2,
+        revision: u64::MAX,
+        entries: vec![local_entry(&record, false)],
+    });
+    let mut registry = memory.registry(vec![]);
+    registry.persist_import_disabled(&record).unwrap();
+    assert_eq!(snapshot(&registry)["revision"], u64::MAX.to_string());
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+// Catches skipping recovery rewrite or incrementing a rewrite-only revision at MAX.
+#[test]
+fn import_disabled_same_disabled_rewrites_at_max_and_retains_marker_on_failure() {
+    let record = local("com.alpha", "Alpha");
+    let state = PluginStateFileV2 {
+        schema_version: 2,
+        revision: u64::MAX,
+        entries: vec![local_entry(&record, false)],
+    };
+    let memory = MemoryPersistence::failing_loaded_from_v1(state.clone());
+    let mut registry = memory.registry(vec![]);
+    assert!(registry.persist_import_disabled(&record).is_err());
+    assert!(
+        matches!(&registry.runtime, Runtime::Available { state: current, requires_rewrite: true, .. } if current == &state)
+    );
+    memory.allow_saves();
+    registry.persist_import_disabled(&record).unwrap();
+    assert_eq!(memory.last_save().unwrap(), state);
+    assert!(matches!(
+        registry.runtime,
+        Runtime::Available {
+            requires_rewrite: false,
+            ..
+        }
+    ));
+    registry.persist_import_disabled(&record).unwrap();
+    assert_eq!(memory.0.lock().unwrap().saves.len(), 2);
+}
+
+// Catches accepting a genuine logical decision without revision headroom.
+#[test]
+fn import_disabled_changed_decision_rejects_max_revision() {
+    let memory = MemoryPersistence::new(PluginStateFileV2 {
+        revision: u64::MAX,
+        ..PluginStateFileV2::empty()
+    });
+    let mut registry = memory.registry(vec![]);
+    let before = registry.catalog_snapshot();
+    let error = registry
+        .persist_import_disabled(&local("com.new", "New"))
+        .unwrap_err();
+    assert_eq!(
+        serde_json::to_value(error).unwrap()["code"],
+        "plugin_revision_exhausted"
+    );
+    assert_eq!(registry.catalog_snapshot(), before);
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+// Catches broadening the internal import writer into arbitrary-source authorization.
+#[test]
+fn import_disabled_rejects_builtin_records_without_saving() {
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = memory.registry(vec![]);
+    let record = PluginRecord::built_in(manifest("com.alpha")).unwrap();
+    assert!(registry.persist_import_disabled(&record).is_err());
+    assert_eq!(snapshot(&registry)["revision"], "0");
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+// Catches internal-only usage being compared for generation or added to catalog IPC.
+#[test]
+fn budget_only_change_does_not_increment_catalog_generation() {
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = memory.registry(vec![]);
+    let mut outcome = LocalDiscoveryOutcome::available(vec![local("com.alpha", "Alpha")]);
+    registry.apply_local_discovery(outcome.clone()).unwrap();
+    let before = snapshot(&registry);
+    outcome.usage = Some(ScanUsage {
+        root_entries: 255,
+        packages: 127,
+        bytes_read: 2_000_000,
+    });
+    assert!(!registry.apply_local_discovery(outcome).unwrap());
+    assert_eq!(snapshot(&registry), before);
+    assert_eq!(registry.catalog_generation(), 1);
+}
+
+// Catches only checking local conflicts or accepting an identical installed manifest.
+#[test]
+fn validate_import_rejects_builtin_and_current_local_id_conflicts() {
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = memory.registry(vec![manifest("com.builtin")]);
+    let installed = local("com.installed", "Installed");
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![installed.clone()]))
+        .unwrap();
+    for record in [local("com.builtin", "Builtin collision"), installed] {
+        assert_eq!(
+            registry.validate_import(&record, ScanUsage::default()),
+            Err(ImportCommitFailure::IdConflict)
+        );
+    }
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+// Catches treating partial/failed discovery as sufficient proof of conflict-free capacity.
+#[test]
+fn validate_import_rejects_unhealthy_local_discovery() {
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = memory.registry(vec![]);
+    for outcome in [
+        LocalDiscoveryOutcome::degraded(vec![], 1).unwrap(),
+        LocalDiscoveryOutcome::unavailable(),
+    ] {
+        registry.apply_local_discovery(outcome).unwrap();
+        assert_eq!(
+            registry.validate_import(&local("com.new", "New"), ScanUsage::default()),
+            Err(ImportCommitFailure::DiscoveryUnavailable)
+        );
+    }
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+// Catches importing while blocked, and retrying a permanently invalid catalog.
+#[test]
+fn import_preflight_and_disabled_writer_reject_unavailable_runtime() {
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    memory.0.lock().unwrap().load_error = true;
+    let record = local("com.new", "New");
+    let mut registry = memory.registry(vec![]);
+    assert!(registry.state_requires_retry());
+    assert_eq!(
+        registry.validate_import(&record, ScanUsage::default()),
+        Err(ImportCommitFailure::StateUnavailable)
+    );
+    let error = registry.persist_import_disabled(&record).unwrap_err();
+    assert_eq!(
+        serde_json::to_value(error).unwrap()["code"],
+        "plugin_state_unavailable"
+    );
+    memory.0.lock().unwrap().load_error = false;
+    registry.retry_state_load();
+    assert!(!registry.state_requires_retry());
+    let mut invalid = memory.registry(vec![manifest("com.dup"), manifest("com.dup")]);
+    assert!(!invalid.state_requires_retry());
+    assert_eq!(
+        invalid.validate_import(&record, ScanUsage::default()),
+        Err(ImportCommitFailure::CatalogInvalid)
+    );
+    let error = invalid.persist_import_disabled(&record).unwrap_err();
+    assert_eq!(
+        serde_json::to_value(error).unwrap()["code"],
+        "plugin_catalog_invalid"
+    );
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+// Catches admission bypassing any scan budget, or measuring something other than canonical bytes.
+#[test]
+fn validate_import_enforces_directory_and_canonical_byte_capacity() {
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = memory.registry(vec![]);
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![]))
+        .unwrap();
+    let record = local("com.new", "New");
+    let bytes = record.canonical_manifest_bytes().unwrap().len();
+    let exact = ScanUsage {
+        root_entries: 255,
+        packages: 127,
+        bytes_read: 2_097_152 - bytes,
+    };
+    assert_eq!(registry.validate_import(&record, exact), Ok(()));
+    for usage in [
+        ScanUsage {
+            root_entries: 256,
+            ..exact
+        },
+        ScanUsage {
+            packages: 128,
+            ..exact
+        },
+        ScanUsage {
+            bytes_read: exact.bytes_read + 1,
+            ..exact
+        },
+        ScanUsage {
+            bytes_read: usize::MAX,
+            ..exact
+        },
+    ] {
+        assert_eq!(
+            registry.validate_import(&record, usage),
+            Err(ImportCommitFailure::CapacityExceeded)
+        );
+    }
+    assert!(memory.0.lock().unwrap().saves.is_empty());
+}
+
+// Catches missing final-publication headroom or rejecting the last available generation.
+#[test]
+fn validate_import_rejects_max_generation_and_accepts_max_minus_one() {
+    let memory = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = memory.registry(vec![]);
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![]))
+        .unwrap();
+    let record = local("com.new", "New");
+    registry.catalog_generation = u64::MAX - 1;
+    assert_eq!(
+        registry.validate_import(&record, ScanUsage::default()),
+        Ok(())
+    );
+    registry.catalog_generation = u64::MAX;
+    assert_eq!(
+        registry.validate_import(&record, ScanUsage::default()),
+        Err(ImportCommitFailure::CatalogGenerationExhausted)
+    );
+    assert!(memory.0.lock().unwrap().saves.is_empty());
 }

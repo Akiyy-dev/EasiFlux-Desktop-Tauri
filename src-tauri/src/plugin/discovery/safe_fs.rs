@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Component, Path};
 
+use super::ScanUsage;
+
 #[derive(Clone, Copy)]
 pub(super) struct ScanLimits {
     pub(super) max_root_entries: usize,
@@ -66,6 +68,7 @@ pub(super) struct PackageBytes {
 pub(super) struct PackageScan {
     pub(super) packages: Vec<PackageBytes>,
     pub(super) rejected_package_count: u32,
+    pub(super) usage: ScanUsage,
 }
 
 /// Deliberately carries neither paths nor underlying platform error details.
@@ -193,6 +196,7 @@ pub(super) fn read_package_candidates(
         .entries(limits.max_root_entries)
         .map_err(|_| RootReadError)?;
     let mut result = PackageScan::default();
+    result.usage.root_entries = names.len();
     let mut slots = Vec::new();
     for name in names {
         match parse_slot_name(&name) {
@@ -201,8 +205,6 @@ pub(super) fn read_package_candidates(
         }
     }
     slots.sort();
-    let mut structurally_acceptable = 0;
-    let mut total = 0;
     for slot in slots {
         let opened = root.open_slot(slot.as_str()).and_then(|directory| {
             directory.check_shape()?;
@@ -216,11 +218,11 @@ pub(super) fn read_package_candidates(
                 continue;
             }
         };
-        structurally_acceptable += 1;
-        if structurally_acceptable > limits.max_packages {
+        result.usage.packages += 1;
+        if result.usage.packages > limits.max_packages {
             return Err(RootReadError);
         }
-        match read_bounded(&mut manifest, limits, &mut total) {
+        match read_bounded(&mut manifest, limits, &mut result.usage.bytes_read) {
             Ok(manifest_bytes) if directory.check_shape().is_ok() => {
                 result.packages.push(PackageBytes {
                     #[cfg(test)]
