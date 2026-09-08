@@ -67,6 +67,21 @@ pub(crate) struct OwnershipMutationFailure {
     pub(crate) persist_outcome: PersistOutcome,
 }
 
+#[derive(Debug)]
+pub(crate) struct StateDecisionFailure {
+    pub(crate) error: AppError,
+    pub(crate) persist_outcome: PersistOutcome,
+}
+
+impl From<AppError> for StateDecisionFailure {
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            persist_outcome: PersistOutcome::NotCommitted,
+        }
+    }
+}
+
 // Resolve the production store for each operation, so failure to resolve the
 // configuration directory remains retryable rather than aborting AppState.
 struct SystemPersistence;
@@ -410,7 +425,10 @@ impl PluginRegistry {
     }
 
     /// Record only the disabled decision; authoritative discovery owns membership.
-    pub(crate) fn persist_import_disabled(&mut self, record: &PluginRecord) -> AppResult<()> {
+    pub(crate) fn persist_import_disabled(
+        &mut self,
+        record: &PluginRecord,
+    ) -> Result<(), StateDecisionFailure> {
         if record.source() != PluginSource::LocalDeclarative
             || matches!(
                 self.publication.runtime,
@@ -420,9 +438,9 @@ impl PluginRegistry {
                 }
             )
         {
-            return Err(plugin_error("plugin_catalog_invalid", "插件目录无效"));
+            return Err(plugin_error("plugin_catalog_invalid", "插件目录无效").into());
         }
-        self.persist_decision(record, false)
+        self.persist_decision_with_outcome(record, false)
     }
 
     pub(crate) fn apply_local_discovery(
@@ -648,6 +666,15 @@ impl PluginRegistry {
     }
 
     fn persist_decision(&mut self, record: &PluginRecord, enabled: bool) -> AppResult<()> {
+        self.persist_decision_with_outcome(record, enabled)
+            .map_err(|failure| failure.error)
+    }
+
+    fn persist_decision_with_outcome(
+        &mut self,
+        record: &PluginRecord,
+        enabled: bool,
+    ) -> Result<(), StateDecisionFailure> {
         let mut candidate = self.publication.clone();
         let Runtime::Available {
             state,
@@ -655,10 +682,7 @@ impl PluginRegistry {
             persistence,
         } = &mut candidate.runtime
         else {
-            return Err(plugin_error(
-                "plugin_state_unavailable",
-                "插件状态存储暂不可用",
-            ));
+            return Err(plugin_error("plugin_state_unavailable", "插件状态存储暂不可用").into());
         };
         // An explicit decision replaces all prior identities for this ID/source,
         // even when changed content is already effectively disabled.
@@ -678,10 +702,9 @@ impl PluginRegistry {
         // Capacity is a distinct transaction outcome and must not be masked by
         // revision exhaustion or flattened into a persistence failure.
         if next.entries.len() > MAX_PLUGIN_STATE_ENTRIES {
-            return Err(plugin_error(
-                "plugin_state_capacity_exceeded",
-                "插件状态容量已达上限",
-            ));
+            return Err(
+                plugin_error("plugin_state_capacity_exceeded", "插件状态容量已达上限").into(),
+            );
         }
         sort_state_entries(&mut next.entries);
         // Serialization order is not a logical decision. It may require a save,
@@ -715,10 +738,10 @@ impl PluginRegistry {
             {
                 Ok(())
             }
-            _ => Err(plugin_error(
-                "plugin_state_persist_failed",
-                "插件状态保存失败",
-            )),
+            _ => Err(StateDecisionFailure {
+                error: plugin_error("plugin_state_persist_failed", "插件状态保存失败"),
+                persist_outcome: outcome,
+            }),
         }
     }
 }

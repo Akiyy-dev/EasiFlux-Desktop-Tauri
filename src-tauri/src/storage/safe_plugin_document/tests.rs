@@ -67,6 +67,39 @@ fn safe_leftovers_are_cleaned_before_exclusive_create() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_delete_sharing_work_handle_blocks_main_until_absence_is_proven() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    for names in [
+        SafeDocumentNames::plugin_state(),
+        SafeDocumentNames::managed_ownership(),
+    ] {
+        for work in [names.tmp, names.pending, names.bak_pending] {
+            let (root, doc) = fixture(names);
+            fs::write(root.path().join(names.main), b"old").unwrap();
+            fs::write(root.path().join(work), b"stale").unwrap();
+            let extra = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(root.path().join(work))
+                .unwrap();
+            assert_eq!(
+                doc.persist(Some(b"old"), b"new").unwrap_err().outcome,
+                PersistOutcome::NotCommitted,
+                "{work}"
+            );
+            assert_eq!(fs::read(root.path().join(names.main)).unwrap(), b"old");
+            drop(extra);
+            doc.persist(Some(b"old"), b"new").unwrap();
+            assert_eq!(fs::read(root.path().join(names.main)).unwrap(), b"new");
+        }
+    }
+}
+
 #[test]
 fn unsafe_pending_symlink_reparse_hardlink_or_case_variant_fails_closed() {
     for names in [

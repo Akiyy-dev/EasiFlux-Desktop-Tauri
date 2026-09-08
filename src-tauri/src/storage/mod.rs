@@ -14,6 +14,8 @@ pub(crate) mod plugin_state;
 pub mod risk_usage;
 pub(crate) mod safe_plugin_document;
 pub mod trade_log;
+#[cfg(windows)]
+pub(crate) mod windows_file_evidence;
 
 pub use cache::CacheStore;
 pub use chart_state_store::ChartStateStore;

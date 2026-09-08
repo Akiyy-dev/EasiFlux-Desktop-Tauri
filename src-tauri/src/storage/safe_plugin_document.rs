@@ -210,12 +210,12 @@ impl SafePluginDocument {
             checkpoint!(self, CleanPending);
             if let Some(file) = held[3].take() {
                 self.bounded(&file)?;
-                parent.remove(self.names.pending, &file)?;
+                parent.remove(self.names.pending, file)?;
             }
             checkpoint!(self, CleanBackupPending);
             if let Some(file) = held[4].take() {
                 self.bounded(&file)?;
-                parent.remove(self.names.bak_pending, &file)?;
+                parent.remove(self.names.bak_pending, file)?;
             }
             parent.sync()?;
             checkpoint!(self, CreatePending);
@@ -250,7 +250,7 @@ impl SafePluginDocument {
             checkpoint!(self, DeleteLegacyTmp);
             if let Some(file) = held[1].take() {
                 self.bounded(&file)?;
-                parent.remove(self.names.tmp, &file)?;
+                parent.remove(self.names.tmp, file)?;
             }
             checkpoint!(self, SyncAfterLegacyTmp);
             parent.sync()?;

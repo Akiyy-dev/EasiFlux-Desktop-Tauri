@@ -97,6 +97,7 @@ struct RecordingPersistence {
     inner: Arc<PluginStateStore>,
     events: Events,
     fail_save: Arc<AtomicBool>,
+    committed_error: Arc<Mutex<Option<crate::storage::safe_plugin_document::PersistOutcome>>>,
     saves: Arc<AtomicUsize>,
 }
 
@@ -106,6 +107,7 @@ impl RecordingPersistence {
             inner: Arc::new(PluginStateStore::with_path(path)),
             events,
             fail_save: Arc::new(AtomicBool::new(false)),
+            committed_error: Arc::new(Mutex::new(None)),
             saves: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -134,7 +136,11 @@ impl PluginStatePersistence for RecordingPersistence {
             }
             .into());
         }
-        self.inner.save(state)
+        let outcome = self.inner.save(state)?;
+        if let Some(outcome) = self.committed_error.lock().unwrap().take() {
+            return Err(crate::storage::safe_plugin_document::PersistFailure { outcome });
+        }
+        Ok(outcome)
     }
 }
 
@@ -1551,8 +1557,86 @@ async fn state_failure_prevents_promotion() {
     assert!(fixture.target_manifests().is_empty());
     assert_eq!(
         *fixture.events.lock().unwrap(),
-        ["scan", "stage", "disable", "cleanup"]
+        ["scan", "stage", "disable"]
     );
+    assert_eq!(fixture.persistence.inner.load().unwrap().state.revision, 0);
+    assert_eq!(fixture.runtime.get_catalog().await.unwrap().revision, "0");
+    assert_eq!(
+        fixture
+            .storage_controls
+            .promote_calls
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(fixture.plugins_root.join("import-staging"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn committed_state_errors_preserve_documents_without_promotion_or_publication() {
+    use crate::storage::safe_plugin_document::PersistOutcome;
+    for outcome in [
+        PersistOutcome::CommittedProcessCrashSafe,
+        PersistOutcome::CommittedDurable,
+    ] {
+        let fixture = ImportFixture::new().await;
+        let preview = fixture.prepare_valid().await;
+        let before = serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
+        *fixture.persistence.committed_error.lock().unwrap() = Some(outcome);
+        fixture.clear_events();
+        let result = wire(
+            fixture
+                .runtime
+                .commit_import(&preview.token, &preview.catalog_generation)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["disabledDecisionSaved"], true, "{outcome:?}");
+        assert_eq!(result["status"], "notImported");
+        assert_eq!(result["reasonCode"], "plugin_state_persist_failed");
+        assert_eq!(result["snapshot"], before);
+        assert_eq!(
+            *fixture.events.lock().unwrap(),
+            ["scan", "stage", "disable"]
+        );
+        assert_eq!(
+            fixture
+                .storage_controls
+                .promote_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(fixture.target_manifests().is_empty());
+        assert!(!fixture.plugins_root.join("managed-ownership.json").exists());
+        assert_eq!(
+            fs::read_dir(fixture.plugins_root.join("import-staging"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let state = fixture.persistence.inner.load().unwrap().state;
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].id.to_string(), "com.example.notes");
+        assert!(!state.entries[0].enabled);
+        // An independent decision must build on the adopted document, not overwrite it.
+        fixture
+            .runtime
+            .set_enabled("com.example.builtin", true, &preview.catalog_generation)
+            .await
+            .unwrap();
+        let next = fixture.persistence.inner.load().unwrap().state;
+        assert_eq!(next.revision, 2);
+        assert_eq!(next.entries.len(), 2);
+        assert!(next
+            .entries
+            .iter()
+            .any(|entry| entry.id.to_string() == "com.example.notes" && !entry.enabled));
+    }
 }
 
 #[tokio::test]

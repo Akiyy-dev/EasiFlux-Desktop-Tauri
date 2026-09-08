@@ -1351,7 +1351,10 @@ pub(crate) mod native {
             ));
         }
         // SAFETY: the successful native call returned a new owned file handle.
-        Ok(unsafe { File::from_raw_handle(handle) })
+        let file = unsafe { File::from_raw_handle(handle) };
+        crate::storage::windows_file_evidence::verify_opened_name(&file, name)?;
+        crate::storage::windows_file_evidence::no_named_streams(&file).map_err(|_| rejected())?;
+        Ok(file)
     }
 
     fn identity(file: &File) -> io::Result<FileIdentity> {

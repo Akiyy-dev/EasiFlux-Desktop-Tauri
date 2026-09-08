@@ -1,5 +1,79 @@
 use super::*;
 
+#[cfg(windows)]
+fn assert_package_rejected_and_retained(
+    root: &std::path::Path,
+    promoted: &PromotedManagedPackage,
+    actual_name: &str,
+) {
+    let parent = platform::native::Directory::open_or_create_root(&root.join("local")).unwrap();
+    let ids = platform::PackageIdentities {
+        directory: promoted.entry.directory_identity,
+        manifest: promoted.entry.manifest_identity,
+        receipt: promoted.entry.receipt_identity,
+    };
+    let actual = root.join("local").join(actual_name);
+    let before_manifest = fs::read(actual.join("manifest.json")).unwrap();
+    let before_receipt = fs::read(actual.join("ownership-receipt.json")).unwrap();
+    assert!(
+        platform::verify_package(&parent, promoted.entry.package_slot().as_str(), &ids).is_err()
+    );
+    assert!(platform::cleanup_exact(
+        &parent,
+        promoted.entry.package_slot().as_str(),
+        &ids.directory,
+        Some(&ids.manifest),
+        Some(&ids.receipt)
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(actual.join("manifest.json")).unwrap(),
+        before_manifest
+    );
+    assert_eq!(
+        fs::read(actual.join("ownership-receipt.json")).unwrap(),
+        before_receipt
+    );
+    assert_eq!(children(&actual).len(), 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_case_renamed_package_is_rejected_by_verification_and_cleanup() {
+    let (_temp, root, promoted, _) = removal_fixture();
+    let name = promoted.entry.package_slot().as_str();
+    let uppercase = name.to_uppercase();
+    fs::rename(
+        root.join("local").join(name),
+        root.join("local").join(&uppercase),
+    )
+    .unwrap();
+    assert_eq!(
+        children(&root.join("local"))[0].file_name().unwrap(),
+        std::ffi::OsStr::new(&uppercase)
+    );
+    assert_package_rejected_and_retained(&root, &promoted, &uppercase);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_package_ads_are_rejected_by_verification_and_cleanup() {
+    for filename in ["manifest.json", "ownership-receipt.json", ""] {
+        let (_temp, root, promoted, _) = removal_fixture();
+        let name = promoted.entry.package_slot().as_str();
+        let package = root.join("local").join(name);
+        let object = if filename.is_empty() {
+            package
+        } else {
+            package.join(filename)
+        };
+        let stream = PathBuf::from(format!("{}:retained", object.display()));
+        fs::write(&stream, b"private stream data").expect("disposable NTFS root must support ADS");
+        assert_package_rejected_and_retained(&root, &promoted, name);
+        assert_eq!(fs::read(&stream).unwrap(), b"private stream data");
+    }
+}
+
 #[test]
 fn prepare_allocates_one_absent_remove_slot() {
     let (_temp, root, record, bytes) = fixture();

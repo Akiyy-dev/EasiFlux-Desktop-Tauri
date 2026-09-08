@@ -223,13 +223,16 @@ fn run_commit_blocking(
         .adopt_import_documents(&candidate);
     match persisted {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            cleanup_owned_stage(stage);
-            runtime
-                .registry
-                .blocking_write()
-                .publish_import_candidate(candidate)?;
-            return Ok(failed_import(runtime, import_state_failure(&error), false));
+        Ok(Err(failure)) => {
+            // Preserve the owned stage and last complete catalog. Only the
+            // authoritative document is adopted, including committed errors.
+            return Ok(failed_import(
+                runtime,
+                import_state_failure(&failure.error),
+                crate::storage::safe_plugin_document::persist_outcome_committed(
+                    failure.persist_outcome,
+                ),
+            ));
         }
         Err(_) => {
             cleanup_owned_stage(stage);

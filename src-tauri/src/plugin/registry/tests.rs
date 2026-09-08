@@ -1882,7 +1882,7 @@ fn import_disabled_save_failure_preserves_all_identities_revision_and_rewrite() 
     let memory = MemoryPersistence::failing_loaded_from_v1(state.clone());
     let mut registry = memory.registry(vec![]);
     let before = registry.catalog_snapshot();
-    let error = registry.persist_import_disabled(&record).unwrap_err();
+    let error = registry.persist_import_disabled(&record).unwrap_err().error;
     assert_eq!(
         serde_json::to_value(error).unwrap()["code"],
         "plugin_state_persist_failed"
@@ -1926,7 +1926,8 @@ fn import_disabled_rejects_513th_retained_identity_before_revision_exhaustion() 
     let mut registry = memory.registry(vec![]);
     let error = registry
         .persist_import_disabled(&local("com.new", "New"))
-        .unwrap_err();
+        .unwrap_err()
+        .error;
     assert_eq!(
         serde_json::to_value(error).unwrap()["code"],
         "plugin_state_capacity_exceeded"
@@ -2015,7 +2016,8 @@ fn import_disabled_changed_decision_rejects_max_revision() {
     let before = registry.catalog_snapshot();
     let error = registry
         .persist_import_disabled(&local("com.new", "New"))
-        .unwrap_err();
+        .unwrap_err()
+        .error;
     assert_eq!(
         serde_json::to_value(error).unwrap()["code"],
         "plugin_revision_exhausted"
@@ -2101,7 +2103,7 @@ fn import_preflight_and_disabled_writer_reject_unavailable_runtime() {
         registry.validate_import(&record, ScanUsage::default()),
         Err(ImportCommitFailure::StateUnavailable)
     );
-    let error = registry.persist_import_disabled(&record).unwrap_err();
+    let error = registry.persist_import_disabled(&record).unwrap_err().error;
     assert_eq!(
         serde_json::to_value(error).unwrap()["code"],
         "plugin_state_unavailable"
@@ -2115,7 +2117,7 @@ fn import_preflight_and_disabled_writer_reject_unavailable_runtime() {
         invalid.validate_import(&record, ScanUsage::default()),
         Err(ImportCommitFailure::CatalogInvalid)
     );
-    let error = invalid.persist_import_disabled(&record).unwrap_err();
+    let error = invalid.persist_import_disabled(&record).unwrap_err().error;
     assert_eq!(
         serde_json::to_value(error).unwrap()["code"],
         "plugin_catalog_invalid"

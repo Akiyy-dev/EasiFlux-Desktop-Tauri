@@ -880,51 +880,7 @@ mod platform {
         Ok(())
     }
 
-    /// A named stream is extra user data even though directory enumeration does
-    /// not show it. Query only the held object; never open or read a stream path.
-    fn no_named_streams(file: &File) -> Result<(), ()> {
-        use windows_sys::Wdk::Storage::FileSystem::{
-            FileStreamInformation, NtQueryInformationFile,
-        };
-        let mut storage = [0u64; 512];
-        let mut status = IO_STATUS_BLOCK::default();
-        // SAFETY: storage is initialized, 8-byte aligned, writable for the stated
-        // length; the owned handle and status block outlive the synchronous call.
-        let result = unsafe {
-            NtQueryInformationFile(
-                file.as_raw_handle(),
-                &mut status,
-                storage.as_mut_ptr().cast(),
-                std::mem::size_of_val(&storage) as u32,
-                FileStreamInformation,
-            )
-        };
-        if result < 0 || status.Information > std::mem::size_of_val(&storage) {
-            return Err(());
-        }
-        // SAFETY: the byte view remains inside the initialized storage buffer.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), status.Information)
-        };
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        // The only permitted stream is the unnamed default data stream. Any
-        // continuation (including an overlong response) is conservatively unsafe.
-        if bytes.len() < 38 {
-            return Err(());
-        }
-        let next = u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| ())?);
-        let length = u32::from_le_bytes(bytes[4..8].try_into().map_err(|_| ())?);
-        let expected: Vec<u8> = "::$DATA"
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        if next != 0 || length != 14 || bytes[24..38] != expected {
-            return Err(());
-        }
-        Ok(())
-    }
+    use crate::storage::windows_file_evidence::no_named_streams;
 
     fn object_identity(file: &File) -> Result<FileIdentity, ()> {
         let mut info = FILE_ID_INFO::default();

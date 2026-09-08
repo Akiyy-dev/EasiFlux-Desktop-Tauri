@@ -109,9 +109,9 @@ mod native {
         pub(in crate::storage::safe_plugin_document) fn remove(
             &self,
             name: &str,
-            file: &File,
+            file: File,
         ) -> io::Result<()> {
-            self.verify(name, file)?;
+            self.verify(name, &file)?;
             // Name-based operation: single writer/no manual edits is mandatory.
             Ok(fs::unlinkat(&self.file, name, fs::AtFlags::empty())?)
         }
@@ -191,7 +191,7 @@ mod native {
                 RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING,
             },
             Storage::FileSystem::{
-                FileDispositionInfo, FileIdInfo, FileNameInfo, GetFileInformationByHandle,
+                FileDispositionInfo, FileIdInfo, GetFileInformationByHandle,
                 GetFileInformationByHandleEx, SetFileInformationByHandle,
                 BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT,
                 FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -294,9 +294,9 @@ mod native {
         pub(in crate::storage::safe_plugin_document) fn remove(
             &self,
             name: &str,
-            file: &File,
+            file: File,
         ) -> io::Result<()> {
-            self.verify(name, file)?;
+            self.verify(name, &file)?;
             let info = FILE_DISPOSITION_INFO { DeleteFile: true };
             // SAFETY: the held verified file has DELETE access; no path is reopened for deletion.
             if unsafe {
@@ -310,7 +310,15 @@ mod native {
             {
                 return Err(io::Error::last_os_error());
             }
-            Ok(())
+            // Disposition is only intent until all handles to this object close.
+            // Keep the verified parent, release our last object handle, and
+            // require an exact relative reopen to prove the work name absent.
+            drop(file);
+            match open_child(&self.file, OsStr::new(name), false, false) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+                Ok(_) => Err(rejected()),
+            }
         }
         pub(in crate::storage::safe_plugin_document) fn replace(
             &self,
@@ -463,41 +471,7 @@ mod native {
         verify_opened_name(&file, name)?;
         Ok(file)
     }
-    fn verify_opened_name(file: &File, expected: &OsStr) -> io::Result<()> {
-        // Query the held object rather than trusting a case-insensitive/8.3
-        // namespace lookup. The fixed buffer bounds even unusual NT paths.
-        let mut buffer = vec![0u32; 16385];
-        let buffer_bytes = (buffer.len() * std::mem::size_of::<u32>()) as u32;
-        // SAFETY: live handle; aligned writable buffer, sized in bytes.
-        if unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle(),
-                FileNameInfo,
-                buffer.as_mut_ptr().cast(),
-                buffer_bytes,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let byte_len = buffer[0] as usize;
-        if byte_len == 0 || byte_len & 1 != 0 || byte_len > buffer_bytes as usize - 4 {
-            return Err(rejected());
-        }
-        // SAFETY: FileNameInfo is a u32 byte count followed by UTF-16 units;
-        // the validated count stays inside the allocated and aligned buffer.
-        let units = unsafe {
-            std::slice::from_raw_parts(buffer.as_ptr().add(1).cast::<u16>(), byte_len / 2)
-        };
-        let actual = units
-            .rsplit(|unit| *unit == u16::from(b'\\'))
-            .next()
-            .ok_or_else(rejected)?;
-        if actual != expected.encode_wide().collect::<Vec<_>>() {
-            return Err(rejected());
-        }
-        Ok(())
-    }
+    use crate::storage::windows_file_evidence::verify_opened_name;
     fn object_identity(file: &File) -> io::Result<FileIdentity> {
         let mut info = FILE_ID_INFO::default();
         // SAFETY: live handle and correctly sized writable output.
