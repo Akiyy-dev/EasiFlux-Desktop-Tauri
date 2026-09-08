@@ -1,21 +1,28 @@
-import { computed, ref } from 'vue'
+import { computed, ref, shallowRef } from 'vue'
 import { defineStore } from 'pinia'
 import {
+  cancelLocalManifestImport,
+  commitLocalManifestImport,
   getPluginCatalog,
+  pluginErrorCode,
   pluginErrorMessage,
+  prepareLocalManifestImport,
   reloadPluginCatalog,
   setPluginEnabled,
 } from '../services/pluginService'
 import type {
+  CommitLocalManifestImportResult,
   PluginAvailability,
   PluginAvailabilityReason,
   PluginCatalogItem,
   PluginCatalogSnapshot,
   PluginLocalDiscoverySummary,
   PluginStatus,
+  ReadyLocalManifestImport,
 } from '../types/plugin'
 
 export type PluginLoadStatus = 'idle' | 'loading' | 'ready' | 'error'
+export type PluginImportStatus = 'idle' | 'choosing' | 'preview' | 'committing' | 'result'
 export type PluginStatusFilter = 'all' | PluginStatus
 
 function hasSameImmutableContent(current: PluginCatalogItem, returned: PluginCatalogItem): boolean {
@@ -48,15 +55,25 @@ export const usePluginStore = defineStore('plugin', () => {
   const statusFilter = ref<PluginStatusFilter>('all')
   const pendingIds = ref(new Set<string>())
   const actionErrors = ref<Record<string, string>>({})
+  const importStatus = ref<PluginImportStatus>('idle')
+  const importPreview = shallowRef<ReadyLocalManifestImport | null>(null)
+  const importPreviewStale = ref(false)
+  const importPreviewDeadline = ref<number | null>(null)
+  const importError = ref<string | null>(null)
+  const importResult = shallowRef<CommitLocalManifestImportResult | null>(null)
+  const importOutcomeUnknown = ref(false)
 
   let loadFlight: Promise<void> | null = null
   let reloadFlight: Promise<void> | null = null
+  let importCommitFlight: Promise<void> | null = null
   let hasConfirmedSnapshot = false
   let snapshotSequence = 0n
   let confirmedSnapshotRevision = 0n
   let confirmedSnapshotOrder = 0n
   let latestAdoptedRequestOrder = 0n
   let mutationSequence = 0
+  let importOwnerSequence = 0n
+  let activeImportOwner: bigint | null = null
   const mutationOwners = new Map<string, number>()
   const confirmedItemRevisions = new Map<string, bigint>()
 
@@ -80,11 +97,11 @@ export const usePluginStore = defineStore('plugin', () => {
     if (BigInt(nextRevision) > BigInt(revision.value)) revision.value = nextRevision
   }
 
-  function adoptSnapshot(snapshot: PluginCatalogSnapshot, requestOrder: bigint): void {
+  function adoptSnapshot(snapshot: PluginCatalogSnapshot, requestOrder: bigint): boolean {
     const nextGeneration = BigInt(snapshot.catalogGeneration)
     const currentGeneration = BigInt(catalogGeneration.value)
     const snapshotRevision = BigInt(snapshot.revision)
-    if (nextGeneration < currentGeneration) return
+    if (nextGeneration < currentGeneration) return false
     if (nextGeneration > currentGeneration || !hasConfirmedSnapshot) {
       // Membership and content identity belong to the generation, not the state revision.
       catalog.value = snapshot.plugins
@@ -103,7 +120,7 @@ export const usePluginStore = defineStore('plugin', () => {
       mutationOwners.clear()
       pendingIds.value = new Set()
       actionErrors.value = {}
-      return
+      return true
     }
 
     // A full snapshot confirms every item at least at its revision. Compare against
@@ -111,7 +128,7 @@ export const usePluginStore = defineStore('plugin', () => {
     if (
       snapshotRevision < confirmedSnapshotRevision
       || (snapshotRevision === confirmedSnapshotRevision && requestOrder < confirmedSnapshotOrder)
-    ) return
+    ) return false
     confirmedSnapshotRevision = snapshotRevision
     confirmedSnapshotOrder = requestOrder
     if (requestOrder > latestAdoptedRequestOrder) latestAdoptedRequestOrder = requestOrder
@@ -161,6 +178,28 @@ export const usePluginStore = defineStore('plugin', () => {
       localDiscovery.value = snapshot.localDiscovery
     }
     adoptGlobalRevision(snapshot.revision)
+    return true
+  }
+
+  function markReadyPreviewStaleAfterAdoption(): void {
+    const preview = importPreview.value
+    if (
+      importStatus.value === 'preview'
+      && preview
+      && BigInt(catalogGeneration.value) > BigInt(preview.catalogGeneration)
+    ) {
+      importPreviewStale.value = true
+    }
+  }
+
+  function confirmAuthoritativeSnapshot(
+    snapshot: PluginCatalogSnapshot,
+    requestOrder: bigint,
+  ): void {
+    if (adoptSnapshot(snapshot, requestOrder)) markReadyPreviewStaleAfterAdoption()
+    hasConfirmedSnapshot = true
+    loadStatus.value = 'ready'
+    loadError.value = null
   }
 
   function beginLoad(): Promise<void> {
@@ -171,10 +210,7 @@ export const usePluginStore = defineStore('plugin', () => {
     const request = (async () => {
       try {
         const snapshot = await getPluginCatalog()
-        adoptSnapshot(snapshot, requestOrder)
-        hasConfirmedSnapshot = true
-        loadStatus.value = 'ready'
-        loadError.value = null
+        confirmAuthoritativeSnapshot(snapshot, requestOrder)
       } catch (error) {
         // Separate flights can settle out of order. Only an adopted newer
         // snapshot supersedes this failure; an ignored response does not.
@@ -212,10 +248,7 @@ export const usePluginStore = defineStore('plugin', () => {
     const request = (async () => {
       try {
         const snapshot = await reloadPluginCatalog()
-        adoptSnapshot(snapshot, requestOrder)
-        hasConfirmedSnapshot = true
-        loadStatus.value = 'ready'
-        loadError.value = null
+        confirmAuthoritativeSnapshot(snapshot, requestOrder)
         reloadStatus.value = 'ready'
       } catch (error) {
         if (requestOrder < latestAdoptedRequestOrder) {
@@ -253,6 +286,140 @@ export const usePluginStore = defineStore('plugin', () => {
     if (error === null) delete next[id]
     else next[id] = error
     actionErrors.value = next
+  }
+
+  function clearReadyImportState(): void {
+    importPreview.value = null
+    importPreviewStale.value = false
+    importPreviewDeadline.value = null
+  }
+
+  async function cancelImportTokenBestEffort(token: string): Promise<void> {
+    try {
+      await cancelLocalManifestImport(token)
+    } catch {
+      // Cancellation is intentionally idempotent and does not surface transport details.
+    }
+  }
+
+  async function prepareImport(): Promise<void> {
+    if (importStatus.value !== 'idle') return
+
+    const owner = ++importOwnerSequence
+    activeImportOwner = owner
+    importStatus.value = 'choosing'
+    clearReadyImportState()
+    importError.value = null
+    importResult.value = null
+    importOutcomeUnknown.value = false
+
+    try {
+      const prepared = await prepareLocalManifestImport()
+      if (activeImportOwner !== owner || importStatus.value !== 'choosing') {
+        if (prepared.status === 'ready') {
+          await cancelImportTokenBestEffort(prepared.token)
+        }
+        return
+      }
+
+      if (prepared.status === 'cancelled') {
+        activeImportOwner = null
+        importStatus.value = 'idle'
+        return
+      }
+
+      importPreview.value = prepared
+      importPreviewDeadline.value = performance.now() + prepared.expiresInSeconds * 1_000
+      importPreviewStale.value = hasConfirmedSnapshot
+        && BigInt(catalogGeneration.value) > BigInt(prepared.catalogGeneration)
+      importStatus.value = 'preview'
+    } catch (error) {
+      if (activeImportOwner !== owner || importStatus.value !== 'choosing') return
+      activeImportOwner = null
+      importError.value = pluginErrorMessage(error)
+      importStatus.value = 'result'
+    }
+  }
+
+  async function cancelImport(): Promise<void> {
+    if (importStatus.value !== 'preview' || !importPreview.value) return
+
+    const token = importPreview.value.token
+    activeImportOwner = null
+    clearReadyImportState()
+    importStatus.value = 'idle'
+    importError.value = null
+    importOutcomeUnknown.value = false
+    await cancelImportTokenBestEffort(token)
+  }
+
+  function commitImport(): Promise<void> {
+    if (importCommitFlight) return importCommitFlight
+    const preview = importPreview.value
+    if (importStatus.value !== 'preview' || !preview || importPreviewStale.value) {
+      return Promise.resolve()
+    }
+
+    importStatus.value = 'committing'
+    importError.value = null
+    importResult.value = null
+    importOutcomeUnknown.value = false
+    const requestOrder = ++snapshotSequence
+    const request = (async () => {
+      try {
+        const result = await commitLocalManifestImport(preview)
+        confirmAuthoritativeSnapshot(result.snapshot, requestOrder)
+        importResult.value = result
+        importOutcomeUnknown.value = false
+      } catch (error) {
+        const code = pluginErrorCode(error)
+        if (code === 'plugin_import_token_invalid' || code === 'plugin_import_busy') {
+          importOutcomeUnknown.value = false
+          importError.value = pluginErrorMessage(error)
+        } else {
+          importOutcomeUnknown.value = true
+          importError.value = '结果尚未确认，请重新扫描。'
+        }
+      } finally {
+        activeImportOwner = null
+        clearReadyImportState()
+        importStatus.value = 'result'
+      }
+    })()
+    importCommitFlight = request
+    void request.finally(() => {
+      if (importCommitFlight === request) importCommitFlight = null
+    })
+    return request
+  }
+
+  function releaseImportView(): void {
+    if (importStatus.value === 'choosing') {
+      activeImportOwner = null
+      clearReadyImportState()
+      importError.value = null
+      importOutcomeUnknown.value = false
+      importStatus.value = 'idle'
+      return
+    }
+
+    if (importStatus.value === 'preview' && importPreview.value) {
+      const token = importPreview.value.token
+      activeImportOwner = null
+      clearReadyImportState()
+      importError.value = null
+      importOutcomeUnknown.value = false
+      importStatus.value = 'idle'
+      void cancelImportTokenBestEffort(token)
+    }
+  }
+
+  function clearImportResult(): void {
+    if (importStatus.value !== 'result') return
+    importResult.value = null
+    importError.value = null
+    importOutcomeUnknown.value = false
+    importStatus.value = 'idle'
   }
 
   async function setEnabled(id: string, enabled: boolean): Promise<boolean> {
@@ -315,6 +482,13 @@ export const usePluginStore = defineStore('plugin', () => {
     statusFilter,
     pendingIds,
     actionErrors,
+    importStatus,
+    importPreview,
+    importPreviewStale,
+    importPreviewDeadline,
+    importError,
+    importResult,
+    importOutcomeUnknown,
     visiblePlugins,
     load,
     retry,
@@ -322,5 +496,10 @@ export const usePluginStore = defineStore('plugin', () => {
     setQuery,
     setStatusFilter,
     setEnabled,
+    prepareImport,
+    cancelImport,
+    commitImport,
+    releaseImportView,
+    clearImportResult,
   }
 })

@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import type {
+  CommitLocalManifestImportResult,
   PluginAvailabilityReason,
   PluginCatalogItem,
   PluginCatalogMutationResult,
   PluginCatalogSnapshot,
   PluginStatus,
+  ReadyLocalManifestImport,
 } from '../../src/types/plugin'
 import { usePluginStore } from '../../src/stores/plugin'
 
@@ -13,6 +15,9 @@ const serviceMocks = vi.hoisted(() => ({
   getCatalog: vi.fn(),
   reloadCatalog: vi.fn(),
   setEnabled: vi.fn(),
+  prepareImport: vi.fn(),
+  cancelImport: vi.fn(),
+  commitImport: vi.fn(),
 }))
 
 vi.mock('../../src/services/pluginService', async (importOriginal) => ({
@@ -20,6 +25,9 @@ vi.mock('../../src/services/pluginService', async (importOriginal) => ({
   getPluginCatalog: serviceMocks.getCatalog,
   reloadPluginCatalog: serviceMocks.reloadCatalog,
   setPluginEnabled: serviceMocks.setEnabled,
+  prepareLocalManifestImport: serviceMocks.prepareImport,
+  cancelLocalManifestImport: serviceMocks.cancelImport,
+  commitLocalManifestImport: serviceMocks.commitImport,
 }))
 
 interface Deferred<T> {
@@ -116,12 +124,373 @@ function mutation(
   }
 }
 
+const preview = {
+  schemaVersion: 1,
+  status: 'ready',
+  token: 'a'.repeat(32),
+  expiresInSeconds: 300,
+  catalogGeneration: '1',
+  manifest: item('com.example.notes').manifest,
+} satisfies ReadyLocalManifestImport
+
+function importedItem(
+  sourcePreview: ReadyLocalManifestImport = preview,
+): PluginCatalogItem {
+  return {
+    ...item(sourcePreview.manifest.id, 'disabled', sourcePreview.manifest),
+    source: 'localDeclarative',
+  }
+}
+
+function importedResult(
+  returnedSnapshot: PluginCatalogSnapshot,
+  sourcePreview: ReadyLocalManifestImport = preview,
+): CommitLocalManifestImportResult {
+  return {
+    schemaVersion: 1,
+    status: 'imported',
+    pluginId: sourcePreview.manifest.id,
+    snapshot: returnedSnapshot,
+  }
+}
+
 async function loadedStore(revision = '1') {
   serviceMocks.getCatalog.mockResolvedValueOnce(snapshot(revision))
   const store = usePluginStore()
   await store.load()
   return store
 }
+
+describe('plugin store manifest import ownership and arbitration', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.reloadCatalog.mockReset()
+    serviceMocks.setEnabled.mockReset()
+    serviceMocks.prepareImport.mockReset()
+    serviceMocks.cancelImport.mockReset()
+    serviceMocks.commitImport.mockReset()
+  })
+
+  it('does not replace a preview generation after reload', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('0', [], '1'))
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    const store = usePluginStore()
+    await store.load()
+    await store.prepareImport()
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('0', [], '2'))
+    await store.reload()
+    expect(store.importPreview).toBe(preview)
+    expect(store.importPreview?.catalogGeneration).toBe('1')
+    expect(store.importPreviewStale).toBe(true)
+    await store.commitImport()
+    expect(serviceMocks.commitImport).not.toHaveBeenCalled()
+  })
+
+  it('late_prepare_after_view_release_cancels_returned_token', async () => {
+    const prepared = deferred<ReadyLocalManifestImport>()
+    serviceMocks.prepareImport.mockReturnValueOnce(prepared.promise)
+    serviceMocks.cancelImport.mockResolvedValueOnce({ schemaVersion: 1, status: 'cancelled' })
+    const store = usePluginStore()
+
+    const choosing = store.prepareImport()
+    expect(store.importStatus).toBe('choosing')
+    store.releaseImportView()
+    expect(store.importStatus).toBe('idle')
+    prepared.resolve(preview)
+    await choosing
+
+    expect(serviceMocks.cancelImport).toHaveBeenCalledExactlyOnceWith(preview.token)
+    expect(store.importStatus).toBe('idle')
+    expect(store.importPreview).toBeNull()
+    expect(store.importError).toBeNull()
+  })
+
+  it('delayed_ready_after_newer_reload_is_stale', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('0', [], '1'))
+    const prepared = deferred<ReadyLocalManifestImport>()
+    serviceMocks.prepareImport.mockReturnValueOnce(prepared.promise)
+    const store = usePluginStore()
+    await store.load()
+
+    const choosing = store.prepareImport()
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('0', [], '9007199254740993'))
+    await store.reload()
+    prepared.resolve({ ...preview, catalogGeneration: '9007199254740992' })
+    await choosing
+
+    expect(store.importStatus).toBe('preview')
+    expect(store.importPreview?.catalogGeneration).toBe('9007199254740992')
+    expect(store.importPreviewStale).toBe(true)
+  })
+
+  it('release_during_commit_preserves_background_snapshot_adoption', async () => {
+    const store = await loadedStore('1')
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    const committed = deferred<CommitLocalManifestImportResult>()
+    serviceMocks.commitImport.mockReturnValueOnce(committed.promise)
+
+    const committing = store.commitImport()
+    expect(store.importStatus).toBe('committing')
+    store.releaseImportView()
+    expect(store.importStatus).toBe('committing')
+    const result = importedResult(snapshot('2', [importedItem()], '2'))
+    committed.resolve(result)
+    await committing
+
+    expect(store.importStatus).toBe('result')
+    expect(store.importResult).toBe(result)
+    expect(store.catalog).toEqual(result.snapshot.plugins)
+    expect(store.catalogGeneration).toBe('2')
+    expect(serviceMocks.cancelImport).not.toHaveBeenCalled()
+  })
+
+  it('late_old_import_snapshot_cannot_restore_removed_member', async () => {
+    const store = await loadedStore('1')
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    const committed = deferred<CommitLocalManifestImportResult>()
+    serviceMocks.commitImport.mockReturnValueOnce(committed.promise)
+    const committing = store.commitImport()
+
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('2', [], '2'))
+    await store.reload()
+    committed.resolve(importedResult(snapshot('99', [importedItem()], '1')))
+    await committing
+
+    expect(store.catalog).toEqual([])
+    expect(store.catalogGeneration).toBe('2')
+    expect(store.revision).toBe('2')
+  })
+
+  it('same_generation_import_snapshot_obeys_revision_and_request_order', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('1', [], '1'))
+    const store = usePluginStore()
+    await store.load()
+    const olderRetry = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(olderRetry.promise)
+    const retrying = store.retry()
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    const importSnapshot = snapshot('2', [importedItem()], '1')
+    serviceMocks.commitImport.mockResolvedValueOnce(importedResult(importSnapshot))
+    await store.commitImport()
+
+    olderRetry.resolve(snapshot('2', [], '1'))
+    await retrying
+    expect(store.catalog).toEqual(importSnapshot.plugins)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('1', [], '1'))
+    await store.reload()
+    expect(store.catalog).toEqual(importSnapshot.plugins)
+    expect(store.revision).toBe('2')
+  })
+
+  it('import_is_first_confirmed_snapshot_and_rejects_older_same_generation_response', async () => {
+    serviceMocks.getCatalog.mockRejectedValueOnce({
+      code: 'plugin_state_unavailable',
+      message: 'private',
+    })
+    const store = usePluginStore()
+    await store.load()
+    expect(store.loadStatus).toBe('error')
+
+    const olderRetry = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(olderRetry.promise)
+    const retrying = store.retry()
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    const importSnapshot = snapshot('2', [importedItem()], '1')
+    serviceMocks.commitImport.mockResolvedValueOnce(importedResult(importSnapshot))
+    await store.commitImport()
+
+    expect(store.catalog).toEqual(importSnapshot.plugins)
+    expect(store.loadStatus).toBe('ready')
+    expect(store.loadError).toBeNull()
+    olderRetry.resolve(snapshot('1', [], '1'))
+    await retrying
+    expect(store.catalog).toEqual(importSnapshot.plugins)
+    expect(store.revision).toBe('2')
+  })
+
+  it('expired_token_is_known_no_write_failure', async () => {
+    const store = await loadedStore('1')
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    serviceMocks.commitImport.mockRejectedValueOnce({
+      code: 'plugin_import_token_invalid',
+      message: 'private token details',
+    })
+
+    await store.commitImport()
+
+    expect(store.importStatus).toBe('result')
+    expect(store.importOutcomeUnknown).toBe(false)
+    expect(store.importError).toBe('预览已过期或失效，请重新选择清单。')
+    expect(store.importResult).toBeNull()
+    expect(serviceMocks.commitImport).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.reloadCatalog).not.toHaveBeenCalled()
+  })
+
+  it('busy_commit_is_known_no_write_failure', async () => {
+    const store = await loadedStore('1')
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    serviceMocks.commitImport.mockRejectedValueOnce({
+      code: 'plugin_import_busy',
+      message: 'private',
+    })
+
+    await store.commitImport()
+
+    expect(store.importOutcomeUnknown).toBe(false)
+    expect(store.importError).toBe('已有清单导入操作，请先完成或取消。')
+  })
+
+  it('unknown_commit_does_not_retry_or_claim_not_imported', async () => {
+    const store = await loadedStore('1')
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    serviceMocks.commitImport.mockRejectedValueOnce({
+      code: 'plugin_import_write_failed',
+      message: 'private write path',
+    })
+
+    await store.commitImport()
+
+    expect(store.importStatus).toBe('result')
+    expect(store.importOutcomeUnknown).toBe(true)
+    expect(store.importError).toBe('结果尚未确认，请重新扫描。')
+    expect(store.importResult).toBeNull()
+    expect(serviceMocks.commitImport).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.prepareImport).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.reloadCatalog).not.toHaveBeenCalled()
+    expect(serviceMocks.cancelImport).not.toHaveBeenCalled()
+  })
+
+  it('double_confirm_calls_service_once', async () => {
+    const store = await loadedStore('1')
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    const committed = deferred<CommitLocalManifestImportResult>()
+    serviceMocks.commitImport.mockReturnValueOnce(committed.promise)
+
+    const first = store.commitImport()
+    const second = store.commitImport()
+    expect(store.importStatus).toBe('committing')
+    expect(serviceMocks.commitImport).toHaveBeenCalledExactlyOnceWith(preview)
+    committed.resolve(importedResult(snapshot('2', [importedItem()], '2')))
+    await Promise.all([first, second])
+    expect(serviceMocks.commitImport).toHaveBeenCalledTimes(1)
+  })
+
+  it('native_cancel_is_not_error', async () => {
+    serviceMocks.prepareImport.mockResolvedValueOnce({ schemaVersion: 1, status: 'cancelled' })
+    const store = usePluginStore()
+
+    await store.prepareImport()
+
+    expect(store.importStatus).toBe('idle')
+    expect(store.importError).toBeNull()
+    expect(store.importResult).toBeNull()
+    expect(store.importOutcomeUnknown).toBe(false)
+  })
+
+  it('partial_failure_preserves_disabled_saved_explanation', async () => {
+    const store = await loadedStore('1')
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    const result = {
+      schemaVersion: 1,
+      status: 'notImported',
+      disabledDecisionSaved: true,
+      reasonCode: 'plugin_import_write_failed',
+      snapshot: snapshot('2', [], '1'),
+    } satisfies CommitLocalManifestImportResult
+    serviceMocks.commitImport.mockResolvedValueOnce(result)
+
+    await store.commitImport()
+
+    expect(store.importStatus).toBe('result')
+    expect(store.importResult).toBe(result)
+    expect(store.importResult?.status).toBe('notImported')
+    if (store.importResult?.status !== 'notImported') throw new Error('notImported required')
+    expect(store.importResult.disabledDecisionSaved).toBe(true)
+    expect(store.importOutcomeUnknown).toBe(false)
+    expect(store.importError).toBeNull()
+    expect(store.revision).toBe('2')
+  })
+
+  it('cancel clears preview synchronously, is idempotent, and ignores transport failure', async () => {
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    const store = usePluginStore()
+    await store.prepareImport()
+    const cancellation = deferred<{ schemaVersion: 1, status: 'cancelled' }>()
+    serviceMocks.cancelImport.mockReturnValueOnce(cancellation.promise)
+
+    const first = store.cancelImport()
+    expect(store.importStatus).toBe('idle')
+    expect(store.importPreview).toBeNull()
+    const second = store.cancelImport()
+    expect(serviceMocks.cancelImport).toHaveBeenCalledExactlyOnceWith(preview.token)
+    cancellation.reject(new Error('lost cancellation response'))
+    await Promise.all([first, second])
+    expect(store.importError).toBeNull()
+  })
+
+  it('non-idle prepare is a no-op and release never cancels a commit', async () => {
+    const prepared = deferred<ReadyLocalManifestImport>()
+    serviceMocks.prepareImport.mockReturnValueOnce(prepared.promise)
+    const store = usePluginStore()
+    const firstPrepare = store.prepareImport()
+    await store.prepareImport()
+    expect(serviceMocks.prepareImport).toHaveBeenCalledTimes(1)
+    prepared.resolve(preview)
+    await firstPrepare
+
+    const committed = deferred<CommitLocalManifestImportResult>()
+    serviceMocks.commitImport.mockReturnValueOnce(committed.promise)
+    const committing = store.commitImport()
+    await store.cancelImport()
+    store.releaseImportView()
+    expect(serviceMocks.cancelImport).not.toHaveBeenCalled()
+    committed.resolve(importedResult(snapshot('2', [importedItem()], '2')))
+    await committing
+  })
+
+  it('result survives view release until it is explicitly cleared', async () => {
+    const store = await loadedStore('1')
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    const result = importedResult(snapshot('2', [importedItem()], '2'))
+    serviceMocks.commitImport.mockResolvedValueOnce(result)
+    await store.commitImport()
+
+    store.releaseImportView()
+    expect(store.importStatus).toBe('result')
+    expect(store.importResult).toBe(result)
+    store.clearImportResult()
+    expect(store.importStatus).toBe('idle')
+    expect(store.importResult).toBeNull()
+    expect(store.importError).toBeNull()
+    expect(store.importOutcomeUnknown).toBe(false)
+  })
+
+  it('an ignored older snapshot cannot make a current preview stale', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('1', [], '2'))
+    const store = usePluginStore()
+    await store.load()
+    const currentPreview = { ...preview, catalogGeneration: '2' }
+    serviceMocks.prepareImport.mockResolvedValueOnce(currentPreview)
+    await store.prepareImport()
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('99', [], '1'))
+
+    await store.reload()
+
+    expect(store.importPreviewStale).toBe(false)
+    expect(store.importPreview?.catalogGeneration).toBe('2')
+  })
+})
 
 describe('plugin store catalog generations', () => {
   beforeEach(() => {
