@@ -16,7 +16,8 @@ use crate::plugin::manifest::{
     PluginCatalogSnapshot,
 };
 use crate::plugin::record::PluginRecord;
-use crate::storage::local_plugin_import::{OwnedImportStage, Promotion};
+use crate::storage::local_plugin_import::{ImportPromotionState, OwnedImportStage};
+use crate::storage::local_plugin_package::PromotedManagedPackage;
 
 use super::{runtime_error, OperationReservation, PluginRuntime};
 
@@ -173,16 +174,20 @@ async fn run_commit(
 
     let storage = Arc::clone(&runtime.storage);
     let bytes = lease.content().bytes().to_vec();
-    let mut stage = match tokio::task::spawn_blocking(move || storage.prepare_stage(&bytes)).await {
-        Ok(Ok(stage)) => stage,
-        Ok(Err(reason)) => {
-            return Ok(snapshot_after_failure(&runtime, reason, false).await);
-        }
-        Err(_) => {
-            tracing::error!("plugin manifest staging worker unavailable");
-            return Err(runtime_error());
-        }
-    };
+    let stage_record = lease.content().record().clone();
+    let mut stage =
+        match tokio::task::spawn_blocking(move || storage.prepare_stage(&stage_record, &bytes))
+            .await
+        {
+            Ok(Ok(stage)) => stage,
+            Ok(Err(reason)) => {
+                return Ok(snapshot_after_failure(&runtime, reason, false).await);
+            }
+            Err(_) => {
+                tracing::error!("plugin manifest staging worker unavailable");
+                return Err(runtime_error());
+            }
+        };
 
     let record = lease.content().record().clone();
     let state_runtime = Arc::clone(&runtime);
@@ -212,7 +217,12 @@ async fn run_commit(
     })
     .await;
     let promotion = match promoted {
-        Ok((_, Ok(promotion))) => promotion,
+        Ok((_, Ok(promotion))) => Some(promotion),
+        Ok((stage, Err(_))) if stage.promotion_state() != ImportPromotionState::NotCommitted => {
+            // Verified commit and an uncertain native outcome both forbid cleanup
+            // or a false notImported claim. Ownership registration belongs to Task 5.
+            None
+        }
         Ok((stage, Err(_))) => {
             cleanup_owned_stage(stage).await;
             return Ok(
@@ -308,12 +318,12 @@ async fn publish_import_outcome(
 
 fn classify_import_result(
     record: &PluginRecord,
-    promotion: Promotion,
+    promotion: Option<PromotedManagedPackage>,
     snapshot: PluginCatalogSnapshot,
 ) -> CommitImportResult {
     let plugin_id = record.manifest().id.to_string();
     let expected = PluginCatalogItem::disabled(record.manifest().clone(), record.source());
-    if promotion.object_identity_verified
+    if promotion.is_some_and(|promotion| promotion.entry.matches_locator(&promotion.locator))
         && snapshot.availability == PluginAvailability::Available
         && snapshot.plugins.iter().any(|item| item == &expected)
     {

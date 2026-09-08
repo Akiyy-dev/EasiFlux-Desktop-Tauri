@@ -1,48 +1,54 @@
-use std::{io, path::PathBuf};
+use std::{collections::BTreeSet, io, path::PathBuf};
 
-use crate::{models::config::APP_NAME, plugin::import::ImportCommitFailure};
-
-mod platform;
+#[cfg(test)]
+use super::local_plugin_package::TestControls;
+use super::local_plugin_package::{
+    platform, ImportFsStep, PromotedManagedPackage, SystemLocalPluginPackageStorage,
+};
+use crate::plugin::{
+    import::ImportCommitFailure,
+    ownership::{ManagedOwnershipEntryV1, OwnershipReceiptV1, PackageSlot, ReceiptId},
+    record::PluginRecord,
+};
 
 pub(crate) trait LocalManifestImportStorage: Send + Sync {
-    fn prepare_stage(&self, bytes: &[u8])
-        -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure>;
+    fn prepare_stage(
+        &self,
+        record: &PluginRecord,
+        bytes: &[u8],
+    ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImportPromotionState {
+    NotCommitted,
+    Committed,
+    CommitUnconfirmed,
 }
 
 pub(crate) trait OwnedImportStage: Send {
-    fn promote(&mut self) -> Result<Promotion, ImportCommitFailure>;
+    fn promote(&mut self) -> Result<PromotedManagedPackage, ImportCommitFailure>;
+    fn promotion_state(&self) -> ImportPromotionState;
     fn cleanup(&mut self) -> Result<(), ImportCommitFailure>;
 }
 
-#[derive(Debug)]
-pub(crate) struct Promotion {
-    pub(crate) object_identity_verified: bool,
-}
-
-/// The system root is resolved only when preparing a stage, never at construction.
 pub(crate) struct SystemLocalManifestImportStorage {
-    plugins_root: Option<PathBuf>,
-    hooks: Hooks,
+    packages: SystemLocalPluginPackageStorage,
 }
-
 impl SystemLocalManifestImportStorage {
     pub(crate) fn new() -> Self {
         Self {
-            plugins_root: None,
-            hooks: Hooks::default(),
+            packages: SystemLocalPluginPackageStorage::new(),
         }
     }
-
     pub(crate) fn with_plugins_root(root: PathBuf) -> Self {
         Self {
-            plugins_root: Some(root),
-            hooks: Hooks::default(),
+            packages: SystemLocalPluginPackageStorage::with_plugins_root(root),
         }
     }
-
     #[cfg(test)]
-    fn with_controls(mut self, controls: TestControls) -> Self {
-        self.hooks.controls = controls;
+    pub(super) fn with_controls(mut self, controls: TestControls) -> Self {
+        self.packages.hooks.controls = controls;
         self
     }
 }
@@ -50,31 +56,91 @@ impl SystemLocalManifestImportStorage {
 impl LocalManifestImportStorage for SystemLocalManifestImportStorage {
     fn prepare_stage(
         &self,
+        record: &PluginRecord,
         bytes: &[u8],
     ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
-        let root = self
-            .plugins_root
-            .clone()
-            .or_else(|| dirs::config_dir().map(|root| root.join(APP_NAME).join("plugins")))
-            .ok_or(ImportCommitFailure::WriteFailed)?;
-        let mut parents =
-            platform::ImportDirectories::open_or_create(&root).map_err(write_failed)?;
-        parents.hooks = self.hooks.clone();
-        // Includes unknown entries and abandoned stages. Nothing is adopted or swept.
+        if record.source() != crate::plugin::manifest::PluginSource::LocalDeclarative
+            || bytes.len() > 16_384
+            || record
+                .canonical_manifest_bytes()
+                .map_err(|_| ImportCommitFailure::WriteFailed)?
+                != bytes
+        {
+            return Err(ImportCommitFailure::WriteFailed);
+        }
+        let parents = self.packages.open().map_err(write_failed)?;
         if parents.staging_count(17).map_err(write_failed)? >= 16 {
             return Err(ImportCommitFailure::StagingCapacityExceeded);
         }
-        for _ in 0..4 {
-            let stage_name = format!("stage-{}", self.hooks.uuid().simple());
-            match parents.create_stage(&stage_name, bytes) {
-                Ok((stage_identity, manifest_identity)) => {
-                    return Ok(Box::new(DiskStage {
-                        parents,
-                        stage_name,
-                        stage_identity,
-                        manifest_identity,
-                        state: StageState::Prepared,
-                    }));
+        let mut stage = DiskStage {
+            parents,
+            record: record.clone(),
+            bytes: bytes.to_vec(),
+            attempt: None,
+            cycles: 0,
+            used: [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()],
+            state: ImportPromotionState::NotCommitted,
+            finished: false,
+            cleanup_blocked: false,
+        };
+        stage.prepare_attempt()?;
+        Ok(Box::new(stage))
+    }
+}
+
+struct Attempt {
+    name: String,
+    receipt: OwnershipReceiptV1,
+    receipt_bytes: Vec<u8>,
+    identities: platform::PackageIdentities,
+}
+struct DiskStage {
+    parents: platform::ImportDirectories,
+    record: PluginRecord,
+    bytes: Vec<u8>,
+    attempt: Option<Attempt>,
+    cycles: usize,
+    used: [BTreeSet<String>; 3],
+    state: ImportPromotionState,
+    finished: bool,
+    cleanup_blocked: bool,
+}
+impl DiskStage {
+    fn prepare_attempt(&mut self) -> Result<(), ImportCommitFailure> {
+        while self.cycles < 4 {
+            self.cycles += 1;
+            let ids: [String; 3] =
+                std::array::from_fn(|_| self.parents.hooks.uuid().simple().to_string());
+            if ids
+                .iter()
+                .enumerate()
+                .any(|(index, id)| !self.used[index].insert(id.clone()))
+            {
+                return Err(ImportCommitFailure::WriteFailed);
+            }
+            let name = format!("stage-{}", ids[0]);
+            let receipt = OwnershipReceiptV1::new(
+                ReceiptId::parse(&ids[1]).map_err(|_| ImportCommitFailure::WriteFailed)?,
+                PackageSlot::parse(&format!("pkg-{}", ids[2]))
+                    .map_err(|_| ImportCommitFailure::WriteFailed)?,
+                &self.record,
+            )
+            .map_err(|_| ImportCommitFailure::WriteFailed)?;
+            let receipt_bytes = receipt
+                .canonical_bytes()
+                .map_err(|_| ImportCommitFailure::WriteFailed)?;
+            match self
+                .parents
+                .create_stage(&name, &self.bytes, &receipt_bytes)
+            {
+                Ok(identities) => {
+                    self.attempt = Some(Attempt {
+                        name,
+                        receipt,
+                        receipt_bytes,
+                        identities,
+                    });
+                    return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(write_failed(error)),
@@ -84,146 +150,102 @@ impl LocalManifestImportStorage for SystemLocalManifestImportStorage {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum StageState {
-    Prepared,
-    Promoted,
-    Cleaned,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    volume: u64,
-    object: u128,
-}
-
-struct DiskStage {
-    parents: platform::ImportDirectories,
-    stage_name: String,
-    stage_identity: FileIdentity,
-    manifest_identity: FileIdentity,
-    state: StageState,
-}
-
 impl OwnedImportStage for DiskStage {
-    fn promote(&mut self) -> Result<Promotion, ImportCommitFailure> {
-        if self.state != StageState::Prepared {
+    fn promote(&mut self) -> Result<PromotedManagedPackage, ImportCommitFailure> {
+        if self.finished || self.state != ImportPromotionState::NotCommitted {
             return Err(ImportCommitFailure::WriteFailed);
         }
-        self.parents
-            .verify_stage(
-                &self.stage_name,
-                &self.stage_identity,
-                &self.manifest_identity,
-            )
-            .map_err(write_failed)?;
-        let mut target = None;
-        for _ in 0..4 {
-            let name = format!("pkg-{}", self.parents.hooks.uuid().simple());
-            match self.parents.promote_exclusive(&self.stage_name, &name) {
+        self.finished = true;
+        loop {
+            let attempt = self
+                .attempt
+                .as_ref()
+                .ok_or(ImportCommitFailure::WriteFailed)?;
+            let target = attempt.receipt.package_slot().as_str();
+            match self.parents.promote_exclusive(
+                &attempt.name,
+                target,
+                &attempt.identities,
+                &self.bytes,
+                &attempt.receipt_bytes,
+                &mut self.state,
+            ) {
                 Ok(()) => {
-                    // The rename is the commit point: no subsequent error is precommit.
-                    self.state = StageState::Promoted;
-                    target = Some(name);
-                    break;
+                    self.parents
+                        .hooks
+                        .checkpoint(ImportFsStep::AfterPromotion)
+                        .map_err(write_failed)?;
+                    let verified = self
+                        .parents
+                        .verify_target(target, &attempt.identities)
+                        .map_err(write_failed)?;
+                    verified
+                        .verify_content(&self.bytes, &attempt.receipt_bytes)
+                        .map_err(write_failed)?;
+                    let locator = verified
+                        .locator(attempt.receipt.clone())
+                        .map_err(write_failed)?;
+                    let entry = ManagedOwnershipEntryV1::managed(
+                        locator
+                            .receipt
+                            .clone()
+                            .ok_or(ImportCommitFailure::WriteFailed)?,
+                        &self.record,
+                        locator.directory_identity,
+                        locator.manifest_identity,
+                    )
+                    .map_err(|_| ImportCommitFailure::WriteFailed)?;
+                    self.parents.sync_after_promotion().map_err(write_failed)?;
+                    return Ok(PromotedManagedPackage { entry, locator });
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    self.parents
+                        .prove_collision(
+                            &attempt.name,
+                            target,
+                            &attempt.identities,
+                            &self.bytes,
+                            &attempt.receipt_bytes,
+                        )
+                        .map_err(write_failed)?;
+                    self.state = ImportPromotionState::NotCommitted;
+                    self.cleanup_blocked = true;
+                    self.parents
+                        .cleanup_stage(&attempt.name, &attempt.identities)
+                        .map_err(write_failed)?;
+                    self.cleanup_blocked = false;
+                    self.attempt = None;
+                    self.prepare_attempt()?;
+                }
                 Err(error) => return Err(write_failed(error)),
             }
         }
-        let target = target.ok_or(ImportCommitFailure::WriteFailed)?;
-        let verified = self
-            .parents
-            .hooks
-            .checkpoint(ImportFsStep::AfterPromotion)
-            .and_then(|()| {
-                self.parents
-                    .verify_target(&target, &self.stage_identity, &self.manifest_identity)
-            });
-        let object_identity_verified = match verified {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(kind = ?error.kind(), "Imported manifest identity could not be confirmed");
-                false
-            }
-        };
-        if let Err(error) = self.parents.sync_after_promotion() {
-            tracing::warn!(kind = ?error.kind(), "Imported manifest directory sync failed");
-        }
-        Ok(Promotion {
-            object_identity_verified,
-        })
     }
-
+    fn promotion_state(&self) -> ImportPromotionState {
+        self.state
+    }
     fn cleanup(&mut self) -> Result<(), ImportCommitFailure> {
-        match self.state {
-            StageState::Promoted => Err(ImportCommitFailure::WriteFailed),
-            StageState::Cleaned => Ok(()),
-            StageState::Prepared => {
-                self.parents
-                    .cleanup_stage(
-                        &self.stage_name,
-                        &self.stage_identity,
-                        &self.manifest_identity,
-                    )
-                    .map_err(write_failed)?;
-                self.state = StageState::Cleaned;
-                Ok(())
-            }
+        if self.state != ImportPromotionState::NotCommitted || self.cleanup_blocked {
+            return Err(ImportCommitFailure::WriteFailed);
         }
+        self.finished = true;
+        self.cleanup_blocked = true;
+        if let Some(attempt) = &self.attempt {
+            self.parents
+                .cleanup_stage(&attempt.name, &attempt.identities)
+                .map_err(write_failed)?;
+        }
+        self.cleanup_blocked = false;
+        self.attempt = None;
+        self.finished = true;
+        Ok(())
     }
 }
 
-// Intentionally no Drop cleanup: forgotten stages are preserved across restart.
+// No Drop cleanup: abandoned, uncertain, and committed packages are preserved.
 fn write_failed(error: io::Error) -> ImportCommitFailure {
     tracing::warn!(kind = ?error.kind(), "Local manifest import filesystem operation failed");
     ImportCommitFailure::WriteFailed
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ImportFsStep {
-    CreateStage,
-    WriteManifest,
-    SyncManifest,
-    #[cfg(unix)]
-    SyncStageDirectory,
-    #[cfg(unix)]
-    SyncStagingParent,
-    BeforePromotion,
-    AfterPromotion,
-    SyncDestinationDirectory,
-}
-
-#[derive(Clone, Default)]
-struct Hooks {
-    #[cfg(test)]
-    controls: TestControls,
-}
-
-impl Hooks {
-    fn checkpoint(&self, _step: ImportFsStep) -> io::Result<()> {
-        #[cfg(test)]
-        if let Some(hook) = &self.controls.hook {
-            return hook(_step);
-        }
-        Ok(())
-    }
-
-    fn uuid(&self) -> uuid::Uuid {
-        #[cfg(test)]
-        if let Some(supplier) = &self.controls.uuid {
-            return supplier();
-        }
-        uuid::Uuid::new_v4()
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Default)]
-struct TestControls {
-    hook: Option<std::sync::Arc<dyn Fn(ImportFsStep) -> io::Result<()> + Send + Sync>>,
-    uuid: Option<std::sync::Arc<dyn Fn() -> uuid::Uuid + Send + Sync>>,
-    rename_error: Option<io::ErrorKind>,
 }
 
 #[cfg(test)]

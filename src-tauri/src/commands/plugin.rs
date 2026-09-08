@@ -260,6 +260,7 @@ mod tests {
     impl LocalManifestImportStorage for CountingStorage {
         fn prepare_stage(
             &self,
+            _record: &crate::plugin::record::PluginRecord,
             _bytes: &[u8],
         ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
             self.0.fetch_add(1, Ordering::SeqCst);

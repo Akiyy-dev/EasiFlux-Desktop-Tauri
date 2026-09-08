@@ -1,3 +1,4 @@
+use crate::storage::local_plugin_package::PromotedManagedPackage as Promotion;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -25,7 +26,8 @@ use crate::plugin::manifest::{PluginManifestV1, PluginSource};
 use crate::plugin::record::PluginRecord;
 use crate::plugin::PluginRegistry;
 use crate::storage::local_plugin_import::{
-    LocalManifestImportStorage, OwnedImportStage, Promotion, SystemLocalManifestImportStorage,
+    ImportPromotionState, LocalManifestImportStorage, OwnedImportStage,
+    SystemLocalManifestImportStorage,
 };
 use crate::storage::plugin_state::{
     PluginStateEntryV2, PluginStateFileV2, PluginStateLoad, PluginStatePersistence,
@@ -209,6 +211,7 @@ struct StorageControls {
     fail_prepare: AtomicBool,
     fail_promote: AtomicBool,
     unverified_promotion: AtomicBool,
+    unconfirmed_promotion: AtomicBool,
     panic_after_promotion: AtomicBool,
     promote_calls: AtomicUsize,
     promotion_block: Mutex<Option<Arc<BlockingPoint>>>,
@@ -260,15 +263,17 @@ struct RecordingStorage {
 impl LocalManifestImportStorage for RecordingStorage {
     fn prepare_stage(
         &self,
+        record: &PluginRecord,
         bytes: &[u8],
     ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
         self.events.lock().unwrap().push("stage");
         if self.controls.fail_prepare.swap(false, Ordering::SeqCst) {
             return Err(ImportCommitFailure::WriteFailed);
         }
-        let inner = self.inner.prepare_stage(bytes)?;
+        let inner = self.inner.prepare_stage(record, bytes)?;
         Ok(Box::new(RecordingStage {
             inner,
+            outcome_unknown: false,
             events: Arc::clone(&self.events),
             controls: Arc::clone(&self.controls),
         }))
@@ -277,11 +282,19 @@ impl LocalManifestImportStorage for RecordingStorage {
 
 struct RecordingStage {
     inner: Box<dyn OwnedImportStage>,
+    outcome_unknown: bool,
     events: Events,
     controls: Arc<StorageControls>,
 }
 
 impl OwnedImportStage for RecordingStage {
+    fn promotion_state(&self) -> ImportPromotionState {
+        if self.outcome_unknown {
+            ImportPromotionState::CommitUnconfirmed
+        } else {
+            self.inner.promotion_state()
+        }
+    }
     fn promote(&mut self) -> Result<Promotion, ImportCommitFailure> {
         self.events.lock().unwrap().push("promote");
         self.controls.promote_calls.fetch_add(1, Ordering::SeqCst);
@@ -291,7 +304,15 @@ impl OwnedImportStage for RecordingStage {
         if self.controls.fail_promote.swap(false, Ordering::SeqCst) {
             return Err(ImportCommitFailure::WriteFailed);
         }
-        let mut promotion = self.inner.promote()?;
+        if self
+            .controls
+            .unconfirmed_promotion
+            .swap(false, Ordering::SeqCst)
+        {
+            self.outcome_unknown = true;
+            return Err(ImportCommitFailure::WriteFailed);
+        }
+        let promotion = self.inner.promote()?;
         if self
             .controls
             .panic_after_promotion
@@ -304,7 +325,7 @@ impl OwnedImportStage for RecordingStage {
             .unverified_promotion
             .swap(false, Ordering::SeqCst)
         {
-            promotion.object_identity_verified = false;
+            return Err(ImportCommitFailure::WriteFailed);
         }
         Ok(promotion)
     }
@@ -323,9 +344,10 @@ struct CrashStorage {
 impl LocalManifestImportStorage for CrashStorage {
     fn prepare_stage(
         &self,
+        record: &PluginRecord,
         bytes: &[u8],
     ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
-        let inner = self.inner.prepare_stage(bytes)?;
+        let inner = self.inner.prepare_stage(record, bytes)?;
         exit_at_checkpoint(&self.checkpoint, "stage-ready");
         Ok(Box::new(CrashStage {
             inner,
@@ -340,6 +362,9 @@ struct CrashStage {
 }
 
 impl OwnedImportStage for CrashStage {
+    fn promotion_state(&self) -> ImportPromotionState {
+        self.inner.promotion_state()
+    }
     fn promote(&mut self) -> Result<Promotion, ImportCommitFailure> {
         let promotion = self.inner.promote()?;
         exit_at_checkpoint(&self.checkpoint, "promoted");
@@ -611,7 +636,15 @@ fn assert_abandoned_stage_fills_capacity(plugins_root: &Path) {
     before.sort();
     let storage = SystemLocalManifestImportStorage::with_plugins_root(plugins_root.to_owned());
     assert_eq!(
-        storage.prepare_stage(VALID).err(),
+        storage
+            .prepare_stage(
+                &PluginRecord::local_declarative(serde_json::from_slice(VALID).unwrap()).unwrap(),
+                &PluginRecord::local_declarative(serde_json::from_slice(VALID).unwrap())
+                    .unwrap()
+                    .canonical_manifest_bytes()
+                    .unwrap()
+            )
+            .err(),
         Some(ImportCommitFailure::StagingCapacityExceeded)
     );
     let mut after = fs::read_dir(&staging)
@@ -1173,6 +1206,41 @@ async fn unverified_promoted_identity_is_imported_not_visible() {
         "disabled"
     );
     assert_eq!(fixture.target_manifests().len(), 1);
+    assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+}
+
+#[tokio::test]
+async fn unconfirmed_promotion_error_never_claims_not_imported_or_cleans_stage() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    fixture
+        .storage_controls
+        .unconfirmed_promotion
+        .store(true, Ordering::SeqCst);
+    fixture.clear_events();
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["status"], "importedNotVisible");
+    assert_eq!(
+        fs::read_dir(fixture.plugins_root.join("import-staging"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert!(fixture.target_manifests().is_empty());
+    assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+    assert_eq!(
+        fixture
+            .storage_controls
+            .promote_calls
+            .load(Ordering::SeqCst),
+        1
+    );
 }
 
 #[tokio::test]
