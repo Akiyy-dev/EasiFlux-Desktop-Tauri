@@ -1012,6 +1012,7 @@ dependencies = [
  "hex",
  "hmac",
  "keyring",
+ "libc",
  "reqwest 0.12.28",
  "rust_decimal",
  "rustix",
