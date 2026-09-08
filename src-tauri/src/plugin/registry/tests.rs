@@ -428,12 +428,14 @@ fn recovered_disabled_identity_rewrites_at_max_revision_after_save_failure() {
     assert!(registry
         .set_enabled("com.easiflux.local", false, "1")
         .is_err());
+    assert_eq!(memory.0.lock().unwrap().saves.len(), 1);
     assert_eq!(registry.catalog_snapshot().revision, u64::MAX.to_string());
 
     memory.allow_saves();
     registry
         .set_enabled("com.easiflux.local", false, "1")
         .unwrap();
+    assert_eq!(memory.0.lock().unwrap().saves.len(), 2);
     assert_eq!(memory.last_save().unwrap(), persisted);
 }
 

@@ -684,6 +684,30 @@ fn saves_preserve_previous_commit_and_recovered_state_in_backup() {
     }
 }
 
+// Catches saving a raw secondary candidate as the backup predecessor after a
+// fail-closed recovery has normalized its local authorization.
+#[test]
+fn saves_normalized_secondary_recovery_as_backup_predecessor() {
+    for suffix in [".tmp", ".bak"] {
+        let fixture = Fixture::new();
+        let mut recovered = state(4);
+        recovered.entries[0].enabled = true;
+        recovered
+            .entries
+            .push(local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A));
+        fixture.write("", b"broken primary");
+        fixture.write(suffix, serde_json::to_vec(&recovered).unwrap());
+
+        fixture.store().save(&state(5)).unwrap();
+
+        let backup: PluginStateFileV2 =
+            serde_json::from_slice(&fs::read(sidecar(&fixture.path(), ".bak")).unwrap()).unwrap();
+        assert_eq!(backup.revision, 4);
+        assert!(backup.entries[0].enabled);
+        assert!(!backup.entries[1].enabled);
+    }
+}
+
 // Catches treating a fully written but uncommitted stage as crash-recovery input.
 #[test]
 fn stale_pending_is_never_read_as_current_and_does_not_block_save() {
