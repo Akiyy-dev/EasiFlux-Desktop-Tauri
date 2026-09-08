@@ -4,7 +4,7 @@ use crate::{
     models::config::APP_NAME,
     plugin::{
         discovery::LocalPackageLocator,
-        ownership::{FileIdentity, ManagedOwnershipEntryV1},
+        ownership::{FileIdentity, ManagedOwnershipEntryV1, RemovalSlot},
     },
 };
 
@@ -48,6 +48,93 @@ pub(crate) struct PromotedManagedPackage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemovalStorageFailure {
+    Unavailable,
+    IdentityChanged,
+    StagingCapacityExceeded,
+    ProvenWriteFailure,
+}
+
+pub(crate) trait ManagedLocalPluginRemovalStorage: Send + Sync {
+    fn prepare(
+        &self,
+        locator: &LocalPackageLocator,
+        entry: &ManagedOwnershipEntryV1,
+    ) -> Result<Box<dyn OwnedRemoval>, RemovalStorageFailure>;
+}
+
+pub(crate) trait OwnedRemoval: Send {
+    fn removal_slot(&self) -> &RemovalSlot;
+    fn reverify_before_rename(&self) -> Result<(), RemovalStorageFailure>;
+    fn quarantine_once(&mut self) -> QuarantineRenameOutcome;
+    /// Fresh read-only evidence. Never grants cleanup permission or changes state.
+    fn verify_quarantine(&self) -> Result<VerifiedQuarantine, RemovalStorageFailure>;
+    fn cleanup_once(&mut self) -> CleanupOutcome;
+}
+
+#[derive(Debug)]
+pub(crate) struct VerifiedQuarantine {
+    pub(crate) entry: Box<ManagedOwnershipEntryV1>,
+    pub(crate) removal_slot: RemovalSlot,
+}
+
+#[derive(Debug)]
+pub(crate) enum QuarantineRenameOutcome {
+    Committed(VerifiedQuarantine),
+    ProvenNotCommitted(RemovalStorageFailure),
+    CommitUnconfirmed,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KnownCleanupShape {
+    Full,
+    ReceiptOnly,
+    EmptyDirectory,
+    BothAbsent,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanupOutcome {
+    Removed,
+    Pending(KnownCleanupShape),
+    Conflict,
+}
+
+impl ManagedLocalPluginRemovalStorage for SystemLocalPluginPackageStorage {
+    fn prepare(
+        &self,
+        locator: &LocalPackageLocator,
+        entry: &ManagedOwnershipEntryV1,
+    ) -> Result<Box<dyn OwnedRemoval>, RemovalStorageFailure> {
+        let parents = self
+            .open()
+            .map_err(|_| RemovalStorageFailure::Unavailable)?;
+        Ok(Box::new(platform::Removal::prepare(
+            parents, locator, entry,
+        )?))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RemovalFsStep {
+    BeforeReverify,
+    BeforeNativeRename,
+    AfterRename,
+    SyncSource,
+    SyncTarget,
+    ReopenTarget,
+    ReadManifest,
+    ReadReceipt,
+    VerifyIdentities,
+    BeforeCleanup,
+    BeforeManifestRemoval,
+    AfterManifestRemoval,
+    BeforeReceiptRemoval,
+    AfterReceiptRemoval,
+    BeforeDirectoryRemoval,
+    AfterDirectoryRemoval,
+    SyncCleanup,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ImportFsStep {
     CreateStage,
     WriteManifest,
@@ -70,6 +157,13 @@ pub(super) struct Hooks {
     pub(super) controls: TestControls,
 }
 impl Hooks {
+    pub(super) fn removal_checkpoint(&self, _step: RemovalFsStep) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &self.controls.removal_hook {
+            return hook(_step);
+        }
+        Ok(())
+    }
     pub(super) fn checkpoint(&self, _step: ImportFsStep) -> io::Result<()> {
         #[cfg(test)]
         if let Some(hook) = &self.controls.hook {
@@ -88,6 +182,8 @@ impl Hooks {
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(super) struct TestControls {
+    pub(super) removal_hook:
+        Option<std::sync::Arc<dyn Fn(RemovalFsStep) -> io::Result<()> + Send + Sync>>,
     pub(super) hook: Option<std::sync::Arc<dyn Fn(ImportFsStep) -> io::Result<()> + Send + Sync>>,
     pub(super) uuid: Option<std::sync::Arc<dyn Fn() -> uuid::Uuid + Send + Sync>>,
     pub(super) rename_error: Option<io::ErrorKind>,

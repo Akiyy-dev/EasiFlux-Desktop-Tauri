@@ -1,4 +1,559 @@
 use super::*;
+
+#[test]
+fn prepare_allocates_one_absent_remove_slot() {
+    let (_temp, root, record, bytes) = fixture();
+    let import = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
+    let promoted = import
+        .prepare_stage(&record, &bytes)
+        .unwrap()
+        .promote()
+        .unwrap();
+    let storage = SystemLocalPluginPackageStorage::with_plugins_root(root.clone());
+    let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+    assert!(!root
+        .join("removal-staging")
+        .join(removal.removal_slot().as_str())
+        .exists());
+    let QuarantineRenameOutcome::Committed(evidence) = removal.quarantine_once() else {
+        panic!("quarantine must be verified");
+    };
+    assert_eq!(&evidence.removal_slot, removal.removal_slot());
+    assert!(matches!(removal.cleanup_once(), CleanupOutcome::Removed));
+    assert!(children(&root.join("local")).is_empty());
+    assert!(children(&root.join("removal-staging")).is_empty());
+}
+
+fn removal_fixture() -> (
+    tempfile::TempDir,
+    PathBuf,
+    PromotedManagedPackage,
+    SystemLocalPluginPackageStorage,
+) {
+    let (temp, root, record, bytes) = fixture();
+    let promoted = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
+        .prepare_stage(&record, &bytes)
+        .unwrap()
+        .promote()
+        .unwrap();
+    let storage = SystemLocalPluginPackageStorage::with_plugins_root(root.clone());
+    (temp, root, promoted, storage)
+}
+
+#[test]
+fn prepare_requires_exact_receipt_manifest_and_three_entry_identities() {
+    for drift in 0..6 {
+        let (_temp, root, promoted, storage) = removal_fixture();
+        let mut entry = promoted.entry.clone();
+        match drift {
+            0 => entry.directory_identity.object += 1,
+            1 => entry.manifest_identity.object += 1,
+            2 => entry.receipt_identity.object += 1,
+            3 => fs::write(
+                root.join("local")
+                    .join(entry.package_slot().as_str())
+                    .join("manifest.json"),
+                b"{}",
+            )
+            .unwrap(),
+            4 => fs::write(
+                root.join("local")
+                    .join(entry.package_slot().as_str())
+                    .join("ownership-receipt.json"),
+                b"{}",
+            )
+            .unwrap(),
+            _ => fs::write(
+                root.join("local")
+                    .join(entry.package_slot().as_str())
+                    .join("extra"),
+                b"retain",
+            )
+            .unwrap(),
+        }
+        assert!(matches!(
+            storage.prepare(&promoted.locator, &entry),
+            Err(RemovalStorageFailure::IdentityChanged)
+        ));
+    }
+}
+
+#[test]
+fn prepare_counts_all_17_removal_entries_and_initial_collision_is_unavailable() {
+    for count in [16, 17] {
+        let (_temp, root, promoted, storage) = removal_fixture();
+        for n in 0..count {
+            fs::write(
+                root.join("removal-staging").join(format!("unknown-{n}")),
+                b"retain",
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            storage.prepare(&promoted.locator, &promoted.entry),
+            Err(RemovalStorageFailure::StagingCapacityExceeded)
+        ));
+    }
+    let (_temp, root, promoted, mut storage) = removal_fixture();
+    let uuid = uuid::Uuid::new_v4();
+    storage.hooks.controls.uuid = Some(Arc::new(move || uuid));
+    fs::write(
+        root.join("removal-staging")
+            .join(format!("remove-{}", uuid.simple())),
+        b"retain",
+    )
+    .unwrap();
+    assert!(matches!(
+        storage.prepare(&promoted.locator, &promoted.entry),
+        Err(RemovalStorageFailure::Unavailable)
+    ));
+}
+
+#[test]
+fn native_success_then_every_post_step_failure_is_unconfirmed_and_cannot_cleanup() {
+    for point in [
+        RemovalFsStep::AfterRename,
+        RemovalFsStep::SyncSource,
+        RemovalFsStep::SyncTarget,
+        RemovalFsStep::ReopenTarget,
+        RemovalFsStep::ReadManifest,
+        RemovalFsStep::ReadReceipt,
+        RemovalFsStep::VerifyIdentities,
+    ] {
+        let (_temp, root, promoted, mut storage) = removal_fixture();
+        storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+            if step == point {
+                Err(io::ErrorKind::PermissionDenied.into())
+            } else {
+                Ok(())
+            }
+        }));
+        let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+        assert!(
+            matches!(
+                removal.quarantine_once(),
+                QuarantineRenameOutcome::CommitUnconfirmed
+            ),
+            "{point:?}"
+        );
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::CommitUnconfirmed
+        ));
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        assert!(children(&root.join("local")).is_empty());
+        assert_eq!(children(&only(&root.join("removal-staging"))).len(), 2);
+    }
+}
+
+#[test]
+fn cleanup_interruptions_are_monotonic_and_second_calls_do_not_mutate() {
+    for (point, shape) in [
+        (RemovalFsStep::BeforeCleanup, KnownCleanupShape::Full),
+        (
+            RemovalFsStep::BeforeManifestRemoval,
+            KnownCleanupShape::Full,
+        ),
+        (
+            RemovalFsStep::AfterManifestRemoval,
+            KnownCleanupShape::ReceiptOnly,
+        ),
+        (
+            RemovalFsStep::BeforeReceiptRemoval,
+            KnownCleanupShape::ReceiptOnly,
+        ),
+        (
+            RemovalFsStep::AfterReceiptRemoval,
+            KnownCleanupShape::EmptyDirectory,
+        ),
+        (
+            RemovalFsStep::BeforeDirectoryRemoval,
+            KnownCleanupShape::EmptyDirectory,
+        ),
+        (
+            RemovalFsStep::AfterDirectoryRemoval,
+            KnownCleanupShape::BothAbsent,
+        ),
+        (RemovalFsStep::SyncCleanup, KnownCleanupShape::BothAbsent),
+    ] {
+        let (_temp, root, promoted, mut storage) = removal_fixture();
+        storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+            if step == point {
+                Err(io::ErrorKind::PermissionDenied.into())
+            } else {
+                Ok(())
+            }
+        }));
+        let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::Committed(_)
+        ));
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Pending(shape));
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::CommitUnconfirmed
+        ));
+        let target = root
+            .join("removal-staging")
+            .join(removal.removal_slot().as_str());
+        match shape {
+            KnownCleanupShape::Full => assert_eq!(children(&target).len(), 2),
+            KnownCleanupShape::ReceiptOnly => assert_eq!(
+                children(&target),
+                vec![target.join("ownership-receipt.json")]
+            ),
+            KnownCleanupShape::EmptyDirectory => assert!(children(&target).is_empty()),
+            KnownCleanupShape::BothAbsent => assert!(!target.exists()),
+        }
+    }
+}
+
+#[test]
+fn adjacent_collision_stops_precommit_native_collision_requires_exact_source() {
+    for native in [false, true] {
+        let (_temp, root, promoted, mut storage) = removal_fixture();
+        let injected = root.clone();
+        let uuid = uuid::Uuid::new_v4();
+        storage.hooks.controls.uuid = Some(Arc::new(move || uuid));
+        storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+            if step
+                == if native {
+                    RemovalFsStep::BeforeNativeRename
+                } else {
+                    RemovalFsStep::BeforeReverify
+                }
+            {
+                fs::create_dir(
+                    injected
+                        .join("removal-staging")
+                        .join(format!("remove-{}", uuid.simple())),
+                )?;
+            }
+            Ok(())
+        }));
+        let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+        let expected = if native {
+            RemovalStorageFailure::ProvenWriteFailure
+        } else {
+            RemovalStorageFailure::IdentityChanged
+        };
+        assert!(
+            matches!(removal.quarantine_once(), QuarantineRenameOutcome::ProvenNotCommitted(value) if value == expected)
+        );
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::CommitUnconfirmed
+        ));
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        assert_eq!(children(&root.join("local")).len(), 1);
+    }
+}
+
+#[test]
+fn every_non_collision_native_error_is_uncertain() {
+    for error in [
+        io::ErrorKind::AlreadyExists,
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::NotFound,
+        io::ErrorKind::Unsupported,
+        io::ErrorKind::Other,
+    ] {
+        let (_temp, root, promoted, mut storage) = removal_fixture();
+        storage.hooks.controls.rename_error = Some(error);
+        let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::CommitUnconfirmed
+        ));
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        assert_eq!(children(&root.join("local")).len(), 1);
+    }
+}
+
+#[test]
+fn manifest_only_extra_or_replaced_child_is_cleanup_conflict() {
+    for drift in 0..3 {
+        let (_temp, root, promoted, storage) = removal_fixture();
+        let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::Committed(_)
+        ));
+        let target = root
+            .join("removal-staging")
+            .join(removal.removal_slot().as_str());
+        match drift {
+            0 => fs::remove_file(target.join("ownership-receipt.json")).unwrap(),
+            1 => fs::write(target.join("extra"), b"retain").unwrap(),
+            _ => {
+                fs::rename(target.join("manifest.json"), root.join("old-manifest")).unwrap();
+                fs::write(target.join("manifest.json"), b"replacement").unwrap();
+            }
+        }
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        assert!(target.join("manifest.json").exists());
+    }
+}
+
+#[test]
+fn fresh_read_only_verification_cannot_authorize_uncertain_cleanup() {
+    let (_temp, root, promoted, mut storage) = removal_fixture();
+    storage.hooks.controls.removal_hook = Some(Arc::new(|step| {
+        if step == RemovalFsStep::AfterRename {
+            Err(io::ErrorKind::Other.into())
+        } else {
+            Ok(())
+        }
+    }));
+    let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+    assert_eq!(removal.reverify_before_rename(), Ok(()));
+    assert!(matches!(
+        removal.quarantine_once(),
+        QuarantineRenameOutcome::CommitUnconfirmed
+    ));
+    let evidence = removal.verify_quarantine().unwrap();
+    assert_eq!(&evidence.removal_slot, removal.removal_slot());
+    assert!(evidence.entry.removal_slot().is_some());
+    assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+    assert_eq!(children(&only(&root.join("removal-staging"))).len(), 2);
+}
+
+#[test]
+fn successful_calls_and_failed_precheck_consume_mutation_budget_before_io() {
+    for stop in [false, true] {
+        let (_temp, root, promoted, mut storage) = removal_fixture();
+        let events = Arc::new(Mutex::new(vec![]));
+        let observed = events.clone();
+        let uuid_calls = Arc::new(AtomicUsize::new(0));
+        let generated = uuid_calls.clone();
+        storage.hooks.controls.uuid = Some(Arc::new(move || {
+            generated.fetch_add(1, Ordering::SeqCst);
+            uuid::Uuid::new_v4()
+        }));
+        storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+            observed.lock().unwrap().push(step);
+            if stop && step == RemovalFsStep::BeforeReverify {
+                Err(io::ErrorKind::Other.into())
+            } else {
+                Ok(())
+            }
+        }));
+        let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+        if stop {
+            assert!(matches!(
+                removal.quarantine_once(),
+                QuarantineRenameOutcome::ProvenNotCommitted(_)
+            ));
+        } else {
+            assert!(matches!(
+                removal.quarantine_once(),
+                QuarantineRenameOutcome::Committed(_)
+            ));
+            assert_eq!(removal.cleanup_once(), CleanupOutcome::Removed);
+        }
+        let original_events = events.lock().unwrap().clone();
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::CommitUnconfirmed
+        ));
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        assert_eq!(*events.lock().unwrap(), original_events);
+        assert_eq!(uuid_calls.load(Ordering::SeqCst), 1);
+        drop(removal);
+        assert_eq!(*events.lock().unwrap(), original_events);
+        assert_eq!(children(&root.join("local")).len(), usize::from(stop));
+    }
+}
+
+#[test]
+fn postrename_reopen_reparses_both_files_and_three_identities() {
+    for drift in 0..5 {
+        let (_temp, root, promoted, mut storage) = removal_fixture();
+        let injected = root.clone();
+        storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+            if step == RemovalFsStep::AfterRename {
+                let target = only(&injected.join("removal-staging"));
+                if drift < 2 {
+                    fs::write(
+                        target.join(if drift == 0 {
+                            "manifest.json"
+                        } else {
+                            "ownership-receipt.json"
+                        }),
+                        b"{}",
+                    )?;
+                } else if drift < 4 {
+                    let path = target.join(if drift == 2 {
+                        "manifest.json"
+                    } else {
+                        "ownership-receipt.json"
+                    });
+                    let bytes = fs::read(&path)?;
+                    fs::rename(&path, injected.join("original"))?;
+                    fs::write(path, bytes)?;
+                } else {
+                    fs::rename(&target, injected.join("original"))?;
+                    fs::create_dir(&target)?;
+                    for name in ["manifest.json", "ownership-receipt.json"] {
+                        fs::copy(injected.join("original").join(name), target.join(name))?;
+                    }
+                }
+            }
+            Ok(())
+        }));
+        let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::CommitUnconfirmed
+        ));
+        assert!(removal.verify_quarantine().is_err());
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        assert_eq!(children(&only(&root.join("removal-staging"))).len(), 2);
+    }
+}
+
+#[test]
+fn child_change_at_final_reverify_stops_before_native_rename() {
+    let (_temp, root, promoted, mut storage) = removal_fixture();
+    let source = root
+        .join("local")
+        .join(promoted.entry.package_slot().as_str());
+    let injected = source.clone();
+    storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+        if step == RemovalFsStep::BeforeNativeRename {
+            fs::write(injected.join("manifest.json"), b"{}")?;
+        }
+        Ok(())
+    }));
+    let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+    assert!(matches!(
+        removal.quarantine_once(),
+        QuarantineRenameOutcome::ProvenNotCommitted(RemovalStorageFailure::IdentityChanged)
+    ));
+    assert!(source.exists());
+    assert!(children(&root.join("removal-staging")).is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_removal_source_and_child_name_swaps_do_not_redirect_held_mutations() {
+    let (_temp, root, promoted, mut storage) = removal_fixture();
+    let injected = root.clone();
+    storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+        let original = injected.join("swapped");
+        match step {
+            RemovalFsStep::BeforeNativeRename => {
+                assert!(fs::rename(only(&injected.join("local")), &original).is_err());
+            }
+            RemovalFsStep::BeforeManifestRemoval => {
+                assert!(fs::rename(
+                    only(&injected.join("removal-staging")).join("manifest.json"),
+                    &original
+                )
+                .is_err());
+            }
+            RemovalFsStep::BeforeReceiptRemoval => {
+                assert!(fs::rename(
+                    only(&injected.join("removal-staging")).join("ownership-receipt.json"),
+                    &original
+                )
+                .is_err());
+            }
+            _ => (),
+        }
+        Ok(())
+    }));
+    let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+    assert!(matches!(
+        removal.quarantine_once(),
+        QuarantineRenameOutcome::Committed(_)
+    ));
+    assert_eq!(removal.cleanup_once(), CleanupOutcome::Removed);
+    assert!(!root.join("swapped").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn best_effort_adjacent_cleanup_checks_all_survivors_and_parent() {
+    for parent_swap in [false, true] {
+        let (_temp, root, promoted, mut storage) = removal_fixture();
+        let injected = root.clone();
+        storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+            if step == RemovalFsStep::BeforeManifestRemoval {
+                let target = only(&injected.join("removal-staging"));
+                if parent_swap {
+                    fs::rename(&target, injected.join("original"))?;
+                    fs::create_dir(&target)?;
+                } else {
+                    fs::rename(
+                        target.join("ownership-receipt.json"),
+                        injected.join("original"),
+                    )?;
+                    fs::write(target.join("ownership-receipt.json"), b"replacement")?;
+                }
+            }
+            Ok(())
+        }));
+        let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::Committed(_)
+        ));
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        let survivor = if parent_swap {
+            root.join("original")
+        } else {
+            only(&root.join("removal-staging"))
+        };
+        assert!(survivor.join("manifest.json").exists());
+    }
+}
+
+#[test]
+fn cleanup_observes_known_prior_subsets_without_recreating_files() {
+    for shape in [
+        KnownCleanupShape::ReceiptOnly,
+        KnownCleanupShape::EmptyDirectory,
+        KnownCleanupShape::BothAbsent,
+    ] {
+        let (_temp, root, promoted, storage) = removal_fixture();
+        let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::Committed(_)
+        ));
+        let target = root
+            .join("removal-staging")
+            .join(removal.removal_slot().as_str());
+        fs::remove_file(target.join("manifest.json")).unwrap();
+        if shape != KnownCleanupShape::ReceiptOnly {
+            fs::remove_file(target.join("ownership-receipt.json")).unwrap();
+        }
+        if shape == KnownCleanupShape::BothAbsent {
+            fs::remove_dir(&target).unwrap();
+        }
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Removed);
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+        assert!(!target.exists());
+    }
+}
+
+#[test]
+fn premature_cleanup_consumes_request_without_later_mutation() {
+    let (_temp, root, promoted, storage) = removal_fixture();
+    let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+    assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+    assert!(matches!(
+        removal.quarantine_once(),
+        QuarantineRenameOutcome::CommitUnconfirmed
+    ));
+    assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+    assert_eq!(children(&root.join("local")).len(), 1);
+    assert!(children(&root.join("removal-staging")).is_empty());
+}
 use crate::storage::local_plugin_import::ImportPromotionState;
 use crate::{
     plugin::{import::test_support::VALID, record::PluginRecord},

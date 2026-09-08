@@ -15,6 +15,443 @@ use std::{
 const MANIFEST: &str = "manifest.json";
 const RECEIPT: &str = "ownership-receipt.json";
 
+use super::{
+    CleanupOutcome, KnownCleanupShape, OwnedRemoval, QuarantineRenameOutcome, RemovalFsStep,
+    RemovalStorageFailure, VerifiedQuarantine,
+};
+use crate::plugin::ownership::{ManagedOwnershipEntryV1, RemovalSlot};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemovalState {
+    Prepared,
+    AttemptConsumed,
+    StoppedPrecommit,
+    CommitUnconfirmed,
+    VerifiedCommitted,
+    CleanupConsumed,
+}
+
+pub(crate) struct Removal {
+    parents: ImportDirectories,
+    source: Option<native::Directory>,
+    entry: ManagedOwnershipEntryV1,
+    slot: RemovalSlot,
+    ids: PackageIdentities,
+    manifest: Vec<u8>,
+    receipt: Vec<u8>,
+    state: RemovalState,
+}
+
+impl Removal {
+    pub(crate) fn prepare(
+        parents: ImportDirectories,
+        locator: &LocalPackageLocator,
+        entry: &ManagedOwnershipEntryV1,
+    ) -> Result<Self, RemovalStorageFailure> {
+        use RemovalStorageFailure::*;
+        if entry.removal_slot().is_some()
+            || !entry.matches_locator(locator)
+            || !locator.receipt.as_ref().is_some_and(|receipt| {
+                entry.matches_receipt(&receipt.model, receipt.canonical_sha256)
+            })
+        {
+            return Err(IdentityChanged);
+        }
+        if parents.removal.entries(17).map_err(|_| Unavailable)?.len() >= 16 {
+            return Err(StagingCapacityExceeded);
+        }
+        let slot = RemovalSlot::parse(&format!("remove-{}", parents.hooks.uuid().simple()))
+            .map_err(|_| Unavailable)?;
+        require_absent(&parents.removal, slot.as_str()).map_err(|_| Unavailable)?;
+        let ids = PackageIdentities {
+            directory: entry.directory_identity,
+            manifest: entry.manifest_identity,
+            receipt: entry.receipt_identity,
+        };
+        let package = verify_package(&parents.local, entry.package_slot().as_str(), &ids)
+            .map_err(removal_read_failure)?;
+        let manifest = read_bounded(&package.manifest, 16_385).map_err(removal_read_failure)?;
+        let receipt = read_bounded(&package.receipt, 4_097).map_err(removal_read_failure)?;
+        validate_removal_content(&manifest, &receipt, entry).map_err(removal_read_failure)?;
+        let VerifiedPackage {
+            directory,
+            manifest: manifest_file,
+            receipt: receipt_file,
+        } = package;
+        drop(manifest_file);
+        drop(receipt_file);
+        Ok(Self {
+            parents,
+            source: Some(directory),
+            entry: entry.clone(),
+            slot,
+            ids,
+            manifest,
+            receipt,
+            state: RemovalState::Prepared,
+        })
+    }
+
+    fn check_source(&self) -> io::Result<()> {
+        let directory = self.source.as_ref().ok_or_else(rejected)?;
+        #[cfg(unix)]
+        if self
+            .parents
+            .local
+            .open_stage(self.entry.package_slot().as_str())?
+            .identity()?
+            != self.ids.directory
+        {
+            return Err(rejected());
+        }
+        let (manifest, receipt) = verify_children(
+            directory,
+            &self.ids.directory,
+            Some(&self.ids.manifest),
+            Some(&self.ids.receipt),
+        )?;
+        verify_content(
+            directory,
+            &manifest.unwrap(),
+            &receipt.unwrap(),
+            &self.manifest,
+            &self.receipt,
+        )
+    }
+
+    fn fresh_quarantine(&self, checkpoints: bool) -> io::Result<VerifiedQuarantine> {
+        let step = |point| {
+            if checkpoints {
+                self.parents.hooks.removal_checkpoint(point)
+            } else {
+                Ok(())
+            }
+        };
+        require_absent(&self.parents.local, self.entry.package_slot().as_str())?;
+        step(RemovalFsStep::ReopenTarget)?;
+        let package = verify_package(&self.parents.removal, self.slot.as_str(), &self.ids)?;
+        step(RemovalFsStep::ReadManifest)?;
+        let manifest = read_bounded(&package.manifest, 16_385)?;
+        step(RemovalFsStep::ReadReceipt)?;
+        let receipt = read_bounded(&package.receipt, 4_097)?;
+        validate_removal_content(&manifest, &receipt, &self.entry)?;
+        if manifest != self.manifest || receipt != self.receipt {
+            return Err(rejected());
+        }
+        step(RemovalFsStep::VerifyIdentities)?;
+        if package.directory.identity()? != self.ids.directory
+            || native::manifest_identity(&package.manifest)? != self.ids.manifest
+            || native::manifest_identity(&package.receipt)? != self.ids.receipt
+        {
+            return Err(rejected());
+        }
+        exact_names(&package.directory, true, true)?;
+        Ok(VerifiedQuarantine {
+            entry: Box::new(self.entry.begin_removal(self.slot.clone())),
+            removal_slot: self.slot.clone(),
+        })
+    }
+
+    fn known_shape(&self) -> io::Result<KnownCleanupShape> {
+        require_absent(&self.parents.local, self.entry.package_slot().as_str())?;
+        if require_absent(&self.parents.removal, self.slot.as_str()).is_ok() {
+            return Ok(KnownCleanupShape::BothAbsent);
+        }
+        let directory = self.parents.removal.open_stage(self.slot.as_str())?;
+        if directory.identity()? != self.ids.directory {
+            return Err(rejected());
+        }
+        let names = directory.entries(3)?;
+        let manifest = names.iter().any(|n| n == OsStr::new(MANIFEST));
+        let receipt = names.iter().any(|n| n == OsStr::new(RECEIPT));
+        if manifest && !receipt {
+            return Err(rejected());
+        }
+        let (m, r) = verify_children(
+            &directory,
+            &self.ids.directory,
+            manifest.then_some(&self.ids.manifest),
+            receipt.then_some(&self.ids.receipt),
+        )?;
+        if let Some(file) = m {
+            if read_bounded(&file, 16_385)? != self.manifest {
+                return Err(rejected());
+            }
+        }
+        if let Some(file) = r {
+            if read_bounded(&file, 4_097)? != self.receipt {
+                return Err(rejected());
+            }
+        }
+        Ok(if manifest {
+            KnownCleanupShape::Full
+        } else if receipt {
+            KnownCleanupShape::ReceiptOnly
+        } else {
+            KnownCleanupShape::EmptyDirectory
+        })
+    }
+
+    fn cleanup(&self) -> io::Result<()> {
+        self.parents
+            .hooks
+            .removal_checkpoint(RemovalFsStep::BeforeCleanup)?;
+        let shape = self.known_shape()?;
+        if shape == KnownCleanupShape::BothAbsent {
+            return self.sync_cleanup();
+        }
+        let (directory, manifest, receipt) = verify(
+            &self.parents.removal,
+            self.slot.as_str(),
+            &self.ids.directory,
+            (shape == KnownCleanupShape::Full).then_some(&self.ids.manifest),
+            matches!(
+                shape,
+                KnownCleanupShape::Full | KnownCleanupShape::ReceiptOnly
+            )
+            .then_some(&self.ids.receipt),
+        )?;
+        // This method owns the only internal directory and child handles. Each
+        // disposition is followed by close + parent-relative absence proof.
+        if let Some(file) = manifest {
+            self.parents
+                .hooks
+                .removal_checkpoint(RemovalFsStep::BeforeManifestRemoval)?;
+            self.check_cleanup_namespace(true, true)?;
+            exact_names(&directory, true, true)?;
+            if read_bounded(&file, 16_385)? != self.manifest {
+                return Err(rejected());
+            }
+            directory.remove_file(MANIFEST, &file)?;
+            drop(file);
+            require_absent(&directory, MANIFEST)?;
+            self.parents
+                .hooks
+                .removal_checkpoint(RemovalFsStep::AfterManifestRemoval)?;
+        }
+        if let Some(file) = receipt {
+            self.parents
+                .hooks
+                .removal_checkpoint(RemovalFsStep::BeforeReceiptRemoval)?;
+            self.check_cleanup_namespace(false, true)?;
+            exact_names(&directory, false, true)?;
+            if read_bounded(&file, 4_097)? != self.receipt {
+                return Err(rejected());
+            }
+            directory.remove_file(RECEIPT, &file)?;
+            drop(file);
+            require_absent(&directory, RECEIPT)?;
+            self.parents
+                .hooks
+                .removal_checkpoint(RemovalFsStep::AfterReceiptRemoval)?;
+        }
+        self.parents
+            .hooks
+            .removal_checkpoint(RemovalFsStep::BeforeDirectoryRemoval)?;
+        self.check_cleanup_namespace(false, false)?;
+        exact_names(&directory, false, false)?;
+        self.parents
+            .removal
+            .remove_stage(self.slot.as_str(), &directory)?;
+        drop(directory);
+        require_absent(&self.parents.removal, self.slot.as_str())?;
+        self.parents
+            .hooks
+            .removal_checkpoint(RemovalFsStep::AfterDirectoryRemoval)?;
+        self.sync_cleanup()
+    }
+    fn check_cleanup_namespace(&self, _manifest: bool, _receipt: bool) -> io::Result<()> {
+        require_absent(&self.parents.local, self.entry.package_slot().as_str())?;
+        // Windows's held directory/child handles pin these names. Unix unlinkat
+        // resolves names: recheck every survivor and its parent immediately before
+        // each unlink. This is best effort, not protection against same-user races.
+        #[cfg(unix)]
+        {
+            let (_, manifest, receipt) = verify(
+                &self.parents.removal,
+                self.slot.as_str(),
+                &self.ids.directory,
+                _manifest.then_some(&self.ids.manifest),
+                _receipt.then_some(&self.ids.receipt),
+            )?;
+            if let Some(file) = manifest {
+                if read_bounded(&file, 16_385)? != self.manifest {
+                    return Err(rejected());
+                }
+            }
+            if let Some(file) = receipt {
+                if read_bounded(&file, 4_097)? != self.receipt {
+                    return Err(rejected());
+                }
+            }
+        }
+        Ok(())
+    }
+    fn sync_cleanup(&self) -> io::Result<()> {
+        self.parents
+            .hooks
+            .removal_checkpoint(RemovalFsStep::SyncCleanup)?;
+        #[cfg(unix)]
+        self.parents.removal.sync()?;
+        require_absent(&self.parents.removal, self.slot.as_str())?;
+        require_absent(&self.parents.local, self.entry.package_slot().as_str())
+    }
+}
+
+impl OwnedRemoval for Removal {
+    fn removal_slot(&self) -> &RemovalSlot {
+        &self.slot
+    }
+    fn reverify_before_rename(&self) -> Result<(), RemovalStorageFailure> {
+        if self.state != RemovalState::Prepared {
+            return Err(RemovalStorageFailure::IdentityChanged);
+        }
+        self.check_source()
+            .and_then(|_| require_absent(&self.parents.removal, self.slot.as_str()))
+            .map_err(|_| RemovalStorageFailure::IdentityChanged)
+    }
+    fn quarantine_once(&mut self) -> QuarantineRenameOutcome {
+        use QuarantineRenameOutcome::*;
+        if self.state != RemovalState::Prepared {
+            return CommitUnconfirmed;
+        }
+        // Consume before any I/O, including the final verification. Never reset.
+        self.state = RemovalState::AttemptConsumed;
+        if self
+            .parents
+            .hooks
+            .removal_checkpoint(RemovalFsStep::BeforeReverify)
+            .and_then(|_| self.check_source())
+            .and_then(|_| require_absent(&self.parents.removal, self.slot.as_str()))
+            .is_err()
+        {
+            self.state = RemovalState::StoppedPrecommit;
+            self.source.take();
+            return ProvenNotCommitted(RemovalStorageFailure::IdentityChanged);
+        }
+        // This final observable checkpoint is still before the native call.
+        // Keep the source directory held; children are reopened and closed here.
+        if self
+            .parents
+            .hooks
+            .removal_checkpoint(RemovalFsStep::BeforeNativeRename)
+            .and_then(|_| self.check_source())
+            .is_err()
+        {
+            self.state = RemovalState::StoppedPrecommit;
+            self.source.take();
+            return ProvenNotCommitted(RemovalStorageFailure::IdentityChanged);
+        }
+        self.state = RemovalState::CommitUnconfirmed;
+        let renamed = (|| {
+            #[cfg(test)]
+            if let Some(error) = self.parents.hooks.controls.rename_error {
+                return Err(error.into());
+            }
+            native::promote_exclusive(
+                &self.parents.local,
+                self.entry.package_slot().as_str(),
+                self.source.as_ref().ok_or_else(rejected)?,
+                &self.parents.removal,
+                self.slot.as_str(),
+            )
+        })();
+        if let Err(error) = renamed {
+            if error.kind() == io::ErrorKind::AlreadyExists
+                && self.check_source().is_ok()
+                && self
+                    .parents
+                    .removal
+                    .entry_identity(self.slot.as_str())
+                    .is_ok_and(|identity| identity != self.ids.directory)
+            {
+                self.state = RemovalState::StoppedPrecommit;
+                self.source.take();
+                return ProvenNotCommitted(RemovalStorageFailure::ProvenWriteFailure);
+            }
+            self.source.take();
+            return CommitUnconfirmed;
+        }
+        // Drop every source duplicate before target-relative reopening on Windows.
+        self.source.take();
+        let verified = (|| {
+            self.parents
+                .hooks
+                .removal_checkpoint(RemovalFsStep::AfterRename)?;
+            self.parents
+                .hooks
+                .removal_checkpoint(RemovalFsStep::SyncSource)?;
+            #[cfg(unix)]
+            self.parents.local.sync()?;
+            self.parents
+                .hooks
+                .removal_checkpoint(RemovalFsStep::SyncTarget)?;
+            #[cfg(unix)]
+            self.parents.removal.sync()?;
+            self.fresh_quarantine(true)
+        })();
+        match verified {
+            Ok(evidence) => {
+                self.state = RemovalState::VerifiedCommitted;
+                Committed(evidence)
+            }
+            Err(_) => CommitUnconfirmed,
+        }
+    }
+    fn verify_quarantine(&self) -> Result<VerifiedQuarantine, RemovalStorageFailure> {
+        self.fresh_quarantine(false).map_err(removal_read_failure)
+    }
+    fn cleanup_once(&mut self) -> CleanupOutcome {
+        let previous = std::mem::replace(&mut self.state, RemovalState::CleanupConsumed);
+        if previous != RemovalState::VerifiedCommitted {
+            self.source.take();
+            return CleanupOutcome::Conflict;
+        }
+        match self.cleanup() {
+            Ok(()) => CleanupOutcome::Removed,
+            Err(_) => match self.known_shape() {
+                Ok(shape) => CleanupOutcome::Pending(shape),
+                Err(_) => CleanupOutcome::Conflict,
+            },
+        }
+    }
+}
+
+fn read_bounded(file: &File, probe: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    file.take(probe).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 >= probe {
+        return Err(rejected());
+    }
+    Ok(bytes)
+}
+fn validate_removal_content(
+    manifest: &[u8],
+    receipt: &[u8],
+    entry: &ManagedOwnershipEntryV1,
+) -> io::Result<()> {
+    let record =
+        PluginRecord::local_declarative(serde_json::from_slice(manifest).map_err(|_| rejected())?)
+            .map_err(|_| rejected())?;
+    let model = OwnershipReceiptV1::parse(receipt).map_err(|_| rejected())?;
+    if record.canonical_manifest_bytes().map_err(|_| rejected())? != manifest
+        || model.canonical_bytes().map_err(|_| rejected())? != receipt
+        || !model.matches_record(&record)
+        || !entry.matches_receipt(&model, model.canonical_sha256())
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+fn removal_read_failure(error: io::Error) -> RemovalStorageFailure {
+    match error.kind() {
+        io::ErrorKind::InvalidInput | io::ErrorKind::NotFound => {
+            RemovalStorageFailure::IdentityChanged
+        }
+        _ => RemovalStorageFailure::Unavailable,
+    }
+}
+
 /// One verified plugins handle owns all fixed child roots and their volume boundary.
 pub(crate) struct ImportDirectories {
     _plugins: native::Directory,
@@ -1025,6 +1462,40 @@ pub(crate) mod native {
         assert!(require_absent(&root, "source").is_err());
         drop(duplicate);
         require_absent(&root, "source").unwrap();
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn windows_removal_duplicate_source_blocks_commit_proof_not_preservation() {
+        use crate::storage::local_plugin_import::{
+            LocalManifestImportStorage, SystemLocalManifestImportStorage,
+        };
+        let base = std::env::current_dir().unwrap().join("target");
+        let temp = tempfile::tempdir_in(base).unwrap();
+        let root = temp.path().canonicalize().unwrap().join("plugins");
+        let record = PluginRecord::local_declarative(
+            serde_json::from_slice(crate::plugin::import::test_support::VALID).unwrap(),
+        )
+        .unwrap();
+        let promoted = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
+            .prepare_stage(&record, &record.canonical_manifest_bytes().unwrap())
+            .unwrap()
+            .promote()
+            .unwrap();
+        let parents = ImportDirectories::open_or_create(&root).unwrap();
+        let mut removal = Removal::prepare(parents, &promoted.locator, &promoted.entry).unwrap();
+        let duplicate = removal.source.as_ref().unwrap().file.try_clone().unwrap();
+        assert!(matches!(
+            removal.quarantine_once(),
+            QuarantineRenameOutcome::CommitUnconfirmed
+        ));
+        assert!(root
+            .join("removal-staging")
+            .join(removal.removal_slot().as_str())
+            .exists());
+        drop(duplicate);
+        assert!(removal.verify_quarantine().is_ok());
+        assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
     }
 
     pub(crate) fn promote_exclusive(
