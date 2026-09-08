@@ -125,6 +125,7 @@ pub(super) enum RemovalFsStep {
     ReadReceipt,
     VerifyIdentities,
     BeforeCleanup,
+    BeforeCleanupReopen,
     BeforeManifestRemoval,
     AfterManifestRemoval,
     BeforeReceiptRemoval,

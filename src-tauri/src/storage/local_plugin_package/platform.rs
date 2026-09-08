@@ -8,7 +8,7 @@ use crate::storage::local_plugin_import::ImportPromotionState;
 use std::{
     ffi::OsStr,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::{Component, Path},
 };
 
@@ -200,6 +200,9 @@ impl Removal {
         if shape == KnownCleanupShape::BothAbsent {
             return self.sync_cleanup();
         }
+        self.parents
+            .hooks
+            .removal_checkpoint(RemovalFsStep::BeforeCleanupReopen)?;
         let (directory, manifest, receipt) = verify(
             &self.parents.removal,
             self.slot.as_str(),
@@ -211,6 +214,19 @@ impl Removal {
             )
             .then_some(&self.ids.receipt),
         )?;
+        // known_shape closed its observation handles. Validate all survivors
+        // again through these newly held handles before deleting any evidence,
+        // and keep them held through their respective disposition/unlink.
+        if let Some(file) = manifest.as_ref() {
+            if read_bounded(file, 16_385)? != self.manifest {
+                return Err(rejected());
+            }
+        }
+        if let Some(file) = receipt.as_ref() {
+            if read_bounded(file, 4_097)? != self.receipt {
+                return Err(rejected());
+            }
+        }
         // This method owns the only internal directory and child handles. Each
         // disposition is followed by close + parent-relative absence proof.
         if let Some(file) = manifest {
@@ -418,6 +434,10 @@ impl OwnedRemoval for Removal {
 }
 
 fn read_bounded(file: &File, probe: u64) -> io::Result<Vec<u8>> {
+    // Cleanup rechecks the same held object more than once. Never treat a prior
+    // validation's EOF as the start of a fresh bounded content read.
+    let mut file = file;
+    file.rewind()?;
     let mut bytes = Vec::new();
     file.take(probe).read_to_end(&mut bytes)?;
     if bytes.len() as u64 >= probe {

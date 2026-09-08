@@ -151,6 +151,7 @@ fn native_success_then_every_post_step_failure_is_unconfirmed_and_cannot_cleanup
 fn cleanup_interruptions_are_monotonic_and_second_calls_do_not_mutate() {
     for (point, shape) in [
         (RemovalFsStep::BeforeCleanup, KnownCleanupShape::Full),
+        (RemovalFsStep::BeforeCleanupReopen, KnownCleanupShape::Full),
         (
             RemovalFsStep::BeforeManifestRemoval,
             KnownCleanupShape::Full,
@@ -553,6 +554,58 @@ fn premature_cleanup_consumes_request_without_later_mutation() {
     assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
     assert_eq!(children(&root.join("local")).len(), 1);
     assert!(children(&root.join("removal-staging")).is_empty());
+}
+
+#[test]
+fn cleanup_reopen_receipt_content_drift_preserves_both_files() {
+    let (_temp, root, promoted, mut storage) = removal_fixture();
+    let original_manifest = fs::read(
+        root.join("local")
+            .join(promoted.entry.package_slot().as_str())
+            .join("manifest.json"),
+    )
+    .unwrap();
+    let injected = root.clone();
+    let checkpoints = Arc::new(AtomicUsize::new(0));
+    let observed = checkpoints.clone();
+    storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+        if step == RemovalFsStep::BeforeCleanupReopen {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let path = only(&injected.join("removal-staging")).join("ownership-receipt.json");
+            let before = platform::native::manifest_identity(&fs::File::open(&path)?)?;
+            fs::write(&path, b"{}")?;
+            let after = platform::native::manifest_identity(&fs::File::open(&path)?)?;
+            assert_eq!(
+                before, after,
+                "in-place content drift must retain the receipt identity"
+            );
+        }
+        Ok(())
+    }));
+    let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+    assert!(matches!(
+        removal.quarantine_once(),
+        QuarantineRenameOutcome::Committed(_)
+    ));
+    assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+    let target = root
+        .join("removal-staging")
+        .join(removal.removal_slot().as_str());
+    assert_eq!(
+        children(&target).len(),
+        2,
+        "content conflict must preserve all evidence"
+    );
+    assert_eq!(
+        fs::read(target.join("manifest.json")).unwrap(),
+        original_manifest
+    );
+    assert_eq!(
+        fs::read(target.join("ownership-receipt.json")).unwrap(),
+        b"{}"
+    );
+    assert_eq!(removal.cleanup_once(), CleanupOutcome::Conflict);
+    assert_eq!(checkpoints.load(Ordering::SeqCst), 1);
 }
 use crate::storage::local_plugin_import::ImportPromotionState;
 use crate::{
