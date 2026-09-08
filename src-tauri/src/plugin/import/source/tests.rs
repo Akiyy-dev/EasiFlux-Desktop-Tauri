@@ -190,17 +190,180 @@ mod unix {
     }
 
     #[test]
-    fn device_source_is_rejected() {
-        assert_source_rejected(SystemLocalManifestReader.read(Path::new("/dev/null")));
+    fn in_memory_source_modes_require_a_regular_file_and_one_link() {
+        use crate::plugin::discovery::safe_fs::is_single_link_regular_file;
+        use rustix::fs::FileType;
+        let regular = FileType::RegularFile.as_raw_mode() | 0o600;
+        let character_device = FileType::CharacterDevice.as_raw_mode() | 0o600;
+        for (mode, links, accepted) in [
+            (regular, 1u64, true),
+            (character_device, 1, false),
+            (regular, 0, false),
+            (regular, 2, false),
+        ] {
+            assert_eq!(is_single_link_regular_file(mode, links), accepted);
+        }
     }
 }
 
 #[cfg(windows)]
 mod windows {
     use super::*;
+    use crate::plugin::discovery::safe_fs::read_manifest_source_at_parent_boundary;
     use std::os::windows::fs::{symlink_file, OpenOptionsExt};
     use std::path::PathBuf;
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    fn reparse_write_handle(path: &Path) -> std::io::Result<fs::File> {
+        // FSCTL_SET_REPARSE_POINT requires write access. GENERIC_WRITE supplies
+        // FILE_WRITE_DATA and FILE_WRITE_ATTRIBUTES; allow every sharing mode
+        // here so failure comes from the reader's held ancestor restrictions.
+        fs::OpenOptions::new()
+            .access_mode(FILE_GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+
+    #[test]
+    fn parent_boundary_rejects_in_place_attribute_only_junction_retarget() {
+        use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        // Keep test-only Win32 control codes local; no extra production feature.
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa0000003;
+        const FSCTL_SET_REPARSE_POINT: u32 = 0x900a4;
+        let temp = fixture();
+        let root = temp.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        let target = root.join("target");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&target).unwrap();
+        let source = parent.join("source.json");
+        fs::write(&source, VALID).unwrap();
+        fs::write(target.join("source.json"), VALID).unwrap();
+        let substitute: Vec<u16> = format!(r"\??\{}", disk_path(&target).display())
+            .encode_utf16()
+            .collect();
+        let print: Vec<u16> = disk_path(&target).as_os_str().encode_wide().collect();
+        let mut data = Vec::new();
+        data.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        data.extend((8u16 + ((substitute.len() + print.len() + 2) * 2) as u16).to_le_bytes());
+        data.extend(0u16.to_le_bytes());
+        data.extend(0u16.to_le_bytes());
+        data.extend(((substitute.len() * 2) as u16).to_le_bytes());
+        data.extend(((substitute.len() * 2 + 2) as u16).to_le_bytes());
+        data.extend(((print.len() * 2) as u16).to_le_bytes());
+        for unit in substitute
+            .iter()
+            .chain([0u16].iter())
+            .chain(print.iter())
+            .chain([0u16].iter())
+        {
+            data.extend(unit.to_le_bytes());
+        }
+        let captured = read_manifest_source_at_parent_boundary(&source, || {
+            let result = fs::OpenOptions::new()
+                .access_mode(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&parent);
+            let handle = result.unwrap();
+            fs::remove_file(&source).unwrap();
+            let mut returned = 0;
+            // SAFETY: live handle and initialized input bytes; no output buffer.
+            let set = unsafe {
+                DeviceIoControl(
+                    handle.as_raw_handle(),
+                    FSCTL_SET_REPARSE_POINT,
+                    data.as_ptr().cast(),
+                    data.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                set,
+                0,
+                "fixture junction update failed: {:?}",
+                std::io::Error::last_os_error().raw_os_error()
+            );
+        });
+        fs::remove_dir(parent).unwrap();
+        assert!(
+            captured.is_err(),
+            "a retargeted ancestor exposed the replacement source"
+        );
+    }
+
+    #[test]
+    fn parent_boundary_pins_every_ancestor_against_rename_until_capture_finishes() {
+        let temp = fixture();
+        let root = temp.path().canonicalize().unwrap();
+        let ancestor = root.join("ancestor");
+        let parent = ancestor.join("parent");
+        fs::create_dir_all(&parent).unwrap();
+        let source = parent.join("source.json");
+        fs::write(&source, VALID).unwrap();
+        let mut reached_boundary = false;
+        let bytes = read_manifest_source_at_parent_boundary(&source, || {
+            reached_boundary = true;
+            for path in [&ancestor, &parent] {
+                let error = fs::rename(path, root.join("replacement-slot")).unwrap_err();
+                assert!(matches!(error.raw_os_error(), Some(5 | 32)));
+            }
+        })
+        .unwrap();
+        assert!(reached_boundary);
+        assert_eq!(bytes, VALID);
+        for path in [&ancestor, &parent] {
+            fs::rename(path, root.join("replacement-slot")).unwrap();
+            fs::rename(root.join("replacement-slot"), path).unwrap();
+        }
+    }
+
+    #[test]
+    fn parent_boundary_denies_reparse_write_handles_until_capture_finishes() {
+        let temp = fixture();
+        let root = temp.path().canonicalize().unwrap();
+        let ancestor = root.join("ancestor");
+        let parent = ancestor.join("parent");
+        fs::create_dir_all(&parent).unwrap();
+        let source = parent.join("source.json");
+        fs::write(&source, VALID).unwrap();
+        let mut reached_boundary = false;
+        let bytes = read_manifest_source_at_parent_boundary(&source, || {
+            reached_boundary = true;
+            for path in [&ancestor, &parent] {
+                let error = reparse_write_handle(path).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(32));
+            }
+        })
+        .unwrap();
+        assert!(reached_boundary);
+        assert_eq!(bytes, VALID);
+        for path in [&ancestor, &parent] {
+            drop(reparse_write_handle(path).unwrap());
+        }
+    }
+
+    #[test]
+    fn an_existing_ancestor_writer_rejects_source_before_capture() {
+        let temp = fixture();
+        let root = temp.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        fs::create_dir(&parent).unwrap();
+        let source = parent.join("source.json");
+        fs::write(&source, VALID).unwrap();
+        let writer = reparse_write_handle(&parent).unwrap();
+        assert_source_rejected(SystemLocalManifestReader.read(&source));
+        drop(writer);
+        assert!(SystemLocalManifestReader.read(&source).is_ok());
+    }
 
     fn disk_path(path: &Path) -> PathBuf {
         PathBuf::from(path.to_str().unwrap().strip_prefix(r"\\?\").unwrap())
