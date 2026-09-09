@@ -35,7 +35,21 @@
 
 用户于 2026-09-10 明确要求减少中途测试。后续实现只运行直接相关的定向检查，完整 frontend、Rust、类型、lint 和 build 在集成完成后统一运行一次。未修改的已通过测试不重复运行。
 
-Windows 包存储测试曾出现间歇性失败；必须保留可诊断信息并做有界复现，不能通过弱化断言或盲目重试宣称稳定。最终验证结果与仍未验证的平台/原生界面项目另行记录。
+Windows 包存储的有界串行检查复现了拒绝访问（OS 5）：38 项中 37 项通过，失败发生在初始导入的 BeforePromotion 之后、AfterPromotion 之前。旧日志不能区分最后一次内容检查与原生重命名；已增加仅测试使用的精确操作标签和提交状态诊断。只读句柄分析没有找到已证实的应用侧生命周期缺陷，也没有证实外部进程干扰。随后一次全量 Rust 测试通过不等于问题已解决，因此本阶段仅提交草稿 PR，不合并。
+
+截至 `9203c4c` 的验证组合如下；前端小修正后只检查受影响部分，没有重复全套测试：
+
+| 检查 | 结果 |
+| --- | --- |
+| 全量前端 | 78 个文件、1,242 项通过 |
+| 焦点/规范修正 | dialog/card/page 75 项通过；后续引用比较小修正的 dialog 6 项通过 |
+| 全量 Rust all-targets | 1,099 项通过；2 个 ignored 是由父测试显式启动的崩溃辅助进程 |
+| TypeScript + Vite build | 通过；保留原有大 chunk 提示 |
+| ESLint | 0 错误、78 个既有警告 |
+| Clippy all-targets | exit 0；项目警告仍在，未压制警告 |
+| Rust 格式 | 39 个已修改且仍存在的 Rust 文件通过 |
+
+本机验证为 Windows。Linux/macOS 的原生文件系统行为仍由三系统 CI 检查；尚未运行隔离配置下的原生整机界面 smoke test，绝不为此对真实用户配置目录执行删除测试。
 
 ## Rulings I made
 
@@ -92,3 +106,9 @@ Ruling: The reproduced Windows package-test flake is a branch verification risk 
 Ruling: Task 9 may minimally extend `PluginMarketplacePage.vue` only to complete its existing exhaustive fixed-copy map for the three new ownership preflight import codes; type checking cannot pass while the public union grows but its total consumer is left incomplete — if wrong, those mappings must move behind a shared presentation API and the page change be reverted.
 
 Ruling: Task 12 may add a narrow cfg(test) diagnostic seam at storage/local_plugin_import.rs's I/O error mapping, where raw OS errors are otherwise erased — assertion-only diagnostics cannot recover operation errors after conversion to WriteFailed — if wrong, this increases test-only coupling and should be replaced with lower-level per-operation evidence; production messages and behavior remain unchanged.
+
+Ruling: Task 11 UI implementation and Task 12 backend/CI proof run concurrently with disjoint owned files; Task 12 waits for controller permission before staging or committing — the active parallel-delegation instruction and user latency preference favor independent work, while serialized commits keep task review ranges isolated — if wrong, any shared-file or fixture dependency requires pausing the affected worker and reconciling before commit; no simultaneous index mutation is allowed.
+
+Ruling: Preserve the pre-existing default capability's opener:default, while static union checks prohibit new dialog/fs/shell/remote authority and allow no additional opener grant; plugin-runtime remains exactly seven fixed commands with no opener or scope — default.json is unchanged from the import baseline and built-in link opening is outside plugin lifecycle authority — if wrong, an independent application-wide capability migration is required; claiming the entire app has no opener permission would be inaccurate.
+
+Ruling: Treat the reproduced Windows OS 5 failure as unresolved reliability risk even though the later full suite passes; publish this stage only as a draft PR and do not merge — bounded tests and read-only handle analysis establish neither a code-level root cause nor external interference — if wrong, the draft may delay an otherwise usable feature, while prematurely declaring stability could hide intermittent failed imports/removals; no blind retry, permission broadening, or weaker assertion is accepted.
