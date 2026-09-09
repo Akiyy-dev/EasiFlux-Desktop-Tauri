@@ -139,6 +139,10 @@ impl SafePluginDocument {
     }
     #[cfg(test)]
     fn checkpoint(&self, step: SafeDocumentStep) -> io::Result<()> {
+        if step == SafeDocumentStep::VerifyMain && self.names.main == "managed-ownership.json" {
+            super::local_plugin_package::crash_checkpoint("import", "ownership-main-committed");
+            super::local_plugin_package::crash_checkpoint("removal", "removing-main-committed");
+        }
         self.hook.as_ref().map_or(Ok(()), |hook| hook(step))
     }
     pub(crate) fn load_candidates(&self) -> io::Result<Vec<CandidateBytes>> {
@@ -271,6 +275,8 @@ impl SafePluginDocument {
             self.bounded(&pending)?;
             checkpoint!(self, SyncParent);
             parent.sync()?;
+            #[cfg(all(test, unix))]
+            super::local_plugin_package::document_parent_synced(self.names.main);
             #[cfg(unix)]
             {
                 outcome = PersistOutcome::CommittedDurable;

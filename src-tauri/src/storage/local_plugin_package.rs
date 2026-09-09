@@ -160,12 +160,33 @@ pub(super) struct Hooks {
 impl Hooks {
     pub(super) fn removal_checkpoint(&self, _step: RemovalFsStep) -> io::Result<()> {
         #[cfg(test)]
+        match _step {
+            RemovalFsStep::AfterRename => crash_checkpoint("removal", "rename-returned"),
+            RemovalFsStep::AfterManifestRemoval => crash_checkpoint("removal", "manifest-removed"),
+            RemovalFsStep::AfterReceiptRemoval => crash_checkpoint("removal", "receipt-removed"),
+            RemovalFsStep::AfterDirectoryRemoval => {
+                crash_checkpoint("removal", "directory-removed")
+            }
+            _ => (),
+        }
+        #[cfg(test)]
         if let Some(hook) = &self.controls.removal_hook {
             return hook(_step);
         }
         Ok(())
     }
     pub(super) fn checkpoint(&self, _step: ImportFsStep) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            IMPORT_DIAGNOSTICS.with(|diagnostics| diagnostics.borrow_mut().steps.push(_step));
+            match _step {
+                ImportFsStep::AfterPromotion => crash_checkpoint("import", "promotion-returned"),
+                ImportFsStep::SyncDestinationDirectory => {
+                    crash_checkpoint("import", "target-verified")
+                }
+                _ => (),
+            }
+        }
         #[cfg(test)]
         if let Some(hook) = &self.controls.hook {
             return hook(_step);
@@ -174,11 +195,96 @@ impl Hooks {
     }
     pub(super) fn uuid(&self) -> uuid::Uuid {
         #[cfg(test)]
+        IMPORT_DIAGNOSTICS.with(|diagnostics| diagnostics.borrow_mut().uuid_count += 1);
+        #[cfg(test)]
         if let Some(supplier) = &self.controls.uuid {
             return supplier();
         }
         uuid::Uuid::new_v4()
     }
+}
+
+/// Test-only bridge. Only the exact ignored child, started with a cleared
+/// environment and a canonical disposable fixture root, may terminate itself.
+#[cfg(test)]
+pub(crate) fn crash_checkpoint(lifecycle: &str, checkpoint: &str) {
+    if std::env::var("EASIFLUX_PLUGIN_TEST_CHILD").as_deref() != Ok(lifecycle) {
+        return;
+    }
+    #[cfg(unix)]
+    if matches!(checkpoint, "promotion-returned" | "rename-returned") {
+        DOCUMENT_PARENT_SYNCS.with(|synced| {
+            let (state, ownership) = synced.get();
+            assert!(
+                state,
+                "package rename must follow successful state parent sync"
+            );
+            if lifecycle == "removal" {
+                assert!(
+                    ownership,
+                    "removal rename must follow successful ownership parent sync"
+                );
+            }
+        });
+    }
+    if std::env::var("EASIFLUX_PLUGIN_TEST_CHECKPOINT").as_deref() != Ok(checkpoint) {
+        return;
+    }
+    let exact = match lifecycle {
+        "import" => "plugin::runtime::import::tests::import_crash_child",
+        "removal" => "plugin::runtime::removal::tests::removal_crash_child",
+        _ => return,
+    };
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    assert_eq!(args, ["--ignored", "--exact", exact, "--nocapture"]);
+    let root = std::path::PathBuf::from(std::env::var_os("EASIFLUX_PLUGIN_TEST_ROOT").unwrap());
+    assert_eq!(root.canonicalize().unwrap(), root);
+    assert!(root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with(&format!("plugin-runtime-{lifecycle}-")));
+    std::process::exit(73);
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static DOCUMENT_PARENT_SYNCS: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+}
+#[cfg(all(test, unix))]
+pub(super) fn document_parent_synced(name: &str) {
+    DOCUMENT_PARENT_SYNCS.with(|synced| {
+        let (state, ownership) = synced.get();
+        synced.set((
+            state || name == "state.json",
+            ownership || name == "managed-ownership.json",
+        ));
+    });
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct ImportDiagnostics {
+    steps: Vec<ImportFsStep>,
+    uuid_count: usize,
+    errors: Vec<(io::ErrorKind, Option<i32>)>,
+}
+#[cfg(test)]
+thread_local! {
+    pub(super) static IMPORT_DIAGNOSTICS: std::cell::RefCell<ImportDiagnostics> = Default::default();
+}
+#[cfg(test)]
+pub(super) fn import_io_failure(error: &io::Error) {
+    import_operation_failure("import-write-failed", error);
+}
+#[cfg(test)]
+pub(super) fn import_operation_failure(operation: &str, error: &io::Error) {
+    IMPORT_DIAGNOSTICS.with(|diagnostics| {
+        let mut diagnostics = diagnostics.borrow_mut();
+        diagnostics.errors.push((error.kind(), error.raw_os_error()));
+        // No paths, slots, object IDs, metadata, or manifest/receipt bytes.
+        eprintln!("local-package operation={operation} checkpoint={:?} kind={:?} raw_os_error={:?} evidence={diagnostics:?}", diagnostics.steps.last(), error.kind(), error.raw_os_error());
+    });
 }
 #[cfg(test)]
 #[derive(Clone, Default)]

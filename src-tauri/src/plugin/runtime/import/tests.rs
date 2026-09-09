@@ -1,4 +1,5 @@
 use crate::storage::local_plugin_package::PromotedManagedPackage as Promotion;
+use crate::storage::managed_plugin_ownership::ManagedOwnershipPersistence;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -37,8 +38,8 @@ use crate::storage::plugin_state::{
 const WATCHDOG: Duration = Duration::from_secs(10);
 const NEVER: usize = usize::MAX;
 const CRASH_EXIT_CODE: i32 = 73;
-const CRASH_ROOT_ENV: &str = "EASIFLUX_IMPORT_TEST_ROOT";
-const CRASH_CHECKPOINT_ENV: &str = "EASIFLUX_IMPORT_TEST_CHECKPOINT";
+const CRASH_ROOT_ENV: &str = "EASIFLUX_PLUGIN_TEST_ROOT";
+const CRASH_CHECKPOINT_ENV: &str = "EASIFLUX_PLUGIN_TEST_CHECKPOINT";
 const CRASH_CHILD_TEST: &str = "plugin::runtime::import::tests::import_crash_child";
 const VALID_FINGERPRINT: &str =
     "v1:sha256:71bb47f19cd31329579e843b621a87085d3e1346a9e354d7f60b1393ee10deee";
@@ -636,6 +637,7 @@ fn run_crash_child(root: &Path, checkpoint: &str) -> ExitStatus {
         .env_clear()
         .env(CRASH_ROOT_ENV, root)
         .env(CRASH_CHECKPOINT_ENV, checkpoint)
+        .env("EASIFLUX_PLUGIN_TEST_CHILD", "import")
         .spawn()
         .unwrap();
     let deadline = Instant::now() + WATCHDOG;
@@ -1221,7 +1223,15 @@ async fn imported_package_stays_disabled_after_primary_corruption_and_backup_rec
 
 #[tokio::test]
 async fn process_crash_checkpoints_reconstruct_only_committed_disk_state() {
-    for checkpoint in ["stage-ready", "disabled-saved", "promoted", "published"] {
+    for checkpoint in [
+        "stage-ready",
+        "disabled-saved",
+        "promotion-returned",
+        "target-verified",
+        "ownership-main-committed",
+        "candidate-built",
+        "published",
+    ] {
         let mut fixture = ImportFixture::with_real_disk().await;
         fixture.seed_enabled_orphan().unwrap();
         fixture.runtime = fixture.restart_runtime();
@@ -1238,7 +1248,7 @@ async fn process_crash_checkpoints_reconstruct_only_committed_disk_state() {
             "checkpoint {checkpoint}"
         );
 
-        if matches!(checkpoint, "promoted" | "published") {
+        if !matches!(checkpoint, "stage-ready" | "disabled-saved") {
             fixture.corrupt_primary().unwrap();
         }
         fixture.runtime = fixture.restart_runtime();
@@ -1282,6 +1292,25 @@ async fn process_crash_checkpoints_reconstruct_only_committed_disk_state() {
             let local = imported_item(&snapshot, "com.example.notes");
             assert_eq!(local["source"], "localDeclarative");
             assert_eq!(local["status"], "disabled");
+            let committed = matches!(
+                checkpoint,
+                "ownership-main-committed" | "candidate-built" | "published"
+            );
+            assert_eq!(
+                local["management"],
+                if committed { "managed" } else { "external" }
+            );
+            assert_eq!(
+                fixture
+                    .ownership
+                    .inner
+                    .load()
+                    .unwrap()
+                    .index
+                    .entries()
+                    .len(),
+                usize::from(committed)
+            );
             assert_eq!(fixture.target_manifests().len(), 1);
             assert!(!persisted_enabled(
                 &fixture.plugins_root,
@@ -1292,6 +1321,37 @@ async fn process_crash_checkpoints_reconstruct_only_committed_disk_state() {
                 direct_entry_count(&fixture.plugins_root.join("import-staging")),
                 0
             );
+            assert!(
+                crate::plugin::discovery::discover_from_plugins_root(&fixture.plugins_root)
+                    .removals
+                    .observations
+                    .is_empty()
+            );
+            // A package without an index must never gain one, with or without its receipt.
+            if !committed {
+                let package = fs::read_dir(&fixture.local_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                fs::remove_file(package.join("ownership-receipt.json")).unwrap();
+                fixture.runtime = fixture.restart_runtime();
+                let no_receipt =
+                    serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
+                assert_eq!(
+                    imported_item(&no_receipt, "com.example.notes")["management"],
+                    "external"
+                );
+                assert!(fixture
+                    .ownership
+                    .inner
+                    .load()
+                    .unwrap()
+                    .index
+                    .entries()
+                    .is_empty());
+            }
         }
     }
 }
@@ -1302,6 +1362,16 @@ async fn import_crash_child() {
     let Some(root) = std::env::var_os(CRASH_ROOT_ENV).map(PathBuf::from) else {
         return;
     };
+    assert_eq!(
+        std::env::var("EASIFLUX_PLUGIN_TEST_CHILD").unwrap(),
+        "import"
+    );
+    assert_eq!(root.canonicalize().unwrap(), root);
+    assert!(root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("plugin-runtime-import-"));
     let Some(checkpoint) =
         std::env::var_os(CRASH_CHECKPOINT_ENV).and_then(|value| value.into_string().ok())
     else {
@@ -1309,7 +1379,13 @@ async fn import_crash_child() {
     };
     assert!(matches!(
         checkpoint.as_str(),
-        "stage-ready" | "disabled-saved" | "promoted" | "published"
+        "stage-ready"
+            | "disabled-saved"
+            | "promotion-returned"
+            | "target-verified"
+            | "ownership-main-committed"
+            | "candidate-built"
+            | "published"
     ));
     let runtime = crash_runtime(&root, &checkpoint);
     let preview = match runtime

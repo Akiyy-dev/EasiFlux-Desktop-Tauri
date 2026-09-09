@@ -65,8 +65,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::discovery::safe_fs::tests --lib
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::import --lib
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml storage::local_plugin_import --lib
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml storage::plugin_state::tests --lib
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::runtime::import::tests --lib
+      - name: Run nonzero plugin lifecycle security suites
+        shell: pwsh
+        run: |
+          $suites = @(
+            'plugin::discovery::safe_fs::tests',
+            'plugin::import',
+            'storage::local_plugin_import',
+            'storage::plugin_state::tests',
+            'plugin::runtime::import::tests',
+            'storage::managed_plugin_ownership::tests',
+            'storage::local_plugin_package::tests',
+            'plugin::ownership::tests',
+            'plugin::runtime::removal::tests'
+          )
+          foreach ($suite in $suites) {
+            $listed = @(& cargo test --locked --manifest-path src-tauri/Cargo.toml $suite --lib -- --list --format terse)
+            $listExit = $LASTEXITCODE
+            if ($listExit -ne 0) { throw "plugin-security list failed with exit $listExit`: $suite" }
+            $selected = @($listed | Where-Object { $_ -match ':\s+test$' })
+            if ($selected.Count -eq 0) { throw "plugin-security filter selected zero tests: $suite" }
+            & cargo test --locked --manifest-path src-tauri/Cargo.toml $suite --lib
+            $runExit = $LASTEXITCODE
+            if ($runExit -ne 0) { throw "plugin-security suite failed with exit $runExit`: $suite" }
+          }

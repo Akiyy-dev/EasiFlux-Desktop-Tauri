@@ -17,6 +17,246 @@ use crate::storage::plugin_state::*;
 use crate::storage::safe_plugin_document::*;
 
 type Events = Arc<Mutex<Vec<&'static str>>>;
+
+const REMOVAL_CRASH_CHILD: &str = "plugin::runtime::removal::tests::removal_crash_child";
+const REMOVAL_CRASH_POINTS: [&str; 10] = [
+    "disabled-saved",
+    "removing-main-committed",
+    "rename-returned",
+    "quarantine-verified",
+    "candidate-scanned",
+    "manifest-removed",
+    "receipt-removed",
+    "directory-removed",
+    "index-deleted",
+    "published",
+];
+
+struct CrashDiskDiscovery(std::path::PathBuf);
+impl LocalPluginDiscovery for CrashDiskDiscovery {
+    fn discover(&self) -> LocalDiscoveryOutcome {
+        discover_from_plugins_root(&self.0)
+    }
+}
+
+fn removal_disk_runtime(root: &std::path::Path) -> Arc<PluginRuntime> {
+    let packages = Arc::new(SystemLocalPluginPackageStorage::with_plugins_root(
+        root.to_owned(),
+    ));
+    Arc::new(PluginRuntime::with_lifecycle_services(
+        PluginRegistry::initialize(
+            vec![],
+            Box::new(PluginStateStore::with_path(root.join("state.json"))),
+            Box::new(ManagedOwnershipStore::with_plugins_root(root.to_owned())),
+        ),
+        Arc::new(CrashDiskDiscovery(root.to_owned())),
+        Arc::new(SystemLocalManifestReader),
+        packages.clone(),
+        packages,
+    ))
+}
+
+fn run_removal_crash_child(root: &std::path::Path, checkpoint: &str) {
+    use std::{
+        process::Command,
+        time::{Duration, Instant},
+    };
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", REMOVAL_CRASH_CHILD, "--nocapture"])
+        .env_clear()
+        .env("EASIFLUX_PLUGIN_TEST_ROOT", root)
+        .env("EASIFLUX_PLUGIN_TEST_CHECKPOINT", checkpoint)
+        .env("EASIFLUX_PLUGIN_TEST_CHILD", "removal")
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(73), "removal checkpoint {checkpoint}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("removal child timed out at {checkpoint}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// Capture only disposable package evidence, not state/index convergence writes.
+fn package_evidence(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        base: &std::path::Path,
+        path: &std::path::Path,
+        result: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        if !path.exists() {
+            return;
+        }
+        result.insert(path.strip_prefix(base).unwrap().to_owned(), vec![]);
+        for item in std::fs::read_dir(path).unwrap() {
+            let path = item.unwrap().path();
+            if path.is_dir() {
+                visit(base, &path, result);
+            } else {
+                result.insert(
+                    path.strip_prefix(base).unwrap().to_owned(),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut result = std::collections::BTreeMap::new();
+    visit(root, &root.join("local"), &mut result);
+    visit(root, &root.join("removal-staging"), &mut result);
+    result
+}
+
+#[tokio::test]
+async fn removal_process_crash_checkpoints_converge_without_automatic_delete() {
+    use crate::storage::local_plugin_import::LocalManifestImportStorage;
+    // Only injected, canonical test roots; no native user profile is opened.
+    let base = std::env::current_dir().unwrap().join("target");
+    std::fs::create_dir_all(&base).unwrap();
+    for checkpoint in REMOVAL_CRASH_POINTS {
+        for damage in if checkpoint == "quarantine-verified" {
+            vec!["none", "manifest-only", "mismatch"]
+        } else {
+            vec!["none"]
+        } {
+            let temp = tempfile::Builder::new()
+                .prefix("plugin-runtime-removal-")
+                .tempdir_in(&base)
+                .unwrap();
+            let disposable = temp.path().canonicalize().unwrap();
+            let root = disposable.join("plugins");
+            let packages = SystemLocalPluginPackageStorage::with_plugins_root(root.clone());
+            let record = record();
+            let promotion = packages
+                .prepare_stage(&record, &record.canonical_manifest_bytes().unwrap())
+                .unwrap()
+                .promote()
+                .unwrap();
+            let source = root
+                .join("local")
+                .join(promotion.entry.package_slot().as_str());
+            let index = ManagedOwnershipStore::with_plugins_root(root.clone());
+            index
+                .save(
+                    &ManagedOwnershipIndexV1::empty()
+                        .register(promotion.entry)
+                        .unwrap(),
+                )
+                .unwrap();
+            let child_root = disposable.clone();
+            tokio::task::spawn_blocking(move || run_removal_crash_child(&child_root, checkpoint))
+                .await
+                .unwrap();
+            let before_index = index.load().unwrap().index;
+            let pre_rename = matches!(checkpoint, "disabled-saved" | "removing-main-committed");
+            assert_eq!(source.exists(), pre_rename, "{checkpoint}");
+            let observations = discover_from_plugins_root(&root).removals.observations;
+            let expected_shape = match checkpoint {
+                "rename-returned" | "quarantine-verified" | "candidate-scanned" => {
+                    Some(RemovalObservationShape::Full)
+                }
+                "manifest-removed" => Some(RemovalObservationShape::ReceiptOnly),
+                "receipt-removed" => Some(RemovalObservationShape::EmptyDirectory),
+                _ => None,
+            };
+            assert_eq!(
+                observations.first().map(|o| o.shape),
+                expected_shape,
+                "{checkpoint}"
+            );
+            assert_eq!(
+                before_index.entries().len(),
+                usize::from(!matches!(checkpoint, "index-deleted" | "published"))
+            );
+            if !pre_rename && !before_index.entries().is_empty() {
+                assert!(before_index.entries()[0].removal_slot().is_some());
+            }
+            if damage != "none" {
+                let quarantine = root
+                    .join("removal-staging")
+                    .join(observations[0].removal_slot.as_str());
+                if damage == "manifest-only" {
+                    std::fs::remove_file(quarantine.join("ownership-receipt.json")).unwrap();
+                } else {
+                    std::fs::write(quarantine.join("manifest.json"), b"{}").unwrap();
+                }
+            }
+            let evidence = package_evidence(&root);
+            let runtime = removal_disk_runtime(&root);
+            for snapshot in [
+                runtime.get_catalog().await.unwrap(),
+                runtime.reload_catalog().await.unwrap(),
+            ] {
+                let snapshot = serde_json::to_value(snapshot).unwrap();
+                assert_eq!(
+                    package_evidence(&root),
+                    evidence,
+                    "restart/reload changed evidence: {checkpoint}/{damage}"
+                );
+                if pre_rename {
+                    assert_eq!(snapshot["plugins"][0]["management"], "managed");
+                    assert_eq!(snapshot["plugins"][0]["status"], "disabled");
+                    assert!(index.load().unwrap().index.entries()[0]
+                        .removal_slot()
+                        .is_none());
+                } else {
+                    assert!(snapshot["plugins"].as_array().unwrap().is_empty());
+                    if damage != "none" {
+                        assert_eq!(snapshot["managedOwnership"]["conflictingEntryCount"], 1);
+                    } else if expected_shape.is_some() {
+                        assert_eq!(snapshot["managedOwnership"]["cleanupPendingCount"], 1);
+                        assert_eq!(index.load().unwrap().index.entries().len(), 1);
+                    } else {
+                        assert!(index.load().unwrap().index.entries().is_empty());
+                    }
+                }
+            }
+            let state = PluginStateStore::with_path(root.join("state.json"))
+                .load()
+                .unwrap()
+                .state;
+            assert_eq!(state.entries.len(), 1);
+            assert!(state.entries.iter().all(|entry| !entry.enabled));
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "launched only by removal_process_crash_checkpoints_converge_without_automatic_delete"]
+async fn removal_crash_child() {
+    let Some(root) = std::env::var_os("EASIFLUX_PLUGIN_TEST_ROOT").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    assert_eq!(
+        std::env::var("EASIFLUX_PLUGIN_TEST_CHILD").unwrap(),
+        "removal"
+    );
+    assert_eq!(root.canonicalize().unwrap(), root);
+    assert!(root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("plugin-runtime-removal-"));
+    let checkpoint = std::env::var("EASIFLUX_PLUGIN_TEST_CHECKPOINT").unwrap();
+    assert!(REMOVAL_CRASH_POINTS.contains(&checkpoint.as_str()));
+    let runtime = removal_disk_runtime(&root.join("plugins"));
+    let snapshot = runtime.get_catalog().await.unwrap();
+    let result = runtime
+        .remove_managed_local_plugin("com.example.notes", &snapshot.catalog_generation)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(result).unwrap()["status"], "removed");
+    panic!("removal checkpoint {checkpoint} was not reached");
+}
 type Saves = Arc<Mutex<VecDeque<(PersistOutcome, bool)>>>;
 type Probe = Arc<
     Mutex<
@@ -879,8 +1119,16 @@ async fn rollback_failure_publishes_removal_pending_once() {
                 .unwrap()
                 .extend([(PersistOutcome::CommittedDurable, false), (outcome, error)]);
             let result = fixture.remove().await;
-            Fixture::reject(&result, "plugin_remove_identity_changed", true);
             let committed = persist_outcome_committed(outcome);
+            Fixture::reject(
+                &result,
+                if committed {
+                    "plugin_remove_identity_changed"
+                } else {
+                    "plugin_ownership_persist_failed"
+                },
+                true,
+            );
             assert_eq!(
                 result["snapshot"]["plugins"][0]["management"],
                 if committed {

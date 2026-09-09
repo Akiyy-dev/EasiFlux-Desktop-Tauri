@@ -1471,12 +1471,14 @@ describe('plugin store managed local removal ownership and arbitration', () => {
     const store = await loadedStoreWith(managedDisabledItem(), '9007199254740992', '11')
     store.beginRemoval('com.example.notes')
     const returned = removalResult(snapshot('9007199254740993', [], '9007199254740993'), status)
+    if (status === 'removedCleanupPending') returned.snapshot.managedOwnership.cleanupPendingCount = 1
     serviceMocks.removeManaged.mockResolvedValueOnce(returned)
     await store.confirmRemoval()
     expect(store.catalog).toEqual([])
     expect(store.catalogGeneration).toBe('9007199254740993')
     expect(store.revision).toBe('9007199254740993')
     expect(store.removalResult).toBe(returned)
+    expect(store.managedOwnership).toEqual(returned.snapshot.managedOwnership)
   })
 
   it('late_lower_generation_remove_snapshot_cannot_delete_new_same_id_item', async () => {
@@ -1509,7 +1511,7 @@ describe('plugin store managed local removal ownership and arbitration', () => {
     expect(store.revision).toBe('13')
   })
 
-  it('removal_request_order_is_captured_at_submission', async () => {
+  it('adversarial_protocol_violation_equal_counter_contradictory_DTOs_use_submission_order', async () => {
     const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
     const removed = deferred<RemoveManagedLocalPluginResult>()
     serviceMocks.removeManaged.mockReturnValueOnce(removed.promise)

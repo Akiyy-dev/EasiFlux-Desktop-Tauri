@@ -308,6 +308,9 @@ fn run_commit_blocking(
     let locator_confirmed = promotion
         .as_ref()
         .is_some_and(|proof| candidate.confirms_import_locator(record, &proof.locator));
+    // Exact boundary: the reconciled candidate exists but is not public yet.
+    #[cfg(test)]
+    crate::storage::local_plugin_package::crash_checkpoint("import", "candidate-built");
     if runtime
         .registry
         .blocking_write()
