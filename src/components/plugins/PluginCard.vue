@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { PluginCatalogItem } from '../../types/plugin'
-import { pluginSourceLabel } from './pluginPresentation'
+import { pluginManagementLabel } from './pluginPresentation'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   plugin: PluginCatalogItem
   pending: boolean
   error: string | null
-}>()
+  removalDisabled?: boolean
+}>(), { removalDisabled: false })
 
 const emit = defineEmits<{
   toggle: [id: string, enabled: boolean]
+  remove: [id: string, opener: HTMLButtonElement]
 }>()
 
 const statusLabels = {
@@ -31,9 +33,15 @@ const describedBy = computed(() => (
   props.error ? `${statusId.value} ${errorId.value}` : statusId.value
 ))
 const disabled = computed(() => (
-  props.pending || !props.plugin.canToggle || props.plugin.status === 'blocked'
+  props.pending
+  || !props.plugin.canToggle
+  || props.plugin.status === 'blocked'
+  || props.plugin.toggleBlockReasonCode === 'removalPending'
 ))
 const reasonLabel = computed(() => {
+  if (props.plugin.toggleBlockReasonCode === 'removalPending') {
+    return pluginManagementLabel('removalPending')
+  }
   if (props.plugin.statusReasonCode) {
     return reasonLabels[props.plugin.statusReasonCode]
   }
@@ -49,6 +57,19 @@ function requestToggle(): void {
     props.plugin.manifest.id,
     props.plugin.status !== 'enabled',
   )
+}
+
+function requestRemoval(event: MouseEvent): void {
+  const opener = event.currentTarget
+  if (
+    props.removalDisabled
+    || props.plugin.management !== 'managed'
+    || props.plugin.status !== 'disabled'
+    || props.plugin.canRemove !== true
+    || !(opener instanceof HTMLButtonElement)
+    || !opener.isConnected
+  ) return
+  emit('remove', props.plugin.manifest.id, opener)
 }
 </script>
 
@@ -90,8 +111,8 @@ function requestToggle(): void {
         <dd>{{ plugin.manifest.publisher }}（{{ plugin.manifest.publisherId }}）</dd>
       </div>
       <div>
-        <dt>来源</dt>
-        <dd>{{ pluginSourceLabel(plugin.source) }}</dd>
+        <dt>来源与管理</dt>
+        <dd>{{ pluginManagementLabel(plugin.management) }}</dd>
       </div>
     </dl>
 
@@ -115,6 +136,28 @@ function requestToggle(): void {
     >
       状态：{{ statusLabel }}<span v-if="reasonLabel">；{{ reasonLabel }}</span>
     </p>
+    <div
+      v-if="plugin.management === 'managed'"
+      class="plugin-card__removal"
+      data-testid="plugin-removal-area"
+    >
+      <p v-if="plugin.status === 'enabled'">
+        如需移除，请先停用此插件。
+      </p>
+      <button
+        v-else-if="plugin.status === 'disabled' && plugin.canRemove"
+        class="ef-btn ef-btn-danger ef-btn-sm"
+        data-testid="plugin-remove-button"
+        type="button"
+        :disabled="props.removalDisabled"
+        @click="requestRemoval"
+      >
+        移除本地包
+      </button>
+      <p v-else>
+        此受管包当前不可移除。
+      </p>
+    </div>
     <p
       v-if="error"
       :id="errorId"

@@ -94,7 +94,8 @@
   gap: var(--ef-space-2);
 }
 
-.plugin-import-dialog {
+.plugin-import-dialog,
+.plugin-removal-dialog {
   width: min(42rem, calc(100vw - 2 * var(--ef-space-4)));
   max-height: min(48rem, calc(100vh - 2 * var(--ef-space-4)));
   padding: 0;
@@ -106,61 +107,75 @@
   box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 35%);
 }
 
-.plugin-import-dialog::backdrop {
+.plugin-import-dialog::backdrop,
+.plugin-removal-dialog::backdrop {
   background: rgb(0 0 0 / 55%);
 }
 
-.plugin-import-dialog__surface {
+.plugin-import-dialog__surface,
+.plugin-removal-dialog__surface {
   display: grid;
   gap: var(--ef-space-4);
   padding: var(--ef-space-5);
 }
 
 .plugin-import-dialog__surface header,
+.plugin-removal-dialog__surface header,
 .plugin-import-dialog__surface header p,
+.plugin-removal-dialog__surface header p,
 .plugin-import-dialog__surface h2,
-.plugin-import-dialog__surface > p {
+.plugin-removal-dialog__surface h2,
+.plugin-import-dialog__surface > p,
+.plugin-removal-dialog__surface > p {
   margin: 0;
 }
 
-.plugin-import-dialog__surface header {
+.plugin-import-dialog__surface header,
+.plugin-removal-dialog__surface header {
   display: grid;
   gap: var(--ef-space-1);
 }
 
-.plugin-import-dialog__surface h2 {
+.plugin-import-dialog__surface h2,
+.plugin-removal-dialog__surface h2 {
   font-size: var(--ef-text-xl);
 }
 
 .plugin-import-dialog__eyebrow,
-.plugin-import-dialog__hint {
+.plugin-import-dialog__hint,
+.plugin-removal-dialog__eyebrow {
   color: var(--muted-foreground);
 }
 
-.plugin-import-dialog__eyebrow {
+.plugin-import-dialog__eyebrow,
+.plugin-removal-dialog__eyebrow {
   font-size: var(--ef-text-xs);
   font-weight: var(--ef-text-label-weight);
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
 
-.plugin-import-dialog__metadata {
+.plugin-import-dialog__metadata,
+.plugin-removal-dialog__metadata {
   display: grid;
   gap: var(--ef-space-2);
   margin: 0;
 }
 
-.plugin-import-dialog__metadata > div {
+.plugin-import-dialog__metadata > div,
+.plugin-removal-dialog__metadata > div {
   display: grid;
   grid-template-columns: minmax(6rem, 0.25fr) minmax(0, 1fr);
   gap: var(--ef-space-2);
 }
 
-.plugin-import-dialog__metadata dt {
+.plugin-import-dialog__metadata dt,
+.plugin-removal-dialog__metadata dt {
   color: var(--muted-foreground);
 }
 
-.plugin-import-dialog__metadata dd {
+.plugin-import-dialog__metadata dd,
+.plugin-removal-dialog__metadata dd {
   min-width: 0;
   margin: 0;
   overflow-wrap: anywhere;
@@ -168,18 +183,23 @@
 
 .plugin-import-dialog__warning,
 .plugin-import-dialog__stale,
-.plugin-import-dialog__progress {
+.plugin-import-dialog__progress,
+.plugin-removal-dialog__warning,
+.plugin-removal-dialog__stale,
+.plugin-removal-dialog__progress {
   padding: var(--ef-space-3);
   border-radius: var(--ef-radius-md);
   background: var(--muted);
 }
 
-.plugin-import-dialog__stale {
+.plugin-import-dialog__stale,
+.plugin-removal-dialog__stale {
   border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
   color: var(--danger);
 }
 
-.plugin-import-dialog__actions {
+.plugin-import-dialog__actions,
+.plugin-removal-dialog__actions {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
@@ -187,13 +207,16 @@
 }
 
 .plugin-import-dialog__actions button:focus-visible,
+.plugin-removal-dialog__actions button:focus-visible,
 .plugin-marketplace-page__notice-actions button:focus-visible,
 .plugin-marketplace-page__notice > button:focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
-.plugin-import-dialog__actions button:disabled {
+.plugin-import-dialog__actions button:disabled,
+.plugin-removal-dialog__actions button:disabled,
+.plugin-card__removal button:disabled {
   cursor: not-allowed;
   opacity: 0.6;
 }
@@ -356,6 +379,20 @@
   color: var(--danger);
 }
 
+.plugin-card__removal {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ef-space-2);
+  padding-top: var(--ef-space-2);
+  border-top: 1px solid var(--border);
+}
+
+.plugin-card__removal p {
+  color: var(--muted-foreground);
+  font-size: var(--ef-text-sm);
+}
+
 .plugin-management-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -400,16 +437,19 @@
     grid-template-columns: 1fr;
   }
 
-  .plugin-import-dialog__surface {
+  .plugin-import-dialog__surface,
+  .plugin-removal-dialog__surface {
     padding: var(--ef-space-4);
   }
 
-  .plugin-import-dialog__metadata > div {
+  .plugin-import-dialog__metadata > div,
+  .plugin-removal-dialog__metadata > div {
     grid-template-columns: 1fr;
     gap: var(--ef-space-1);
   }
 
-  .plugin-import-dialog__actions {
+  .plugin-import-dialog__actions,
+  .plugin-removal-dialog__actions {
     align-items: stretch;
     flex-direction: column-reverse;
   }
