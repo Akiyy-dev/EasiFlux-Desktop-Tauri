@@ -8,6 +8,22 @@ interface FocusControl {
   focus: () => void
 }
 
+interface DialogControl {
+  readonly open: boolean
+  showModal: () => void
+  close: () => void
+}
+
+interface DialogActionControl extends FocusControl {
+  readonly disabled: boolean
+}
+
+interface DialogKeyEvent {
+  readonly key: string
+  readonly shiftKey: boolean
+  preventDefault: () => void
+}
+
 const props = defineProps<{
   plugin: PluginCatalogItem
   submitting: boolean
@@ -20,53 +36,58 @@ const emit = defineEmits<{
   cancel: []
 }>()
 
-const dialog = ref<HTMLDialogElement | null>(null)
-const cancelButton = ref<HTMLButtonElement | null>(null)
+const dialog = ref<DialogControl | null>(null)
+const cancelButton = ref<DialogActionControl | null>(null)
+const confirmButton = ref<DialogActionControl | null>(null)
 const actionRequested = ref(false)
+const acceptedSubmission = ref(props.submitting)
 let returnFocusTarget: FocusControl | null = null
-let submitted = false
 
 function requestCancel(event?: { preventDefault: () => void }): void {
   event?.preventDefault()
-  if (props.submitting || actionRequested.value) return
+  if (acceptedSubmission.value || props.submitting || actionRequested.value) return
   actionRequested.value = true
   emit('cancel')
 }
 
 function requestConfirm(): void {
-  if (props.submitting || props.stale || actionRequested.value) return
+  if (acceptedSubmission.value || props.submitting || props.stale || actionRequested.value) return
   actionRequested.value = true
-  submitted = true
   emit('confirm')
 }
 
-function trapFocus(event: KeyboardEvent): void {
+function trapFocus(event: DialogKeyEvent): void {
   if (event.key !== 'Tab') return
-  const controls = [...(dialog.value?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? [])]
-    .filter((control) => control.isConnected)
-  if (controls.length === 0) {
+  const controls = [cancelButton.value, confirmButton.value].filter(
+    (control): control is DialogActionControl => (
+      control !== null && control.isConnected && !control.disabled
+    ),
+  )
+  const first = controls[0]
+  const last = controls[controls.length - 1]
+  if (!first || !last) {
     event.preventDefault()
     return
   }
-  const first = controls[0]
-  const last = controls[controls.length - 1]
-  if (event.shiftKey && document.activeElement === first) {
+  const active = globalThis.document.activeElement
+  if (event.shiftKey && active === first) {
     event.preventDefault()
     last.focus()
-  } else if (!event.shiftKey && document.activeElement === last) {
+  } else if (!event.shiftKey && active === last) {
     event.preventDefault()
     first.focus()
-  } else if (!controls.includes(document.activeElement as HTMLButtonElement)) {
+  } else if (!controls.some((control) => control === active)) {
     event.preventDefault()
     ;(event.shiftKey ? last : first).focus()
   }
 }
 
+watch(() => props.submitting, (submitting) => {
+  if (submitting) acceptedSubmission.value = true
+})
+
 watch(() => props.stale, (stale) => {
-  if (stale && !props.submitting) {
-    actionRequested.value = false
-    submitted = false
-  }
+  if (stale && !acceptedSubmission.value) actionRequested.value = false
 })
 
 onMounted(async () => {
@@ -80,11 +101,11 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  if (dialog.value?.open) dialog.value.close()
+  if (!acceptedSubmission.value && dialog.value?.open) dialog.value.close()
 })
 
 onUnmounted(() => {
-  if (!submitted && returnFocusTarget?.isConnected) returnFocusTarget.focus()
+  if (!acceptedSubmission.value && returnFocusTarget?.isConnected) returnFocusTarget.focus()
 })
 </script>
 
@@ -151,6 +172,7 @@ onUnmounted(() => {
           取消
         </button>
         <button
+          ref="confirmButton"
           class="ef-btn ef-btn-danger"
           data-testid="plugin-removal-confirm"
           type="button"

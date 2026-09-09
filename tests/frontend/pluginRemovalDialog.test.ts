@@ -1,5 +1,5 @@
 import { mount } from '@vue/test-utils'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 import PluginRemovalDialog from '../../src/components/plugins/PluginRemovalDialog.vue'
 import type { PluginCatalogItem } from '../../src/types/plugin'
@@ -170,10 +170,18 @@ describe('PluginRemovalDialog', () => {
     wrapper.unmount()
   })
 
-  it('blocks every cancellation path and focus restoration after submission begins', async () => {
+  it('keeps accepted-flight teardown focus-neutral across stale updates and remounts', async () => {
     const opener = document.createElement('button')
     document.body.append(opener)
     opener.focus()
+    let nativeReturnTarget = opener
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value: vi.fn(function(this: HTMLDialogElement) {
+        this.removeAttribute('open')
+        nativeReturnTarget.focus()
+      }),
+    })
     const wrapper = mountDialog({ opener })
     await nextTick()
     await wrapper.get('[data-testid="plugin-removal-confirm"]').trigger('click')
@@ -190,9 +198,20 @@ describe('PluginRemovalDialog', () => {
     expect(cancelEvent.defaultPrevented).toBe(true)
     expect(wrapper.emitted('cancel')).toBeUndefined()
 
+    await wrapper.setProps({ submitting: false, stale: true })
     document.body.tabIndex = -1
     document.body.focus()
     wrapper.unmount()
+    expect(document.activeElement).toBe(document.body)
+
+    const remountOpener = document.createElement('button')
+    document.body.append(remountOpener)
+    remountOpener.focus()
+    nativeReturnTarget = remountOpener
+    const remounted = mountDialog({ opener: remountOpener, submitting: true })
+    await nextTick()
+    document.body.focus()
+    remounted.unmount()
     expect(document.activeElement).toBe(document.body)
   })
 })

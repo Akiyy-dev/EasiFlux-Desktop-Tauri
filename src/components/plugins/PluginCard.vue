@@ -3,6 +3,15 @@ import { computed } from 'vue'
 import type { PluginCatalogItem } from '../../types/plugin'
 import { pluginManagementLabel } from './pluginPresentation'
 
+interface RemovalOpener {
+  readonly isConnected: boolean
+  focus: () => void
+}
+
+interface RemovalClickEvent {
+  readonly currentTarget: unknown
+}
+
 const props = withDefaults(defineProps<{
   plugin: PluginCatalogItem
   pending: boolean
@@ -12,7 +21,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   toggle: [id: string, enabled: boolean]
-  remove: [id: string, opener: HTMLButtonElement]
+  remove: [id: string, opener: RemovalOpener]
 }>()
 
 const statusLabels = {
@@ -59,15 +68,20 @@ function requestToggle(): void {
   )
 }
 
-function requestRemoval(event: MouseEvent): void {
+function isRemovalOpener(value: unknown): value is RemovalOpener {
+  if (typeof value !== 'object' || value === null) return false
+  const candidate = value as { isConnected?: unknown; focus?: unknown }
+  return candidate.isConnected === true && typeof candidate.focus === 'function'
+}
+
+function requestRemoval(event: RemovalClickEvent): void {
   const opener = event.currentTarget
   if (
     props.removalDisabled
     || props.plugin.management !== 'managed'
     || props.plugin.status !== 'disabled'
     || props.plugin.canRemove !== true
-    || !(opener instanceof HTMLButtonElement)
-    || !opener.isConnected
+    || !isRemovalOpener(opener)
   ) return
   emit('remove', props.plugin.manifest.id, opener)
 }
