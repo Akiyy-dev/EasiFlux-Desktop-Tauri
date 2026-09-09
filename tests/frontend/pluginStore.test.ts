@@ -1471,7 +1471,10 @@ describe('plugin store managed local removal ownership and arbitration', () => {
     const store = await loadedStoreWith(managedDisabledItem(), '9007199254740992', '11')
     store.beginRemoval('com.example.notes')
     const returned = removalResult(snapshot('9007199254740993', [], '9007199254740993'), status)
-    if (status === 'removedCleanupPending') returned.snapshot.managedOwnership.cleanupPendingCount = 1
+    if (status === 'removedCleanupPending') {
+      returned.snapshot.managedOwnership.status = 'degraded'
+      returned.snapshot.managedOwnership.cleanupPendingCount = 1
+    }
     serviceMocks.removeManaged.mockResolvedValueOnce(returned)
     await store.confirmRemoval()
     expect(store.catalog).toEqual([])

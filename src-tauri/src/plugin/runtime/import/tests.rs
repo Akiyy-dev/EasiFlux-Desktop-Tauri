@@ -257,6 +257,24 @@ struct StorageControls {
     after_promotion: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
+struct RemovalPrepareSpy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl crate::storage::local_plugin_package::ManagedLocalPluginRemovalStorage for RemovalPrepareSpy {
+    fn prepare(
+        &self,
+        _locator: &crate::plugin::discovery::LocalPackageLocator,
+        _entry: &crate::plugin::ownership::ManagedOwnershipEntryV1,
+    ) -> Result<
+        Box<dyn crate::storage::local_plugin_package::OwnedRemoval>,
+        crate::storage::local_plugin_package::RemovalStorageFailure,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(crate::storage::local_plugin_package::RemovalStorageFailure::Unavailable)
+    }
+}
+
 impl StorageControls {
     fn fail_next_prepare(&self) {
         self.fail_prepare.store(true, Ordering::SeqCst);
@@ -440,6 +458,7 @@ struct ImportFixture {
     discovery: Arc<RecordingDiscovery>,
     persistence: RecordingPersistence,
     storage_controls: Arc<StorageControls>,
+    removal_prepares: Arc<AtomicUsize>,
     ownership: RecordingOwnership,
 }
 
@@ -481,6 +500,10 @@ impl ImportFixture {
             events: Arc::clone(&events),
             controls: Arc::clone(&storage_controls),
         });
+        let removal_prepares = Arc::new(AtomicUsize::new(0));
+        let removal_storage = Arc::new(RemovalPrepareSpy {
+            calls: Arc::clone(&removal_prepares),
+        });
         let ownership = RecordingOwnership {
             inner: Arc::new(
                 crate::storage::managed_plugin_ownership::ManagedOwnershipStore::with_plugins_root(
@@ -495,11 +518,12 @@ impl ImportFixture {
             Box::new(persistence.clone()),
             Box::new(ownership.clone()),
         );
-        let runtime = Arc::new(PluginRuntime::with_import_services(
+        let runtime = Arc::new(PluginRuntime::with_lifecycle_services(
             registry,
             discovery.clone(),
             Arc::new(SystemLocalManifestReader),
             storage,
+            removal_storage,
         ));
         runtime.get_catalog().await.unwrap();
         Self {
@@ -512,6 +536,7 @@ impl ImportFixture {
             discovery,
             persistence,
             storage_controls,
+            removal_prepares,
             ownership,
         }
     }
@@ -861,6 +886,91 @@ async fn postcommit_index_uncertainty_returns_imported_not_visible_with_last_com
         assert_eq!(result["snapshot"], before);
         assert_eq!(fixture.target_manifests().len(), 1);
         assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+    }
+}
+
+#[tokio::test]
+async fn unpublished_import_documents_block_old_generation_lifecycle_until_reload() {
+    for failure in ["committed-index-error", "unavailable-postscan"] {
+        let fixture = ImportFixture::new().await;
+        let initial_preview = fixture.prepare_valid().await;
+        let initial = wire(
+            fixture
+                .runtime
+                .commit_import(&initial_preview.token, &initial_preview.catalog_generation)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(initial["status"], "imported");
+        let before = initial["snapshot"].clone();
+        let generation = before["catalogGeneration"].as_str().unwrap().to_owned();
+
+        fs::write(&fixture.source, unrelated_manifest()).unwrap();
+        let preview = fixture.prepare_valid().await;
+        match failure {
+            "committed-index-error" => fixture.ownership.failure.store(2, Ordering::SeqCst),
+            "unavailable-postscan" => fixture.discovery.panic_on(5),
+            _ => unreachable!(),
+        }
+        let result = wire(
+            fixture
+                .runtime
+                .commit_import(&preview.token, &preview.catalog_generation)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["status"], "importedNotVisible", "{failure}");
+        assert_eq!(result["snapshot"], before, "{failure}");
+        assert_eq!(
+            serde_json::to_value(fixture.runtime.registry.read().await.catalog_snapshot()).unwrap(),
+            before,
+            "{failure}"
+        );
+
+        fixture.clear_events();
+        let state_saves = fixture.persistence.saves.load(Ordering::SeqCst);
+        let removal_prepares = fixture.removal_prepares.load(Ordering::SeqCst);
+        let toggle = fixture
+            .runtime
+            .set_enabled("com.example.notes", true, &generation)
+            .await
+            .unwrap_err();
+        assert_eq!(error_code(toggle), "plugin_catalog_stale", "{failure}");
+        let removal = serde_json::to_value(
+            fixture
+                .runtime
+                .remove_managed_local_plugin("com.example.notes", &generation)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(removal["status"], "notRemoved", "{failure}");
+        assert_eq!(removal["reasonCode"], "plugin_catalog_stale", "{failure}");
+        assert_eq!(
+            fixture.persistence.saves.load(Ordering::SeqCst),
+            state_saves,
+            "{failure}"
+        );
+        assert_eq!(
+            fixture.removal_prepares.load(Ordering::SeqCst),
+            removal_prepares,
+            "{failure}"
+        );
+        assert!(fixture.events.lock().unwrap().is_empty(), "{failure}");
+
+        let reconciled = fixture.runtime.reload_catalog().await.unwrap();
+        assert_ne!(reconciled.catalog_generation, generation, "{failure}");
+        fixture.clear_events();
+        fixture
+            .runtime
+            .set_enabled("com.example.notes", true, &reconciled.catalog_generation)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.persistence.saves.load(Ordering::SeqCst),
+            state_saves + 1,
+            "{failure}"
+        );
     }
 }
 
