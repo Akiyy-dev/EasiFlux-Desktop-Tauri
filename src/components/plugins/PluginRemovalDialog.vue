@@ -39,20 +39,32 @@ const emit = defineEmits<{
 const dialog = ref<DialogControl | null>(null)
 const cancelButton = ref<DialogActionControl | null>(null)
 const confirmButton = ref<DialogActionControl | null>(null)
-const actionRequested = ref(false)
 const acceptedSubmission = ref(props.submitting)
+let cancelRequested = false
+let confirmationRequested = false
 let returnFocusTarget: FocusControl | null = null
 
 function requestCancel(event?: { preventDefault: () => void }): void {
   event?.preventDefault()
-  if (acceptedSubmission.value || props.submitting || actionRequested.value) return
-  actionRequested.value = true
+  if (
+    acceptedSubmission.value
+    || props.submitting
+    || cancelRequested
+    || confirmationRequested
+  ) return
+  cancelRequested = true
   emit('cancel')
 }
 
 function requestConfirm(): void {
-  if (acceptedSubmission.value || props.submitting || props.stale || actionRequested.value) return
-  actionRequested.value = true
+  if (
+    acceptedSubmission.value
+    || props.submitting
+    || props.stale
+    || cancelRequested
+    || confirmationRequested
+  ) return
+  confirmationRequested = true
   emit('confirm')
 }
 
@@ -87,7 +99,7 @@ watch(() => props.submitting, (submitting) => {
 })
 
 watch(() => props.stale, (stale) => {
-  if (stale && !acceptedSubmission.value) actionRequested.value = false
+  if (stale && !acceptedSubmission.value) confirmationRequested = false
 })
 
 onMounted(async () => {
@@ -101,11 +113,19 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  if (!acceptedSubmission.value && dialog.value?.open) dialog.value.close()
+  if (
+    !acceptedSubmission.value
+    && !confirmationRequested
+    && dialog.value?.open
+  ) dialog.value.close()
 })
 
 onUnmounted(() => {
-  if (!acceptedSubmission.value && returnFocusTarget?.isConnected) returnFocusTarget.focus()
+  if (
+    !acceptedSubmission.value
+    && !confirmationRequested
+    && returnFocusTarget?.isConnected
+  ) returnFocusTarget.focus()
 })
 </script>
 

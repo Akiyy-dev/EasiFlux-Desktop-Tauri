@@ -159,7 +159,10 @@ describe('PluginRemovalDialog', () => {
   })
 
   it('allows cancellation when submission revalidation makes a requested confirmation stale', async () => {
-    const wrapper = mountDialog()
+    const opener = document.createElement('button')
+    document.body.append(opener)
+    opener.focus()
+    const wrapper = mountDialog({ opener })
     await nextTick()
     await wrapper.get('[data-testid="plugin-removal-confirm"]').trigger('click')
     await wrapper.setProps({ stale: true })
@@ -168,6 +171,30 @@ describe('PluginRemovalDialog', () => {
     expect(wrapper.emitted('confirm')).toHaveLength(1)
     expect(wrapper.emitted('cancel')).toHaveLength(1)
     wrapper.unmount()
+    expect(document.activeElement).toBe(opener)
+  })
+
+  it('keeps immediate confirmed teardown focus-neutral before submitting propagates', async () => {
+    const opener = document.createElement('button')
+    document.body.append(opener)
+    opener.focus()
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value: vi.fn(function(this: HTMLDialogElement) {
+        this.removeAttribute('open')
+        opener.focus()
+      }),
+    })
+    const wrapper = mountDialog({ opener })
+    await nextTick()
+
+    await wrapper.get('[data-testid="plugin-removal-confirm"]').trigger('click')
+    expect(wrapper.emitted('confirm')).toHaveLength(1)
+    document.body.tabIndex = -1
+    document.body.focus()
+    wrapper.unmount()
+
+    expect(document.activeElement).toBe(document.body)
   })
 
   it('keeps accepted-flight teardown focus-neutral across stale updates and remounts', async () => {
