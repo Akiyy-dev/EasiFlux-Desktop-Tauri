@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-09-local-manifest-removal-design.md` — implement the complete approved revision at `dd2cdeb`; executors must read it in full before every task.
 
+**Implementation amendments:** [2026-09-10 implementation notes](../specs/2026-09-10-local-manifest-removal-implementation-notes.md) supersede conflicting literal Windows API calls, unreachable capacity-test cases, and repeated full-suite steps below. The user requested focused intermediate checks and one complete verification at the end; preserve existing evidence instead of rerunning unchanged suites.
+
 ## Global Constraints
 
 - `pkg-*` names, manifest fingerprints, plugin-state decisions, package shape, an isolated receipt, or an isolated index entry never authorize deletion by themselves.

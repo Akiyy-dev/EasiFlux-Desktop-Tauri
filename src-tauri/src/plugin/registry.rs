@@ -664,6 +664,20 @@ impl PluginRegistry {
     /// Persisted documents survive a failed/uncertain publication. The previous
     /// complete DTO remains authoritative until a complete candidate can replace it.
     pub(crate) fn adopt_import_documents(&mut self, candidate: &Self) {
+        let state_changed = match (&self.publication.runtime, &candidate.publication.runtime) {
+            (Runtime::Available { state: current, .. }, Runtime::Available { state: next, .. }) => {
+                current != next
+            }
+            (
+                Runtime::Unavailable {
+                    reason: current, ..
+                },
+                Runtime::Unavailable { reason: next, .. },
+            ) => current != next,
+            _ => true,
+        };
+        self.removal_authority_unreconciled |= state_changed
+            || self.publication.ownership.entries() != candidate.publication.ownership.entries();
         self.publication.runtime = candidate.publication.runtime.clone();
         self.publication.ownership = candidate.publication.ownership.clone();
     }

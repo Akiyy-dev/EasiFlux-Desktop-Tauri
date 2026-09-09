@@ -105,11 +105,10 @@ fn removal_fixture() -> (
     SystemLocalPluginPackageStorage,
 ) {
     let (temp, root, record, bytes) = fixture();
-    let promoted = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
+    let mut stage = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
         .prepare_stage(&record, &bytes)
-        .unwrap()
-        .promote()
         .unwrap();
+    let promoted = expect_promotion(stage.as_mut(), "removal-fixture-promotion");
     let storage = SystemLocalPluginPackageStorage::with_plugins_root(root.clone());
     (temp, root, promoted, storage)
 }
@@ -696,12 +695,27 @@ use std::{
 };
 
 fn fixture() -> (tempfile::TempDir, PathBuf, PluginRecord, Vec<u8>) {
+    IMPORT_DIAGNOSTICS.with(|diagnostics| *diagnostics.borrow_mut() = ImportDiagnostics::default());
     let base = std::env::current_dir().unwrap().join("target");
     let temp = tempfile::tempdir_in(base).unwrap();
     let root = temp.path().canonicalize().unwrap().join("plugins");
     let record = PluginRecord::local_declarative(serde_json::from_slice(VALID).unwrap()).unwrap();
     let bytes = record.canonical_manifest_bytes().unwrap();
     (temp, root, record, bytes)
+}
+fn expect_promotion(
+    stage: &mut dyn crate::storage::local_plugin_import::OwnedImportStage,
+    operation: &str,
+) -> PromotedManagedPackage {
+    stage.promote().unwrap_or_else(|_| {
+        IMPORT_DIAGNOSTICS.with(|diagnostics| {
+            panic!(
+                "operation={operation} state={:?} evidence={:?}",
+                stage.promotion_state(),
+                diagnostics.borrow()
+            )
+        })
+    })
 }
 fn children(root: &Path) -> Vec<PathBuf> {
     fs::read_dir(root)
@@ -764,8 +778,8 @@ fn receipt_and_target_slot_are_host_generated() {
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root);
     let mut a = storage.prepare_stage(&record, &bytes).unwrap();
     let mut b = storage.prepare_stage(&record, &bytes).unwrap();
-    let a = a.promote().unwrap();
-    let b = b.promote().unwrap();
+    let a = expect_promotion(a.as_mut(), "host-generated-first-promotion");
+    let b = expect_promotion(b.as_mut(), "host-generated-second-promotion");
     let ar = &a.locator.receipt.as_ref().unwrap().model;
     let br = &b.locator.receipt.as_ref().unwrap().model;
     assert_ne!(ar.receipt_id(), br.receipt_id());
@@ -813,11 +827,34 @@ fn collision_attempts(collisions: usize) {
         },
     );
     let mut stage = storage.prepare_stage(&record, &bytes).unwrap();
-    assert_eq!(stage.promote().is_ok(), collisions < 4);
+    let result = stage.promote();
+    let evidence = IMPORT_DIAGNOSTICS.with(|diagnostics| {
+        format!(
+            "operation=collision-promotion collisions={collisions} state={:?} evidence={:?}",
+            stage.promotion_state(),
+            diagnostics.borrow()
+        )
+    });
+    assert_eq!(
+        result.is_ok(),
+        collisions < 4,
+        "{evidence}; success={}",
+        result.is_ok()
+    );
     let snapshots = snapshots.lock().unwrap();
     let total = (collisions + 1).min(4);
-    assert_eq!(snapshots.len(), total);
-    assert_eq!(uuid_count.load(Ordering::SeqCst), total * 3);
+    assert_eq!(
+        snapshots.len(),
+        total,
+        "{evidence}; snapshots={}",
+        snapshots.len()
+    );
+    assert_eq!(
+        uuid_count.load(Ordering::SeqCst),
+        total * 3,
+        "{evidence}; snapshots={}",
+        snapshots.len()
+    );
     for (i, (path, data, receipt)) in snapshots.iter().enumerate() {
         assert!(!path.exists());
         assert_eq!(*data, receipt.canonical_bytes().unwrap());
@@ -1255,14 +1292,10 @@ fn uncertain_native_collision_never_retries_or_cleans_source() {
 
 #[test]
 fn promoted_import_contains_exact_receipt_and_manifest_bound_to_entry() {
-    let base = std::env::current_dir().unwrap().join("target");
-    let temp = tempfile::tempdir_in(base).unwrap();
-    let root = temp.path().canonicalize().unwrap().join("plugins");
+    let (_temp, root, record, bytes) = fixture();
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
-    let record = PluginRecord::local_declarative(serde_json::from_slice(VALID).unwrap()).unwrap();
-    let bytes = record.canonical_manifest_bytes().unwrap();
     let mut stage = storage.prepare_stage(&record, &bytes).unwrap();
-    let promoted = stage.promote().unwrap();
+    let promoted = expect_promotion(stage.as_mut(), "receipt-entry-proof-promotion");
     assert!(promoted.entry.matches_locator(&promoted.locator));
     let target = root
         .join("local")

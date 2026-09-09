@@ -254,6 +254,8 @@ impl OwnedImportStage for DiskStage {
 
 // No Drop cleanup: abandoned, uncertain, and committed packages are preserved.
 fn write_failed(error: io::Error) -> ImportCommitFailure {
+    #[cfg(test)]
+    super::local_plugin_package::import_io_failure(&error);
     tracing::warn!(kind = ?error.kind(), "Local manifest import filesystem operation failed");
     ImportCommitFailure::WriteFailed
 }

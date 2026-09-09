@@ -112,6 +112,8 @@ fn run_removal(
         ));
     }
 
+    #[cfg(test)]
+    crate::storage::local_plugin_package::crash_checkpoint("removal", "disabled-saved");
     let removing = candidate.persist_removing(preflight.entry.receipt_id(), owned.removal_slot());
     runtime
         .registry
@@ -162,8 +164,14 @@ fn run_removal(
     let verified = owned.verify_quarantine().is_ok_and(|evidence| {
         *evidence.entry == removing_entry && &evidence.removal_slot == owned.removal_slot()
     });
+    #[cfg(test)]
+    if verified {
+        crate::storage::local_plugin_package::crash_checkpoint("removal", "quarantine-verified");
+    }
     let mut outcome = std::panic::catch_unwind(AssertUnwindSafe(|| runtime.discovery.discover()))
         .unwrap_or_else(|_| LocalDiscoveryOutcome::unavailable());
+    #[cfg(test)]
+    crate::storage::local_plugin_package::crash_checkpoint("removal", "candidate-scanned");
     let scan_available = outcome.summary.status != LocalDiscoveryStatus::Unavailable
         && outcome.removals.status != LocalDiscoveryStatus::Unavailable;
     let scan_proves_conflict = outcome
@@ -201,6 +209,10 @@ fn run_removal(
     let index_clean = deletion
         .as_ref()
         .is_some_and(|result| persist_outcome_committed(persistence_outcome(result)));
+    #[cfg(test)]
+    if index_clean {
+        crate::storage::local_plugin_package::crash_checkpoint("removal", "index-deleted");
+    }
     let index_committed_error = deletion.as_ref().is_some_and(|result| {
         result.is_err() && persist_outcome_committed(persistence_outcome(result))
     });
@@ -230,6 +242,8 @@ fn run_removal(
         .registry
         .blocking_write()
         .publish_candidate_once(candidate, &baseline)?;
+    #[cfg(test)]
+    crate::storage::local_plugin_package::crash_checkpoint("removal", "published");
     if rename_uncertain || !verified || index_committed_error || conflicted {
         Ok(RemovalResult::removed_catalog_unconfirmed(
             normalized_id,
@@ -259,7 +273,12 @@ fn rollback(
 ) -> AppResult<RemovalResult> {
     // A rollback authorizes no further destructive action. Even a committed
     // error is adopted and is a successful rollback; never write it twice.
-    let _result = candidate.rollback_removing(preflight.entry.receipt_id());
+    let result = candidate.rollback_removing(preflight.entry.receipt_id());
+    let failure = if persist_outcome_committed(persistence_outcome(&result)) {
+        failure
+    } else {
+        AfterDisabledFailure::OwnershipPersistFailed
+    };
     runtime
         .registry
         .blocking_write()

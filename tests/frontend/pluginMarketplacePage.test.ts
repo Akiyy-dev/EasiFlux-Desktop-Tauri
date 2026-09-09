@@ -16,6 +16,7 @@ import type {
   PluginCatalogSnapshot,
   PluginStatus,
   ReadyLocalManifestImport,
+  RemoveManagedLocalPluginResult,
 } from '../../src/types/plugin'
 import type { PluginSection } from '../../src/types/navigation'
 
@@ -26,6 +27,7 @@ const serviceMocks = vi.hoisted(() => ({
   prepareImport: vi.fn(),
   cancelImport: vi.fn(),
   commitImport: vi.fn(),
+  removeManaged: vi.fn(),
 }))
 
 vi.mock('../../src/services/pluginService', async (importOriginal) => ({
@@ -36,6 +38,7 @@ vi.mock('../../src/services/pluginService', async (importOriginal) => ({
   prepareLocalManifestImport: serviceMocks.prepareImport,
   cancelLocalManifestImport: serviceMocks.cancelImport,
   commitLocalManifestImport: serviceMocks.commitImport,
+  removeManagedLocalPlugin: serviceMocks.removeManaged,
 }))
 
 vi.mock('../../src/composables/useChartWorkspaceAutosaveHost', () => ({
@@ -180,6 +183,16 @@ function importedSnapshot(): PluginCatalogSnapshot {
   }
 }
 
+function managedItem(overrides: Partial<PluginCatalogItem> = {}): PluginCatalogItem {
+  return {
+    ...pluginItem('com.example.notes', '本地笔记'),
+    source: 'localDeclarative',
+    management: 'managed',
+    canRemove: true,
+    ...overrides,
+  }
+}
+
 let pinia: Pinia
 
 function mountPage(section: PluginSection = 'installed', attachTo?: Element) {
@@ -212,13 +225,13 @@ describe('PluginMarketplacePage local discovery', () => {
 
     expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
     expect(wrapper.text()).toContain('本地声明示例')
-    expect(wrapper.text()).toContain('本地声明式包 · 已发现，未执行')
+    expect(wrapper.text()).toContain('本地声明式包 · 外部放置，应用不会删除')
     await wrapper.setProps({ section: 'market' })
     expect(wrapper.text()).not.toContain('本地声明示例')
     expect(wrapper.text()).toContain('内置 · 随应用提供')
     await wrapper.setProps({ section: 'manage' })
     expect(wrapper.text()).toContain('本地声明示例')
-    expect(wrapper.text()).toContain('本地声明式包 · 已发现，未执行')
+    expect(wrapper.text()).toContain('本地声明式包 · 外部放置，应用不会删除')
     expect(wrapper.text()).toContain('内置 · 随应用提供')
     expect(wrapper.get('[data-testid="disabled-count"]').text()).toContain('2')
   })
@@ -465,7 +478,7 @@ describe('PluginMarketplacePage recovery precedence', () => {
     await subsystem.get('button').trigger('click')
     expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
     expect(wrapper.findAll('[role="alert"]')).toHaveLength(2)
-    recovery.resolve(availableSnapshot(undefined, '4'))
+    recovery.resolve({ ...availableSnapshot(undefined, '4'), catalogGeneration: '2' })
     await flushPromises()
     expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
   })
@@ -482,7 +495,7 @@ describe('PluginMarketplacePage recovery precedence', () => {
     await recovery.trigger('click')
     expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(2)
     expect(serviceMocks.reloadCatalog).not.toHaveBeenCalled()
-    retry.resolve(availableSnapshot(undefined, '4'))
+    retry.resolve({ ...availableSnapshot(undefined, '4'), catalogGeneration: '2' })
     await flushPromises()
     expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
   })
@@ -695,9 +708,9 @@ describe('PluginMarketplacePage catalog views', () => {
     expect(wrapper.get('[data-testid="disabled-count"]').text()).toContain('1')
     expect(wrapper.get('[data-testid="blocked-count"]').text()).toContain('1')
     expect(wrapper.findAll('[data-testid="plugin-management-item"]')).toHaveLength(3)
-    expect(wrapper.findAll('[data-testid="management-requested-capabilities"]'))
+    expect(wrapper.findAll('[data-testid="requested-capabilities"]'))
       .toHaveLength(3)
-    expect(wrapper.findAll('[data-testid="management-granted-capabilities"]'))
+    expect(wrapper.findAll('[data-testid="granted-capabilities"]'))
       .toHaveLength(3)
     expect(wrapper.text()).toContain('无需额外权限')
   })
@@ -949,6 +962,30 @@ describe('PluginMarketplacePage local manifest import', () => {
     wrapper.unmount()
   })
 
+  it('explains importedExternal without offering destructive recovery or same-ID re-import', async () => {
+    serviceMocks.commitImport.mockResolvedValueOnce({
+      schemaVersion: 2,
+      status: 'importedExternal',
+      pluginId: readyPreview.manifest.id,
+      reasonCode: 'plugin_import_ownership_not_registered',
+      snapshot: {
+        ...importedSnapshot(),
+        plugins: [{ ...managedItem(), management: 'external', canRemove: false }],
+      },
+    } satisfies CommitLocalManifestImportResult)
+    const wrapper = await mountLoaded()
+    await openReadyPreview(wrapper)
+    await wrapper.get('[data-testid="plugin-import-confirm"]').trigger('click')
+    await flushPromises()
+
+    const result = wrapper.get('[data-testid="plugin-import-status"]')
+    expect(result.text()).toContain('保持外部放置，EasiFlux 不会移除')
+    expect(result.text()).toContain('请勿重复导入同一插件 ID')
+    expect(result.find('[data-testid="plugin-import-result-reload"]').exists()).toBe(false)
+    expect(result.findAll('button').map((button) => button.text())).toEqual(['关闭提示'])
+    wrapper.unmount()
+  })
+
   it('uses the exact partial-failure warning and requires explicit dismissal', async () => {
     serviceMocks.commitImport.mockResolvedValueOnce({
       schemaVersion: 2,
@@ -1069,6 +1106,220 @@ describe('PluginMarketplacePage local manifest import', () => {
 
     expect(release).toHaveBeenCalledTimes(1)
     expect(serviceMocks.cancelImport).toHaveBeenCalledWith(readyPreview.token)
+  })
+})
+
+describe('PluginMarketplacePage managed removal', () => {
+  let showModalDescriptor: PropertyDescriptor | undefined
+  let closeDescriptor: PropertyDescriptor | undefined
+
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    for (const mock of Object.values(serviceMocks)) mock.mockReset()
+    showModalDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'showModal')
+    closeDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'close')
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', '') },
+    })
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open') },
+    })
+  })
+
+  afterEach(() => {
+    if (showModalDescriptor) Object.defineProperty(HTMLDialogElement.prototype, 'showModal', showModalDescriptor)
+    else delete HTMLDialogElement.prototype.showModal
+    if (closeDescriptor) Object.defineProperty(HTMLDialogElement.prototype, 'close', closeDescriptor)
+    else delete HTMLDialogElement.prototype.close
+    document.body.removeAttribute('tabindex')
+    document.body.replaceChildren()
+  })
+
+  async function mountManaged(section: PluginSection = 'installed') {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([managedItem()]))
+    const wrapper = mountPage(section, document.body)
+    await flushPromises()
+    return wrapper
+  }
+
+  function removedResult(status: 'removed' | 'removedCleanupPending' | 'removedCatalogUnconfirmed'): RemoveManagedLocalPluginResult {
+    const snapshot = { ...availableSnapshot([], '2'), catalogGeneration: '2' }
+    if (status === 'removedCatalogUnconfirmed') {
+      return {
+        schemaVersion: 1,
+        status,
+        pluginId: 'com.example.notes',
+        reasonCode: 'plugin_remove_publication_unconfirmed',
+        snapshot,
+      }
+    }
+    return { schemaVersion: 1, status, pluginId: 'com.example.notes', snapshot }
+  }
+
+  async function openAndConfirm(wrapper: Awaited<ReturnType<typeof mountManaged>>): Promise<void> {
+    await wrapper.get('[data-testid="plugin-remove-button"]').trigger('click')
+    await nextTick()
+    await wrapper.get('[data-testid="plugin-removal-confirm"]').trigger('click')
+  }
+
+  it('removal_entry_exists_in_installed_and_manage_but_never_market', async () => {
+    const wrapper = await mountManaged()
+    expect(wrapper.find('[data-testid="plugin-remove-button"]').exists()).toBe(true)
+    await wrapper.setProps({ section: 'market' })
+    expect(wrapper.find('[data-testid="plugin-remove-button"]').exists()).toBe(false)
+    await wrapper.setProps({ section: 'manage' })
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(1)
+    expect(wrapper.find('[data-testid="plugin-remove-button"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('page_passes_current_parsed_item_and_connected_opener_to_dialog', async () => {
+    const wrapper = await mountManaged()
+    const opener = wrapper.get<HTMLButtonElement>('[data-testid="plugin-remove-button"]')
+    opener.element.focus()
+    await opener.trigger('click')
+    await nextTick()
+
+    const dialog = wrapper.getComponent({ name: 'PluginRemovalDialog' })
+    expect(dialog.props('plugin')).toEqual(managedItem())
+    expect(dialog.props('opener')).toBe(opener.element)
+    await dialog.get('[data-testid="plugin-removal-cancel"]').trigger('click')
+    await nextTick()
+    expect(document.activeElement).toBe(opener.element)
+    wrapper.unmount()
+  })
+
+  it('rollback_cleanup_and_conflict_counts_are_distinct', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...availableSnapshot([managedItem()]),
+      managedOwnership: {
+        status: 'degraded',
+        rollbackPendingCount: 2,
+        cleanupPendingCount: 3,
+        conflictingEntryCount: 4,
+      },
+    })
+    const wrapper = mountPage('installed')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="plugin-removal-rollback-summary"]').text()).toContain('2')
+    expect(wrapper.get('[data-testid="plugin-removal-rollback-summary"]').text()).toContain('仍在本地')
+    expect(wrapper.get('[data-testid="plugin-removal-cleanup-summary"]').text()).toContain('3')
+    expect(wrapper.get('[data-testid="plugin-removal-cleanup-summary"]').text()).toContain('已离开插件发现')
+    expect(wrapper.get('[data-testid="plugin-removal-conflict-summary"]').text()).toContain('4')
+    expect(wrapper.get('[data-testid="plugin-removal-conflict-summary"]').text()).toContain('不会删除')
+    wrapper.unmount()
+  })
+
+  it('ownership_unavailable_warns_without_hiding_external_browsing', async () => {
+    const external = { ...managedItem(), management: 'external', canRemove: false } as PluginCatalogItem
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...availableSnapshot([external]),
+      managedOwnership: {
+        status: 'unavailable', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0,
+      },
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="plugin-ownership-unavailable-summary"]').text())
+      .toContain('应用不会删除')
+    expect(wrapper.text()).toContain('本地笔记')
+    expect(wrapper.get<HTMLInputElement>('[role="switch"]').element.disabled).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('removed_success_waits_for_result_snapshot', async () => {
+    const response = deferred<RemoveManagedLocalPluginResult>()
+    serviceMocks.removeManaged.mockReturnValueOnce(response.promise)
+    const wrapper = await mountManaged()
+    await openAndConfirm(wrapper)
+    await nextTick()
+
+    expect(wrapper.text()).toContain('本地笔记')
+    expect(wrapper.get('[data-testid="plugin-removal-progress"]').attributes('role')).toBe('status')
+    response.resolve(removedResult('removed'))
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('本地笔记')
+    const result = wrapper.get('[data-testid="plugin-removal-result"]')
+    expect(result.attributes('role')).toBe('status')
+    expect(result.text()).toContain('已移除')
+    wrapper.unmount()
+  })
+
+  it('cleanup_pending_unconfirmed_and_unknown_offer_reload_only', async () => {
+    for (const outcome of ['removedCleanupPending', 'removedCatalogUnconfirmed', 'unknown'] as const) {
+      const wrapper = await mountManaged()
+      if (outcome === 'unknown') serviceMocks.removeManaged.mockRejectedValueOnce(new Error('private transport'))
+      else serviceMocks.removeManaged.mockResolvedValueOnce(removedResult(outcome))
+      await openAndConfirm(wrapper)
+      await flushPromises()
+
+      const result = wrapper.get('[data-testid="plugin-removal-result"]')
+      expect(result.text()).toMatch(/人工维护|尚未确认/)
+      expect(result.text()).not.toMatch(/private|再次移除|重试移除/)
+      expect(result.get('[data-testid="plugin-removal-result-reload"]').text())
+        .toBe('重新扫描本地插件')
+      expect(wrapper.find('[data-testid="plugin-removal-confirm"]').exists()).toBe(false)
+      wrapper.unmount()
+    }
+  })
+
+  it('not_removed_uses_fixed_local_copy_and_disabled_note', async () => {
+    serviceMocks.removeManaged.mockResolvedValueOnce({
+      schemaVersion: 1,
+      status: 'notRemoved',
+      disabledDecisionSaved: true,
+      reasonCode: 'plugin_remove_write_failed',
+      snapshot: { ...availableSnapshot([managedItem()], '2'), catalogGeneration: '2' },
+    } satisfies RemoveManagedLocalPluginResult)
+    const wrapper = await mountManaged()
+    await openAndConfirm(wrapper)
+    await flushPromises()
+
+    const result = wrapper.get('[data-testid="plugin-removal-result"]')
+    expect(result.text()).toContain('未能安全移除本地包')
+    expect(result.text()).toContain('停用偏好已确认保存并保留')
+    expect(result.text()).not.toContain('plugin_remove_write_failed')
+    wrapper.unmount()
+  })
+
+  it('page_never_replays_remove', async () => {
+    serviceMocks.removeManaged.mockResolvedValueOnce(removedResult('removedCatalogUnconfirmed'))
+    serviceMocks.reloadCatalog.mockResolvedValueOnce({ ...availableSnapshot([]), catalogGeneration: '3' })
+    const wrapper = await mountManaged()
+    await openAndConfirm(wrapper)
+    await flushPromises()
+    await wrapper.get('[data-testid="plugin-removal-result-reload"]').trigger('click')
+    await flushPromises()
+
+    expect(serviceMocks.removeManaged).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  it('unmount_during_submit_does_not_cancel_or_restore_focus_from_late_result', async () => {
+    const response = deferred<RemoveManagedLocalPluginResult>()
+    serviceMocks.removeManaged.mockReturnValueOnce(response.promise)
+    const wrapper = await mountManaged()
+    const opener = wrapper.get<HTMLButtonElement>('[data-testid="plugin-remove-button"]')
+    opener.element.focus()
+    await openAndConfirm(wrapper)
+    document.body.tabIndex = -1
+    document.body.focus()
+    const release = vi.spyOn(usePluginStore(), 'releaseRemovalView')
+
+    wrapper.unmount()
+    response.resolve(removedResult('removed'))
+    await flushPromises()
+    expect(release).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.removeManaged).toHaveBeenCalledTimes(1)
+    expect(document.activeElement).toBe(document.body)
   })
 })
 

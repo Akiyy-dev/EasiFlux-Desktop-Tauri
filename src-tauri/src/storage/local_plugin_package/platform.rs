@@ -15,6 +15,19 @@ use std::{
 const MANIFEST: &str = "manifest.json";
 const RECEIPT: &str = "ownership-receipt.json";
 
+// Evaluate once and preserve the original I/O result. Only test builds retain
+// the operation label/kind/raw-OS diagnostic; no retry or fallback is introduced.
+macro_rules! import_io {
+    ($operation:literal, $expression:expr) => {{
+        let result = $expression;
+        #[cfg(test)]
+        if let Err(error) = &result {
+            super::import_operation_failure($operation, error);
+        }
+        result
+    }};
+}
+
 use super::{
     CleanupOutcome, KnownCleanupShape, OwnedRemoval, QuarantineRenameOutcome, RemovalFsStep,
     RemovalStorageFailure, VerifiedQuarantine,
@@ -622,8 +635,14 @@ impl ImportDirectories {
         receipt: &[u8],
         state: &mut ImportPromotionState,
     ) -> io::Result<()> {
-        let verified = self.verify_stage(stage, ids)?;
-        verified.verify_content(bytes, receipt)?;
+        let verified = import_io!(
+            "promotion-initial-stage-verification",
+            self.verify_stage(stage, ids)
+        )?;
+        import_io!(
+            "promotion-initial-content-verification",
+            verified.verify_content(bytes, receipt)
+        )?;
         // Hold source identity at the injection/native boundary; only children close.
         let VerifiedPackage {
             directory,
@@ -635,18 +654,24 @@ impl ImportDirectories {
         self.hooks.checkpoint(ImportFsStep::BeforePromotion)?;
         // Reopen only children below the still-held source after the last hook.
         // Closing the directory here would reopen a source-name race on Windows.
-        let (manifest, receipt_file) = verify_children(
-            &directory,
-            &ids.directory,
-            Some(&ids.manifest),
-            Some(&ids.receipt),
+        let (manifest, receipt_file) = import_io!(
+            "promotion-final-child-reverification",
+            verify_children(
+                &directory,
+                &ids.directory,
+                Some(&ids.manifest),
+                Some(&ids.receipt),
+            )
         )?;
-        verify_content(
-            &directory,
-            &manifest.unwrap(),
-            &receipt_file.unwrap(),
-            bytes,
-            receipt,
+        import_io!(
+            "promotion-final-content-reverification",
+            verify_content(
+                &directory,
+                &manifest.unwrap(),
+                &receipt_file.unwrap(),
+                bytes,
+                receipt,
+            )
         )?;
         #[cfg(test)]
         if let Some(error) = self.hooks.controls.rename_error {
@@ -657,8 +682,10 @@ impl ImportDirectories {
             return Err(rejected());
         }
         *state = ImportPromotionState::CommitUnconfirmed;
-        let result =
-            native::promote_exclusive(&self.staging, stage, &directory, &self.local, target);
+        let result = import_io!(
+            "promotion-native-exclusive-rename",
+            native::promote_exclusive(&self.staging, stage, &directory, &self.local, target)
+        );
         if result.is_ok() {
             *state = ImportPromotionState::Committed;
         }

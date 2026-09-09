@@ -8,10 +8,12 @@ import {
   pluginErrorMessage,
   prepareLocalManifestImport,
   reloadPluginCatalog,
+  removeManagedLocalPlugin,
   setPluginEnabled,
 } from '../services/pluginService'
 import type {
   CommitLocalManifestImportResult,
+  ManagedOwnershipSummary,
   PluginAvailability,
   PluginAvailabilityReason,
   PluginCatalogItem,
@@ -19,11 +21,19 @@ import type {
   PluginLocalDiscoverySummary,
   PluginStatus,
   ReadyLocalManifestImport,
+  RemoveManagedLocalPluginResult,
 } from '../types/plugin'
 
 export type PluginLoadStatus = 'idle' | 'loading' | 'ready' | 'error'
 export type PluginImportStatus = 'idle' | 'choosing' | 'preview' | 'committing' | 'result'
+export type PluginRemovalStatus = 'idle' | 'confirming' | 'removing' | 'result'
 export type PluginStatusFilter = 'all' | PluginStatus
+
+export interface RemovalTarget {
+  plugin: PluginCatalogItem
+  revision: string
+  catalogGeneration: string
+}
 
 function hasSameImmutableContent(current: PluginCatalogItem, returned: PluginCatalogItem): boolean {
   const currentFields = Object.entries(current.manifest)
@@ -37,7 +47,31 @@ function hasSameImmutableContent(current: PluginCatalogItem, returned: PluginCat
         returned.manifest[key as keyof PluginCatalogItem['manifest']],
       )
     ))
+    && current.management === returned.management
+    && current.toggleBlockReasonCode === returned.toggleBlockReasonCode
     && JSON.stringify(current.grantedCapabilities) === JSON.stringify(returned.grantedCapabilities)
+}
+
+function hasSameManagedOwnership(
+  current: ManagedOwnershipSummary,
+  returned: ManagedOwnershipSummary,
+): boolean {
+  return current.status === returned.status
+    && current.conflictingEntryCount === returned.conflictingEntryCount
+    && current.rollbackPendingCount === returned.rollbackPendingCount
+    && current.cleanupPendingCount === returned.cleanupPendingCount
+}
+
+function cloneCatalogItem(plugin: PluginCatalogItem): PluginCatalogItem {
+  return {
+    ...plugin,
+    manifest: {
+      ...plugin.manifest,
+      contributions: [],
+      requestedCapabilities: [],
+    },
+    grantedCapabilities: [],
+  }
 }
 
 export const usePluginStore = defineStore('plugin', () => {
@@ -45,6 +79,7 @@ export const usePluginStore = defineStore('plugin', () => {
   const revision = ref('0')
   const catalogGeneration = ref('0')
   const localDiscovery = ref<PluginLocalDiscoverySummary | null>(null)
+  const managedOwnership = ref<ManagedOwnershipSummary | null>(null)
   const availability = ref<PluginAvailability | null>(null)
   const availabilityReasonCode = ref<PluginAvailabilityReason | null>(null)
   const loadStatus = ref<PluginLoadStatus>('idle')
@@ -62,10 +97,17 @@ export const usePluginStore = defineStore('plugin', () => {
   const importError = ref<string | null>(null)
   const importResult = shallowRef<CommitLocalManifestImportResult | null>(null)
   const importOutcomeUnknown = ref(false)
+  const removalStatus = ref<PluginRemovalStatus>('idle')
+  const removalTarget = shallowRef<RemovalTarget | null>(null)
+  const removalConfirmationStale = ref(false)
+  const removalError = ref<string | null>(null)
+  const removalResult = shallowRef<RemoveManagedLocalPluginResult | null>(null)
+  const removalOutcomeUnknown = ref(false)
 
   let loadFlight: Promise<void> | null = null
   let reloadFlight: Promise<void> | null = null
   let importCommitFlight: Promise<void> | null = null
+  let removalFlight: Promise<void> | null = null
   let hasConfirmedSnapshot = false
   let snapshotSequence = 0n
   let confirmedSnapshotRevision = 0n
@@ -74,6 +116,8 @@ export const usePluginStore = defineStore('plugin', () => {
   let mutationSequence = 0
   let importOwnerSequence = 0n
   let activeImportOwner: bigint | null = null
+  let removalOwnerSequence = 0n
+  let activeRemovalOwner: bigint | null = null
   const mutationOwners = new Map<string, number>()
   const confirmedItemRevisions = new Map<string, bigint>()
 
@@ -97,6 +141,21 @@ export const usePluginStore = defineStore('plugin', () => {
     if (BigInt(nextRevision) > BigInt(revision.value)) revision.value = nextRevision
   }
 
+  function hasSameGenerationStructure(snapshot: PluginCatalogSnapshot): boolean {
+    if (
+      managedOwnership.value === null
+      || !hasSameManagedOwnership(managedOwnership.value, snapshot.managedOwnership)
+      || snapshot.plugins.length !== catalog.value.length
+    ) return false
+    const currentById = new Map(
+      catalog.value.map((plugin) => [plugin.manifest.id, plugin] as const),
+    )
+    return snapshot.plugins.every((plugin) => {
+      const current = currentById.get(plugin.manifest.id)
+      return current !== undefined && hasSameImmutableContent(current, plugin)
+    })
+  }
+
   function adoptSnapshot(snapshot: PluginCatalogSnapshot, requestOrder: bigint): boolean {
     const nextGeneration = BigInt(snapshot.catalogGeneration)
     const currentGeneration = BigInt(catalogGeneration.value)
@@ -110,6 +169,7 @@ export const usePluginStore = defineStore('plugin', () => {
       availability.value = snapshot.availability
       availabilityReasonCode.value = snapshot.availabilityReasonCode
       localDiscovery.value = snapshot.localDiscovery
+      managedOwnership.value = snapshot.managedOwnership
       confirmedSnapshotRevision = snapshotRevision
       confirmedSnapshotOrder = requestOrder
       if (requestOrder > latestAdoptedRequestOrder) latestAdoptedRequestOrder = requestOrder
@@ -122,6 +182,10 @@ export const usePluginStore = defineStore('plugin', () => {
       actionErrors.value = {}
       return true
     }
+
+    // A generation owns membership and immutable/ownership structure. Reject a
+    // contradictory same-generation response before it can advance arbitration.
+    if (!hasSameGenerationStructure(snapshot)) return false
 
     // A full snapshot confirms every item at least at its revision. Compare against
     // that confirmation, not the global revision that unrelated mutations can advance.
@@ -176,6 +240,7 @@ export const usePluginStore = defineStore('plugin', () => {
       availability.value = snapshot.availability
       availabilityReasonCode.value = snapshot.availabilityReasonCode
       localDiscovery.value = snapshot.localDiscovery
+      managedOwnership.value = snapshot.managedOwnership
     }
     adoptGlobalRevision(snapshot.revision)
     return true
@@ -192,11 +257,37 @@ export const usePluginStore = defineStore('plugin', () => {
     }
   }
 
+  function currentRemovalTargetMatches(target: RemovalTarget): boolean {
+    if (catalogGeneration.value !== target.catalogGeneration) return false
+    const current = catalog.value.find(
+      (plugin) => plugin.manifest.id === target.plugin.manifest.id,
+    )
+    return current !== undefined
+      && current.management === 'managed'
+      && current.status === 'disabled'
+      && current.canRemove === true
+      && hasSameImmutableContent(target.plugin, current)
+  }
+
+  function markOpenRemovalConfirmationStaleAfterAdoption(): void {
+    if (
+      removalStatus.value === 'confirming'
+      && removalTarget.value
+      && !removalConfirmationStale.value
+      && !currentRemovalTargetMatches(removalTarget.value)
+    ) {
+      removalConfirmationStale.value = true
+    }
+  }
+
   function confirmAuthoritativeSnapshot(
     snapshot: PluginCatalogSnapshot,
     requestOrder: bigint,
   ): void {
-    if (adoptSnapshot(snapshot, requestOrder)) markReadyPreviewStaleAfterAdoption()
+    if (adoptSnapshot(snapshot, requestOrder)) {
+      markReadyPreviewStaleAfterAdoption()
+      markOpenRemovalConfirmationStaleAfterAdoption()
+    }
     hasConfirmedSnapshot = true
     loadStatus.value = 'ready'
     loadError.value = null
@@ -422,6 +513,107 @@ export const usePluginStore = defineStore('plugin', () => {
     importStatus.value = 'idle'
   }
 
+  function clearRemovalState(): void {
+    removalTarget.value = null
+    removalConfirmationStale.value = false
+    removalError.value = null
+    removalResult.value = null
+    removalOutcomeUnknown.value = false
+  }
+
+  function beginRemoval(id: string): boolean {
+    if (
+      !hasConfirmedSnapshot
+      || activeRemovalOwner !== null
+      || removalFlight !== null
+      || removalStatus.value !== 'idle'
+    ) return false
+    const plugin = catalog.value.find((candidate) => candidate.manifest.id === id)
+    if (
+      !plugin
+      || plugin.management !== 'managed'
+      || plugin.status !== 'disabled'
+      || plugin.canRemove !== true
+    ) return false
+
+    const owner = ++removalOwnerSequence
+    activeRemovalOwner = owner
+    clearRemovalState()
+    removalTarget.value = {
+      plugin: cloneCatalogItem(plugin),
+      revision: revision.value,
+      catalogGeneration: catalogGeneration.value,
+    }
+    removalStatus.value = 'confirming'
+    return true
+  }
+
+  function cancelRemoval(): void {
+    if (removalStatus.value !== 'confirming') return
+    activeRemovalOwner = null
+    clearRemovalState()
+    removalStatus.value = 'idle'
+  }
+
+  function confirmRemoval(): Promise<void> {
+    if (removalFlight) return removalFlight
+    const target = removalTarget.value
+    const owner = activeRemovalOwner
+    if (
+      removalStatus.value !== 'confirming'
+      || !target
+      || owner === null
+      || removalConfirmationStale.value
+    ) return Promise.resolve()
+    if (!currentRemovalTargetMatches(target)) {
+      removalConfirmationStale.value = true
+      return Promise.resolve()
+    }
+
+    removalStatus.value = 'removing'
+    removalError.value = null
+    removalResult.value = null
+    removalOutcomeUnknown.value = false
+    // Equal generation/revision snapshots are owned by request start order, so
+    // allocate before awaiting the native operation.
+    const requestOrder = ++snapshotSequence
+    const request = (async () => {
+      try {
+        const result = await removeManagedLocalPlugin(
+          target.plugin.manifest.id,
+          target.catalogGeneration,
+        )
+        if (activeRemovalOwner !== owner) return
+        confirmAuthoritativeSnapshot(result.snapshot, requestOrder)
+        removalResult.value = result
+      } catch {
+        if (activeRemovalOwner !== owner) return
+        removalOutcomeUnknown.value = true
+        removalError.value = '移除结果尚未确认，请重新扫描。'
+      } finally {
+        if (activeRemovalOwner === owner) {
+          activeRemovalOwner = null
+          removalStatus.value = 'result'
+        }
+      }
+    })()
+    removalFlight = request
+    void request.finally(() => {
+      if (removalFlight === request) removalFlight = null
+    })
+    return request
+  }
+
+  function releaseRemovalView(): void {
+    if (removalStatus.value === 'confirming') cancelRemoval()
+  }
+
+  function clearRemovalResult(): void {
+    if (removalStatus.value !== 'result') return
+    clearRemovalState()
+    removalStatus.value = 'idle'
+  }
+
   async function setEnabled(id: string, enabled: boolean): Promise<boolean> {
     const existing = catalog.value.find((plugin) => plugin.manifest.id === id)
     if (!existing || !existing.canToggle) return false
@@ -453,6 +645,7 @@ export const usePluginStore = defineStore('plugin', () => {
       ))
       confirmedItemRevisions.set(id, resultRevision)
       adoptGlobalRevision(result.revision)
+      markOpenRemovalConfirmationStaleAfterAdoption()
       return true
     } catch (error) {
       if (mutationOwners.get(id) === owner && catalogGeneration.value === requestGeneration) {
@@ -472,6 +665,7 @@ export const usePluginStore = defineStore('plugin', () => {
     revision,
     catalogGeneration,
     localDiscovery,
+    managedOwnership,
     availability,
     availabilityReasonCode,
     loadStatus,
@@ -489,6 +683,12 @@ export const usePluginStore = defineStore('plugin', () => {
     importError,
     importResult,
     importOutcomeUnknown,
+    removalStatus,
+    removalTarget,
+    removalConfirmationStale,
+    removalError,
+    removalResult,
+    removalOutcomeUnknown,
     visiblePlugins,
     load,
     retry,
@@ -501,5 +701,10 @@ export const usePluginStore = defineStore('plugin', () => {
     commitImport,
     releaseImportView,
     clearImportResult,
+    beginRemoval,
+    cancelRemoval,
+    confirmRemoval,
+    releaseRemovalView,
+    clearRemovalResult,
   }
 })
