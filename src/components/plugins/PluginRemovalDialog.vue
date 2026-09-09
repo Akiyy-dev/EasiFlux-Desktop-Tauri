@@ -70,13 +70,13 @@ function trapFocus(event: DialogKeyEvent): void {
     return
   }
   const active = globalThis.document.activeElement
-  if (event.shiftKey && active === first) {
+  if (event.shiftKey && Object.is(active, first)) {
     event.preventDefault()
     last.focus()
-  } else if (!event.shiftKey && active === last) {
+  } else if (!event.shiftKey && Object.is(active, last)) {
     event.preventDefault()
     first.focus()
-  } else if (!controls.some((control) => control === active)) {
+  } else if (!controls.some((control) => Object.is(control, active))) {
     event.preventDefault()
     ;(event.shiftKey ? last : first).focus()
   }
