@@ -30,7 +30,7 @@
 
 **Interfaces:** consume the existing `PluginRuntime::set_enabled`, `reload_catalog`, `PluginCatalogSnapshot::catalog_generation`, and recording persistence; produce no new production API.
 
-- [ ] Reproduce `committed_state_errors_preserve_documents_without_promotion_or_publication` using:
+- [x] Reproduce `committed_state_errors_preserve_documents_without_promotion_or_publication` using:
 
 ```powershell
 cargo test --locked --manifest-path src-tauri/Cargo.toml committed_state_errors_preserve_documents_without_promotion_or_publication --lib
@@ -38,7 +38,7 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml committed_state_errors_
 
 Expected RED matches CI run 34392763374: `plugin_catalog_stale` at the old success unwrap. macOS RED is already recorded in the same run: E0425 at `safe_plugin_document/tests.rs:424`, unavailable `rustix::fs::mknodat`.
 
-- [ ] Retain every state/package preservation assertion. Replace the stale-generation success assumption with rejection plus no-new-save evidence, followed by explicit successful reload and a new-generation toggle. Keep the original assertion that the independent decision preserves the imported disabled entry:
+- [x] Retain every state/package preservation assertion. Replace the stale-generation success assumption with rejection plus no-new-save evidence, followed by explicit successful reload and a new-generation toggle. Keep the original assertion that the independent decision preserves the imported disabled entry:
 
 ```rust
 let saves_before = fixture.persistence.saves.load(Ordering::SeqCst);
@@ -55,7 +55,7 @@ fixture.runtime
 
 Use the repository's existing safe error-code accessor if `AppError` is not directly serializable. Verify the existing revision/entry assertions still express preservation, not discarded state.
 
-- [ ] Replace the unsupported FIFO creator with the same direct POSIX command pattern already used by discovery tests. Do not invoke a shell or interpolate a command string:
+- [x] Replace the unsupported FIFO creator with the same direct POSIX command pattern already used by discovery tests. Do not invoke a shell or interpolate a command string:
 
 ```rust
 use std::os::unix::fs::FileTypeExt;
@@ -72,7 +72,7 @@ assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
 
 Retain the persist rejection assertion for every reserved name and both document families.
 
-- [ ] Run the import-runtime module once after both corrections and scoped formatting/diff checks. Windows cannot verify the Unix-only branch; Linux/macOS CI must actually compile/run it. Do not install dependencies or rerun the frontend:
+- [x] Run the import-runtime module once after both corrections and scoped formatting/diff checks. Windows cannot verify the Unix-only branch; Linux/macOS CI must actually compile/run it. Do not install dependencies or rerun the frontend:
 
 ```powershell
 cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::runtime::import::tests --lib
@@ -99,3 +99,15 @@ These are diagnostic/verification tracks, not authorization for speculative prod
 | CI task vs Windows diagnosis | Disjoint source ownership; Cargo runs serialized |
 | Diagnostic evidence vs release claim | Passing rerun cannot clear unresolved OS 5 by itself |
 | UI smoke vs real user state | No native launch until isolation is proven |
+
+## 2026-09-11 execution evidence
+
+Task 1 is committed as `7a24f44` (`test(plugin): align lifecycle CI contracts`), changing only the two requested test files. The focused RED failed with `plugin_catalog_stale` at the legacy success unwrap. The corrected import module passed once: 38 passed, 0 failed, 1 intentionally ignored child-process helper. Scoped rustfmt and diff hygiene passed. The 35 existing dead-code warnings were retained; no production code or safety rule changed. Unix-specific compilation and execution still require CI.
+
+The single Windows package-module diagnostic run returned 40 passed / 1 failed. The failing case was `successful_calls_and_failed_precheck_consume_mutation_budget_before_io`; the historical `postrename_reopen_reparses_both_files_and_three_identities` case passed. The first tool response was truncated, losing the failure's panic and exact-operation evidence. One authorized exact-case invocation with a sufficient output budget passed (1 passed / 1101 filtered). No additional module or focused batch was run. This new failure cannot be labeled OS 5 from the retained evidence, and the single passing invocation does not clear either failure.
+
+A narrow read-only audit found that this case's hooks, event list, UUID counter and temporary plugin root are fixture-local; import diagnostics are thread-local. It found no concrete cross-test shared-state explanation. Existing diagnostics also discard original native NTSTATUS when mapping to a Win32 error, and final-child/content labels each cover multiple underlying I/O operations. The historical OS 5 root cause therefore remains unresolved; no retries, permission changes, relaxed checks or speculative production fix were added.
+
+Native whole-app smoke was not launched. Production `AppState::new` selects stores with separate platform config/data roots (`src-tauri/src/state.rs`); native setup starts the scheduler unconditionally (`src-tauri/src/lib.rs`). Credentials use the fixed system keyring service, while scheduler/bootstrap and `src/App.vue` can initiate network work and account auto-connection. There is no supported disposable-profile entrypoint. Merely redirecting `APPDATA` is not a proven isolation contract.
+
+The smallest prerequisite for future native smoke is an explicit profile selected before `AppState` construction, atomically providing disposable roots for all stores, a non-system empty credential repository, and disabled scheduler/bootstrap, auto-connect and provider networking. It must fail closed if any isolation element is missing. This profile is not implemented by Task 1 and needs its own narrow design. PR #30 remains draft; the first functional plugin remains deferred until the stability decision.
