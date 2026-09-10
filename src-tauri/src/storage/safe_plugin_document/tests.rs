@@ -415,20 +415,23 @@ fn successful_parent_sync_is_required_for_durable_outcome() {
 #[cfg(unix)]
 #[test]
 fn fifo_reserved_objects_are_rejected_without_blocking() {
+    use std::os::unix::fs::FileTypeExt;
+
     for names in [
         SafeDocumentNames::plugin_state(),
         SafeDocumentNames::managed_ownership(),
     ] {
         for name in names.all() {
             let (root, doc) = fixture(names);
-            rustix::fs::mknodat(
-                rustix::fs::CWD,
-                root.path().join(name),
-                rustix::fs::FileType::Fifo,
-                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-                0,
-            )
-            .unwrap();
+            let path = root.path().join(name);
+            assert!(path.is_absolute());
+            let output = std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&path)
+                .output()
+                .expect("POSIX mkfifo must be available for Unix security tests");
+            assert!(output.status.success(), "mkfifo failed: {output:?}");
+            assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
             assert_eq!(
                 doc.persist(None, b"new").unwrap_err().outcome,
                 PersistOutcome::NotCommitted

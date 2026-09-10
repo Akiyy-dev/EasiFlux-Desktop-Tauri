@@ -1810,9 +1810,21 @@ async fn committed_state_errors_preserve_documents_without_promotion_or_publicat
         assert_eq!(state.entries[0].id.to_string(), "com.example.notes");
         assert!(!state.entries[0].enabled);
         // An independent decision must build on the adopted document, not overwrite it.
-        fixture
+        let saves_before = fixture.persistence.saves.load(Ordering::SeqCst);
+        let error = fixture
             .runtime
             .set_enabled("com.example.builtin", true, &preview.catalog_generation)
+            .await
+            .unwrap_err();
+        assert_eq!(error_code(error), "plugin_catalog_stale");
+        assert_eq!(
+            fixture.persistence.saves.load(Ordering::SeqCst),
+            saves_before
+        );
+        let refreshed = fixture.runtime.reload_catalog().await.unwrap();
+        fixture
+            .runtime
+            .set_enabled("com.example.builtin", true, &refreshed.catalog_generation)
             .await
             .unwrap();
         let next = fixture.persistence.inner.load().unwrap().state;
