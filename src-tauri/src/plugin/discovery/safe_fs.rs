@@ -5,6 +5,7 @@ use std::io::{self, Read};
 use std::path::{Component, Path};
 
 use super::ScanUsage;
+use crate::plugin::ownership::{FileIdentity, PackageSlot, RemovalSlot};
 
 #[derive(Clone, Copy)]
 pub(super) struct ScanLimits {
@@ -24,6 +25,7 @@ impl ScanLimits {
         }
     }
 
+    #[cfg(test)]
     fn validate(self) -> Result<(), RootReadError> {
         let ceiling = Self::production();
         if self.max_root_entries > ceiling.max_root_entries
@@ -61,7 +63,11 @@ pub(super) struct PackageBytes {
     // Retained only so tests can assert deterministic scan ordering.
     #[cfg(test)]
     pub(super) slot: LocalPackageSlot,
+    pub(super) package_slot: PackageSlot,
+    pub(super) directory_identity: FileIdentity,
+    pub(super) manifest_identity: FileIdentity,
     pub(super) manifest_bytes: Vec<u8>,
+    pub(super) receipt: Option<(Vec<u8>, FileIdentity)>,
 }
 
 #[derive(Default)]
@@ -69,6 +75,7 @@ pub(super) struct PackageScan {
     pub(super) packages: Vec<PackageBytes>,
     pub(super) rejected_package_count: u32,
     pub(super) usage: ScanUsage,
+    pub(super) occupied_slots: Vec<PackageSlot>,
 }
 
 /// Deliberately carries neither paths nor underlying platform error details.
@@ -177,21 +184,37 @@ fn read_bounded(
     }
 }
 
+#[cfg(test)]
 pub(super) fn read_package_candidates(
     root: &Path,
     limits: ScanLimits,
 ) -> Result<PackageScan, RootReadError> {
     limits.validate()?;
-    if !root.is_absolute()
-        || root
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
-    {
+    if !safe_root_path(root) {
         return Err(RootReadError);
     }
     let Some(root) = platform::Directory::open_root(root)? else {
         return Ok(PackageScan::default());
     };
+    read_local_directory(&root, limits)
+}
+
+fn safe_root_path(root: &Path) -> bool {
+    root.is_absolute()
+        && !root
+            .as_os_str()
+            .as_encoded_bytes()
+            .split(|b| *b == b'/' || (cfg!(windows) && *b == b'\\'))
+            .any(|part| part == b"." || part == b"..")
+        && !root
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+}
+
+fn read_local_directory(
+    root: &platform::Directory,
+    limits: ScanLimits,
+) -> Result<PackageScan, RootReadError> {
     let names = root
         .entries(limits.max_root_entries)
         .map_err(|_| RootReadError)?;
@@ -201,42 +224,316 @@ pub(super) fn read_package_candidates(
     for name in names {
         match parse_slot_name(&name) {
             Some(slot) => slots.push(slot),
-            None => result.rejected_package_count += 1,
+            None => {
+                result.rejected_package_count += 1;
+                // Case aliases are presence-only evidence, never locator authority.
+                // Unix proves canonical absence relative to the held directory.
+                if let Some(slot) = name
+                    .to_str()
+                    .and_then(|name| PackageSlot::parse(&name.to_ascii_lowercase()).ok())
+                    .filter(|slot| root.canonical_may_be_occupied(slot.as_str()))
+                {
+                    result.occupied_slots.push(slot);
+                }
+            }
         }
     }
     slots.sort();
     for slot in slots {
-        let opened = root.open_slot(slot.as_str()).and_then(|directory| {
-            directory.check_shape()?;
-            let manifest = directory.open_manifest()?;
-            Ok((directory, manifest))
-        });
-        let (directory, mut manifest) = match opened {
-            Ok(opened) => opened,
-            Err(()) => {
-                result.rejected_package_count += 1;
-                continue;
-            }
-        };
-        result.usage.packages += 1;
-        if result.usage.packages > limits.max_packages {
-            return Err(RootReadError);
-        }
-        match read_bounded(&mut manifest, limits, &mut result.usage.bytes_read) {
-            Ok(manifest_bytes) if directory.check_shape().is_ok() => {
+        let package_slot = PackageSlot::parse(slot.as_str()).map_err(|_| RootReadError)?;
+        result.occupied_slots.push(package_slot.clone());
+        let object = read_object(
+            root,
+            slot.as_str(),
+            limits,
+            &mut result.usage.bytes_read,
+            false,
+            &mut || {
+                result.usage.packages += 1;
+                (result.usage.packages <= limits.max_packages)
+                    .then_some(())
+                    .ok_or(ReadFailure::Root)
+            },
+        );
+        match object {
+            Ok(object) if object.manifest.is_some() => {
+                let (manifest_bytes, manifest_identity) = object.manifest.unwrap();
                 result.packages.push(PackageBytes {
+                    package_slot,
                     #[cfg(test)]
                     slot,
+                    directory_identity: object.directory_identity,
+                    manifest_identity,
                     manifest_bytes,
+                    receipt: object.receipt,
                 });
             }
             Err(ReadFailure::Root) => return Err(RootReadError),
             _ => result.rejected_package_count += 1,
         }
-        // Keep both handles alive through the second shape check.
-        drop(manifest);
-        drop(directory);
     }
+    finalize_occupied_slots(&mut result.occupied_slots)?;
+    Ok(result)
+}
+
+// Presence is set-like, unlike candidates/observations. Return the extra names
+// so removal conflict accounting still counts coexisting invalid siblings.
+fn finalize_occupied_slots<T: Ord>(slots: &mut Vec<T>) -> Result<u32, RootReadError> {
+    let count = slots.len();
+    slots.sort();
+    slots.dedup();
+    u32::try_from(count - slots.len()).map_err(|_| RootReadError)
+}
+
+pub(super) struct ObjectBytes {
+    pub(super) unknown_shape: bool,
+    pub(super) directory_identity: FileIdentity,
+    pub(super) manifest: Option<(Vec<u8>, FileIdentity)>,
+    pub(super) receipt: Option<(Vec<u8>, FileIdentity)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static POST_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn known_shape(directory: &platform::Directory, partial: bool) -> Result<(bool, bool), ()> {
+    let names = directory.entries(3)?;
+    if names
+        .iter()
+        .any(|name| name != "manifest.json" && name != "ownership-receipt.json")
+    {
+        return Err(());
+    }
+    let manifest = names.iter().any(|name| name == "manifest.json");
+    let receipt = names.iter().any(|name| name == "ownership-receipt.json");
+    if !partial && !manifest {
+        return Err(());
+    }
+    Ok((manifest, receipt))
+}
+
+/// Every opened object stays held until both the exact names and named object
+/// identities have been checked again. No bytes or identity can authorize deletion alone.
+fn read_object(
+    root: &platform::Directory,
+    name: &str,
+    limits: ScanLimits,
+    total: &mut usize,
+    partial: bool,
+    on_shape: &mut dyn FnMut() -> Result<(), ReadFailure>,
+) -> Result<ObjectBytes, ReadFailure> {
+    let directory = root.open_slot(name).map_err(|_| ReadFailure::Package)?;
+    let shape = known_shape(&directory, partial).map_err(|_| ReadFailure::Package)?;
+    let directory_identity = directory.identity().map_err(|_| ReadFailure::Package)?;
+    let mut manifest = shape
+        .0
+        .then(|| directory.open_regular_file(OsStr::new("manifest.json")))
+        .transpose()
+        .map_err(|_| ReadFailure::Package)?;
+    let mut receipt = shape
+        .1
+        .then(|| directory.open_regular_file(OsStr::new("ownership-receipt.json")))
+        .transpose()
+        .map_err(|_| ReadFailure::Package)?;
+    on_shape()?;
+    // Do not skip the second known-file probe when the first is oversized.
+    let manifest_bytes = manifest
+        .as_mut()
+        .map(|file| read_bounded(file, limits, total))
+        .transpose();
+    if matches!(manifest_bytes, Err(ReadFailure::Root)) {
+        return Err(ReadFailure::Root);
+    }
+    let receipt_limits = ScanLimits {
+        max_manifest_bytes: 4096,
+        ..limits
+    };
+    let receipt_bytes = receipt
+        .as_mut()
+        .map(|file| read_bounded(file, receipt_limits, total))
+        .transpose();
+    if matches!(receipt_bytes, Err(ReadFailure::Root)) {
+        return Err(ReadFailure::Root);
+    }
+    let manifest_bytes = manifest_bytes?;
+    let receipt_bytes = receipt_bytes?;
+    #[cfg(test)]
+    POST_READ.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().take() {
+            callback();
+        }
+    });
+    let identity = |file: &File| platform::file_identity(file).map_err(|_| ReadFailure::Package);
+    let manifest_identity = manifest.as_ref().map(identity).transpose()?;
+    let receipt_identity = receipt.as_ref().map(identity).transpose()?;
+    if manifest_identity.is_some_and(|identity| identity.volume != directory_identity.volume)
+        || receipt_identity.is_some_and(|identity| identity.volume != directory_identity.volume)
+    {
+        return Err(ReadFailure::Package);
+    }
+    if known_shape(&directory, partial).ok() != Some(shape)
+        || root
+            .open_slot(name)
+            .and_then(|current| current.identity())
+            .ok()
+            != Some(directory_identity)
+        || manifest_identity.is_some_and(|expected| {
+            directory
+                .open_regular_file(OsStr::new("manifest.json"))
+                .and_then(|current| platform::file_identity(&current))
+                .ok()
+                != Some(expected)
+        })
+        || receipt_identity.is_some_and(|expected| {
+            directory
+                .open_regular_file(OsStr::new("ownership-receipt.json"))
+                .and_then(|current| platform::file_identity(&current))
+                .ok()
+                != Some(expected)
+        })
+    {
+        return Err(ReadFailure::Package);
+    }
+    Ok(ObjectBytes {
+        unknown_shape: false,
+        directory_identity,
+        manifest: manifest_bytes.zip(manifest_identity),
+        receipt: receipt_bytes.zip(receipt_identity),
+    })
+}
+
+pub(super) struct RemovalScan {
+    pub(super) objects: Vec<(RemovalSlot, ObjectBytes)>,
+    pub(super) occupied_slots: Vec<RemovalSlot>,
+    pub(super) unknown_count: u32,
+    pub(super) bytes_read: usize,
+}
+
+pub(super) const REMOVAL_BYTE_LIMIT: usize = 328 * 1024;
+
+pub(super) fn read_both_roots(
+    root: &Path,
+    #[cfg(test)] removal_limit: usize,
+) -> (
+    Result<PackageScan, RootReadError>,
+    Result<RemovalScan, RootReadError>,
+) {
+    #[cfg(not(test))]
+    let removal_limit = REMOVAL_BYTE_LIMIT;
+    if !safe_root_path(root) || removal_limit > REMOVAL_BYTE_LIMIT {
+        return (Err(RootReadError), Err(RootReadError));
+    }
+    let root = match platform::Directory::open_root(root) {
+        Ok(Some(root)) => root,
+        Ok(None) => return (Ok(PackageScan::default()), Ok(empty_removal_scan())),
+        Err(_) => return (Err(RootReadError), Err(RootReadError)),
+    };
+    let Ok(root_identity) = root.identity() else {
+        return (Err(RootReadError), Err(RootReadError));
+    };
+    let local = root
+        .optional_child("local")
+        .map_err(|_| RootReadError)
+        .and_then(|local| {
+            local.map_or_else(
+                || Ok(PackageScan::default()),
+                |local| {
+                    if local.identity().map_err(|_| RootReadError)?.volume != root_identity.volume {
+                        return Err(RootReadError);
+                    }
+                    read_local_directory(&local, ScanLimits::production())
+                },
+            )
+        });
+    let removals = root
+        .optional_child("removal-staging")
+        .map_err(|_| RootReadError)
+        .and_then(|removals| {
+            removals.map_or_else(
+                || Ok(empty_removal_scan()),
+                |removals| {
+                    if removals.identity().map_err(|_| RootReadError)?.volume
+                        != root_identity.volume
+                    {
+                        return Err(RootReadError);
+                    }
+                    read_removal_directory(&removals, removal_limit)
+                },
+            )
+        });
+    (local, removals)
+}
+
+fn empty_removal_scan() -> RemovalScan {
+    RemovalScan {
+        objects: vec![],
+        occupied_slots: vec![],
+        unknown_count: 0,
+        bytes_read: 0,
+    }
+}
+
+fn read_removal_directory(
+    root: &platform::Directory,
+    limit: usize,
+) -> Result<RemovalScan, RootReadError> {
+    let mut names = root.entries(16).map_err(|_| RootReadError)?;
+    names.sort();
+    let mut result = empty_removal_scan();
+    for name in names {
+        let Some(slot) = name.to_str().and_then(|name| RemovalSlot::parse(name).ok()) else {
+            if let Some(slot) = name
+                .to_str()
+                .and_then(|name| RemovalSlot::parse(&name.to_ascii_lowercase()).ok())
+                .filter(|slot| root.canonical_may_be_occupied(slot.as_str()))
+            {
+                result.occupied_slots.push(slot);
+                continue;
+            }
+            result.unknown_count += 1;
+            continue;
+        };
+        result.occupied_slots.push(slot.clone());
+        let limits = ScanLimits {
+            max_total_bytes: limit,
+            ..ScanLimits::production()
+        };
+        match read_object(
+            root,
+            slot.as_str(),
+            limits,
+            &mut result.bytes_read,
+            true,
+            &mut || Ok(()),
+        ) {
+            Ok(object) => result.objects.push((slot, object)),
+            Err(ReadFailure::Root) => return Err(RootReadError),
+            Err(ReadFailure::Package) => {
+                // Unknown children are never read. Retain only a safely reopened
+                // directory identity as conflict evidence, not cleanup authority.
+                if let Ok(directory_identity) = root
+                    .open_slot(slot.as_str())
+                    .and_then(|directory| directory.identity())
+                {
+                    result.objects.push((
+                        slot,
+                        ObjectBytes {
+                            unknown_shape: true,
+                            directory_identity,
+                            manifest: None,
+                            receipt: None,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    let duplicate_names = finalize_occupied_slots(&mut result.occupied_slots)?;
+    result.unknown_count = result
+        .unknown_count
+        .checked_add(duplicate_names)
+        .ok_or(RootReadError)?;
     Ok(result)
 }
 
@@ -252,20 +549,44 @@ pub(crate) fn is_single_link_regular_file(
 #[cfg(unix)]
 mod platform {
     use super::*;
-    use rustix::fd::OwnedFd;
-    use rustix::fs::{fstat, open, openat, Dir, Mode, OFlags};
+    use rustix::fs::{fstat, open, openat, statat, AtFlags, Dir, Mode, OFlags};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
 
     const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::DIRECTORY)
         .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC);
 
-    pub(super) struct Directory(OwnedFd);
+    pub(super) struct Directory(File);
 
     pub(super) type SourceDirectory = Directory;
 
     impl Directory {
+        // Called only with a strictly parsed ASCII slot. This no-follow metadata
+        // probe grants no identity authority and reads no unknown file contents.
+        pub(super) fn canonical_may_be_occupied(&self, slot: &str) -> bool {
+            !matches!(
+                statat(&self.0, slot, AtFlags::SYMLINK_NOFOLLOW),
+                Err(rustix::io::Errno::NOENT)
+            )
+        }
+
+        pub(super) fn identity(&self) -> Result<FileIdentity, ()> {
+            let metadata = self.0.metadata().map_err(|_| ())?;
+            Ok(FileIdentity {
+                volume: metadata.dev(),
+                object: u128::from(metadata.ino()),
+            })
+        }
+
+        pub(super) fn optional_child(&self, name: &str) -> Result<Option<Self>, ()> {
+            match openat(&self.0, name, DIRECTORY_FLAGS, Mode::empty()) {
+                Ok(fd) => Ok(Some(Self(File::from(fd)))),
+                Err(rustix::io::Errno::NOENT) => Ok(None),
+                Err(_) => Err(()),
+            }
+        }
         pub(super) fn open_root(path: &Path) -> Result<Option<Self>, RootReadError> {
             let mut held = open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(|_| RootReadError)?;
             for component in path.components() {
@@ -278,11 +599,12 @@ mod platform {
                     Err(_) => return Err(RootReadError),
                 };
             }
-            Ok(Some(Self(held)))
+            Ok(Some(Self(File::from(held))))
         }
 
         pub(super) fn open_slot(&self, slot: &str) -> Result<Self, ()> {
             openat(&self.0, slot, DIRECTORY_FLAGS, Mode::empty())
+                .map(File::from)
                 .map(Self)
                 .map_err(|_| ())
         }
@@ -302,19 +624,6 @@ mod platform {
                 names.push(OsStr::from_bytes(name).to_owned());
             }
             Ok(names)
-        }
-
-        pub(super) fn check_shape(&self) -> Result<(), ()> {
-            let names = self.entries(1)?;
-            if names.len() == 1 && names[0] == OsStr::new("manifest.json") {
-                Ok(())
-            } else {
-                Err(())
-            }
-        }
-
-        pub(super) fn open_manifest(&self) -> Result<File, ()> {
-            self.open_regular_file(OsStr::new("manifest.json"))
         }
 
         pub(super) fn open_regular_file(&self, name: &OsStr) -> Result<File, ()> {
@@ -337,6 +646,17 @@ mod platform {
             Ok(File::from(fd))
         }
     }
+
+    pub(super) fn file_identity(file: &File) -> Result<FileIdentity, ()> {
+        let metadata = file.metadata().map_err(|_| ())?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(());
+        }
+        Ok(FileIdentity {
+            volume: metadata.dev(),
+            object: u128::from(metadata.ino()),
+        })
+    }
 }
 
 #[cfg(windows)]
@@ -354,10 +674,12 @@ mod platform {
     };
     use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING};
     use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
-        FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, SYNCHRONIZE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -409,6 +731,10 @@ mod platform {
     }
 
     fn open_source_child(parent: &File, name: &OsStr, directory: bool) -> Result<File, ()> {
+        open_relative_child(parent, name, directory).map_err(|_| ())
+    }
+
+    fn open_relative_child(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
         // Native relative names must be exactly one component: no namespace,
         // separator, dot navigation, ADS, or embedded NUL can reach NtCreateFile.
         let mut units: Vec<u16> = name.encode_wide().collect();
@@ -417,9 +743,15 @@ mod platform {
             || name == OsStr::new("..")
             || units.iter().any(|unit| matches!(*unit, 0 | 47 | 58 | 92))
         {
-            return Err(());
+            return Err(io::ErrorKind::InvalidInput.into());
         }
-        let byte_len = u16::try_from(units.len().checked_mul(2).ok_or(())?).map_err(|_| ())?;
+        let byte_len = u16::try_from(
+            units
+                .len()
+                .checked_mul(2)
+                .ok_or(io::ErrorKind::InvalidInput)?,
+        )
+        .map_err(|_| io::ErrorKind::InvalidInput)?;
         let unicode_name = UNICODE_STRING {
             Length: byte_len,
             MaximumLength: byte_len,
@@ -464,14 +796,17 @@ mod platform {
             )
         };
         if status < 0 {
-            return Err(());
+            // SAFETY: converts a scalar NTSTATUS, with no pointer arguments.
+            return Err(io::Error::from_raw_os_error(unsafe {
+                windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
+            } as i32));
         }
         // SAFETY: NtCreateFile succeeded and transferred this owned file handle.
         let file = unsafe { File::from_raw_handle(handle) };
         if directory {
-            validate_directory(&file).map_err(|_| ())?;
+            validate_directory(&file).map_err(|_| io::ErrorKind::InvalidInput)?;
         } else {
-            validate_regular_file(&file)?;
+            validate_regular_file(&file).map_err(|_| io::ErrorKind::InvalidInput)?;
         }
         Ok(file)
     }
@@ -510,14 +845,19 @@ mod platform {
         if !metadata.is_dir() || is_reparse_point(metadata.file_attributes()) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
+        no_named_streams(file).map_err(|_| io::ErrorKind::InvalidInput)?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn open_manifest(path: &Path) -> Result<File, ()> {
         let file = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
+            .custom_flags(
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN,
+            )
             .open(path)
             .map_err(|_| ())?;
         validate_regular_file(&file)?;
@@ -536,7 +876,36 @@ mod platform {
         if success == 0 || information.nNumberOfLinks != 1 {
             return Err(());
         }
+        no_named_streams(file)?;
         Ok(())
+    }
+
+    use crate::storage::windows_file_evidence::no_named_streams;
+
+    fn object_identity(file: &File) -> Result<FileIdentity, ()> {
+        let mut info = FILE_ID_INFO::default();
+        // SAFETY: the live owned handle and correctly sized writable buffer
+        // remain valid for the synchronous metadata query.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(());
+        }
+        Ok(FileIdentity {
+            volume: info.VolumeSerialNumber,
+            object: u128::from_le_bytes(info.FileId.Identifier),
+        })
+    }
+
+    pub(super) fn file_identity(file: &File) -> Result<FileIdentity, ()> {
+        validate_regular_file(file)?;
+        object_identity(file)
     }
 
     impl Directory {
@@ -559,7 +928,7 @@ mod platform {
                     return Err(RootReadError);
                 };
                 current.push(name);
-                match open_directory(&current) {
+                match open_relative_child(held.last().ok_or(RootReadError)?, name, true) {
                     Ok(file) => held.push(file),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                     Err(_) => return Err(RootReadError),
@@ -573,11 +942,37 @@ mod platform {
 
         pub(super) fn open_slot(&self, slot: &str) -> Result<Self, ()> {
             let path = self.path.join(slot);
-            let held = open_directory(&path).map_err(|_| ())?;
+            let held = open_source_child(self._held.last().ok_or(())?, OsStr::new(slot), true)?;
             Ok(Self {
                 path,
                 _held: vec![held],
             })
+        }
+
+        pub(super) fn identity(&self) -> Result<FileIdentity, ()> {
+            object_identity(self._held.last().ok_or(())?)
+        }
+
+        pub(super) fn canonical_may_be_occupied(&self, _slot: &str) -> bool {
+            // Preserve Windows' conservative case-alias occupancy rule.
+            true
+        }
+
+        pub(super) fn optional_child(&self, name: &str) -> Result<Option<Self>, ()> {
+            match open_relative_child(self._held.last().ok_or(())?, OsStr::new(name), true) {
+                Ok(file) => {
+                    // Windows lookup ignores case: require the exact enumerated name.
+                    if !self.entries(256)?.iter().any(|entry| entry == name) {
+                        return Err(());
+                    }
+                    Ok(Some(Self {
+                        path: self.path.join(name),
+                        _held: vec![file],
+                    }))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(()),
+            }
         }
 
         pub(super) fn entries(&self, max: usize) -> Result<Vec<OsString>, ()> {
@@ -592,21 +987,8 @@ mod platform {
             Ok(names)
         }
 
-        pub(super) fn check_shape(&self) -> Result<(), ()> {
-            let names = self.entries(1)?;
-            if names.len() == 1 && names[0] == OsStr::new("manifest.json") {
-                Ok(())
-            } else {
-                Err(())
-            }
-        }
-
-        pub(super) fn open_manifest(&self) -> Result<File, ()> {
-            self.open_regular_file(OsStr::new("manifest.json"))
-        }
-
         pub(super) fn open_regular_file(&self, name: &OsStr) -> Result<File, ()> {
-            open_manifest(&self.path.join(name))
+            open_source_child(self._held.last().ok_or(())?, name, false)
         }
     }
 }

@@ -10,7 +10,10 @@ use crate::plugin::manifest::{
     PluginId, PluginPublisherId, PluginSource, APPROVAL_FINGERPRINT_NONE,
 };
 
-use super::atomic_file::{read_bounded, AtomicFile, CandidateBytes};
+use super::safe_plugin_document::{
+    outcome_satisfies_destructive_barrier, CandidateBytes, PersistFailure, PersistResult,
+    SafeDocumentNames, SafePluginDocument,
+};
 
 pub(crate) const MAX_PLUGIN_STATE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_PLUGIN_STATE_ENTRIES: usize = 512;
@@ -323,7 +326,7 @@ mod decimal_revision {
 }
 
 /// Inspects only schemaVersion without materializing a future layout.
-struct StateSchema(u64);
+pub(super) struct StateSchema(pub(super) u64);
 impl<'de> Deserialize<'de> for StateSchema {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct SchemaVisitor;
@@ -364,11 +367,19 @@ pub(crate) struct PluginStateLoad {
 
 pub(crate) trait PluginStatePersistence: Send + Sync {
     fn load(&self) -> AppResult<PluginStateLoad>;
-    fn save(&self, state: &PluginStateFileV2) -> AppResult<()>;
+    fn save(&self, state: &PluginStateFileV2) -> PersistResult;
+    fn save_before_destructive_rename(&self, state: &PluginStateFileV2) -> PersistResult {
+        let outcome = self.save(state)?;
+        if outcome_satisfies_destructive_barrier(outcome) {
+            Ok(outcome)
+        } else {
+            Err(PersistFailure { outcome })
+        }
+    }
 }
 
 pub(crate) struct PluginStateStore {
-    file: AtomicFile,
+    file: SafePluginDocument,
     transaction: Mutex<()>,
 }
 
@@ -381,18 +392,27 @@ impl PluginStateStore {
     }
     pub(crate) fn with_path(path: PathBuf) -> Self {
         Self {
-            file: AtomicFile::new(path),
+            file: SafePluginDocument::new(
+                path.parent()
+                    .unwrap_or_else(|| std::path::Path::new(""))
+                    .to_owned(),
+                SafeDocumentNames::plugin_state(),
+                MAX_PLUGIN_STATE_BYTES,
+            ),
             transaction: Mutex::new(()),
         }
     }
 
     fn load_locked(&self) -> AppResult<Option<PluginStateLoad>> {
         let mut invalid = false;
-        for (index, path) in [&self.file.main, &self.file.temp(), &self.file.backup()]
+        for (index, candidate) in self
+            .file
+            .load_candidates()
+            .map_err(io_error)?
             .into_iter()
             .enumerate()
         {
-            let bytes = match read_bounded(path, MAX_PLUGIN_STATE_BYTES).map_err(io_error)? {
+            let bytes = match candidate {
                 CandidateBytes::Missing => continue,
                 CandidateBytes::Oversized if index == 0 => return Err(unavailable()),
                 CandidateBytes::Oversized => {
@@ -463,7 +483,7 @@ impl PluginStatePersistence for PluginStateStore {
             requires_rewrite: false,
         }))
     }
-    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
+    fn save(&self, state: &PluginStateFileV2) -> PersistResult {
         let _guard = self.transaction.lock().map_err(|_| unavailable())?;
         state
             .validate_for_persistence()
@@ -475,9 +495,7 @@ impl PluginStatePersistence for PluginStateStore {
             .map(|loaded| serde_json::to_vec(&loaded.state))
             .transpose()
             .map_err(|_| invalid_state())?;
-        self.file
-            .replace(&bytes, previous.as_deref())
-            .map_err(io_error)
+        self.file.persist(previous.as_deref(), &bytes)
     }
 }
 

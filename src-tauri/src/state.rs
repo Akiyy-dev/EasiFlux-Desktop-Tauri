@@ -317,8 +317,15 @@ mod tests {
             }
         }
 
-        fn save(&self, _state: &PluginStateFileV2) -> AppResult<()> {
-            Ok(())
+        fn save(
+            &self,
+            _state: &PluginStateFileV2,
+        ) -> crate::storage::safe_plugin_document::PersistResult {
+            Ok(if cfg!(windows) {
+                crate::storage::safe_plugin_document::PersistOutcome::CommittedProcessCrashSafe
+            } else {
+                crate::storage::safe_plugin_document::PersistOutcome::CommittedDurable
+            })
         }
     }
 
@@ -345,7 +352,11 @@ mod tests {
             let discovery = discovery.clone();
             move || {
                 PluginRuntime::initialize(
-                    PluginRegistry::initialize(Vec::new(), Box::new(resolver)),
+                    PluginRegistry::initialize(
+                        Vec::new(),
+                        Box::new(resolver),
+                        crate::plugin::ownership::empty_test_persistence(),
+                    ),
                     discovery,
                 )
             }
@@ -362,12 +373,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             serde_json::json!({
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "revision": "0",
                 "catalogGeneration": "1",
                 "availability": "available",
                 "availabilityReasonCode": null,
                 "localDiscovery": {"status": "unavailable", "rejectedPackageCount": 0},
+                "managedOwnership": {"status":"unavailable","conflictingEntryCount":0,"rollbackPendingCount":0,"cleanupPendingCount":0},
                 "plugins": []
             })
         );

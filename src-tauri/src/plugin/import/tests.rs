@@ -364,6 +364,7 @@ fn import_result_wire_keys_match_spec() {
         PluginAvailability::Available,
         None,
         LocalDiscoverySummary::available(),
+        crate::plugin::manifest::ManagedOwnershipSummary::available(),
         vec![],
     );
     assert_eq!(
@@ -372,7 +373,7 @@ fn import_result_wire_keys_match_spec() {
             snapshot.clone()
         ))
         .unwrap(),
-        json!({"schemaVersion":1,"status":"imported","pluginId":"com.example.notes","snapshot":snapshot})
+        json!({"schemaVersion":2,"status":"imported","pluginId":"com.example.notes","snapshot":snapshot})
     );
     assert_eq!(
         serde_json::to_value(CommitImportResult::imported_not_visible(
@@ -380,9 +381,29 @@ fn import_result_wire_keys_match_spec() {
             snapshot.clone()
         ))
         .unwrap(),
-        json!({"schemaVersion":1,"status":"importedNotVisible","pluginId":"com.example.notes","reasonCode":"plugin_import_publication_unconfirmed","snapshot":snapshot})
+        json!({"schemaVersion":2,"status":"importedNotVisible","pluginId":"com.example.notes","reasonCode":"plugin_import_publication_unconfirmed","snapshot":snapshot})
+    );
+    assert_eq!(
+        serde_json::to_value(CommitImportResult::imported_external(
+            "com.example.notes".into(),
+            snapshot.clone()
+        ))
+        .unwrap(),
+        json!({"schemaVersion":2,"status":"importedExternal","pluginId":"com.example.notes","reasonCode":"plugin_import_ownership_not_registered","snapshot":snapshot})
     );
     for (reason, code) in [
+        (
+            ImportCommitFailure::OwnershipUnavailable,
+            "plugin_ownership_unavailable",
+        ),
+        (
+            ImportCommitFailure::OwnershipCapacityExceeded,
+            "plugin_ownership_capacity_exceeded",
+        ),
+        (
+            ImportCommitFailure::OwnershipRevisionExhausted,
+            "plugin_ownership_revision_exhausted",
+        ),
         (ImportCommitFailure::CatalogStale, "plugin_catalog_stale"),
         (
             ImportCommitFailure::CatalogInvalid,
@@ -440,7 +461,7 @@ fn import_result_wire_keys_match_spec() {
                     snapshot.clone()
                 ))
                 .unwrap(),
-                json!({"schemaVersion":1,"status":"notImported","disabledDecisionSaved":saved,"reasonCode":code,"snapshot":snapshot})
+                json!({"schemaVersion":2,"status":"notImported","disabledDecisionSaved":saved,"reasonCode":code,"snapshot":snapshot})
             );
         }
     }

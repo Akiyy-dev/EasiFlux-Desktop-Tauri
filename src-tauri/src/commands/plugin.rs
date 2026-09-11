@@ -8,6 +8,7 @@ use crate::plugin::import::{
     CancelImportResult, CommitImportResult, LocalManifestSelector, PrepareImportResult,
 };
 use crate::plugin::manifest::{PluginCatalogMutationResult, PluginCatalogSnapshot};
+use crate::plugin::removal::RemoveManagedLocalPluginResult;
 use crate::plugin::PluginRuntime;
 use crate::state::AppState;
 
@@ -55,6 +56,16 @@ pub(crate) async fn commit_local_manifest_import_from(
 ) -> AppResult<CommitImportResult> {
     runtime
         .commit_import(token, expected_catalog_generation)
+        .await
+}
+
+pub(crate) async fn remove_managed_local_plugin_from(
+    runtime: &Arc<PluginRuntime>,
+    id: &str,
+    expected_catalog_generation: &str,
+) -> AppResult<RemoveManagedLocalPluginResult> {
+    runtime
+        .remove_managed_local_plugin(id, expected_catalog_generation)
         .await
 }
 
@@ -107,6 +118,15 @@ pub async fn commit_local_manifest_import(
     commit_local_manifest_import_from(&state.plugins, &token, &expected_catalog_generation).await
 }
 
+#[tauri::command]
+pub async fn remove_managed_local_plugin(
+    state: State<'_, AppState>,
+    id: String,
+    expected_catalog_generation: String,
+) -> AppResult<RemoveManagedLocalPluginResult> {
+    remove_managed_local_plugin_from(&state.plugins, &id, &expected_catalog_generation).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -119,16 +139,23 @@ mod tests {
 
     use super::*;
     use crate::error::AppError;
-    use crate::plugin::discovery::{LocalDiscoveryOutcome, LocalPluginDiscovery};
+    use crate::plugin::discovery::{
+        LocalDiscoveryOutcome, LocalPackageLocator, LocalPluginDiscovery,
+    };
     use crate::plugin::import::source::LocalManifestReader;
     use crate::plugin::import::{
         test_support::VALID, ImportCommitFailure, LocalManifestSelector, PrepareImportResult,
-        PreparedManifest, SelectedManifestSource,
+        PreparedManifest, SelectedManifestSource, SystemLocalManifestReader,
     };
     use crate::plugin::manifest::{PluginId, PluginManifestV1, PluginPublisherId, PluginSource};
+    use crate::plugin::ownership::ManagedOwnershipEntryV1;
     use crate::plugin::record::PluginRecord;
+    use crate::plugin::removal::{BeforeDisabledFailure, RemoveManagedLocalPluginResult};
     use crate::plugin::PluginRegistry;
     use crate::storage::local_plugin_import::{LocalManifestImportStorage, OwnedImportStage};
+    use crate::storage::local_plugin_package::{
+        ManagedLocalPluginRemovalStorage, OwnedRemoval, RemovalStorageFailure,
+    };
     use crate::storage::plugin_state::{
         PluginStateEntryV2, PluginStateFileV2, PluginStateLoad, PluginStatePersistence,
     };
@@ -156,7 +183,11 @@ mod tests {
         }
 
         fn registry(&self, manifests: Vec<PluginManifestV1>) -> PluginRegistry {
-            PluginRegistry::initialize(manifests, Box::new(self.clone()))
+            PluginRegistry::initialize(
+                manifests,
+                Box::new(self.clone()),
+                crate::plugin::ownership::empty_test_persistence(),
+            )
         }
     }
 
@@ -173,11 +204,18 @@ mod tests {
             })
         }
 
-        fn save(&self, next: &PluginStateFileV2) -> AppResult<()> {
+        fn save(
+            &self,
+            next: &PluginStateFileV2,
+        ) -> crate::storage::safe_plugin_document::PersistResult {
             let mut state = self.0.lock().unwrap();
             state.saves.push(next.clone());
             state.persisted = next.clone();
-            Ok(())
+            Ok(if cfg!(windows) {
+                crate::storage::safe_plugin_document::PersistOutcome::CommittedProcessCrashSafe
+            } else {
+                crate::storage::safe_plugin_document::PersistOutcome::CommittedDurable
+            })
         }
     }
 
@@ -249,10 +287,24 @@ mod tests {
     impl LocalManifestImportStorage for CountingStorage {
         fn prepare_stage(
             &self,
+            _record: &crate::plugin::record::PluginRecord,
             _bytes: &[u8],
         ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err(ImportCommitFailure::WriteFailed)
+        }
+    }
+
+    struct CountingRemovalStorage(Arc<AtomicUsize>);
+
+    impl ManagedLocalPluginRemovalStorage for CountingRemovalStorage {
+        fn prepare(
+            &self,
+            _locator: &LocalPackageLocator,
+            _entry: &ManagedOwnershipEntryV1,
+        ) -> Result<Box<dyn OwnedRemoval>, RemovalStorageFailure> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(RemovalStorageFailure::Unavailable)
         }
     }
 
@@ -276,6 +328,19 @@ mod tests {
         ))
     }
 
+    fn removal_runtime_with(
+        persistence: &MemoryPersistence,
+        removal_calls: Arc<AtomicUsize>,
+    ) -> Arc<PluginRuntime> {
+        Arc::new(PluginRuntime::with_lifecycle_services(
+            persistence.registry(vec![]),
+            Arc::new(FixedDiscovery(LocalDiscoveryOutcome::available(vec![]))),
+            Arc::new(SystemLocalManifestReader),
+            Arc::new(CountingStorage(Arc::new(AtomicUsize::new(0)))),
+            Arc::new(CountingRemovalStorage(removal_calls)),
+        ))
+    }
+
     // Catches returning the stale unavailable snapshot without asking persistence again.
     #[tokio::test]
     async fn catalog_command_retries_unavailable_state_before_snapshotting() {
@@ -293,12 +358,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             json!({
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "revision": "7",
                 "catalogGeneration": "1",
                 "availability": "available",
                 "availabilityReasonCode": null,
                 "localDiscovery": {"status": "available", "rejectedPackageCount": 0},
+                "managedOwnership": {"status":"available","conflictingEntryCount":0,"rollbackPendingCount":0,"cleanupPendingCount":0},
                 "plugins": [{
                     "manifest": {
                         "schemaVersion": 1,
@@ -312,6 +378,7 @@ mod tests {
                         "requestedCapabilities": []
                     },
                     "source": "builtIn",
+                    "management": "builtIn", "canRemove": false, "toggleBlockReasonCode": null,
                     "grantedCapabilities": [],
                     "status": "enabled",
                     "canToggle": true,
@@ -410,7 +477,7 @@ mod tests {
             .unwrap();
 
         let value = serde_json::to_value(result).unwrap();
-        assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(value["schemaVersion"], 3);
         assert_eq!(value["revision"], "1");
         assert_eq!(value["catalogGeneration"], "0");
         assert_eq!(value["plugin"]["manifest"]["id"], "com.easiflux.alpha");
@@ -444,7 +511,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(result).unwrap(),
             json!({
-                "schemaVersion": 2, "catalogGeneration": "1", "revision": "1",
+                "schemaVersion": 3, "catalogGeneration": "1", "revision": "1",
                 "plugin": {
                     "manifest": {
                         "schemaVersion": 1, "id": "com.easiflux.alpha", "name": "Alpha",
@@ -453,6 +520,7 @@ mod tests {
                         "contributions": [], "requestedCapabilities": []
                     },
                     "source": "localDeclarative", "grantedCapabilities": [],
+                    "management": "external", "canRemove": false, "toggleBlockReasonCode": null,
                     "status": "enabled", "canToggle": true, "statusReasonCode": null
                 }
             })
@@ -582,5 +650,141 @@ mod tests {
             json!({"schemaVersion": 1, "status": "cancelled"})
         );
         assert!(persistence.0.lock().unwrap().saves.is_empty());
+    }
+
+    // Catches expanding the public command with a path, slot, receipt, fingerprint,
+    // publisher, object identity, or raw manifest input, or normalizing either input.
+    #[tokio::test]
+    async fn remove_helper_forwards_only_id_and_expected_generation() {
+        fn command_only(
+            state: State<'_, AppState>,
+            id: String,
+            expected_catalog_generation: String,
+        ) {
+            drop(remove_managed_local_plugin(
+                state,
+                id,
+                expected_catalog_generation,
+            ));
+        }
+
+        let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+        let removal_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = removal_runtime_with(&persistence, Arc::clone(&removal_calls));
+        let snapshot = runtime.get_catalog().await.unwrap();
+
+        let noncanonical_id = remove_managed_local_plugin_from(
+            &runtime,
+            "com.EasiFlux.notes",
+            &snapshot.catalog_generation,
+        )
+        .await;
+        let Err(noncanonical_id) = noncanonical_id else {
+            panic!("noncanonical id must remain invalid");
+        };
+        assert_eq!(
+            serde_json::to_value(noncanonical_id).unwrap()["code"],
+            "plugin_invalid_id"
+        );
+
+        let noncanonical_generation = remove_managed_local_plugin_from(
+            &runtime,
+            "com.example.notes",
+            &format!("0{}", snapshot.catalog_generation),
+        )
+        .await
+        .unwrap();
+        let wire = serde_json::to_value(noncanonical_generation).unwrap();
+        assert_eq!(wire["status"], "notRemoved");
+        assert_eq!(wire["reasonCode"], "plugin_catalog_stale");
+        assert_eq!(removal_calls.load(Ordering::SeqCst), 0);
+        let _ = command_only;
+    }
+
+    // Catches dropping or reshaping any Task 6 removal result at the command boundary.
+    #[tokio::test]
+    async fn remove_command_serializes_every_result_branch() {
+        let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+        let runtime = removal_runtime_with(&persistence, Arc::new(AtomicUsize::new(0)));
+        let snapshot = runtime.get_catalog().await.unwrap();
+        let snapshot_wire = serde_json::to_value(&snapshot).unwrap();
+        let cases = [
+            (
+                RemoveManagedLocalPluginResult::removed(
+                    "com.example.notes".into(),
+                    snapshot.clone(),
+                ),
+                json!({
+                    "schemaVersion": 1,
+                    "status": "removed",
+                    "pluginId": "com.example.notes",
+                    "snapshot": snapshot_wire.clone()
+                }),
+            ),
+            (
+                RemoveManagedLocalPluginResult::removed_cleanup_pending(
+                    "com.example.notes".into(),
+                    snapshot.clone(),
+                ),
+                json!({
+                    "schemaVersion": 1,
+                    "status": "removedCleanupPending",
+                    "pluginId": "com.example.notes",
+                    "snapshot": snapshot_wire.clone()
+                }),
+            ),
+            (
+                RemoveManagedLocalPluginResult::removed_catalog_unconfirmed(
+                    "com.example.notes".into(),
+                    snapshot.clone(),
+                ),
+                json!({
+                    "schemaVersion": 1,
+                    "status": "removedCatalogUnconfirmed",
+                    "pluginId": "com.example.notes",
+                    "reasonCode": "plugin_remove_publication_unconfirmed",
+                    "snapshot": snapshot_wire.clone()
+                }),
+            ),
+            (
+                RemoveManagedLocalPluginResult::not_removed(
+                    BeforeDisabledFailure::NotManaged,
+                    snapshot,
+                ),
+                json!({
+                    "schemaVersion": 1,
+                    "status": "notRemoved",
+                    "disabledDecisionSaved": false,
+                    "reasonCode": "plugin_remove_not_managed",
+                    "snapshot": snapshot_wire
+                }),
+            ),
+        ];
+
+        for (result, expected) in cases {
+            assert_eq!(serde_json::to_value(result).unwrap(), expected);
+        }
+    }
+
+    // Catches translating a normal business refusal into a rejected IPC promise.
+    #[tokio::test]
+    async fn remove_command_keeps_business_rejections_in_ok() {
+        let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+        let removal_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = removal_runtime_with(&persistence, Arc::clone(&removal_calls));
+        let snapshot = runtime.get_catalog().await.unwrap();
+
+        let result = remove_managed_local_plugin_from(
+            &runtime,
+            "com.example.notes",
+            &snapshot.catalog_generation,
+        )
+        .await;
+        assert!(result.is_ok(), "business refusal must remain an Ok result");
+        let wire = serde_json::to_value(result.unwrap()).unwrap();
+        assert_eq!(wire["status"], "notRemoved");
+        assert_eq!(wire["reasonCode"], "plugin_remove_not_managed");
+        assert_eq!(wire["disabledDecisionSaved"], false);
+        assert_eq!(removal_calls.load(Ordering::SeqCst), 0);
     }
 }

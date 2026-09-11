@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, it } from 'vitest'
 
-it('declares all three OS runners and all import security suites', () => {
+it('runs nonzero lifecycle security suites on all three OS runners', () => {
   const workflow = readFileSync(resolve(process.cwd(), '.github/workflows/ci.yml'), 'utf8')
   const match = workflow.match(
     /(?:^|\r?\n)[ ]{2}plugin-security:\r?\n[\s\S]*?(?=\r?\n[ ]{2}[a-zA-Z0-9_-]+:\r?\n|$)/,
@@ -17,9 +17,21 @@ it('declares all three OS runners and all import security suites', () => {
     'storage::local_plugin_import',
     'storage::plugin_state::tests',
     'plugin::runtime::import::tests',
+    'storage::managed_plugin_ownership::tests',
+    'storage::local_plugin_package::tests',
+    'plugin::ownership::tests',
+    'plugin::runtime::removal::tests',
   ]) {
-    expect(job).toContain(
-      `cargo test --locked --manifest-path src-tauri/Cargo.toml ${suite} --lib`,
-    )
+    expect(job).toContain(`'${suite}'`)
   }
+  expect(job).toContain('shell: pwsh')
+  expect(job).toContain('foreach ($suite in $suites)')
+  expect(job).toContain('cargo test --locked --manifest-path src-tauri/Cargo.toml $suite --lib -- --list --format terse')
+  expect(job).toContain("$_ -match ':\\s+test$'")
+  expect(job).toContain('if ($selected.Count -eq 0) { throw')
+  expect(job).toContain('if ($listExit -ne 0) { throw')
+  expect(job).toContain('if ($runExit -ne 0) { throw')
+  expect(job).toContain('& cargo test --locked --manifest-path src-tauri/Cargo.toml $suite --lib')
+  expect(workflow).toMatch(/permissions:\r?\n  contents: read/)
+  expect(workflow).toContain('cargo test --locked --all-targets')
 })

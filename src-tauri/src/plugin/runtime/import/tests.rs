@@ -1,3 +1,5 @@
+use crate::storage::local_plugin_package::PromotedManagedPackage as Promotion;
+use crate::storage::managed_plugin_ownership::ManagedOwnershipPersistence;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -25,7 +27,8 @@ use crate::plugin::manifest::{PluginManifestV1, PluginSource};
 use crate::plugin::record::PluginRecord;
 use crate::plugin::PluginRegistry;
 use crate::storage::local_plugin_import::{
-    LocalManifestImportStorage, OwnedImportStage, Promotion, SystemLocalManifestImportStorage,
+    ImportPromotionState, LocalManifestImportStorage, OwnedImportStage,
+    SystemLocalManifestImportStorage,
 };
 use crate::storage::plugin_state::{
     PluginStateEntryV2, PluginStateFileV2, PluginStateLoad, PluginStatePersistence,
@@ -35,13 +38,44 @@ use crate::storage::plugin_state::{
 const WATCHDOG: Duration = Duration::from_secs(10);
 const NEVER: usize = usize::MAX;
 const CRASH_EXIT_CODE: i32 = 73;
-const CRASH_ROOT_ENV: &str = "EASIFLUX_IMPORT_TEST_ROOT";
-const CRASH_CHECKPOINT_ENV: &str = "EASIFLUX_IMPORT_TEST_CHECKPOINT";
+const CRASH_ROOT_ENV: &str = "EASIFLUX_PLUGIN_TEST_ROOT";
+const CRASH_CHECKPOINT_ENV: &str = "EASIFLUX_PLUGIN_TEST_CHECKPOINT";
 const CRASH_CHILD_TEST: &str = "plugin::runtime::import::tests::import_crash_child";
 const VALID_FINGERPRINT: &str =
     "v1:sha256:71bb47f19cd31329579e843b621a87085d3e1346a9e354d7f60b1393ee10deee";
 
 type Events = Arc<Mutex<Vec<&'static str>>>;
+
+#[derive(Clone)]
+struct RecordingOwnership {
+    inner: Arc<crate::storage::managed_plugin_ownership::ManagedOwnershipStore>,
+    events: Events,
+    failure: Arc<AtomicUsize>,
+}
+
+impl crate::storage::managed_plugin_ownership::ManagedOwnershipPersistence for RecordingOwnership {
+    fn load(&self) -> AppResult<crate::storage::managed_plugin_ownership::ManagedOwnershipLoad> {
+        self.inner.load()
+    }
+    fn save(
+        &self,
+        index: &crate::plugin::ownership::ManagedOwnershipIndexV1,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
+        use crate::storage::safe_plugin_document::{PersistFailure, PersistOutcome};
+        self.events.lock().unwrap().push("save-index");
+        match self.failure.swap(0, Ordering::SeqCst) {
+            1 => Err(PersistFailure {
+                outcome: PersistOutcome::NotCommitted,
+            }),
+            2 => {
+                let outcome = self.inner.save(index)?;
+                Err(PersistFailure { outcome })
+            }
+            3 => panic!("injected index worker uncertainty"),
+            _ => self.inner.save(index),
+        }
+    }
+}
 
 struct FixedSelector(Option<PathBuf>);
 
@@ -64,6 +98,7 @@ struct RecordingPersistence {
     inner: Arc<PluginStateStore>,
     events: Events,
     fail_save: Arc<AtomicBool>,
+    committed_error: Arc<Mutex<Option<crate::storage::safe_plugin_document::PersistOutcome>>>,
     saves: Arc<AtomicUsize>,
 }
 
@@ -73,6 +108,7 @@ impl RecordingPersistence {
             inner: Arc::new(PluginStateStore::with_path(path)),
             events,
             fail_save: Arc::new(AtomicBool::new(false)),
+            committed_error: Arc::new(Mutex::new(None)),
             saves: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -87,7 +123,10 @@ impl PluginStatePersistence for RecordingPersistence {
         self.inner.load()
     }
 
-    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
+    fn save(
+        &self,
+        state: &PluginStateFileV2,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
         self.events.lock().unwrap().push("disable");
         self.saves.fetch_add(1, Ordering::SeqCst);
         if self.fail_save.swap(false, Ordering::SeqCst) {
@@ -95,9 +134,14 @@ impl PluginStatePersistence for RecordingPersistence {
                 code: "plugin_state_persist_failed",
                 message: "插件状态保存失败",
                 diagnostic: None,
-            });
+            }
+            .into());
         }
-        self.inner.save(state)
+        let outcome = self.inner.save(state)?;
+        if let Some(outcome) = self.committed_error.lock().unwrap().take() {
+            return Err(crate::storage::safe_plugin_document::PersistFailure { outcome });
+        }
+        Ok(outcome)
     }
 }
 
@@ -111,10 +155,13 @@ impl PluginStatePersistence for CrashPersistence {
         self.inner.load()
     }
 
-    fn save(&self, state: &PluginStateFileV2) -> AppResult<()> {
-        self.inner.save(state)?;
+    fn save(
+        &self,
+        state: &PluginStateFileV2,
+    ) -> crate::storage::safe_plugin_document::PersistResult {
+        let outcome = self.inner.save(state)?;
         exit_at_checkpoint(&self.checkpoint, "disabled-saved");
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -202,9 +249,30 @@ struct StorageControls {
     fail_prepare: AtomicBool,
     fail_promote: AtomicBool,
     unverified_promotion: AtomicBool,
+    unconfirmed_promotion: AtomicBool,
     panic_after_promotion: AtomicBool,
+    panic_promotion_state: AtomicBool,
     promote_calls: AtomicUsize,
     promotion_block: Mutex<Option<Arc<BlockingPoint>>>,
+    after_promotion: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+struct RemovalPrepareSpy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl crate::storage::local_plugin_package::ManagedLocalPluginRemovalStorage for RemovalPrepareSpy {
+    fn prepare(
+        &self,
+        _locator: &crate::plugin::discovery::LocalPackageLocator,
+        _entry: &crate::plugin::ownership::ManagedOwnershipEntryV1,
+    ) -> Result<
+        Box<dyn crate::storage::local_plugin_package::OwnedRemoval>,
+        crate::storage::local_plugin_package::RemovalStorageFailure,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(crate::storage::local_plugin_package::RemovalStorageFailure::Unavailable)
+    }
 }
 
 impl StorageControls {
@@ -253,15 +321,17 @@ struct RecordingStorage {
 impl LocalManifestImportStorage for RecordingStorage {
     fn prepare_stage(
         &self,
+        record: &PluginRecord,
         bytes: &[u8],
     ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
         self.events.lock().unwrap().push("stage");
         if self.controls.fail_prepare.swap(false, Ordering::SeqCst) {
             return Err(ImportCommitFailure::WriteFailed);
         }
-        let inner = self.inner.prepare_stage(bytes)?;
+        let inner = self.inner.prepare_stage(record, bytes)?;
         Ok(Box::new(RecordingStage {
             inner,
+            outcome_unknown: false,
             events: Arc::clone(&self.events),
             controls: Arc::clone(&self.controls),
         }))
@@ -270,11 +340,23 @@ impl LocalManifestImportStorage for RecordingStorage {
 
 struct RecordingStage {
     inner: Box<dyn OwnedImportStage>,
+    outcome_unknown: bool,
     events: Events,
     controls: Arc<StorageControls>,
 }
 
 impl OwnedImportStage for RecordingStage {
+    fn promotion_state(&self) -> ImportPromotionState {
+        assert!(
+            !self.controls.panic_promotion_state.load(Ordering::SeqCst),
+            "injected promotion-state worker failure"
+        );
+        if self.outcome_unknown {
+            ImportPromotionState::CommitUnconfirmed
+        } else {
+            self.inner.promotion_state()
+        }
+    }
     fn promote(&mut self) -> Result<Promotion, ImportCommitFailure> {
         self.events.lock().unwrap().push("promote");
         self.controls.promote_calls.fetch_add(1, Ordering::SeqCst);
@@ -284,7 +366,19 @@ impl OwnedImportStage for RecordingStage {
         if self.controls.fail_promote.swap(false, Ordering::SeqCst) {
             return Err(ImportCommitFailure::WriteFailed);
         }
-        let mut promotion = self.inner.promote()?;
+        if self
+            .controls
+            .unconfirmed_promotion
+            .swap(false, Ordering::SeqCst)
+        {
+            self.outcome_unknown = true;
+            return Err(ImportCommitFailure::WriteFailed);
+        }
+        let promotion = self.inner.promote()?;
+        self.events.lock().unwrap().push("verify-target");
+        if let Some(action) = self.controls.after_promotion.lock().unwrap().take() {
+            action();
+        }
         if self
             .controls
             .panic_after_promotion
@@ -297,7 +391,7 @@ impl OwnedImportStage for RecordingStage {
             .unverified_promotion
             .swap(false, Ordering::SeqCst)
         {
-            promotion.object_identity_verified = false;
+            return Err(ImportCommitFailure::WriteFailed);
         }
         Ok(promotion)
     }
@@ -316,9 +410,10 @@ struct CrashStorage {
 impl LocalManifestImportStorage for CrashStorage {
     fn prepare_stage(
         &self,
+        record: &PluginRecord,
         bytes: &[u8],
     ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
-        let inner = self.inner.prepare_stage(bytes)?;
+        let inner = self.inner.prepare_stage(record, bytes)?;
         exit_at_checkpoint(&self.checkpoint, "stage-ready");
         Ok(Box::new(CrashStage {
             inner,
@@ -333,6 +428,9 @@ struct CrashStage {
 }
 
 impl OwnedImportStage for CrashStage {
+    fn promotion_state(&self) -> ImportPromotionState {
+        self.inner.promotion_state()
+    }
     fn promote(&mut self) -> Result<Promotion, ImportCommitFailure> {
         let promotion = self.inner.promote()?;
         exit_at_checkpoint(&self.checkpoint, "promoted");
@@ -360,6 +458,8 @@ struct ImportFixture {
     discovery: Arc<RecordingDiscovery>,
     persistence: RecordingPersistence,
     storage_controls: Arc<StorageControls>,
+    removal_prepares: Arc<AtomicUsize>,
+    ownership: RecordingOwnership,
 }
 
 impl ImportFixture {
@@ -400,15 +500,30 @@ impl ImportFixture {
             events: Arc::clone(&events),
             controls: Arc::clone(&storage_controls),
         });
+        let removal_prepares = Arc::new(AtomicUsize::new(0));
+        let removal_storage = Arc::new(RemovalPrepareSpy {
+            calls: Arc::clone(&removal_prepares),
+        });
+        let ownership = RecordingOwnership {
+            inner: Arc::new(
+                crate::storage::managed_plugin_ownership::ManagedOwnershipStore::with_plugins_root(
+                    plugins_root.clone(),
+                ),
+            ),
+            events: Arc::clone(&events),
+            failure: Arc::new(AtomicUsize::new(0)),
+        };
         let registry = PluginRegistry::initialize(
             vec![manifest_from_bytes(builtin_manifest())],
             Box::new(persistence.clone()),
+            Box::new(ownership.clone()),
         );
-        let runtime = Arc::new(PluginRuntime::with_import_services(
+        let runtime = Arc::new(PluginRuntime::with_lifecycle_services(
             registry,
             discovery.clone(),
             Arc::new(SystemLocalManifestReader),
             storage,
+            removal_storage,
         ));
         runtime.get_catalog().await.unwrap();
         Self {
@@ -421,6 +536,8 @@ impl ImportFixture {
             discovery,
             persistence,
             storage_controls,
+            removal_prepares,
+            ownership,
         }
     }
 
@@ -479,6 +596,7 @@ impl ImportFixture {
         let registry = PluginRegistry::initialize(
             vec![manifest_from_bytes(builtin_manifest())],
             Box::new(PluginStateStore::with_path(self.state_path())),
+            Box::new(self.ownership.clone()),
         );
         Arc::new(PluginRuntime::with_import_services(
             registry,
@@ -521,6 +639,11 @@ fn crash_runtime(root: &Path, checkpoint: &str) -> Arc<PluginRuntime> {
             inner: PluginStateStore::with_path(plugins_root.join("state.json")),
             checkpoint: checkpoint.to_owned(),
         }),
+        Box::new(
+            crate::storage::managed_plugin_ownership::ManagedOwnershipStore::with_plugins_root(
+                plugins_root.clone(),
+            ),
+        ),
     );
     Arc::new(PluginRuntime::with_import_services(
         registry,
@@ -539,6 +662,7 @@ fn run_crash_child(root: &Path, checkpoint: &str) -> ExitStatus {
         .env_clear()
         .env(CRASH_ROOT_ENV, root)
         .env(CRASH_CHECKPOINT_ENV, checkpoint)
+        .env("EASIFLUX_PLUGIN_TEST_CHILD", "import")
         .spawn()
         .unwrap();
     let deadline = Instant::now() + WATCHDOG;
@@ -601,7 +725,15 @@ fn assert_abandoned_stage_fills_capacity(plugins_root: &Path) {
     before.sort();
     let storage = SystemLocalManifestImportStorage::with_plugins_root(plugins_root.to_owned());
     assert_eq!(
-        storage.prepare_stage(VALID).err(),
+        storage
+            .prepare_stage(
+                &PluginRecord::local_declarative(serde_json::from_slice(VALID).unwrap()).unwrap(),
+                &PluginRecord::local_declarative(serde_json::from_slice(VALID).unwrap())
+                    .unwrap()
+                    .canonical_manifest_bytes()
+                    .unwrap()
+            )
+            .err(),
         Some(ImportCommitFailure::StagingCapacityExceeded)
     );
     let mut after = fs::read_dir(&staging)
@@ -666,6 +798,499 @@ fn imported_item<'a>(snapshot: &'a Value, id: &str) -> &'a Value {
 }
 
 #[tokio::test]
+async fn import_registers_ownership_only_after_verified_promotion() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    fixture.clear_events();
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        *fixture.events.lock().unwrap(),
+        [
+            "scan",
+            "stage",
+            "disable",
+            "promote",
+            "verify-target",
+            "save-index",
+            "scan"
+        ]
+    );
+    assert_eq!(result["schemaVersion"], 2);
+    assert_eq!(result["status"], "imported");
+    let item = imported_item(&result["snapshot"], "com.example.notes");
+    assert_eq!(item["management"], "managed");
+    assert_eq!(item["status"], "disabled");
+    assert_eq!(item["canRemove"], true);
+    assert_eq!(result["snapshot"]["catalogGeneration"], "2");
+    let restarted =
+        serde_json::to_value(fixture.restart_runtime().get_catalog().await.unwrap()).unwrap();
+    assert_eq!(
+        imported_item(&restarted, "com.example.notes")["management"],
+        "managed"
+    );
+}
+
+#[tokio::test]
+async fn index_save_failure_after_promotion_returns_imported_external_only_when_snapshot_confirms_external(
+) {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    fixture.ownership.failure.store(1, Ordering::SeqCst);
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["status"], "importedExternal");
+    assert_eq!(
+        result["reasonCode"],
+        "plugin_import_ownership_not_registered"
+    );
+    assert_eq!(
+        imported_item(&result["snapshot"], "com.example.notes")["canRemove"],
+        false
+    );
+    assert_eq!(fixture.target_manifests().len(), 1);
+    assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+    let restarted =
+        serde_json::to_value(fixture.restart_runtime().get_catalog().await.unwrap()).unwrap();
+    assert_eq!(
+        imported_item(&restarted, "com.example.notes")["management"],
+        "external"
+    );
+}
+
+#[tokio::test]
+async fn postcommit_index_uncertainty_returns_imported_not_visible_with_last_complete_snapshot() {
+    for failure in [2, 3] {
+        let fixture = ImportFixture::new().await;
+        let preview = fixture.prepare_valid().await;
+        let before = serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
+        fixture.ownership.failure.store(failure, Ordering::SeqCst);
+        let result = wire(
+            fixture
+                .runtime
+                .commit_import(&preview.token, &preview.catalog_generation)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["status"], "importedNotVisible");
+        assert_eq!(result["snapshot"], before);
+        assert_eq!(fixture.target_manifests().len(), 1);
+        assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+    }
+}
+
+#[tokio::test]
+async fn unpublished_import_documents_block_old_generation_lifecycle_until_reload() {
+    for failure in ["committed-index-error", "unavailable-postscan"] {
+        let fixture = ImportFixture::new().await;
+        let initial_preview = fixture.prepare_valid().await;
+        let initial = wire(
+            fixture
+                .runtime
+                .commit_import(&initial_preview.token, &initial_preview.catalog_generation)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(initial["status"], "imported");
+        let before = initial["snapshot"].clone();
+        let generation = before["catalogGeneration"].as_str().unwrap().to_owned();
+
+        fs::write(&fixture.source, unrelated_manifest()).unwrap();
+        let preview = fixture.prepare_valid().await;
+        match failure {
+            "committed-index-error" => fixture.ownership.failure.store(2, Ordering::SeqCst),
+            "unavailable-postscan" => fixture.discovery.panic_on(5),
+            _ => unreachable!(),
+        }
+        let result = wire(
+            fixture
+                .runtime
+                .commit_import(&preview.token, &preview.catalog_generation)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["status"], "importedNotVisible", "{failure}");
+        assert_eq!(result["snapshot"], before, "{failure}");
+        assert_eq!(
+            serde_json::to_value(fixture.runtime.registry.read().await.catalog_snapshot()).unwrap(),
+            before,
+            "{failure}"
+        );
+
+        fixture.clear_events();
+        let state_saves = fixture.persistence.saves.load(Ordering::SeqCst);
+        let removal_prepares = fixture.removal_prepares.load(Ordering::SeqCst);
+        let toggle = fixture
+            .runtime
+            .set_enabled("com.example.notes", true, &generation)
+            .await
+            .unwrap_err();
+        assert_eq!(error_code(toggle), "plugin_catalog_stale", "{failure}");
+        let removal = serde_json::to_value(
+            fixture
+                .runtime
+                .remove_managed_local_plugin("com.example.notes", &generation)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(removal["status"], "notRemoved", "{failure}");
+        assert_eq!(removal["reasonCode"], "plugin_catalog_stale", "{failure}");
+        assert_eq!(
+            fixture.persistence.saves.load(Ordering::SeqCst),
+            state_saves,
+            "{failure}"
+        );
+        assert_eq!(
+            fixture.removal_prepares.load(Ordering::SeqCst),
+            removal_prepares,
+            "{failure}"
+        );
+        assert!(fixture.events.lock().unwrap().is_empty(), "{failure}");
+
+        let reconciled = fixture.runtime.reload_catalog().await.unwrap();
+        assert_ne!(reconciled.catalog_generation, generation, "{failure}");
+        fixture.clear_events();
+        fixture
+            .runtime
+            .set_enabled("com.example.notes", true, &reconciled.catalog_generation)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.persistence.saves.load(Ordering::SeqCst),
+            state_saves + 1,
+            "{failure}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ownership_unavailable_and_max_revision_reject_before_stage() {
+    for (bytes, reason) in [
+        (
+            br#"{"schemaVersion":99}"#.as_slice(),
+            "plugin_ownership_unavailable",
+        ),
+        (
+            br#"{"schemaVersion":1,"revision":"18446744073709551615","entries":[]}"#.as_slice(),
+            "plugin_ownership_revision_exhausted",
+        ),
+    ] {
+        let fixture = ImportFixture::new().await;
+        fs::write(fixture.plugins_root.join("managed-ownership.json"), bytes).unwrap();
+        fixture.runtime.reload_catalog().await.unwrap();
+        let preview = fixture.prepare_valid().await;
+        fixture.clear_events();
+        let result = wire(
+            fixture
+                .runtime
+                .commit_import(&preview.token, &preview.catalog_generation)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["status"], "notImported");
+        assert_eq!(result["reasonCode"], reason);
+        assert_eq!(*fixture.events.lock().unwrap(), ["scan"]);
+        assert!(fixture.target_manifests().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ownership_160_capacity_rejects_before_stage() {
+    use crate::plugin::ownership::*;
+    let fixture = ImportFixture::new().await;
+    let mut index = ManagedOwnershipIndexV1::empty();
+    for number in 1..=160u128 {
+        let mut manifest = manifest_from_bytes(VALID);
+        manifest.id =
+            crate::plugin::manifest::PluginId::parse(format!("com.example.p{number}")).unwrap();
+        let record = PluginRecord::local_declarative(manifest).unwrap();
+        let receipt = OwnershipReceiptV1::new(
+            ReceiptId::parse(&format!("{number:012x}40008000{number:012x}")).unwrap(),
+            PackageSlot::parse(&format!("pkg-{number:032x}")).unwrap(),
+            &record,
+        )
+        .unwrap();
+        let entry = ManagedOwnershipEntryV1::managed(
+            VerifiedPackageReceipt {
+                canonical_sha256: receipt.canonical_sha256(),
+                model: receipt,
+                file_identity: FileIdentity {
+                    volume: 1,
+                    object: number * 3,
+                },
+            },
+            &record,
+            FileIdentity {
+                volume: 1,
+                object: number * 3 + 1,
+            },
+            FileIdentity {
+                volume: 1,
+                object: number * 3 + 2,
+            },
+        )
+        .unwrap();
+        index = index.register(entry).unwrap();
+    }
+    fs::write(
+        fixture.plugins_root.join("managed-ownership.json"),
+        index.canonical_bytes().unwrap(),
+    )
+    .unwrap();
+    fixture.runtime.reload_catalog().await.unwrap();
+    let preview = fixture.prepare_valid().await;
+    fixture.clear_events();
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["reasonCode"], "plugin_ownership_capacity_exceeded");
+    assert_eq!(*fixture.events.lock().unwrap(), ["scan"]);
+    assert_eq!(fixture.target_manifests().len(), 0);
+}
+
+#[tokio::test]
+async fn one_complete_candidate_is_published_and_no_registry_lock_crosses_promotion() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    let before = fixture.runtime.get_catalog().await.unwrap();
+    let mut promotion = fixture.storage_controls.block_next_promotion();
+    let mut commit = Box::pin(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation),
+    );
+    assert!(futures_util::poll!(&mut commit).is_pending());
+    promotion.wait_started().await;
+    {
+        let live = fixture
+            .runtime
+            .registry
+            .try_read()
+            .expect("filesystem work must not hold registry lock");
+        assert_eq!(live.catalog_snapshot(), before);
+    }
+    let stage = fs::read_dir(fixture.plugins_root.join("import-staging"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut files = fs::read_dir(stage)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    files.sort();
+    assert_eq!(files, ["manifest.json", "ownership-receipt.json"]);
+    promotion.release();
+    let result = wire(commit.await.unwrap());
+    assert_eq!(result["status"], "imported");
+    assert_eq!(result["snapshot"]["catalogGeneration"], "2");
+    assert_eq!(result["snapshot"]["revision"], "1");
+}
+
+#[tokio::test]
+async fn changed_promoted_locator_never_reports_imported() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    let root = fixture.local_root.clone();
+    *fixture.storage_controls.after_promotion.lock().unwrap() = Some(Box::new(move || {
+        let package = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+        let target = root.join("pkg-ffffffffffffffffffffffffffffffff");
+        fs::rename(package, target).unwrap();
+    }));
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["status"], "importedNotVisible");
+    assert_eq!(fixture.target_manifests().len(), 1);
+    assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+}
+
+#[tokio::test]
+async fn target_identity_change_during_verification_never_registers_index() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    let root = fixture.local_root.clone();
+    let retained = fixture.root().join("retained-manifest.json");
+    *fixture.storage_controls.after_promotion.lock().unwrap() = Some(Box::new(move || {
+        let package = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+        fs::rename(package.join("manifest.json"), retained).unwrap();
+        fs::write(
+            package.join("manifest.json"),
+            PreparedManifest::parse(VALID).unwrap().bytes(),
+        )
+        .unwrap();
+    }));
+    fixture.storage_controls.make_next_promotion_unverified();
+    fixture.clear_events();
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["status"], "importedNotVisible");
+    assert_eq!(fixture.target_manifests().len(), 1);
+    assert!(!fixture.events.lock().unwrap().contains(&"save-index"));
+    assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+    let reload =
+        serde_json::to_value(fixture.restart_runtime().get_catalog().await.unwrap()).unwrap();
+    assert_eq!(
+        imported_item(&reload, "com.example.notes")["management"],
+        "external"
+    );
+}
+
+#[tokio::test]
+async fn unexpected_postpromotion_worker_panic_is_still_a_structured_committed_result() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    fixture.storage_controls.make_next_promotion_unverified();
+    fixture
+        .storage_controls
+        .panic_promotion_state
+        .store(true, Ordering::SeqCst);
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["status"], "importedNotVisible");
+    assert_eq!(fixture.target_manifests().len(), 1);
+    assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
+}
+
+#[tokio::test]
+async fn state_revision_and_capacity_reject_before_any_stage_access() {
+    for full in [false, true] {
+        let mut fixture = ImportFixture::new().await;
+        let entries = if full {
+            (0..512).map(|number| json!({
+                "id": format!("com.example.old{number}"), "source": "builtIn", "publisherId": "com.example",
+                "approvalFingerprint": "v1:none", "enabled": false
+            })).collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        fs::write(
+            fixture.state_path(),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2, "revision": "18446744073709551615", "entries": entries
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fixture.runtime = fixture.restart_runtime();
+        let preview = fixture.prepare_valid().await;
+        let result = wire(
+            fixture
+                .runtime
+                .commit_import(&preview.token, &preview.catalog_generation)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            result["reasonCode"],
+            if full {
+                "plugin_state_capacity_exceeded"
+            } else {
+                "plugin_revision_exhausted"
+            }
+        );
+        assert_eq!(result["disabledDecisionSaved"], false);
+        assert!(!fixture.plugins_root.join("import-staging").exists());
+    }
+}
+
+#[tokio::test]
+async fn index_not_committed_plus_failed_postscan_retains_external_without_false_confirmation() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    let before = serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
+    fixture.ownership.failure.store(1, Ordering::SeqCst);
+    fixture.discovery.panic_on(3);
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["status"], "importedNotVisible");
+    assert_eq!(result["snapshot"], before);
+    let reload = serde_json::to_value(fixture.runtime.reload_catalog().await.unwrap()).unwrap();
+    let item = imported_item(&reload, "com.example.notes");
+    assert_eq!(item["management"], "external");
+    assert_eq!(item["status"], "disabled");
+    assert_eq!(item["canRemove"], false);
+    assert_eq!(
+        fixture
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| **event == "save-index")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_final_publication_preserves_complete_snapshot_and_registered_package() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    let runtime = Arc::clone(&fixture.runtime);
+    *fixture.storage_controls.after_promotion.lock().unwrap() = Some(Box::new(move || {
+        runtime
+            .registry
+            .blocking_write()
+            .set_catalog_generation_for_test(u64::MAX);
+    }));
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["status"], "importedNotVisible");
+    assert_eq!(
+        result["snapshot"]["catalogGeneration"],
+        u64::MAX.to_string()
+    );
+    assert_eq!(result["snapshot"]["plugins"].as_array().unwrap().len(), 1);
+    assert_eq!(fixture.target_manifests().len(), 1);
+    let restarted =
+        serde_json::to_value(fixture.restart_runtime().get_catalog().await.unwrap()).unwrap();
+    assert_eq!(
+        imported_item(&restarted, "com.example.notes")["management"],
+        "managed"
+    );
+}
+
+#[tokio::test]
 async fn imported_package_stays_disabled_after_primary_corruption_and_backup_recovery() {
     let mut fixture = ImportFixture::with_real_disk().await;
     fixture.seed_enabled_orphan().unwrap();
@@ -708,7 +1333,15 @@ async fn imported_package_stays_disabled_after_primary_corruption_and_backup_rec
 
 #[tokio::test]
 async fn process_crash_checkpoints_reconstruct_only_committed_disk_state() {
-    for checkpoint in ["stage-ready", "disabled-saved", "promoted", "published"] {
+    for checkpoint in [
+        "stage-ready",
+        "disabled-saved",
+        "promotion-returned",
+        "target-verified",
+        "ownership-main-committed",
+        "candidate-built",
+        "published",
+    ] {
         let mut fixture = ImportFixture::with_real_disk().await;
         fixture.seed_enabled_orphan().unwrap();
         fixture.runtime = fixture.restart_runtime();
@@ -725,7 +1358,7 @@ async fn process_crash_checkpoints_reconstruct_only_committed_disk_state() {
             "checkpoint {checkpoint}"
         );
 
-        if matches!(checkpoint, "promoted" | "published") {
+        if !matches!(checkpoint, "stage-ready" | "disabled-saved") {
             fixture.corrupt_primary().unwrap();
         }
         fixture.runtime = fixture.restart_runtime();
@@ -769,6 +1402,25 @@ async fn process_crash_checkpoints_reconstruct_only_committed_disk_state() {
             let local = imported_item(&snapshot, "com.example.notes");
             assert_eq!(local["source"], "localDeclarative");
             assert_eq!(local["status"], "disabled");
+            let committed = matches!(
+                checkpoint,
+                "ownership-main-committed" | "candidate-built" | "published"
+            );
+            assert_eq!(
+                local["management"],
+                if committed { "managed" } else { "external" }
+            );
+            assert_eq!(
+                fixture
+                    .ownership
+                    .inner
+                    .load()
+                    .unwrap()
+                    .index
+                    .entries()
+                    .len(),
+                usize::from(committed)
+            );
             assert_eq!(fixture.target_manifests().len(), 1);
             assert!(!persisted_enabled(
                 &fixture.plugins_root,
@@ -779,6 +1431,37 @@ async fn process_crash_checkpoints_reconstruct_only_committed_disk_state() {
                 direct_entry_count(&fixture.plugins_root.join("import-staging")),
                 0
             );
+            assert!(
+                crate::plugin::discovery::discover_from_plugins_root(&fixture.plugins_root)
+                    .removals
+                    .observations
+                    .is_empty()
+            );
+            // A package without an index must never gain one, with or without its receipt.
+            if !committed {
+                let package = fs::read_dir(&fixture.local_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                fs::remove_file(package.join("ownership-receipt.json")).unwrap();
+                fixture.runtime = fixture.restart_runtime();
+                let no_receipt =
+                    serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
+                assert_eq!(
+                    imported_item(&no_receipt, "com.example.notes")["management"],
+                    "external"
+                );
+                assert!(fixture
+                    .ownership
+                    .inner
+                    .load()
+                    .unwrap()
+                    .index
+                    .entries()
+                    .is_empty());
+            }
         }
     }
 }
@@ -789,6 +1472,16 @@ async fn import_crash_child() {
     let Some(root) = std::env::var_os(CRASH_ROOT_ENV).map(PathBuf::from) else {
         return;
     };
+    assert_eq!(
+        std::env::var("EASIFLUX_PLUGIN_TEST_CHILD").unwrap(),
+        "import"
+    );
+    assert_eq!(root.canonicalize().unwrap(), root);
+    assert!(root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("plugin-runtime-import-"));
     let Some(checkpoint) =
         std::env::var_os(CRASH_CHECKPOINT_ENV).and_then(|value| value.into_string().ok())
     else {
@@ -796,7 +1489,13 @@ async fn import_crash_child() {
     };
     assert!(matches!(
         checkpoint.as_str(),
-        "stage-ready" | "disabled-saved" | "promoted" | "published"
+        "stage-ready"
+            | "disabled-saved"
+            | "promotion-returned"
+            | "target-verified"
+            | "ownership-main-committed"
+            | "candidate-built"
+            | "published"
     ));
     let runtime = crash_runtime(&root, &checkpoint);
     let preview = match runtime
@@ -906,7 +1605,15 @@ async fn commit_orders_disable_before_promotion_and_publishes_disabled_content()
     );
     assert_eq!(
         *fixture.events.lock().unwrap(),
-        ["scan", "stage", "disable", "promote", "scan"]
+        [
+            "scan",
+            "stage",
+            "disable",
+            "promote",
+            "verify-target",
+            "save-index",
+            "scan"
+        ]
     );
 }
 
@@ -1036,8 +1743,98 @@ async fn state_failure_prevents_promotion() {
     assert!(fixture.target_manifests().is_empty());
     assert_eq!(
         *fixture.events.lock().unwrap(),
-        ["scan", "stage", "disable", "cleanup"]
+        ["scan", "stage", "disable"]
     );
+    assert_eq!(fixture.persistence.inner.load().unwrap().state.revision, 0);
+    assert_eq!(fixture.runtime.get_catalog().await.unwrap().revision, "0");
+    assert_eq!(
+        fixture
+            .storage_controls
+            .promote_calls
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(fixture.plugins_root.join("import-staging"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn committed_state_errors_preserve_documents_without_promotion_or_publication() {
+    use crate::storage::safe_plugin_document::PersistOutcome;
+    for outcome in [
+        PersistOutcome::CommittedProcessCrashSafe,
+        PersistOutcome::CommittedDurable,
+    ] {
+        let fixture = ImportFixture::new().await;
+        let preview = fixture.prepare_valid().await;
+        let before = serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
+        *fixture.persistence.committed_error.lock().unwrap() = Some(outcome);
+        fixture.clear_events();
+        let result = wire(
+            fixture
+                .runtime
+                .commit_import(&preview.token, &preview.catalog_generation)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["disabledDecisionSaved"], true, "{outcome:?}");
+        assert_eq!(result["status"], "notImported");
+        assert_eq!(result["reasonCode"], "plugin_state_persist_failed");
+        assert_eq!(result["snapshot"], before);
+        assert_eq!(
+            *fixture.events.lock().unwrap(),
+            ["scan", "stage", "disable"]
+        );
+        assert_eq!(
+            fixture
+                .storage_controls
+                .promote_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(fixture.target_manifests().is_empty());
+        assert!(!fixture.plugins_root.join("managed-ownership.json").exists());
+        assert_eq!(
+            fs::read_dir(fixture.plugins_root.join("import-staging"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let state = fixture.persistence.inner.load().unwrap().state;
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].id.to_string(), "com.example.notes");
+        assert!(!state.entries[0].enabled);
+        // An independent decision must build on the adopted document, not overwrite it.
+        let saves_before = fixture.persistence.saves.load(Ordering::SeqCst);
+        let error = fixture
+            .runtime
+            .set_enabled("com.example.builtin", true, &preview.catalog_generation)
+            .await
+            .unwrap_err();
+        assert_eq!(error_code(error), "plugin_catalog_stale");
+        assert_eq!(
+            fixture.persistence.saves.load(Ordering::SeqCst),
+            saves_before
+        );
+        let refreshed = fixture.runtime.reload_catalog().await.unwrap();
+        fixture
+            .runtime
+            .set_enabled("com.example.builtin", true, &refreshed.catalog_generation)
+            .await
+            .unwrap();
+        let next = fixture.persistence.inner.load().unwrap().state;
+        assert_eq!(next.revision, 2);
+        assert_eq!(next.entries.len(), 2);
+        assert!(next
+            .entries
+            .iter()
+            .any(|entry| entry.id.to_string() == "com.example.notes" && !entry.enabled));
+    }
 }
 
 #[tokio::test]
@@ -1137,17 +1934,15 @@ async fn postscan_failure_reports_imported_not_visible() {
         result["reasonCode"],
         "plugin_import_publication_unconfirmed"
     );
-    assert_eq!(
-        result["snapshot"]["localDiscovery"]["status"],
-        "unavailable"
-    );
+    assert_eq!(result["snapshot"]["localDiscovery"]["status"], "available");
     assert_eq!(fixture.target_manifests().len(), 1);
 }
 
 #[tokio::test]
-async fn unverified_promoted_identity_is_imported_not_visible() {
+async fn committed_promotion_error_preserves_last_complete_snapshot() {
     let fixture = ImportFixture::new().await;
     let preview = fixture.prepare_valid().await;
+    let before = serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
     fixture.storage_controls.make_next_promotion_unverified();
     fixture.clear_events();
     let result = wire(
@@ -1159,10 +1954,106 @@ async fn unverified_promoted_identity_is_imported_not_visible() {
     );
     assert_eq!(result["status"], "importedNotVisible");
     assert_eq!(
-        imported_item(&result["snapshot"], "com.example.notes")["status"],
-        "disabled"
+        result["reasonCode"],
+        "plugin_import_publication_unconfirmed"
+    );
+    assert_eq!(result["snapshot"], before);
+    assert_eq!(
+        serde_json::to_value(fixture.runtime.registry.read().await.catalog_snapshot()).unwrap(),
+        before
     );
     assert_eq!(fixture.target_manifests().len(), 1);
+    assert_eq!(
+        *fixture.events.lock().unwrap(),
+        [
+            "scan",
+            "stage",
+            "disable",
+            "promote",
+            "verify-target",
+            "scan"
+        ]
+    );
+    assert!(!fixture.plugins_root.join("managed-ownership.json").exists());
+    let state = fixture.persistence.inner.load().unwrap().state;
+    assert_eq!(state.revision, 1);
+    assert_eq!(state.entries.len(), 1);
+    assert_eq!(state.entries[0].id.to_string(), "com.example.notes");
+    assert!(!state.entries[0].enabled);
+    let replay = expect_commit_error(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await,
+    );
+    assert_eq!(error_code(replay), "plugin_import_token_invalid");
+    assert_eq!(
+        fixture
+            .storage_controls
+            .promote_calls
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unconfirmed_promotion_error_preserves_last_complete_snapshot() {
+    let fixture = ImportFixture::new().await;
+    let preview = fixture.prepare_valid().await;
+    let before = serde_json::to_value(fixture.runtime.get_catalog().await.unwrap()).unwrap();
+    fixture
+        .storage_controls
+        .unconfirmed_promotion
+        .store(true, Ordering::SeqCst);
+    fixture.clear_events();
+    let result = wire(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["status"], "importedNotVisible");
+    assert_eq!(
+        result["reasonCode"],
+        "plugin_import_publication_unconfirmed"
+    );
+    assert_eq!(result["snapshot"], before);
+    assert_eq!(
+        serde_json::to_value(fixture.runtime.registry.read().await.catalog_snapshot()).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read_dir(fixture.plugins_root.join("import-staging"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert!(fixture.target_manifests().is_empty());
+    assert_eq!(
+        *fixture.events.lock().unwrap(),
+        ["scan", "stage", "disable", "promote", "scan"]
+    );
+    assert!(!fixture.plugins_root.join("managed-ownership.json").exists());
+    let state = fixture.persistence.inner.load().unwrap().state;
+    assert_eq!(state.revision, 1);
+    assert_eq!(state.entries.len(), 1);
+    assert_eq!(state.entries[0].id.to_string(), "com.example.notes");
+    assert!(!state.entries[0].enabled);
+    let replay = expect_commit_error(
+        fixture
+            .runtime
+            .commit_import(&preview.token, &preview.catalog_generation)
+            .await,
+    );
+    assert_eq!(error_code(replay), "plugin_import_token_invalid");
+    assert_eq!(
+        fixture
+            .storage_controls
+            .promote_calls
+            .load(Ordering::SeqCst),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1171,14 +2062,14 @@ async fn promotion_worker_panic_is_outcome_unknown_without_cleanup() {
     let preview = fixture.prepare_valid().await;
     fixture.storage_controls.panic_after_next_promotion();
     fixture.clear_events();
-    let error = expect_commit_error(
+    let serialized = wire(
         fixture
             .runtime
             .commit_import(&preview.token, &preview.catalog_generation)
-            .await,
+            .await
+            .unwrap(),
     );
-    let serialized = serde_json::to_value(error).unwrap();
-    assert_eq!(serialized, json!("内部错误: 插件目录请求暂不可用"));
+    assert_eq!(serialized["status"], "importedNotVisible");
     assert!(!serialized.to_string().contains("private"));
     assert_eq!(fixture.target_manifests().len(), 1);
     assert!(!fixture.events.lock().unwrap().contains(&"cleanup"));
@@ -1236,6 +2127,20 @@ async fn lost_commit_caller_still_finishes_once() {
     assert_eq!(
         imported_item(&snapshot, "com.example.notes")["status"],
         "disabled"
+    );
+    assert_eq!(
+        imported_item(&snapshot, "com.example.notes")["management"],
+        "managed"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| **event == "save-index")
+            .count(),
+        1
     );
 }
 

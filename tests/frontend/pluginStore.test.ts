@@ -6,6 +6,7 @@ import type {
   PluginCatalogItem,
   PluginCatalogMutationResult,
   PluginCatalogSnapshot,
+  RemoveManagedLocalPluginResult,
   PluginStatus,
   ReadyLocalManifestImport,
 } from '../../src/types/plugin'
@@ -18,6 +19,7 @@ const serviceMocks = vi.hoisted(() => ({
   prepareImport: vi.fn(),
   cancelImport: vi.fn(),
   commitImport: vi.fn(),
+  removeManaged: vi.fn(),
 }))
 
 vi.mock('../../src/services/pluginService', async (importOriginal) => ({
@@ -28,6 +30,7 @@ vi.mock('../../src/services/pluginService', async (importOriginal) => ({
   prepareLocalManifestImport: serviceMocks.prepareImport,
   cancelLocalManifestImport: serviceMocks.cancelImport,
   commitLocalManifestImport: serviceMocks.commitImport,
+  removeManagedLocalPlugin: serviceMocks.removeManaged,
 }))
 
 interface Deferred<T> {
@@ -66,6 +69,9 @@ function item(
       ...overrides,
     },
     source: 'builtIn',
+    management: 'builtIn',
+    canRemove: false,
+    toggleBlockReasonCode: null,
     status,
     statusReasonCode: reason,
     canToggle: status !== 'blocked',
@@ -82,10 +88,11 @@ function snapshot(
   catalogGeneration = '1',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision,
     catalogGeneration,
     localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
     availability: 'available',
     availabilityReasonCode: null,
     plugins,
@@ -97,10 +104,11 @@ function unavailableSnapshot(
   reason: PluginAvailabilityReason = 'stateUnavailable',
 ): PluginCatalogSnapshot {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision,
     catalogGeneration: '1',
     localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
     availability: 'unavailable',
     availabilityReasonCode: reason,
     plugins: [
@@ -117,7 +125,7 @@ function mutation(
   catalogGeneration = '1',
 ): PluginCatalogMutationResult {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision,
     catalogGeneration,
     plugin: item(id, enabled ? 'enabled' : 'disabled'),
@@ -139,6 +147,8 @@ function importedItem(
   return {
     ...item(sourcePreview.manifest.id, 'disabled', sourcePreview.manifest),
     source: 'localDeclarative',
+    management: 'managed',
+    canRemove: true,
   }
 }
 
@@ -147,11 +157,59 @@ function importedResult(
   sourcePreview: ReadyLocalManifestImport = preview,
 ): CommitLocalManifestImportResult {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: 'imported',
     pluginId: sourcePreview.manifest.id,
     snapshot: returnedSnapshot,
   }
+}
+
+function managedDisabledItem(
+  overrides: Partial<PluginCatalogItem> = {},
+): PluginCatalogItem {
+  return {
+    ...item('com.example.notes'),
+    source: 'localDeclarative',
+    management: 'managed',
+    canRemove: true,
+    ...overrides,
+  }
+}
+
+function removalResult(
+  returnedSnapshot: PluginCatalogSnapshot,
+  status: RemoveManagedLocalPluginResult['status'] = 'removed',
+): RemoveManagedLocalPluginResult {
+  if (status === 'notRemoved') {
+    return {
+      schemaVersion: 1,
+      status,
+      disabledDecisionSaved: false,
+      reasonCode: 'plugin_remove_requires_disabled',
+      snapshot: returnedSnapshot,
+    }
+  }
+  if (status === 'removedCatalogUnconfirmed') {
+    return {
+      schemaVersion: 1,
+      status,
+      pluginId: 'com.example.notes',
+      reasonCode: 'plugin_remove_publication_unconfirmed',
+      snapshot: returnedSnapshot,
+    }
+  }
+  return { schemaVersion: 1, status, pluginId: 'com.example.notes', snapshot: returnedSnapshot }
+}
+
+async function loadedStoreWith(
+  plugin: PluginCatalogItem,
+  catalogGeneration = '1',
+  revision = '1',
+) {
+  serviceMocks.getCatalog.mockResolvedValueOnce(snapshot(revision, [plugin], catalogGeneration))
+  const store = usePluginStore()
+  await store.load()
+  return store
 }
 
 async function loadedStore(revision = '1') {
@@ -170,6 +228,7 @@ describe('plugin store manifest import ownership and arbitration', () => {
     serviceMocks.prepareImport.mockReset()
     serviceMocks.cancelImport.mockReset()
     serviceMocks.commitImport.mockReset()
+    serviceMocks.removeManaged.mockReset()
   })
 
   it('does not replace a preview generation after reload', async () => {
@@ -273,14 +332,16 @@ describe('plugin store manifest import ownership and arbitration', () => {
     const retrying = store.retry()
     serviceMocks.prepareImport.mockResolvedValueOnce(preview)
     await store.prepareImport()
-    const importSnapshot = snapshot('2', [importedItem()], '1')
+    const importSnapshot = snapshot('2', [importedItem()], '2')
     serviceMocks.commitImport.mockResolvedValueOnce(importedResult(importSnapshot))
     await store.commitImport()
 
-    olderRetry.resolve(snapshot('2', [], '1'))
+    olderRetry.resolve(snapshot('2', [
+      { ...importedItem(), status: 'enabled', canRemove: false },
+    ], '2'))
     await retrying
     expect(store.catalog).toEqual(importSnapshot.plugins)
-    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('1', [], '1'))
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('1', [importedItem()], '2'))
     await store.reload()
     expect(store.catalog).toEqual(importSnapshot.plugins)
     expect(store.revision).toBe('2')
@@ -401,11 +462,11 @@ describe('plugin store manifest import ownership and arbitration', () => {
     serviceMocks.prepareImport.mockResolvedValueOnce(preview)
     await store.prepareImport()
     const result = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: 'notImported',
       disabledDecisionSaved: true,
       reasonCode: 'plugin_import_write_failed',
-      snapshot: snapshot('2', [], '1'),
+      snapshot: snapshot('2', [], '2'),
     } satisfies CommitLocalManifestImportResult
     serviceMocks.commitImport.mockResolvedValueOnce(result)
 
@@ -527,7 +588,7 @@ describe('plugin store catalog generations', () => {
 
   it('new generation replaces metadata, source, discovery and item revisions even with a lower state revision', async () => {
     const store = await loadedStore('9')
-    const replacement = { ...item('com.easiflux.alpha', 'disabled', { name: 'Replacement', version: '2.0.0' }), source: 'localDeclarative' as const }
+    const replacement: PluginCatalogItem = { ...item('com.easiflux.alpha', 'disabled', { name: 'Replacement', version: '2.0.0' }), source: 'localDeclarative', management: 'external' }
     serviceMocks.reloadCatalog.mockResolvedValueOnce({
       ...snapshot('2', [replacement], '2'),
       localDiscovery: { status: 'degraded', rejectedPackageCount: 2 },
@@ -625,7 +686,10 @@ describe('plugin store catalog generations', () => {
     const newerService = older === 'load' ? serviceMocks.reloadCatalog : serviceMocks.getCatalog
     olderService.mockReturnValueOnce(response.promise)
     const pending = older === 'load' ? store.retry() : store.reload()
-    const fresh = snapshot('4', [item('com.easiflux.alpha', 'enabled')])
+    const fresh = snapshot('4', [
+      item('com.easiflux.alpha', 'enabled'),
+      item('com.easiflux.beta', 'enabled'),
+    ])
     newerService.mockResolvedValueOnce(fresh)
     await (older === 'load' ? store.reload() : store.retry())
     response.reject({ code: 'plugin_state_unavailable', message: 'private' })
@@ -705,12 +769,13 @@ describe('plugin store catalog generations', () => {
     const response = deferred<PluginCatalogMutationResult>()
     serviceMocks.setEnabled.mockReturnValueOnce(response.promise)
     const changing = store.setEnabled('com.easiflux.alpha', true)
-    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('2', []))
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('2', [], '2'))
     await store.retry()
     response.resolve(mutation('3', 'com.easiflux.alpha', true))
     await expect(changing).resolves.toBe(false)
     expect(store.catalog).toEqual([])
     expect(store.revision).toBe('2')
+    expect(store.catalogGeneration).toBe('2')
   })
 
   it('accepts equal per-item revisions for idempotent mutation confirmations', async () => {
@@ -763,7 +828,10 @@ describe('plugin store snapshot tie arbitration', () => {
       const reloading = store.reload()
       const stale = unavailableSnapshot('0')
       stale.localDiscovery = { status: 'unavailable', rejectedPackageCount: 0 }
-      const fresh = snapshot('0', [item('com.easiflux.alpha', 'disabled', { name: 'Recovered' })])
+      const fresh = snapshot('0', [
+        item('com.easiflux.alpha', 'enabled'),
+        item('com.easiflux.beta', 'enabled'),
+      ])
       fresh.localDiscovery = { status: 'degraded', rejectedPackageCount: 1 }
       if (completion === 'load-first') {
         getResponse.resolve(stale)
@@ -797,7 +865,10 @@ describe('plugin store snapshot tie arbitration', () => {
     const sameRetry = store.retry()
     expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(1)
     expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(2)
-    const fresh = snapshot('0', [item('com.easiflux.alpha', 'disabled', { name: 'Explicit retry' })])
+    const fresh = snapshot('0', [
+      item('com.easiflux.alpha', 'enabled'),
+      item('com.easiflux.beta', 'enabled'),
+    ])
     retryResponse.resolve(fresh)
     await Promise.all([retrying, sameRetry])
     reloadResponse.resolve(unavailableSnapshot('0'))
@@ -807,18 +878,21 @@ describe('plugin store snapshot tie arbitration', () => {
   })
 
   it.each([
-    ['generation', '2', '0'],
-    ['revision', '1', '2'],
-  ])('a higher %s wins even if its request started earlier', async (_label, generation, revision) => {
+    ['generation', '2', '0', []],
+    ['revision', '1', '2', [
+      item('com.easiflux.alpha', 'enabled'),
+      item('com.easiflux.beta', 'enabled'),
+    ]],
+  ] as const)('a higher %s wins even if its request started earlier', async (_label, generation, revision, plugins) => {
     const getResponse = deferred<PluginCatalogSnapshot>()
     serviceMocks.getCatalog.mockReturnValueOnce(getResponse.promise)
     serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('1'))
     const store = usePluginStore()
     const loading = store.load()
     await store.reload()
-    getResponse.resolve(snapshot(revision, [], generation))
+    getResponse.resolve(snapshot(revision, [...plugins], generation))
     await loading
-    expect(store.catalog).toEqual([])
+    expect(store.catalog).toEqual(plugins)
     expect(store.catalogGeneration).toBe(generation)
     expect(store.revision).toBe(revision)
   })
@@ -830,7 +904,10 @@ describe('plugin store snapshot tie arbitration', () => {
     const retrying = store.retry()
     serviceMocks.reloadCatalog.mockRejectedValueOnce({ code: 'plugin_catalog_stale', message: 'private' })
     await store.reload()
-    const fresh = snapshot('0', [item('com.easiflux.alpha', 'disabled', { name: 'Retry result' })])
+    const fresh = snapshot('0', [
+      item('com.easiflux.alpha', 'enabled'),
+      item('com.easiflux.beta', 'enabled'),
+    ])
     retryResponse.resolve(fresh)
     await retrying
     expect(store.catalog).toEqual(fresh.plugins)
@@ -844,7 +921,7 @@ describe('plugin store snapshot tie arbitration', () => {
     const retrying = store.retry()
     const fresh = snapshot('1', [
       item('com.easiflux.alpha'),
-      item('com.easiflux.beta', 'enabled', { name: 'Fresh Beta' }),
+      item('com.easiflux.beta', 'disabled'),
     ])
     serviceMocks.reloadCatalog.mockResolvedValueOnce(fresh)
     await store.reload()
@@ -853,7 +930,7 @@ describe('plugin store snapshot tie arbitration', () => {
     retryResponse.resolve(snapshot('1'))
     await retrying
     expect(store.catalog[0].status).toBe('enabled')
-    expect(store.catalog[1].manifest.name).toBe('Fresh Beta')
+    expect(store.catalog[1].status).toBe('disabled')
     expect(store.revision).toBe('2')
   })
 })
@@ -1009,7 +1086,9 @@ describe('plugin store mutation ownership and revisions', () => {
   })
 
   it.each([
-    ['source', 'item', { source: 'localDeclarative' }],
+    ['source', 'item', { source: 'localDeclarative', management: 'external' }],
+    ['management', 'item', { management: 'external' }],
+    ['toggle block', 'item', { toggleBlockReasonCode: 'removalPending' }],
     ['id', 'manifest', { id: 'com.easiflux.beta' }],
     ['schema', 'manifest', { schemaVersion: 2 }],
     ['publisher identity', 'manifest', { publisherId: 'com.other' }],
@@ -1259,5 +1338,273 @@ describe('plugin store mutation ownership and revisions', () => {
     expect(store.revision).toBe('4')
     expect(store.pendingIds).toBe(confirmedPending)
     expect(store.actionErrors).toBe(confirmedErrors)
+  })
+})
+
+describe('plugin store managed local removal ownership and arbitration', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.reloadCatalog.mockReset()
+    serviceMocks.setEnabled.mockReset()
+    serviceMocks.prepareImport.mockReset()
+    serviceMocks.cancelImport.mockReset()
+    serviceMocks.commitImport.mockReset()
+    serviceMocks.removeManaged.mockReset()
+  })
+
+  it('captures only a current managed disabled removable item and generation', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    expect(store.beginRemoval('com.example.notes')).toBe(true)
+    expect(store.removalStatus).toBe('confirming')
+    expect(store.removalTarget?.plugin.manifest.id).toBe('com.example.notes')
+    expect(store.removalTarget?.catalogGeneration).toBe('7')
+    expect(store.removalTarget?.revision).toBe('11')
+    expect(store.managedOwnership).toEqual({
+      status: 'available',
+      conflictingEntryCount: 0,
+      rollbackPendingCount: 0,
+      cleanupPendingCount: 0,
+    })
+  })
+
+  it.each([
+    ['built-in', item('com.example.notes')],
+    ['external', { ...managedDisabledItem(), management: 'external', canRemove: false }],
+    ['enabled', { ...managedDisabledItem(), status: 'enabled', canRemove: false }],
+    ['conflict', { ...managedDisabledItem(), management: 'ownershipConflict', canRemove: false }],
+    ['unavailable', { ...managedDisabledItem(), management: 'ownershipUnavailable', canRemove: false }],
+    ['pending', {
+      ...managedDisabledItem(),
+      management: 'removalPending',
+      canRemove: false,
+      toggleBlockReasonCode: 'removalPending',
+    }],
+  ] as const)('built_in_external_enabled_conflict_unavailable_and_pending_cannot_open_removal: %s', async (_label, plugin) => {
+    const store = await loadedStoreWith(plugin as PluginCatalogItem)
+    expect(store.beginRemoval('com.example.notes')).toBe(false)
+    expect(store.removalStatus).toBe('idle')
+    expect(store.removalTarget).toBeNull()
+  })
+
+  it('double_confirm_coalesces_to_one_service_call', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    const removed = deferred<RemoveManagedLocalPluginResult>()
+    serviceMocks.removeManaged.mockReturnValueOnce(removed.promise)
+    store.beginRemoval('com.example.notes')
+
+    const first = store.confirmRemoval()
+    const second = store.confirmRemoval()
+    expect(serviceMocks.removeManaged).toHaveBeenCalledExactlyOnceWith('com.example.notes', '7')
+    removed.resolve(removalResult(snapshot('12', [], '8')))
+    await Promise.all([first, second])
+    expect(serviceMocks.removeManaged).toHaveBeenCalledTimes(1)
+  })
+
+  it('new_generation_permanently_invalidates_unsubmitted_confirmation', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    store.beginRemoval('com.example.notes')
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('1', [managedDisabledItem()], '8'))
+    await store.reload()
+    expect(store.removalConfirmationStale).toBe(true)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('2', [managedDisabledItem()], '9'))
+    await store.reload()
+    expect(store.removalConfirmationStale).toBe(true)
+    await store.confirmRemoval()
+    expect(serviceMocks.removeManaged).not.toHaveBeenCalled()
+  })
+
+  it('same_generation_higher_revision_target_reenable_invalidates_confirmation', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    store.beginRemoval('com.example.notes')
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('12', [
+      { ...managedDisabledItem(), status: 'enabled', canRemove: false },
+    ], '7'))
+    await store.reload()
+    expect(store.removalConfirmationStale).toBe(true)
+  })
+
+  it('same_generation_unrelated_revision_does_not_invalidate_unchanged_target', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('11', [
+      managedDisabledItem(),
+      item('com.easiflux.beta'),
+    ], '7'))
+    const store = usePluginStore()
+    await store.load()
+    store.beginRemoval('com.example.notes')
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('12', [
+      managedDisabledItem(),
+      item('com.easiflux.beta', 'enabled'),
+    ], '7'))
+    await store.reload()
+    expect(store.removalConfirmationStale).toBe(false)
+  })
+
+  it('confirm_rechecks_current_target_before_invoke', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    store.beginRemoval('com.example.notes')
+    store.catalog[0].status = 'enabled'
+    store.catalog[0].canRemove = false
+    await store.confirmRemoval()
+    expect(store.removalConfirmationStale).toBe(true)
+    expect(store.removalStatus).toBe('confirming')
+    expect(serviceMocks.removeManaged).not.toHaveBeenCalled()
+  })
+
+  it('store_never_optimistically_removes_the_card', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    const removed = deferred<RemoveManagedLocalPluginResult>()
+    serviceMocks.removeManaged.mockReturnValueOnce(removed.promise)
+    store.beginRemoval('com.example.notes')
+    const pending = store.confirmRemoval()
+    expect(store.catalog.map((plugin) => plugin.manifest.id)).toEqual(['com.example.notes'])
+    removed.resolve(removalResult(snapshot('12', [], '8')))
+    await pending
+  })
+
+  it.each([
+    'removed',
+    'removedCleanupPending',
+    'removedCatalogUnconfirmed',
+    'notRemoved',
+  ] as const)('every_valid_remove_branch_routes_snapshot_through_common_bigint_arbitration: %s', async (status) => {
+    const store = await loadedStoreWith(managedDisabledItem(), '9007199254740992', '11')
+    store.beginRemoval('com.example.notes')
+    const returned = removalResult(snapshot('9007199254740993', [], '9007199254740993'), status)
+    if (status === 'removedCleanupPending') {
+      returned.snapshot.managedOwnership.status = 'degraded'
+      returned.snapshot.managedOwnership.cleanupPendingCount = 1
+    }
+    serviceMocks.removeManaged.mockResolvedValueOnce(returned)
+    await store.confirmRemoval()
+    expect(store.catalog).toEqual([])
+    expect(store.catalogGeneration).toBe('9007199254740993')
+    expect(store.revision).toBe('9007199254740993')
+    expect(store.removalResult).toBe(returned)
+    expect(store.managedOwnership).toEqual(returned.snapshot.managedOwnership)
+  })
+
+  it('late_lower_generation_remove_snapshot_cannot_delete_new_same_id_item', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    const removed = deferred<RemoveManagedLocalPluginResult>()
+    serviceMocks.removeManaged.mockReturnValueOnce(removed.promise)
+    store.beginRemoval('com.example.notes')
+    const pending = store.confirmRemoval()
+    const replacement = { ...managedDisabledItem(), management: 'external', canRemove: false } as PluginCatalogItem
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('1', [replacement], '8'))
+    await store.reload()
+    removed.resolve(removalResult(snapshot('99', [], '7')))
+    await pending
+    expect(store.catalog).toEqual([replacement])
+    expect(store.catalogGeneration).toBe('8')
+  })
+
+  it('same_generation_lower_revision_cannot_overwrite_newer_target_status', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    const removed = deferred<RemoveManagedLocalPluginResult>()
+    serviceMocks.removeManaged.mockReturnValueOnce(removed.promise)
+    store.beginRemoval('com.example.notes')
+    const pending = store.confirmRemoval()
+    const enabled = { ...managedDisabledItem(), status: 'enabled', canRemove: false } as PluginCatalogItem
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('13', [enabled], '7'))
+    await store.reload()
+    removed.resolve(removalResult(snapshot('12', [managedDisabledItem()], '7'), 'notRemoved'))
+    await pending
+    expect(store.catalog).toEqual([enabled])
+    expect(store.revision).toBe('13')
+  })
+
+  it('adversarial_protocol_violation_equal_counter_contradictory_DTOs_use_submission_order', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    const removed = deferred<RemoveManagedLocalPluginResult>()
+    serviceMocks.removeManaged.mockReturnValueOnce(removed.promise)
+    store.beginRemoval('com.example.notes')
+    const pending = store.confirmRemoval()
+    const enabled = { ...managedDisabledItem(), status: 'enabled', canRemove: false } as PluginCatalogItem
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('12', [enabled], '7'))
+    await store.reload()
+    removed.resolve(removalResult(snapshot('12', [managedDisabledItem()], '7'), 'notRemoved'))
+    await pending
+    expect(store.catalog).toEqual([enabled])
+    expect(store.revision).toBe('12')
+  })
+
+  it.each([
+    ['membership', (candidate: PluginCatalogSnapshot) => { candidate.plugins = [] }],
+    ['manifest', (candidate: PluginCatalogSnapshot) => { candidate.plugins[0].manifest.name = 'Changed' }],
+    ['source', (candidate: PluginCatalogSnapshot) => { candidate.plugins[0].source = 'builtIn' }],
+    ['management', (candidate: PluginCatalogSnapshot) => { candidate.plugins[0].management = 'external' }],
+    ['toggle block', (candidate: PluginCatalogSnapshot) => { candidate.plugins[0].toggleBlockReasonCode = 'removalPending' }],
+    ['capabilities', (candidate: PluginCatalogSnapshot) => { candidate.plugins[0].grantedCapabilities = ['network'] as never[] }],
+    ['ownership', (candidate: PluginCatalogSnapshot) => {
+      candidate.managedOwnership = { status: 'degraded', conflictingEntryCount: 1, rollbackPendingCount: 0, cleanupPendingCount: 0 }
+    }],
+  ] as const)('same_generation_structural_or_ownership_change_is_rejected: %s', async (_label, mutate) => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    const candidate = snapshot('99', [managedDisabledItem()], '7')
+    mutate(candidate)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(candidate)
+    await store.reload()
+    expect(store.revision).toBe('11')
+    expect(store.catalog).toEqual([managedDisabledItem()])
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(snapshot('12', [
+      { ...managedDisabledItem(), status: 'enabled', canRemove: false },
+    ], '7'))
+    await store.reload()
+    expect(store.revision).toBe('12')
+    expect(store.catalog[0].status).toBe('enabled')
+  })
+
+  it('remove_and_import_have_independent_flight_owners', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '1', '1')
+    const removed = deferred<RemoveManagedLocalPluginResult>()
+    serviceMocks.removeManaged.mockReturnValueOnce(removed.promise)
+    store.beginRemoval('com.example.notes')
+    const removing = store.confirmRemoval()
+    serviceMocks.prepareImport.mockResolvedValueOnce(preview)
+    await store.prepareImport()
+    expect(store.removalStatus).toBe('removing')
+    expect(store.importStatus).toBe('preview')
+    expect(store.pendingIds.size).toBe(0)
+    removed.resolve(removalResult(snapshot('2', [], '2')))
+    await removing
+  })
+
+  it.each([
+    new Error('transport lost'),
+    { code: 'plugin_invalid_response', message: 'private parser details' },
+  ])('transport_or_parser_failure_becomes_unknown_without_retry', async (failure) => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    store.beginRemoval('com.example.notes')
+    serviceMocks.removeManaged.mockRejectedValueOnce(failure)
+    await store.confirmRemoval()
+    expect(store.removalStatus).toBe('result')
+    expect(store.removalOutcomeUnknown).toBe(true)
+    expect(store.removalError).toBe('移除结果尚未确认，请重新扫描。')
+    expect(store.removalResult).toBeNull()
+    expect(serviceMocks.removeManaged).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.reloadCatalog).not.toHaveBeenCalled()
+  })
+
+  it('release_view_clears_only_unsubmitted_confirmation_but_keeps_accepted_owned_flight', async () => {
+    const store = await loadedStoreWith(managedDisabledItem(), '7', '11')
+    store.beginRemoval('com.example.notes')
+    store.releaseRemovalView()
+    expect(store.removalStatus).toBe('idle')
+    expect(store.removalTarget).toBeNull()
+
+    const removed = deferred<RemoveManagedLocalPluginResult>()
+    serviceMocks.removeManaged.mockReturnValueOnce(removed.promise)
+    store.beginRemoval('com.example.notes')
+    const pending = store.confirmRemoval()
+    store.releaseRemovalView()
+    expect(store.removalStatus).toBe('removing')
+    removed.resolve(removalResult(snapshot('12', [], '8')))
+    await pending
+    expect(store.removalStatus).toBe('result')
+    expect(store.catalog).toEqual([])
+    store.clearRemovalResult()
+    expect(store.removalStatus).toBe('idle')
+    expect(store.removalTarget).toBeNull()
   })
 })
