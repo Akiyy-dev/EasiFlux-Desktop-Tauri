@@ -10,7 +10,41 @@ use crate::plugin::import::{
 use crate::plugin::manifest::{PluginCatalogMutationResult, PluginCatalogSnapshot};
 use crate::plugin::removal::RemoveManagedLocalPluginResult;
 use crate::plugin::PluginRuntime;
-use crate::state::AppState;
+
+pub(crate) struct PluginCommandState {
+    runtime: Arc<PluginRuntime>,
+    #[cfg(any(test, feature = "plugin-smoke"))]
+    selector: Option<Arc<dyn LocalManifestSelector>>,
+}
+
+impl PluginCommandState {
+    pub(crate) fn new(runtime: Arc<PluginRuntime>) -> Self {
+        Self {
+            runtime,
+            #[cfg(any(test, feature = "plugin-smoke"))]
+            selector: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "plugin-smoke"))]
+    pub(crate) fn with_selector(
+        runtime: Arc<PluginRuntime>,
+        selector: Arc<dyn LocalManifestSelector>,
+    ) -> Self {
+        Self {
+            runtime,
+            selector: Some(selector),
+        }
+    }
+
+    fn selector(&self, window: WebviewWindow) -> Arc<dyn LocalManifestSelector> {
+        #[cfg(any(test, feature = "plugin-smoke"))]
+        if let Some(selector) = &self.selector {
+            return Arc::clone(selector);
+        }
+        Arc::new(NativeLocalManifestSelector::new(window))
+    }
+}
 
 pub(crate) async fn get_plugin_catalog_from(
     runtime: &Arc<PluginRuntime>,
@@ -70,61 +104,62 @@ pub(crate) async fn remove_managed_local_plugin_from(
 }
 
 #[tauri::command]
-pub async fn get_plugin_catalog(state: State<'_, AppState>) -> AppResult<PluginCatalogSnapshot> {
-    get_plugin_catalog_from(&state.plugins).await
+pub async fn get_plugin_catalog(
+    state: State<'_, PluginCommandState>,
+) -> AppResult<PluginCatalogSnapshot> {
+    get_plugin_catalog_from(&state.runtime).await
 }
 
 #[tauri::command]
-pub async fn reload_plugin_catalog(state: State<'_, AppState>) -> AppResult<PluginCatalogSnapshot> {
-    reload_plugin_catalog_from(&state.plugins).await
+pub async fn reload_plugin_catalog(
+    state: State<'_, PluginCommandState>,
+) -> AppResult<PluginCatalogSnapshot> {
+    reload_plugin_catalog_from(&state.runtime).await
 }
 
 #[tauri::command]
 pub async fn set_plugin_enabled(
-    state: State<'_, AppState>,
+    state: State<'_, PluginCommandState>,
     id: String,
     enabled: bool,
     expected_catalog_generation: String,
 ) -> AppResult<PluginCatalogMutationResult> {
-    set_plugin_enabled_from(&state.plugins, &id, enabled, &expected_catalog_generation).await
+    set_plugin_enabled_from(&state.runtime, &id, enabled, &expected_catalog_generation).await
 }
 
 #[tauri::command]
 pub async fn prepare_local_manifest_import(
     window: WebviewWindow,
-    state: State<'_, AppState>,
+    state: State<'_, PluginCommandState>,
 ) -> AppResult<PrepareImportResult> {
-    prepare_local_manifest_import_from(
-        &state.plugins,
-        Arc::new(NativeLocalManifestSelector::new(window)),
-    )
-    .await
+    let selector = state.selector(window);
+    prepare_local_manifest_import_from(&state.runtime, selector).await
 }
 
 #[tauri::command]
 pub async fn cancel_local_manifest_import(
-    state: State<'_, AppState>,
+    state: State<'_, PluginCommandState>,
     token: String,
 ) -> AppResult<CancelImportResult> {
-    cancel_local_manifest_import_from(&state.plugins, &token)
+    cancel_local_manifest_import_from(&state.runtime, &token)
 }
 
 #[tauri::command]
 pub async fn commit_local_manifest_import(
-    state: State<'_, AppState>,
+    state: State<'_, PluginCommandState>,
     token: String,
     expected_catalog_generation: String,
 ) -> AppResult<CommitImportResult> {
-    commit_local_manifest_import_from(&state.plugins, &token, &expected_catalog_generation).await
+    commit_local_manifest_import_from(&state.runtime, &token, &expected_catalog_generation).await
 }
 
 #[tauri::command]
 pub async fn remove_managed_local_plugin(
-    state: State<'_, AppState>,
+    state: State<'_, PluginCommandState>,
     id: String,
     expected_catalog_generation: String,
 ) -> AppResult<RemoveManagedLocalPluginResult> {
-    remove_managed_local_plugin_from(&state.plugins, &id, &expected_catalog_generation).await
+    remove_managed_local_plugin_from(&state.runtime, &id, &expected_catalog_generation).await
 }
 
 #[cfg(test)]
@@ -540,14 +575,14 @@ mod tests {
 
     #[test]
     fn public_import_command_signatures_expose_no_path_or_manifest_inputs() {
-        fn prepare_only(window: WebviewWindow, state: State<'_, AppState>) {
+        fn prepare_only(window: WebviewWindow, state: State<'_, PluginCommandState>) {
             drop(prepare_local_manifest_import(window, state));
         }
-        fn cancel_only(state: State<'_, AppState>, token: String) {
+        fn cancel_only(state: State<'_, PluginCommandState>, token: String) {
             drop(cancel_local_manifest_import(state, token));
         }
         fn commit_only(
-            state: State<'_, AppState>,
+            state: State<'_, PluginCommandState>,
             token: String,
             expected_catalog_generation: String,
         ) {
@@ -657,7 +692,7 @@ mod tests {
     #[tokio::test]
     async fn remove_helper_forwards_only_id_and_expected_generation() {
         fn command_only(
-            state: State<'_, AppState>,
+            state: State<'_, PluginCommandState>,
             id: String,
             expected_catalog_generation: String,
         ) {

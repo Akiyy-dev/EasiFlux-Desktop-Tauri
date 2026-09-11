@@ -10,8 +10,11 @@ mod state;
 mod storage;
 mod ws;
 
+use std::sync::Arc;
+
 use tauri::{Manager, RunEvent};
 
+use commands::plugin::PluginCommandState;
 use commands::*;
 use state::AppState;
 
@@ -32,6 +35,7 @@ pub fn run() {
             // or command handling can expose startup to the frontend. The
             // returned driver performs network initialization asynchronously.
             let scheduler_start = scheduler.start();
+            app.manage(PluginCommandState::new(Arc::clone(&state.plugins)));
             app.manage(state);
 
             let emitter = {
