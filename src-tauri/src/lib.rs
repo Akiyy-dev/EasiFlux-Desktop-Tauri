@@ -5,6 +5,10 @@ mod error;
 mod events;
 mod models;
 mod plugin;
+#[cfg(any(test, feature = "plugin-smoke"))]
+mod plugin_smoke;
+#[cfg(feature = "plugin-smoke")]
+pub use plugin_smoke::run_plugin_smoke;
 mod services;
 mod state;
 mod storage;
