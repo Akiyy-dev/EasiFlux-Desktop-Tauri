@@ -15,7 +15,7 @@
 - Metadata-only; no plugin execution or capability expansion in production.
 - Default production binary, scheduler/startup and plugin command names/payloads remain unchanged.
 - Never construct production `AppState`, platform-default plugin stores, account/keyring/provider services or the opener plugin in the smoke runner.
-- Require an absolute existing `--parent`; create one fresh exclusive `plugin-smoke-<UUID>` child. No existing-profile reuse, platform-root fallback, overwrite, creation retry or recursive cleanup.
+- Require an absolute existing `--parent` canonically within the build checkout's `target` (parent of `CARGO_MANIFEST_DIR` plus `target`); reject an artifact-root symlink resolving outside the canonical checkout. Reject out-of-workspace parents before reserving a child. Create one fresh exclusive `plugin-smoke-<UUID>` child. No existing-profile reuse, platform-root fallback, overwrite, creation retry or recursive cleanup.
 - All application-owned plugin state, source, ownership, package/staging, WebView2 user data and report files stay beneath that child. Retain it on exit.
 - Only the canonical fixture source may be read; automatic selection returns that source. Other selected files reject before reading contents.
 - Reuse the exact seven production command wrappers and existing Marketplace/store/service. Do not mock IPC or persistence.
@@ -43,12 +43,14 @@
 - `PluginSmokeProfile::inspect_final_state(&self) -> Result<SmokeNativeChecks, String>` produces serializable booleans `source_unchanged`, `disabled_decision_retained`, `ownership_empty`, `local_empty`, `staging_empty`.
 - `SmokeNativeChecks::passed(&self) -> bool` is the conjunction of all five checks, consumed by Task 2.
 
-- [ ] Add focused tests before implementation; no fallback to live stores even in RED. A constructor stub may safely return an error to allow compiling RED. Required cases: relative/missing/non-directory parent rejects before creating a child; two fresh profiles are distinct; a real import/remove cycle in one profile preserves source bytes and disabled preference while the other profile stays empty.
+- [ ] Add focused tests before implementation; no fallback to live stores even in RED. A constructor stub may safely return an error to allow compiling RED. Required cases: relative/missing/non-directory/out-of-workspace parent rejects before creating a child; two fresh workspace profiles are distinct; a real import/remove cycle in one profile preserves source bytes and disabled preference while the other profile stays empty. Use a fixture-owned parent beneath the build checkout's target, not the system temporary root, for successful lifecycle cases.
 
 Use real runtime calls and typed/serialized results, not mock persistence:
 
 ```rust
-let parent = tempfile::tempdir().unwrap();
+let artifact_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("target");
+std::fs::create_dir_all(&artifact_root).unwrap();
+let parent = tempfile::tempdir_in(artifact_root).unwrap();
 let profile = PluginSmokeProfile::create(parent.path()).unwrap();
 let other = PluginSmokeProfile::create(parent.path()).unwrap();
 let runtime = profile.runtime();

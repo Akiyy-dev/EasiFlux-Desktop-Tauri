@@ -22,7 +22,7 @@ An optional selector override is available only to tests and the `plugin-smoke` 
 
 ## Isolated fixture profile
 
-The opt-in host requires `--parent <absolute existing directory>`; there is no default to platform configuration or data directories. Resolve this parent once, reject missing/non-directory/relative parents, and create one fresh `plugin-smoke-<UUID>` child with an exclusive create. Never accept an existing profile for reuse, overwrite it, delete it on exit, or automatically retry creation. The caller/launcher must select a workspace-owned test-artifact parent.
+The opt-in host requires `--parent <absolute existing directory>` within the build checkout's `target` directory (derived from the parent of `CARGO_MANIFEST_DIR`); there is no default to platform configuration or data directories. Resolve this parent once, reject missing/non-directory/relative/out-of-workspace parents before reserving a child, and create one fresh `plugin-smoke-<UUID>` child with an exclusive create. Compare canonical paths against the canonical artifact root, rejecting an artifact-root symlink that resolves outside the canonical checkout. Never accept an existing profile for reuse, overwrite it, delete it on exit, or automatically retry creation. This developer-only host is intentionally tied to the source checkout where it was built; arbitrary/system-temp parents are unsupported and reject without writes. This enforces the workspace-owned test-artifact boundary, not a workaround or explanation for the separate Windows directory-open error.
 
 All application-owned plugin files live beneath that fresh child:
 
