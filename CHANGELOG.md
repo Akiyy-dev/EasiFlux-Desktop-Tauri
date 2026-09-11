@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.6.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.5.0...easiflux-desktop-tauri-v0.6.0) (2026-09-11)
+
+
+### Features
+
+* **plugin:** add accessible local manifest import confirmation ([4cdcb41](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/4cdcb41994c755fbea58c6c03c06d46d38c3970e))
+* **plugin:** add bounded local package reader ([b419c43](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/b419c43100172419ffc5ddad92bd7ea42157dacf))
+* **plugin:** add isolated registry runtime ([cf80863](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/cf80863115bbda11929d33ac270bddc908ddefb7))
+* **plugin:** add secure local manifest import ([eab8021](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/eab8021ab003f42a89b4ce54dc86f47cf462515e))
+* **plugin:** add serialized local catalog reload ([a5e09e2](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/a5e09e2a2c0c09dbddff3b5113bacbd10001e1af))
+* **plugin:** add trust records and catalog transport v2 ([7ff9584](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/7ff958494c3fb1d553ae0dc4fb97709cf81b310a))
+* **plugin:** add typed frontend state ([3dcdbc2](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/3dcdbc2e9ff0486ee8a850efc3fe73d7483f744e))
+* **plugin:** arbitrate manifest import sessions in the store ([1caa3b3](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/1caa3b34f527c6389e049cb2c58216fd6dc97b93))
+* **plugin:** build marketplace management UI ([b6c0133](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/b6c013344dc898fc4a38a3b93e09a93cdaa26202))
+* **plugin:** coordinate fail-closed manifest import publication ([f67fc96](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/f67fc9658db668bce73853e4ac48d75da9b56549))
+* **plugin:** define single-use manifest import sessions ([3935f84](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/3935f8431b5bfa509d171dfdc93c17f6cf00cfaf))
+* **plugin:** define strict manifest contract ([8d43f01](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/8d43f010bde813163f85b4b28395a17d5c3ae098))
+* **plugin:** establish runtime foundation and local manifest discovery ([19ba635](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/19ba635bdd8ecd67deef318740a7671b5b6f1a15))
+* **plugin:** expose constrained host commands ([857d472](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/857d47290f0525e370cf96717a1d012b5df76deb))
+* **plugin:** expose local discovery in marketplace UI ([8094981](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/8094981e1301f7939bc4695f5f1ee5327ea81d2c))
+* **plugin:** expose native manifest import with restricted IPC ([4915408](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/49154086eef03613043f265c13f366d400948af8))
+* **plugin:** merge local manifests with catalog generations ([e26a982](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/e26a982188c57a3b58ad56b6ee918e5501ee3e2a))
+* **plugin:** migrate enable state to schema v2 ([5920d81](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/5920d815d9f46199abefd123896b85c418f05bb0))
+* **plugin:** persist bounded enable state ([b3880ef](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/b3880ef61c90ee1abfaab339b057fb2c458d0558))
+* **plugin:** read selected manifests with bounded safe handles ([99d9d08](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/99d9d084c4d5e1d44f9483a8f3c0e28469f42921))
+* **plugin:** reconcile catalog generations in frontend ([82022b8](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/82022b84541c9118f4b5530b3e53e0d68c0ec890))
+* **plugin:** stage and exclusively promote local manifests ([5b31b5a](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/5b31b5aa9fd9433924f310ac34372c651252304d))
+* **plugin:** validate import budgets and persist disabled identities ([48d601f](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/48d601fae0e07b3a56d86f06dec7c9b1e763fdc5))
+* **plugin:** validate manifest import frontend protocols ([d68ade9](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/d68ade9c193dbee3f64f01a6b8c6f436aba2d22c))
+
+
+### Bug Fixes
+
+* **ci:** restrict workflow token permissions ([4a316ac](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/4a316ac2c2d70a4a523e95abbcdeec35bb7644d9))
+* **ci:** restrict workflow token permissions ([0f3b2c7](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/0f3b2c714cb71756906cceb9a099f8495da98320))
+* **ci:** use test contexts for capability checks ([49f7feb](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/49f7feba222f2de4e5bc3ee78c01fec72701c0ae))
+* **docs:** remove plugin spec trailing whitespace ([16248e2](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/16248e21a4a953a8acd7c8f9d9028057646d909c))
+* **plugin:** align manifest transport contract ([4696885](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/4696885597a76a1eede46e42d138de44436f1b6e))
+* **plugin:** anchor selected sources to Windows directory handles ([9449fb6](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/9449fb6917774f9f28c98fb83b9efedeacb413e1))
+* **plugin:** arbitrate tied snapshots and mutation identity ([65c994c](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/65c994c46c3e7dc47adbd9fa0fb49f2493f8695b))
+* **plugin:** close final local discovery review gaps ([2e519da](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/2e519da9c35ab7ccdec4de2171cc81e429c7c437))
+* **plugin:** constrain catalog item states ([38e1447](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/38e14473a7635f2f9934f5583166a3dc25bca6a2))
+* **plugin:** eliminate identifier lint regression ([afab161](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/afab1610b2dcc9121176d7db19f73f1225448264))
+* **plugin:** fail closed when recovering local plugin state ([98c2c0d](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/98c2c0d6fbad788991887ecdc396f1183c884bcb))
+* **plugin:** preserve accepted catalog reload order ([79afd13](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/79afd1387411505dea81088931a155ee40493ca3))
+* **plugin:** preserve confirmed UI state ([4720437](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/47204378f27394118856492b4a1caa8ab8684152))
+* **plugin:** preserve import trigger focus across picker ([a139afd](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/a139afdc21da0cd028f68e78e515777c641a83b5))
+* **plugin:** protect strict state schema boundaries ([7877f33](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/7877f3371f007108b18bbb6bf8468147cd404744))
+* **plugin:** reject hard-linked manifests and port FIFO tests ([cf19ad7](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/cf19ad7500fc95c598d870a0bd2f13db10163f76))
+* **plugin:** require object-shaped state entries ([49169bb](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/49169bbe5b5d985136dee8584fc77bd0ac775b48))
+* **plugin:** scope commands to main webview ([cace5f5](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/cace5f5d3ceee0d103ddc2834821efd2a7e1f5fd))
+* **plugin:** structure exhausted import publication ([21b72ae](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/21b72aee46b4b2581ef24e356594915a40d8653e))
+* **plugin:** unify catalog failure recovery alerts ([37be3ce](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/37be3ce299f3ba771206e0fda90e180382e0a5fd))
+
 ## [0.5.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.4.1...easiflux-desktop-tauri-v0.5.0) (2026-09-06)
 
 
