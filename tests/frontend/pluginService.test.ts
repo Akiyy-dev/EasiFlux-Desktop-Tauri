@@ -1,11 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import {
+  cancelLocalManifestImport,
+  commitLocalManifestImport,
   getPluginCatalog,
+  pluginErrorCode,
+  prepareLocalManifestImport,
   reloadPluginCatalog,
   pluginErrorMessage,
   setPluginEnabled,
 } from '../../src/services/pluginService'
+import type {
+  LocalManifestImportCommitFailure,
+  ReadyLocalManifestImport,
+} from '../../src/types/plugin'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
 
@@ -94,6 +102,107 @@ function validMutation(
   status: 'enabled' | 'disabled' = 'enabled',
 ): WireObject {
   return { schemaVersion: 2, revision: '43', catalogGeneration: '2', plugin: validItem(id, status) }
+}
+
+function readyImport(
+  manifest: WireObject = validManifest('com.example.notes', 'com.example'),
+): WireObject {
+  return {
+    schemaVersion: 1,
+    status: 'ready',
+    token: 'a'.repeat(32),
+    expiresInSeconds: 300,
+    catalogGeneration: '2',
+    manifest,
+  }
+}
+
+function importedItem(
+  manifest: WireObject = validManifest('com.example.notes', 'com.example'),
+): WireObject {
+  return {
+    manifest,
+    source: 'localDeclarative',
+    status: 'disabled',
+    statusReasonCode: null,
+    canToggle: true,
+    grantedCapabilities: [],
+  }
+}
+
+function importSnapshot(
+  manifest: WireObject = validManifest('com.example.notes', 'com.example'),
+  localDiscoveryStatus: 'available' | 'degraded' = 'available',
+): WireObject {
+  return {
+    schemaVersion: 2,
+    revision: '43',
+    catalogGeneration: '3',
+    localDiscovery: {
+      status: localDiscoveryStatus,
+      rejectedPackageCount: localDiscoveryStatus === 'degraded' ? 1 : 0,
+    },
+    availability: 'available',
+    availabilityReasonCode: null,
+    plugins: [importedItem(manifest)],
+  }
+}
+
+function importedResult(
+  manifest: WireObject = validManifest('com.example.notes', 'com.example'),
+): WireObject {
+  return {
+    schemaVersion: 1,
+    status: 'imported',
+    pluginId: 'com.example.notes',
+    snapshot: importSnapshot(manifest),
+  }
+}
+
+function notImportedResult(
+  reasonCode: LocalManifestImportCommitFailure = 'plugin_import_id_conflict',
+  disabledDecisionSaved = false,
+): WireObject {
+  return {
+    schemaVersion: 1,
+    status: 'notImported',
+    disabledDecisionSaved,
+    reasonCode,
+    snapshot: validSnapshot(),
+  }
+}
+
+function importedNotVisibleResult(snapshot: WireObject = validSnapshot()): WireObject {
+  return {
+    schemaVersion: 1,
+    status: 'importedNotVisible',
+    pluginId: 'com.example.notes',
+    reasonCode: 'plugin_import_publication_unconfirmed',
+    snapshot,
+  }
+}
+
+async function parseReadyThroughPrepare(value: unknown): Promise<ReadyLocalManifestImport> {
+  vi.mocked(tauriInvoke).mockResolvedValueOnce(value)
+  const parsed = await prepareLocalManifestImport()
+  if (parsed.status !== 'ready') throw new Error('ready preview required')
+  return parsed
+}
+
+async function expectPrepareRejected(value: unknown): Promise<void> {
+  vi.mocked(tauriInvoke).mockResolvedValueOnce(value)
+  await expect(prepareLocalManifestImport()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+}
+
+async function expectCancelRejected(value: unknown): Promise<void> {
+  vi.mocked(tauriInvoke).mockResolvedValueOnce(value)
+  await expect(cancelLocalManifestImport('a'.repeat(32))).rejects.toThrow(INVALID_RESPONSE_ERROR)
+}
+
+async function expectCommitRejected(value: unknown): Promise<void> {
+  const preview = await parseReadyThroughPrepare(readyImport())
+  vi.mocked(tauriInvoke).mockResolvedValueOnce(value)
+  await expect(commitLocalManifestImport(preview)).rejects.toThrow(INVALID_RESPONSE_ERROR)
 }
 
 function firstItem(snapshot: WireObject): WireObject {
@@ -527,6 +636,371 @@ describe('plugin service transport validation', () => {
   })
 })
 
+describe('local manifest import transport validation', () => {
+  beforeEach(() => {
+    vi.mocked(tauriInvoke).mockReset()
+  })
+
+  it('invokes prepare without a frontend path and accepts native cancellation', async () => {
+    const cancelled = { schemaVersion: 1, status: 'cancelled' }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(cancelled)
+
+    await expect(prepareLocalManifestImport()).resolves.toEqual(cancelled)
+    expect(tauriInvoke).toHaveBeenCalledTimes(1)
+    expect(tauriInvoke).toHaveBeenCalledWith('prepare_local_manifest_import')
+  })
+
+  it('accepts an exact ready preview at the canonical u64 maximum', async () => {
+    const ready = readyImport()
+    ready.catalogGeneration = U64_MAX
+
+    await expect(parseReadyThroughPrepare(ready)).resolves.toEqual(ready)
+  })
+
+  it('invokes cancel with only the opaque token and validates its result', async () => {
+    const cancelled = { schemaVersion: 1, status: 'cancelled' }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(cancelled)
+
+    await expect(cancelLocalManifestImport('a'.repeat(32))).resolves.toEqual(cancelled)
+    expect(tauriInvoke).toHaveBeenCalledTimes(1)
+    expect(tauriInvoke).toHaveBeenCalledWith('cancel_local_manifest_import', {
+      token: 'a'.repeat(32),
+    })
+  })
+
+  it('commits only a preview token and its bound generation', async () => {
+    const manifest = validManifest('com.example.notes', 'com.example')
+    const preview = {
+      schemaVersion: 1,
+      status: 'ready',
+      token: 'a'.repeat(32),
+      expiresInSeconds: 300,
+      catalogGeneration: '2',
+      manifest,
+    }
+    const parsed = await parseReadyThroughPrepare(preview)
+    const result = notImportedResult()
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
+
+    await expect(commitLocalManifestImport(parsed)).resolves.toEqual(result)
+    expect(tauriInvoke).toHaveBeenLastCalledWith('commit_local_manifest_import', {
+      token: 'a'.repeat(32),
+      expectedCatalogGeneration: '2',
+    })
+    expect(tauriInvoke).toHaveBeenCalledTimes(2)
+  })
+
+  it('accepts imported only when the degraded authoritative snapshot has the exact disabled item', async () => {
+    const preview = await parseReadyThroughPrepare(readyImport())
+    const result = importedResult()
+    const snapshot = result.snapshot as WireObject
+    snapshot.localDiscovery = { status: 'degraded', rejectedPackageCount: 1 }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
+
+    await expect(commitLocalManifestImport(preview)).resolves.toEqual(result)
+  })
+
+  it.each([
+    'plugin_catalog_stale',
+    'plugin_catalog_invalid',
+    'plugin_catalog_generation_exhausted',
+    'plugin_state_unavailable',
+    'plugin_state_persist_failed',
+    'plugin_state_capacity_exceeded',
+    'plugin_revision_exhausted',
+    'plugin_import_id_conflict',
+    'plugin_import_discovery_unavailable',
+    'plugin_import_capacity_exceeded',
+    'plugin_import_staging_capacity_exceeded',
+    'plugin_import_write_failed',
+  ] satisfies LocalManifestImportCommitFailure[])(
+    'accepts the closed notImported reason %s before a disabled decision',
+    async (reasonCode) => {
+      const preview = await parseReadyThroughPrepare(readyImport())
+      const result = notImportedResult(reasonCode)
+      vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
+
+      await expect(commitLocalManifestImport(preview)).resolves.toEqual(result)
+    },
+  )
+
+  it('accepts the sole partial notImported result after a disabled write decision', async () => {
+    const preview = await parseReadyThroughPrepare(readyImport())
+    const result = notImportedResult('plugin_import_write_failed', true)
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
+
+    await expect(commitLocalManifestImport(preview)).resolves.toEqual(result)
+  })
+
+  it('accepts importedNotVisible with an unavailable snapshot that omits the target', async () => {
+    const preview = await parseReadyThroughPrepare(readyImport())
+    const result = importedNotVisibleResult(unavailableSnapshot())
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
+
+    await expect(commitLocalManifestImport(preview)).resolves.toEqual(result)
+  })
+
+  it.each([
+    ['cancelled', { schemaVersion: 1, status: 'cancelled', token: 'a'.repeat(32) }],
+    ['ready', { ...readyImport(), privatePath: 'C:\\secret\\manifest.json' }],
+  ])('rejects extra keys on a prepare %s branch', async (_branch, value) => {
+    await expectPrepareRejected(value)
+  })
+
+  it.each([
+    ['null envelope', null],
+    ['array envelope', []],
+    ['unknown status', { schemaVersion: 1, status: 'unknown' }],
+    ['cancelled with wrong schema', { schemaVersion: 2, status: 'cancelled' }],
+    ['ready with wrong schema', { ...readyImport(), schemaVersion: 2 }],
+  ])('rejects a malformed prepare result: %s', async (_label, value) => {
+    await expectPrepareRejected(value)
+  })
+
+  it.each(['schemaVersion', 'status'])(
+    'rejects a missing prepare-cancelled %s',
+    async (key) => {
+      const value: WireObject = { schemaVersion: 1, status: 'cancelled' }
+      delete value[key]
+      await expectPrepareRejected(value)
+    },
+  )
+
+  it.each([
+    'schemaVersion',
+    'status',
+    'token',
+    'expiresInSeconds',
+    'catalogGeneration',
+    'manifest',
+  ])('rejects a missing prepare-ready %s', async (key) => {
+    const value = readyImport()
+    delete value[key]
+    await expectPrepareRejected(value)
+  })
+
+  it.each([
+    ['ttl below the fixed value', 299],
+    ['ttl above the fixed value', 301],
+    ['ttl as a string', '300'],
+    ['ttl as null', null],
+  ])('rejects %s', async (_label, expiresInSeconds) => {
+    const value = readyImport()
+    value.expiresInSeconds = expiresInSeconds
+    await expectPrepareRejected(value)
+  })
+
+  it.each([
+    ['uppercase', 'A'.repeat(32)],
+    ['non-hex', 'g'.repeat(32)],
+    ['31 characters', 'a'.repeat(31)],
+    ['33 characters', 'a'.repeat(33)],
+    ['non-string', 7],
+  ])('rejects a ready token that is %s', async (_label, token) => {
+    const value = readyImport()
+    value.token = token
+    await expectPrepareRejected(value)
+  })
+
+  it.each(['00', '+1', '18446744073709551616', '9'.repeat(10_000)])(
+    'rejects a ready preview with noncanonical or overflowing generation %s',
+    async (catalogGeneration) => {
+      const value = readyImport()
+      value.catalogGeneration = catalogGeneration
+      await expectPrepareRejected(value)
+    },
+  )
+
+  it('rejects an oversized ready generation before invoking BigInt', async () => {
+    const value = readyImport()
+    value.catalogGeneration = '9'.repeat(10_000)
+    const bigIntSpy = vi.spyOn(globalThis, 'BigInt')
+
+    try {
+      await expectPrepareRejected(value)
+      expect(bigIntSpy).not.toHaveBeenCalled()
+    } finally {
+      bigIntSpy.mockRestore()
+    }
+  })
+
+  it.each([
+    ['contributions', [{}]],
+    ['requestedCapabilities', ['network']],
+  ])('rejects a ready manifest with non-empty %s', async (field, content) => {
+    const value = readyImport()
+    const manifest = value.manifest as WireObject
+    manifest[field] = content
+    await expectPrepareRejected(value)
+  })
+
+  it('rejects an extra key on a cancel response', async () => {
+    await expectCancelRejected({ schemaVersion: 1, status: 'cancelled', tokenAccepted: true })
+  })
+
+  it.each(['schemaVersion', 'status'])('rejects a missing cancel response %s', async (key) => {
+    const value: WireObject = { schemaVersion: 1, status: 'cancelled' }
+    delete value[key]
+    await expectCancelRejected(value)
+  })
+
+  it.each([
+    ['wrong schema', { schemaVersion: 2, status: 'cancelled' }],
+    ['wrong status', { schemaVersion: 1, status: 'ready' }],
+  ])('rejects a cancel response with %s', async (_label, value) => {
+    await expectCancelRejected(value)
+  })
+
+  it.each([
+    ['imported', () => importedResult()],
+    ['notImported', () => notImportedResult()],
+    ['importedNotVisible', () => importedNotVisibleResult()],
+  ] as const)('rejects extra keys on a commit %s branch', async (_branch, makeResult) => {
+    const value = makeResult()
+    value.privatePath = 'C:\\secret\\manifest.json'
+    await expectCommitRejected(value)
+  })
+
+  it.each([
+    ['null envelope', null],
+    ['array envelope', []],
+    ['unknown status', { schemaVersion: 1, status: 'unknown' }],
+    ['imported with wrong schema', { ...importedResult(), schemaVersion: 2 }],
+    ['notImported with wrong schema', { ...notImportedResult(), schemaVersion: 2 }],
+    [
+      'importedNotVisible with wrong schema',
+      { ...importedNotVisibleResult(), schemaVersion: 2 },
+    ],
+  ])('rejects a malformed commit result: %s', async (_label, value) => {
+    await expectCommitRejected(value)
+  })
+
+  it.each([
+    ['imported schemaVersion', () => importedResult(), 'schemaVersion'],
+    ['imported status', () => importedResult(), 'status'],
+    ['imported pluginId', () => importedResult(), 'pluginId'],
+    ['imported snapshot', () => importedResult(), 'snapshot'],
+    ['notImported schemaVersion', () => notImportedResult(), 'schemaVersion'],
+    ['notImported status', () => notImportedResult(), 'status'],
+    ['notImported disabledDecisionSaved', () => notImportedResult(), 'disabledDecisionSaved'],
+    ['notImported reasonCode', () => notImportedResult(), 'reasonCode'],
+    ['notImported snapshot', () => notImportedResult(), 'snapshot'],
+    ['importedNotVisible schemaVersion', () => importedNotVisibleResult(), 'schemaVersion'],
+    ['importedNotVisible status', () => importedNotVisibleResult(), 'status'],
+    ['importedNotVisible pluginId', () => importedNotVisibleResult(), 'pluginId'],
+    ['importedNotVisible reasonCode', () => importedNotVisibleResult(), 'reasonCode'],
+    ['importedNotVisible snapshot', () => importedNotVisibleResult(), 'snapshot'],
+  ] as const)('rejects a missing commit %s', async (_label, makeResult, key) => {
+    const value = makeResult()
+    delete value[key]
+    await expectCommitRejected(value)
+  })
+
+  it.each([
+    ['plugin id', (value: WireObject) => { value.pluginId = 'com.example.other' }],
+    ['target item', (value: WireObject) => {
+      const snapshot = value.snapshot as WireObject
+      snapshot.plugins = [validItem('com.easiflux.analytics')]
+    }],
+    ['top-level availability', (value: WireObject) => {
+      value.snapshot = unavailableSnapshot()
+    }],
+    ['local source', (value: WireObject) => {
+      const snapshot = value.snapshot as WireObject
+      firstItem(snapshot).source = 'builtIn'
+    }],
+    ['disabled status', (value: WireObject) => {
+      const snapshot = value.snapshot as WireObject
+      firstItem(snapshot).status = 'enabled'
+    }],
+  ])('rejects imported with the wrong %s', async (_label, mutate) => {
+    const value = importedResult()
+    mutate(value)
+    await expectCommitRejected(value)
+  })
+
+  it.each([
+    ['id', 'com.example.other'],
+    ['publisherId', 'com.other'],
+    ['publisher', 'Other Publisher'],
+    ['name', 'Other Name'],
+    ['description', 'Other description'],
+    ['version', '1.2.4'],
+  ])('rejects imported when manifest %s differs from the confirmed preview', async (field, changed) => {
+    const value = importedResult()
+    const snapshot = value.snapshot as WireObject
+    manifestFromItem(firstItem(snapshot))[field] = changed
+    await expectCommitRejected(value)
+  })
+
+  it.each([
+    'plugin_catalog_stale',
+    'plugin_catalog_invalid',
+    'plugin_catalog_generation_exhausted',
+    'plugin_state_unavailable',
+    'plugin_state_persist_failed',
+    'plugin_state_capacity_exceeded',
+    'plugin_revision_exhausted',
+    'plugin_import_id_conflict',
+    'plugin_import_discovery_unavailable',
+    'plugin_import_capacity_exceeded',
+    'plugin_import_staging_capacity_exceeded',
+  ] satisfies LocalManifestImportCommitFailure[])(
+    'rejects disabledDecisionSaved=true with pre-decision reason %s',
+    async (reasonCode) => {
+      await expectCommitRejected(notImportedResult(reasonCode, true))
+    },
+  )
+
+  it.each([
+    ['publication reason in notImported', 'plugin_import_publication_unconfirmed'],
+    ['unknown reason', 'plugin_import_other'],
+  ])('rejects %s', async (_label, reasonCode) => {
+    const value = notImportedResult()
+    value.reasonCode = reasonCode
+    await expectCommitRejected(value)
+  })
+
+  it.each([null, 0, 'false'])('rejects non-boolean disabledDecisionSaved %j', async (saved) => {
+    const value = notImportedResult()
+    value.disabledDecisionSaved = saved
+    await expectCommitRejected(value)
+  })
+
+  it.each([
+    ['wrong publication reason', (value: WireObject) => {
+      value.reasonCode = 'plugin_import_write_failed'
+    }],
+    ['wrong plugin id', (value: WireObject) => {
+      value.pluginId = 'com.example.other'
+    }],
+  ])('rejects importedNotVisible with %s', async (_label, mutate) => {
+    const value = importedNotVisibleResult()
+    mutate(value)
+    await expectCommitRejected(value)
+  })
+
+  it.each([
+    ['imported', () => importedResult()],
+    ['notImported', () => notImportedResult()],
+    ['importedNotVisible', () => importedNotVisibleResult()],
+  ] as const)('strictly parses nested snapshots for %s', async (_branch, makeResult) => {
+    const value = makeResult()
+    const snapshot = value.snapshot as WireObject
+    snapshot.catalogGeneration = '00'
+    await expectCommitRejected(value)
+  })
+
+  it('does not retry a rejected commit or fabricate a result', async () => {
+    const preview = await parseReadyThroughPrepare(readyImport())
+    const backendError = { code: 'plugin_import_token_invalid', message: 'expired' }
+    vi.mocked(tauriInvoke).mockRejectedValueOnce(backendError)
+
+    await expect(commitLocalManifestImport(preview)).rejects.toBe(backendError)
+    expect(tauriInvoke).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('plugin error sanitization', () => {
   it.each([
     ['plugin_catalog_stale', '插件目录已更新，请刷新后重试。'],
@@ -539,6 +1013,17 @@ describe('plugin error sanitization', () => {
     ['plugin_state_persist_failed', '保存插件状态失败，请重试。'],
     ['plugin_revision_exhausted', '插件状态版本已达到上限，请联系支持。'],
     ['plugin_not_toggleable', '该插件当前无法更改启用状态。'],
+    ['plugin_import_busy', '已有清单导入操作，请先完成或取消。'],
+    ['plugin_import_dialog_unavailable', '无法打开文件选择器，请重试。'],
+    ['plugin_import_source_rejected', '无法安全读取所选文件，请选择普通本地 JSON 文件。'],
+    ['plugin_import_manifest_invalid', '清单格式或内容不符合当前插件要求。'],
+    ['plugin_import_token_invalid', '预览已过期或失效，请重新选择清单。'],
+    ['plugin_import_id_conflict', '已存在相同插件 ID；当前不支持覆盖或更新。'],
+    ['plugin_import_discovery_unavailable', '请先修复本地插件发现问题，再导入清单。'],
+    ['plugin_import_capacity_exceeded', '本地插件数量或读取预算已达上限。'],
+    ['plugin_import_staging_capacity_exceeded', '导入暂存区需要人工检查和清理。'],
+    ['plugin_import_write_failed', '无法完成清单写入，请检查后重试。'],
+    ['plugin_import_publication_unconfirmed', '清单已写入，但目录结果尚未确认，请重新扫描。'],
   ])('maps known closed code %s without reflecting the backend message', (code, expected) => {
     const backendMessage = 'C:\\Users\\secret\\plugins\\state.json: raw JSON'
     const message = pluginErrorMessage({ code, message: backendMessage })
@@ -549,8 +1034,50 @@ describe('plugin error sanitization', () => {
   })
 
   it.each([
+    'plugin_invalid_id',
+    'plugin_not_found',
+    'plugin_catalog_invalid',
+    'plugin_state_unavailable',
+    'plugin_state_persist_failed',
+    'plugin_revision_exhausted',
+    'plugin_not_toggleable',
+    'plugin_catalog_stale',
+    'plugin_catalog_generation_exhausted',
+    'plugin_state_capacity_exceeded',
+    'plugin_import_busy',
+    'plugin_import_dialog_unavailable',
+    'plugin_import_source_rejected',
+    'plugin_import_manifest_invalid',
+    'plugin_import_token_invalid',
+    'plugin_import_id_conflict',
+    'plugin_import_discovery_unavailable',
+    'plugin_import_capacity_exceeded',
+    'plugin_import_staging_capacity_exceeded',
+    'plugin_import_write_failed',
+    'plugin_import_publication_unconfirmed',
+  ])('returns the known exact code %s from a valid transport error', (code) => {
+    expect(pluginErrorCode({ code, message: 'untrusted backend text' })).toBe(code)
+  })
+
+  it.each([
+    ['unknown code', { code: 'plugin_other', message: 'secret' }],
+    ['extra key', { code: 'plugin_not_found', message: 'secret', path: 'C:\\secret' }],
+    ['missing code', { message: 'secret' }],
+    ['missing message', { code: 'plugin_not_found' }],
+    ['non-string code', { code: 7, message: 'secret' }],
+    ['non-string message', { code: 'plugin_not_found', message: 7 }],
+    ['raw Error', new Error('C:\\secret\\stack')],
+    ['raw string', '{"path":"C:\\\\secret"}'],
+    ['null', null],
+  ])('rejects %s as an error-code transport', (_label, error) => {
+    expect(pluginErrorCode(error)).toBeNull()
+  })
+
+  it.each([
     ['extra field', { code: 'plugin_not_found', message: 'secret', path: 'C:\\secret' }],
     ['unknown code', { code: 'plugin_other', message: 'secret' }],
+    ['missing code', { message: 'secret' }],
+    ['missing message', { code: 'plugin_not_found' }],
     ['non-string code', { code: 7, message: 'secret' }],
     ['non-string message', { code: 'plugin_not_found', message: 7 }],
     ['raw Error', new Error('C:\\secret\\stack')],

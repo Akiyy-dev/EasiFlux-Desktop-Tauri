@@ -5,6 +5,7 @@ pub mod config;
 mod config_persistence;
 pub mod credentials;
 pub mod kline_store;
+pub(crate) mod local_plugin_import;
 pub mod notification_store;
 pub mod order_submissions;
 pub(crate) mod plugin_state;

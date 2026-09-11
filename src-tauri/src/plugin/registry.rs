@@ -8,10 +8,12 @@ use crate::storage::plugin_state::{
 };
 
 use super::builtin::builtin_manifests;
-use super::discovery::LocalDiscoveryOutcome;
+use super::discovery::{LocalDiscoveryOutcome, ScanUsage};
+use super::import::ImportCommitFailure;
 use super::manifest::{
-    LocalDiscoverySummary, PluginAvailability, PluginAvailabilityReason, PluginCatalogItem,
-    PluginCatalogMutationResult, PluginCatalogSnapshot, PluginId, PluginManifestV1,
+    LocalDiscoveryStatus, LocalDiscoverySummary, PluginAvailability, PluginAvailabilityReason,
+    PluginCatalogItem, PluginCatalogMutationResult, PluginCatalogSnapshot, PluginId,
+    PluginManifestV1, PluginSource,
 };
 use super::record::PluginRecord;
 
@@ -102,6 +104,72 @@ impl PluginRegistry {
 
     pub(crate) fn catalog_generation(&self) -> u64 {
         self.catalog_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_catalog_generation_for_test(&mut self, generation: u64) {
+        self.catalog_generation = generation;
+    }
+
+    pub(crate) fn state_requires_retry(&self) -> bool {
+        matches!(
+            self.runtime,
+            Runtime::Unavailable {
+                reason: PluginAvailabilityReason::StateUnavailable,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn validate_import(
+        &self,
+        record: &PluginRecord,
+        usage: ScanUsage,
+    ) -> Result<(), ImportCommitFailure> {
+        match &self.runtime {
+            Runtime::Unavailable {
+                reason: PluginAvailabilityReason::CatalogInvalid,
+                ..
+            } => {
+                return Err(ImportCommitFailure::CatalogInvalid);
+            }
+            Runtime::Unavailable { .. } => return Err(ImportCommitFailure::StateUnavailable),
+            Runtime::Available { .. } => {}
+        }
+        if self.local_summary.status != LocalDiscoveryStatus::Available {
+            return Err(ImportCommitFailure::DiscoveryUnavailable);
+        }
+        if self.builtins.contains_key(&record.manifest().id)
+            || self.locals.contains_key(&record.manifest().id)
+        {
+            return Err(ImportCommitFailure::IdConflict);
+        }
+        let bytes = record
+            .canonical_manifest_bytes()
+            .map_err(|_| ImportCommitFailure::CapacityExceeded)?;
+        if !usage.can_add_manifest(bytes.len()) {
+            return Err(ImportCommitFailure::CapacityExceeded);
+        }
+        if self.catalog_generation == u64::MAX {
+            return Err(ImportCommitFailure::CatalogGenerationExhausted);
+        }
+        Ok(())
+    }
+
+    /// Record only the disabled decision; authoritative discovery owns membership.
+    pub(crate) fn persist_import_disabled(&mut self, record: &PluginRecord) -> AppResult<()> {
+        if record.source() != PluginSource::LocalDeclarative
+            || matches!(
+                self.runtime,
+                Runtime::Unavailable {
+                    reason: PluginAvailabilityReason::CatalogInvalid,
+                    ..
+                }
+            )
+        {
+            return Err(plugin_error("plugin_catalog_invalid", "插件目录无效"));
+        }
+        self.persist_decision(record, false)
     }
 
     pub(crate) fn apply_local_discovery(
@@ -217,7 +285,20 @@ impl PluginRegistry {
             .builtins
             .get(&id)
             .or_else(|| self.locals.get(&id))
+            .cloned()
             .ok_or_else(|| plugin_error("plugin_not_found", "插件不存在"))?;
+        self.persist_decision(&record, enabled)?;
+        let Runtime::Available { state, .. } = &self.runtime else {
+            unreachable!("a successful decision requires available state");
+        };
+        Ok(PluginCatalogMutationResult::new(
+            state.revision.to_string(),
+            self.catalog_generation.to_string(),
+            catalog_item(&record, enabled),
+        ))
+    }
+
+    fn persist_decision(&mut self, record: &PluginRecord, enabled: bool) -> AppResult<()> {
         let Runtime::Available {
             state,
             requires_rewrite,
@@ -257,11 +338,7 @@ impl PluginRegistry {
         // like v1 migration, but must not consume a revision (even at u64::MAX).
         let decision_changed = next.entries != previous_entries;
         if next == *state && !*requires_rewrite {
-            return Ok(PluginCatalogMutationResult::new(
-                state.revision.to_string(),
-                self.catalog_generation.to_string(),
-                catalog_item(record, enabled),
-            ));
+            return Ok(());
         }
         if decision_changed {
             next.revision = state
@@ -276,11 +353,7 @@ impl PluginRegistry {
             .map_err(|_| plugin_error("plugin_state_persist_failed", "插件状态保存失败"))?;
         *state = next;
         *requires_rewrite = false;
-        Ok(PluginCatalogMutationResult::new(
-            state.revision.to_string(),
-            self.catalog_generation.to_string(),
-            catalog_item(record, enabled),
-        ))
+        Ok(())
     }
 }
 

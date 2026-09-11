@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Component, Path};
 
+use super::ScanUsage;
+
 #[derive(Clone, Copy)]
 pub(super) struct ScanLimits {
     pub(super) max_root_entries: usize,
@@ -66,11 +68,78 @@ pub(super) struct PackageBytes {
 pub(super) struct PackageScan {
     pub(super) packages: Vec<PackageBytes>,
     pub(super) rejected_package_count: u32,
+    pub(super) usage: ScanUsage,
 }
 
 /// Deliberately carries neither paths nor underlying platform error details.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) struct RootReadError;
+
+/// Deliberately carries neither paths nor underlying platform error details.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct SourceReadError;
+
+pub(crate) fn read_manifest_source(path: &Path) -> Result<Vec<u8>, SourceReadError> {
+    read_manifest_source_with_boundary(
+        path,
+        #[cfg(test)]
+        || {},
+    )
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn read_manifest_source_at_parent_boundary(
+    path: &Path,
+    before_file_open: impl FnOnce(),
+) -> Result<Vec<u8>, SourceReadError> {
+    read_manifest_source_with_boundary(path, before_file_open)
+}
+
+fn read_manifest_source_with_boundary(
+    path: &Path,
+    #[cfg(test)] before_file_open: impl FnOnce(),
+) -> Result<Vec<u8>, SourceReadError> {
+    // Components normalizes interior dots on ordinary paths. Inspect the raw
+    // spelling first so no current/parent component disappears before opening.
+    let is_separator = |byte: &u8| *byte == b'/' || (cfg!(windows) && *byte == b'\\');
+    if !path.is_absolute()
+        || path
+            .as_os_str()
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(is_separator)
+        || path
+            .as_os_str()
+            .as_encoded_bytes()
+            .split(is_separator)
+            .any(|part| part == b"." || part == b"..")
+        || path.components().any(|component| match component {
+            Component::ParentDir | Component::CurDir => true,
+            // A drive-prefix colon is not a Normal component. Reject ADS in
+            // every other component before any ancestor is opened.
+            Component::Normal(name) => cfg!(windows) && name.as_encoded_bytes().contains(&b':'),
+            _ => false,
+        })
+    {
+        return Err(SourceReadError);
+    }
+    let parent = path.parent().ok_or(SourceReadError)?;
+    let name = path.file_name().ok_or(SourceReadError)?;
+    let directory = platform::SourceDirectory::open_root(parent)
+        .map_err(|_| SourceReadError)?
+        .ok_or(SourceReadError)?;
+    #[cfg(test)]
+    before_file_open();
+    let mut file = directory
+        .open_regular_file(name)
+        .map_err(|_| SourceReadError)?;
+    // The existing loop reads at most 16,385 bytes, including the probe byte.
+    let bytes =
+        read_bounded(&mut file, ScanLimits::production(), &mut 0).map_err(|_| SourceReadError);
+    drop(file);
+    drop(directory);
+    bytes
+}
 
 enum ReadFailure {
     Package,
@@ -127,6 +196,7 @@ pub(super) fn read_package_candidates(
         .entries(limits.max_root_entries)
         .map_err(|_| RootReadError)?;
     let mut result = PackageScan::default();
+    result.usage.root_entries = names.len();
     let mut slots = Vec::new();
     for name in names {
         match parse_slot_name(&name) {
@@ -135,8 +205,6 @@ pub(super) fn read_package_candidates(
         }
     }
     slots.sort();
-    let mut structurally_acceptable = 0;
-    let mut total = 0;
     for slot in slots {
         let opened = root.open_slot(slot.as_str()).and_then(|directory| {
             directory.check_shape()?;
@@ -150,11 +218,11 @@ pub(super) fn read_package_candidates(
                 continue;
             }
         };
-        structurally_acceptable += 1;
-        if structurally_acceptable > limits.max_packages {
+        result.usage.packages += 1;
+        if result.usage.packages > limits.max_packages {
             return Err(RootReadError);
         }
-        match read_bounded(&mut manifest, limits, &mut total) {
+        match read_bounded(&mut manifest, limits, &mut result.usage.bytes_read) {
             Ok(manifest_bytes) if directory.check_shape().is_ok() => {
                 result.packages.push(PackageBytes {
                     #[cfg(test)]
@@ -173,10 +241,19 @@ pub(super) fn read_package_candidates(
 }
 
 #[cfg(unix)]
+pub(crate) fn is_single_link_regular_file(
+    mode: rustix::fs::RawMode,
+    links: impl Into<u64>,
+) -> bool {
+    rustix::fs::FileType::from_raw_mode(mode) == rustix::fs::FileType::RegularFile
+        && links.into() == 1
+}
+
+#[cfg(unix)]
 mod platform {
     use super::*;
     use rustix::fd::OwnedFd;
-    use rustix::fs::{fstat, open, openat, Dir, FileType, Mode, OFlags};
+    use rustix::fs::{fstat, open, openat, Dir, Mode, OFlags};
     use std::os::unix::ffi::OsStrExt;
 
     const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -185,6 +262,8 @@ mod platform {
         .union(OFlags::CLOEXEC);
 
     pub(super) struct Directory(OwnedFd);
+
+    pub(super) type SourceDirectory = Directory;
 
     impl Directory {
         pub(super) fn open_root(path: &Path) -> Result<Option<Self>, RootReadError> {
@@ -235,9 +314,13 @@ mod platform {
         }
 
         pub(super) fn open_manifest(&self) -> Result<File, ()> {
+            self.open_regular_file(OsStr::new("manifest.json"))
+        }
+
+        pub(super) fn open_regular_file(&self, name: &OsStr) -> Result<File, ()> {
             let fd = openat(
                 &self.0,
-                "manifest.json",
+                name,
                 OFlags::RDONLY
                     | OFlags::NOFOLLOW
                     | OFlags::CLOEXEC
@@ -248,9 +331,7 @@ mod platform {
             .map_err(|_| ())?;
             // Do not read (or trust a pre-open type check) before this fstat.
             let metadata = fstat(&fd).map_err(|_| ())?;
-            if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
-                || metadata.st_nlink != 1
-            {
+            if !is_single_link_regular_file(metadata.st_mode, metadata.st_nlink) {
                 return Err(());
             }
             Ok(File::from(fd))
@@ -262,14 +343,23 @@ mod platform {
 mod platform {
     use super::*;
     use std::fs::{self, OpenOptions};
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::{PathBuf, Prefix};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SEQUENTIAL_ONLY, FILE_SYNCHRONOUS_IO_NONALERT,
+    };
+    use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING};
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, SYNCHRONIZE,
     };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     pub(super) fn is_reparse_point(attributes: u32) -> bool {
         attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -277,22 +367,150 @@ mod platform {
 
     pub(super) struct Directory {
         path: PathBuf,
-        // Excluding FILE_SHARE_DELETE pins every path prefix against replacement.
-        // Ancestors stay held for the complete root scan, slots through each read.
+        // Discovery retains its existing attribute-only read/write-sharing mode.
         _held: Vec<File>,
     }
 
+    // No pathname is retained: every source child is opened relative to the
+    // immediately preceding handle, even if an ancestor becomes a reparse point.
+    pub(super) struct SourceDirectory {
+        held: Vec<File>,
+    }
+
+    impl SourceDirectory {
+        pub(super) fn open_root(path: &Path) -> Result<Option<Self>, RootReadError> {
+            let mut components = path.components();
+            let Some(Component::Prefix(prefix)) = components.next() else {
+                return Err(RootReadError);
+            };
+            if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+                || components.next() != Some(Component::RootDir)
+            {
+                return Err(RootReadError);
+            }
+            // Only the disk root is absolute. Nothing below it is reopened by path.
+            let mut disk_root = PathBuf::from(prefix.as_os_str());
+            disk_root.push(r"\");
+            let mut held = vec![open_source_directory(&disk_root).map_err(|_| RootReadError)?];
+            for component in components {
+                let Component::Normal(name) = component else {
+                    return Err(RootReadError);
+                };
+                let child = open_source_child(held.last().ok_or(RootReadError)?, name, true)
+                    .map_err(|_| RootReadError)?;
+                held.push(child);
+            }
+            Ok(Some(Self { held }))
+        }
+
+        pub(super) fn open_regular_file(&self, name: &OsStr) -> Result<File, ()> {
+            open_source_child(self.held.last().ok_or(())?, name, false)
+        }
+    }
+
+    fn open_source_child(parent: &File, name: &OsStr, directory: bool) -> Result<File, ()> {
+        // Native relative names must be exactly one component: no namespace,
+        // separator, dot navigation, ADS, or embedded NUL can reach NtCreateFile.
+        let mut units: Vec<u16> = name.encode_wide().collect();
+        if units.is_empty()
+            || name == OsStr::new(".")
+            || name == OsStr::new("..")
+            || units.iter().any(|unit| matches!(*unit, 0 | 47 | 58 | 92))
+        {
+            return Err(());
+        }
+        let byte_len = u16::try_from(units.len().checked_mul(2).ok_or(())?).map_err(|_| ())?;
+        let unicode_name = UNICODE_STRING {
+            Length: byte_len,
+            MaximumLength: byte_len,
+            Buffer: units.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &unicode_name,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            ..Default::default()
+        };
+        let access = if directory {
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        } else {
+            FILE_GENERIC_READ
+        };
+        let shape = if directory {
+            FILE_DIRECTORY_FILE
+        } else {
+            FILE_NON_DIRECTORY_FILE | FILE_SEQUENTIAL_ONLY
+        };
+        let mut handle = std::ptr::null_mut();
+        let mut status_block = IO_STATUS_BLOCK::default();
+        // SAFETY: parent is live; unicode_name and its initialized UTF-16 buffer
+        // outlive this synchronous call. Output pointers are valid and writable.
+        // FILE_OPEN cannot create/replace anything. A successful handle is owned
+        // exactly once by File below, including all post-open validation failures.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                access,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                0,
+                FILE_SHARE_READ,
+                FILE_OPEN,
+                shape | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            return Err(());
+        }
+        // SAFETY: NtCreateFile succeeded and transferred this owned file handle.
+        let file = unsafe { File::from_raw_handle(handle) };
+        if directory {
+            validate_directory(&file).map_err(|_| ())?;
+        } else {
+            validate_regular_file(&file)?;
+        }
+        Ok(file)
+    }
+
     fn open_directory(path: &Path) -> io::Result<File> {
+        open_directory_with_access(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )
+    }
+
+    fn open_source_directory(path: &Path) -> io::Result<File> {
+        // Attribute-only opens do not establish the required sharing checks.
+        // Real directory-read access, without write/delete sharing, pins every
+        // ancestor against rename and incompatible writer handles until read.
+        open_directory_with_access(
+            path,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+        )
+    }
+
+    fn open_directory_with_access(path: &Path, access: u32, sharing: u32) -> io::Result<File> {
         let file = OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .access_mode(access)
+            .share_mode(sharing)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
+        validate_directory(&file)?;
+        Ok(file)
+    }
+
+    fn validate_directory(file: &File) -> io::Result<()> {
         let metadata = file.metadata()?;
         if !metadata.is_dir() || is_reparse_point(metadata.file_attributes()) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
-        Ok(file)
+        Ok(())
     }
 
     pub(super) fn open_manifest(path: &Path) -> Result<File, ()> {
@@ -302,6 +520,11 @@ mod platform {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
             .open(path)
             .map_err(|_| ())?;
+        validate_regular_file(&file)?;
+        Ok(file)
+    }
+
+    fn validate_regular_file(file: &File) -> Result<(), ()> {
         let metadata = file.metadata().map_err(|_| ())?;
         if !metadata.is_file() || is_reparse_point(metadata.file_attributes()) {
             return Err(());
@@ -313,7 +536,7 @@ mod platform {
         if success == 0 || information.nNumberOfLinks != 1 {
             return Err(());
         }
-        Ok(file)
+        Ok(())
     }
 
     impl Directory {
@@ -379,7 +602,11 @@ mod platform {
         }
 
         pub(super) fn open_manifest(&self) -> Result<File, ()> {
-            open_manifest(&self.path.join("manifest.json"))
+            self.open_regular_file(OsStr::new("manifest.json"))
+        }
+
+        pub(super) fn open_regular_file(&self, name: &OsStr) -> Result<File, ()> {
+            open_manifest(&self.path.join(name))
         }
     }
 }

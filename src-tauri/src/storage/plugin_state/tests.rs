@@ -107,6 +107,86 @@ fn local_entry(id: &str, fingerprint: &str) -> PluginStateEntryV2 {
     }
 }
 
+// Catches secondary recovery resurrecting a local authorization while preserving
+// a valid built-in decision, revision, and damaged primary evidence.
+#[test]
+fn secondary_recovery_disables_local_but_preserves_builtin_and_revision() {
+    for suffix in [".tmp", ".bak"] {
+        let fixture = Fixture::new();
+        let mut saved = state(u64::MAX);
+        saved.entries[0].enabled = true;
+        saved
+            .entries
+            .push(local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A));
+        fixture.write("", b"broken primary");
+        fixture.write(suffix, serde_json::to_vec(&saved).unwrap());
+
+        let loaded = fixture.store().load().unwrap();
+
+        assert!(loaded.state.entries[0].enabled);
+        assert!(!loaded.state.entries[1].enabled);
+        assert_eq!(loaded.state.revision, u64::MAX);
+        assert!(loaded.requires_rewrite);
+        assert_eq!(fs::read(fixture.path()).unwrap(), b"broken primary");
+    }
+}
+
+// Catches applying fail-closed recovery semantics to a valid primary document.
+#[test]
+fn primary_recovery_retains_local_enabled() {
+    let fixture = Fixture::new();
+    let mut saved = state(7);
+    saved
+        .entries
+        .push(local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A));
+    fixture.write("", serde_json::to_vec(&saved).unwrap());
+
+    let loaded = fixture.store().load().unwrap();
+
+    assert!(loaded.state.entries[1].enabled);
+    assert!(!loaded.requires_rewrite);
+}
+
+// Catches skipping a required recovery rewrite only because all local entries
+// were already disabled in the selected secondary candidate.
+#[test]
+fn secondary_with_already_disabled_locals_still_requires_rewrite() {
+    let fixture = Fixture::new();
+    let mut saved = state(7);
+    let mut local = local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A);
+    local.enabled = false;
+    saved.entries.push(local);
+    fixture.write("", b"broken primary");
+    fixture.write(".bak", serde_json::to_vec(&saved).unwrap());
+
+    let loaded = fixture.store().load().unwrap();
+
+    assert!(!loaded.state.entries[1].enabled);
+    assert!(loaded.requires_rewrite);
+}
+
+// Catches falling back from terminal primary candidates to a valid sidecar.
+#[test]
+fn future_or_oversized_primary_never_falls_back() {
+    for (primary, code) in [
+        (
+            br#"{"schemaVersion":3,"revision":"8","entries":[]}"#.to_vec(),
+            "plugin_state_unsupported_schema",
+        ),
+        (
+            vec![b' '; MAX_PLUGIN_STATE_BYTES + 1],
+            "plugin_state_unavailable",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.write("", &primary);
+        fixture.write(".tmp", document(1));
+        fixture.write(".bak", document(2));
+
+        assert_plugin_code(fixture.store().load(), code);
+    }
+}
+
 // Catches loading v1 into a v1 runtime state instead of canonical v2 while
 // forgetting to request a deferred migration write.
 #[test]
@@ -604,6 +684,30 @@ fn saves_preserve_previous_commit_and_recovered_state_in_backup() {
     }
 }
 
+// Catches saving a raw secondary candidate as the backup predecessor after a
+// fail-closed recovery has normalized its local authorization.
+#[test]
+fn saves_normalized_secondary_recovery_as_backup_predecessor() {
+    for suffix in [".tmp", ".bak"] {
+        let fixture = Fixture::new();
+        let mut recovered = state(4);
+        recovered.entries[0].enabled = true;
+        recovered
+            .entries
+            .push(local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A));
+        fixture.write("", b"broken primary");
+        fixture.write(suffix, serde_json::to_vec(&recovered).unwrap());
+
+        fixture.store().save(&state(5)).unwrap();
+
+        let backup: PluginStateFileV2 =
+            serde_json::from_slice(&fs::read(sidecar(&fixture.path(), ".bak")).unwrap()).unwrap();
+        assert_eq!(backup.revision, 4);
+        assert!(backup.entries[0].enabled);
+        assert!(!backup.entries[1].enabled);
+    }
+}
+
 // Catches treating a fully written but uncommitted stage as crash-recovery input.
 #[test]
 fn stale_pending_is_never_read_as_current_and_does_not_block_save() {
@@ -662,6 +766,76 @@ fn injected_write_rotation_promotion_and_restore_failures_never_publish_uncommit
                 fixture.store().load().unwrap().state.revision,
                 if prior.is_some() { 1 } else { 0 }
             );
+        }
+    }
+}
+
+// Catches any atomic-write checkpoint reviving a local authorization that was
+// normalized while the save transaction recovered from a secondary candidate.
+#[test]
+fn every_write_checkpoint_preserves_secondary_recovery_normalization() {
+    for suffix in [".tmp", ".bak"] {
+        for (failures, committed) in [
+            (vec![WriteStep::TempWrite], false),
+            (vec![WriteStep::BackupRotation], false),
+            (vec![WriteStep::Promotion], false),
+            (vec![WriteStep::Promotion, WriteStep::Restore], false),
+            (vec![WriteStep::PostCommitSync], true),
+        ] {
+            let fixture = Fixture::new();
+            let mut recovered = state(41);
+            recovered.entries[0].enabled = true;
+            recovered
+                .entries
+                .push(local_entry("com.easiflux.local", LOCAL_FINGERPRINT_A));
+            fixture.write("", b"broken primary");
+            fixture.write(suffix, serde_json::to_vec(&recovered).unwrap());
+
+            let mut requested = recovered.clone();
+            requested.revision = 42;
+            requested.entries[1].enabled = false;
+            let requested_failures = failures.clone();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&observed);
+            let mut store = fixture.store();
+            store.file.hook = Some(Arc::new(move |step| {
+                recorded.lock().unwrap().push(step);
+                if failures.contains(&step) {
+                    Err(std::io::Error::other("raw-secret recovery fault"))
+                } else {
+                    Ok(())
+                }
+            }));
+
+            let saved = store.save(&requested);
+            if committed {
+                saved.unwrap();
+            } else {
+                assert_sanitized(saved.unwrap_err());
+            }
+            for failure in requested_failures {
+                assert!(
+                    observed.lock().unwrap().contains(&failure),
+                    "requested secondary-recovery fault {failure:?} did not run"
+                );
+            }
+
+            let loaded = fixture.store().load().unwrap();
+            assert_eq!(loaded.state.revision, if committed { 42 } else { 41 });
+            let builtin = loaded
+                .state
+                .entries
+                .iter()
+                .find(|entry| entry.source == PluginSource::BuiltIn)
+                .unwrap();
+            assert!(builtin.enabled);
+            let local = loaded
+                .state
+                .entries
+                .iter()
+                .find(|entry| entry.source == PluginSource::LocalDeclarative)
+                .unwrap();
+            assert!(!local.enabled);
         }
     }
 }

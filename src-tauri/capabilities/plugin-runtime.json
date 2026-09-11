@@ -6,6 +6,9 @@
   "permissions": [
     "allow-get-plugin-catalog",
     "allow-reload-plugin-catalog",
-    "allow-set-plugin-enabled"
+    "allow-set-plugin-enabled",
+    "allow-prepare-local-manifest-import",
+    "allow-cancel-local-manifest-import",
+    "allow-commit-local-manifest-import"
   ]
 }

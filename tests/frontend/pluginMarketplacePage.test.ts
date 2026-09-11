@@ -8,11 +8,14 @@ import PluginMarketplacePage from '../../src/components/plugins/PluginMarketplac
 import Sidebar from '../../src/components/layout/Sidebar.vue'
 import { usePluginStore } from '../../src/stores/plugin'
 import type {
+  CommitLocalManifestImportResult,
+  PrepareLocalManifestImportResult,
   PluginAvailabilityReason,
   PluginCatalogItem,
   PluginCatalogMutationResult,
   PluginCatalogSnapshot,
   PluginStatus,
+  ReadyLocalManifestImport,
 } from '../../src/types/plugin'
 import type { PluginSection } from '../../src/types/navigation'
 
@@ -20,6 +23,9 @@ const serviceMocks = vi.hoisted(() => ({
   getCatalog: vi.fn(),
   reloadCatalog: vi.fn(),
   setEnabled: vi.fn(),
+  prepareImport: vi.fn(),
+  cancelImport: vi.fn(),
+  commitImport: vi.fn(),
 }))
 
 vi.mock('../../src/services/pluginService', async (importOriginal) => ({
@@ -27,6 +33,9 @@ vi.mock('../../src/services/pluginService', async (importOriginal) => ({
   getPluginCatalog: serviceMocks.getCatalog,
   reloadPluginCatalog: serviceMocks.reloadCatalog,
   setPluginEnabled: serviceMocks.setEnabled,
+  prepareLocalManifestImport: serviceMocks.prepareImport,
+  cancelLocalManifestImport: serviceMocks.cancelImport,
+  commitLocalManifestImport: serviceMocks.commitImport,
 }))
 
 vi.mock('../../src/composables/useChartWorkspaceAutosaveHost', () => ({
@@ -125,6 +134,41 @@ function mutation(
     revision: '2',
     catalogGeneration: '1',
     plugin: pluginItem(id, 'Beta 交易', enabled ? 'enabled' : 'disabled'),
+  }
+}
+
+const readyPreview = {
+  schemaVersion: 1,
+  status: 'ready',
+  token: 'a'.repeat(32),
+  expiresInSeconds: 300,
+  catalogGeneration: '1',
+  manifest: {
+    schemaVersion: 1,
+    id: 'com.example.notes',
+    publisherId: 'com.example',
+    publisher: 'Example 作者',
+    name: '本地笔记',
+    description: '只包含声明式元数据。',
+    version: '1.2.3',
+    contributions: [],
+    requestedCapabilities: [],
+  },
+} satisfies ReadyLocalManifestImport
+
+function importedSnapshot(): PluginCatalogSnapshot {
+  return {
+    ...availableSnapshot([
+      {
+        manifest: readyPreview.manifest,
+        source: 'localDeclarative',
+        grantedCapabilities: [],
+        status: 'disabled',
+        canToggle: true,
+        statusReasonCode: null,
+      },
+    ], '2'),
+    catalogGeneration: '2',
   }
 }
 
@@ -700,6 +744,303 @@ describe('PluginMarketplacePage catalog views', () => {
     expect(confirmedControl.element.disabled).toBe(false)
     expect(wrapper.get('[role="alert"]').text()).toContain('保存插件状态失败，请重试。')
     expect(wrapper.text()).not.toContain('private')
+  })
+})
+
+describe('PluginMarketplacePage local manifest import', () => {
+  let showModalDescriptor: PropertyDescriptor | undefined
+  let closeDescriptor: PropertyDescriptor | undefined
+
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.reloadCatalog.mockReset()
+    serviceMocks.setEnabled.mockReset()
+    serviceMocks.prepareImport.mockReset()
+    serviceMocks.cancelImport.mockReset()
+    serviceMocks.commitImport.mockReset()
+    serviceMocks.cancelImport.mockResolvedValue({ schemaVersion: 1, status: 'cancelled' })
+
+    showModalDescriptor = Object.getOwnPropertyDescriptor(
+      HTMLDialogElement.prototype,
+      'showModal',
+    )
+    closeDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'close')
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) {
+        this.setAttribute('open', '')
+      },
+    })
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) {
+        this.removeAttribute('open')
+      },
+    })
+  })
+
+  afterEach(() => {
+    if (showModalDescriptor) {
+      Object.defineProperty(HTMLDialogElement.prototype, 'showModal', showModalDescriptor)
+    } else {
+      delete HTMLDialogElement.prototype.showModal
+    }
+    if (closeDescriptor) {
+      Object.defineProperty(HTMLDialogElement.prototype, 'close', closeDescriptor)
+    } else {
+      delete HTMLDialogElement.prototype.close
+    }
+    document.body.removeAttribute('tabindex')
+    document.body.replaceChildren()
+  })
+
+  async function mountLoaded(section: PluginSection = 'installed') {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot())
+    const wrapper = mountPage(section, document.body)
+    await flushPromises()
+    return wrapper
+  }
+
+  async function openReadyPreview(
+    wrapper: Awaited<ReturnType<typeof mountLoaded>>,
+  ): Promise<void> {
+    serviceMocks.prepareImport.mockResolvedValueOnce(readyPreview)
+    await wrapper.get('[data-testid="plugin-import-button"]').trigger('click')
+    await flushPromises()
+  }
+
+  it('shows the import entry only in installed and manage while preserving reload as the first action', async () => {
+    const wrapper = await mountLoaded('installed')
+
+    expect(wrapper.findAll('header button')[0].text()).toBe('重新扫描本地插件')
+    expect(wrapper.get('[data-testid="plugin-import-button"]').text()).toBe('导入本地清单')
+    await wrapper.setProps({ section: 'market' })
+    expect(wrapper.find('[data-testid="plugin-import-button"]').exists()).toBe(false)
+    await wrapper.setProps({ section: 'manage' })
+    expect(wrapper.get('[data-testid="plugin-import-button"]').text()).toBe('导入本地清单')
+    wrapper.unmount()
+  })
+
+  it('keeps the entry disabled while choosing and treats native cancellation as idle without an alert', async () => {
+    const choice = deferred<PrepareLocalManifestImportResult>()
+    serviceMocks.prepareImport.mockReturnValueOnce(choice.promise)
+    const wrapper = await mountLoaded()
+    const entry = wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-button"]')
+
+    await entry.trigger('click')
+    await nextTick()
+    expect(entry.element.disabled).toBe(true)
+    expect(wrapper.get('[data-testid="plugin-import-choosing"]').attributes('role')).toBe('status')
+    expect(wrapper.find('[data-testid="plugin-import-alert"]').exists()).toBe(false)
+
+    choice.resolve({ schemaVersion: 1, status: 'cancelled' })
+    await flushPromises()
+    expect(entry.element.disabled).toBe(false)
+    expect(wrapper.find('[data-testid="plugin-import-choosing"]').exists()).toBe(false)
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+    wrapper.unmount()
+  })
+
+  it('restores the connected import trigger after the native picker blurred it', async () => {
+    const choice = deferred<PrepareLocalManifestImportResult>()
+    serviceMocks.prepareImport.mockReturnValueOnce(choice.promise)
+    const wrapper = await mountLoaded()
+    const entry = wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-button"]')
+    entry.element.focus()
+
+    await entry.trigger('click')
+    await nextTick()
+    expect(entry.element.disabled).toBe(true)
+    document.body.tabIndex = -1
+    document.body.focus()
+    expect(document.activeElement).toBe(document.body)
+
+    choice.resolve(readyPreview)
+    await flushPromises()
+    const dialog = wrapper.get('dialog')
+    expect(document.activeElement).toBe(
+      dialog.get('[data-testid="plugin-import-cancel"]').element,
+    )
+
+    dialog.element.dispatchEvent(new Event('cancel', { cancelable: true }))
+    await flushPromises()
+
+    expect(entry.element.isConnected).toBe(true)
+    expect(entry.element.disabled).toBe(false)
+    expect(document.activeElement).toBe(entry.element)
+    wrapper.unmount()
+  })
+
+  it('retains the preview across section changes and delegates explicit cancellation', async () => {
+    const wrapper = await mountLoaded()
+    await openReadyPreview(wrapper)
+
+    expect(wrapper.find('dialog').exists()).toBe(true)
+    await wrapper.setProps({ section: 'market' })
+    expect(wrapper.find('[data-testid="plugin-import-button"]').exists()).toBe(false)
+    expect(wrapper.find('dialog').exists()).toBe(true)
+    await wrapper.setProps({ section: 'manage' })
+    expect(wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-button"]')
+      .element.disabled).toBe(true)
+
+    await wrapper.get('[data-testid="plugin-import-cancel"]').trigger('click')
+    await flushPromises()
+    expect(serviceMocks.cancelImport).toHaveBeenCalledWith(readyPreview.token)
+    expect(wrapper.find('dialog').exists()).toBe(false)
+    expect(wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-button"]')
+      .element.disabled).toBe(false)
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+    wrapper.unmount()
+  })
+
+  it('announces a completed import as status and keeps the entry disabled until dismissal', async () => {
+    const imported: CommitLocalManifestImportResult = {
+      schemaVersion: 1,
+      status: 'imported',
+      pluginId: readyPreview.manifest.id,
+      snapshot: importedSnapshot(),
+    }
+    serviceMocks.commitImport.mockResolvedValueOnce(imported)
+    const wrapper = await mountLoaded()
+    await openReadyPreview(wrapper)
+
+    await wrapper.get('[data-testid="plugin-import-confirm"]').trigger('click')
+    await flushPromises()
+
+    const result = wrapper.get('[data-testid="plugin-import-status"]')
+    expect(result.attributes('role')).toBe('status')
+    expect(result.text()).toContain('清单已导入，默认停用')
+    expect(wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-button"]')
+      .element.disabled).toBe(true)
+    await result.get('[data-testid="plugin-import-dismiss"]').trigger('click')
+    expect(wrapper.find('[data-testid="plugin-import-status"]').exists()).toBe(false)
+    expect(wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-button"]')
+      .element.disabled).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('uses the exact partial-failure warning and requires explicit dismissal', async () => {
+    serviceMocks.commitImport.mockResolvedValueOnce({
+      schemaVersion: 1,
+      status: 'notImported',
+      disabledDecisionSaved: true,
+      reasonCode: 'plugin_import_write_failed',
+      snapshot: availableSnapshot(),
+    } satisfies CommitLocalManifestImportResult)
+    const wrapper = await mountLoaded()
+    await openReadyPreview(wrapper)
+    await wrapper.get('[data-testid="plugin-import-confirm"]').trigger('click')
+    await flushPromises()
+
+    const alert = wrapper.get('[data-testid="plugin-import-alert"]')
+    expect(alert.attributes('role')).toBe('alert')
+    expect(alert.get('p').text())
+      .toBe('导入未完成；该清单的停用偏好已保存，旧启用不会恢复')
+    expect(wrapper.text()).not.toContain('清单已导入，默认停用')
+    expect(wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-button"]')
+      .element.disabled).toBe(true)
+    await alert.get('[data-testid="plugin-import-dismiss"]').trigger('click')
+    expect(wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-button"]')
+      .element.disabled).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('renders known prepare and not-imported errors as local alert copy', async () => {
+    serviceMocks.prepareImport.mockRejectedValueOnce({
+      code: 'plugin_import_source_rejected',
+      message: 'D:\\private\\manifest.json',
+    })
+    const wrapper = await mountLoaded()
+    await wrapper.get('[data-testid="plugin-import-button"]').trigger('click')
+    await flushPromises()
+
+    let alert = wrapper.get('[data-testid="plugin-import-alert"]')
+    expect(alert.attributes('role')).toBe('alert')
+    expect(alert.text()).toContain('无法安全读取所选文件，请选择普通本地 JSON 文件。')
+    expect(alert.text()).not.toContain('private')
+    await alert.get('[data-testid="plugin-import-dismiss"]').trigger('click')
+
+    serviceMocks.commitImport.mockResolvedValueOnce({
+      schemaVersion: 1,
+      status: 'notImported',
+      disabledDecisionSaved: false,
+      reasonCode: 'plugin_import_id_conflict',
+      snapshot: availableSnapshot(),
+    } satisfies CommitLocalManifestImportResult)
+    await openReadyPreview(wrapper)
+    await wrapper.get('[data-testid="plugin-import-confirm"]').trigger('click')
+    await flushPromises()
+    alert = wrapper.get('[data-testid="plugin-import-alert"]')
+    expect(alert.attributes('role')).toBe('alert')
+    expect(alert.text()).toContain('已存在相同插件 ID；当前不支持覆盖或更新。')
+    wrapper.unmount()
+  })
+
+  it('offers reload rather than retry-import when publication is unconfirmed', async () => {
+    serviceMocks.commitImport.mockResolvedValueOnce({
+      schemaVersion: 1,
+      status: 'importedNotVisible',
+      pluginId: readyPreview.manifest.id,
+      reasonCode: 'plugin_import_publication_unconfirmed',
+      snapshot: availableSnapshot(),
+    } satisfies CommitLocalManifestImportResult)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce({
+      ...importedSnapshot(),
+      catalogGeneration: '3',
+    })
+    const wrapper = await mountLoaded()
+    await openReadyPreview(wrapper)
+    await wrapper.get('[data-testid="plugin-import-confirm"]').trigger('click')
+    await flushPromises()
+
+    const alert = wrapper.get('[data-testid="plugin-import-alert"]')
+    expect(alert.attributes('role')).toBe('alert')
+    expect(alert.text()).toContain('清单已写入，但目录结果尚未确认，请重新扫描。')
+    expect(alert.text()).not.toContain('重试导入')
+    await alert.get('[data-testid="plugin-import-result-reload"]').trigger('click')
+    await flushPromises()
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.prepareImport).toHaveBeenCalledTimes(1)
+    expect(wrapper.find('[data-testid="plugin-import-alert"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('treats an unknown commit outcome as an alert with reload and never retries import', async () => {
+    serviceMocks.commitImport.mockRejectedValueOnce(new Error('transport lost private path'))
+    serviceMocks.reloadCatalog.mockResolvedValueOnce({
+      ...availableSnapshot(),
+      catalogGeneration: '2',
+    })
+    const wrapper = await mountLoaded()
+    await openReadyPreview(wrapper)
+    await wrapper.get('[data-testid="plugin-import-confirm"]').trigger('click')
+    await flushPromises()
+
+    const alert = wrapper.get('[data-testid="plugin-import-alert"]')
+    expect(alert.attributes('role')).toBe('alert')
+    expect(alert.text()).toContain('结果尚未确认，请重新扫描。')
+    expect(alert.text()).not.toMatch(/transport|private|重试导入/)
+    await alert.get('[data-testid="plugin-import-result-reload"]').trigger('click')
+    await flushPromises()
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.commitImport).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.prepareImport).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  it('releases a ready import view when the page unmounts', async () => {
+    const wrapper = await mountLoaded()
+    await openReadyPreview(wrapper)
+    const store = usePluginStore()
+    const release = vi.spyOn(store, 'releaseImportView')
+
+    wrapper.unmount()
+    await flushPromises()
+
+    expect(release).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.cancelImport).toHaveBeenCalledWith(readyPreview.token)
   })
 })
 

@@ -1,5 +1,8 @@
 import { tauriInvoke } from '../composables/useTauriCommand'
 import type {
+  CancelLocalManifestImportResult,
+  CommitLocalManifestImportResult,
+  LocalManifestImportCommitFailure,
   PluginAvailability,
   PluginAvailabilityReason,
   PluginCatalogItem,
@@ -8,6 +11,8 @@ import type {
   PluginLocalDiscoverySummary,
   PluginManifestV1,
   PluginStatus,
+  PrepareLocalManifestImportResult,
+  ReadyLocalManifestImport,
 } from '../types/plugin'
 
 const INVALID_RESPONSE_ERROR = '插件服务返回的数据无效，请重试。'
@@ -15,7 +20,7 @@ const GENERIC_ERROR = '插件操作失败，请重试。'
 const U64_MAX = 18_446_744_073_709_551_615n
 const textEncoder = new TextEncoder()
 
-type PluginErrorCode =
+export type PluginErrorCode =
   | 'plugin_invalid_id'
   | 'plugin_not_found'
   | 'plugin_catalog_invalid'
@@ -26,6 +31,17 @@ type PluginErrorCode =
   | 'plugin_catalog_stale'
   | 'plugin_catalog_generation_exhausted'
   | 'plugin_state_capacity_exceeded'
+  | 'plugin_import_busy'
+  | 'plugin_import_dialog_unavailable'
+  | 'plugin_import_source_rejected'
+  | 'plugin_import_manifest_invalid'
+  | 'plugin_import_token_invalid'
+  | 'plugin_import_id_conflict'
+  | 'plugin_import_discovery_unavailable'
+  | 'plugin_import_capacity_exceeded'
+  | 'plugin_import_staging_capacity_exceeded'
+  | 'plugin_import_write_failed'
+  | 'plugin_import_publication_unconfirmed'
 
 const ERROR_MESSAGES = {
   plugin_invalid_id: '插件标识无效。',
@@ -38,6 +54,17 @@ const ERROR_MESSAGES = {
   plugin_catalog_stale: '插件目录已更新，请刷新后重试。',
   plugin_catalog_generation_exhausted: '插件目录版本已达到上限，请联系支持。',
   plugin_state_capacity_exceeded: '插件状态容量已达到上限，请联系支持。',
+  plugin_import_busy: '已有清单导入操作，请先完成或取消。',
+  plugin_import_dialog_unavailable: '无法打开文件选择器，请重试。',
+  plugin_import_source_rejected: '无法安全读取所选文件，请选择普通本地 JSON 文件。',
+  plugin_import_manifest_invalid: '清单格式或内容不符合当前插件要求。',
+  plugin_import_token_invalid: '预览已过期或失效，请重新选择清单。',
+  plugin_import_id_conflict: '已存在相同插件 ID；当前不支持覆盖或更新。',
+  plugin_import_discovery_unavailable: '请先修复本地插件发现问题，再导入清单。',
+  plugin_import_capacity_exceeded: '本地插件数量或读取预算已达上限。',
+  plugin_import_staging_capacity_exceeded: '导入暂存区需要人工检查和清理。',
+  plugin_import_write_failed: '无法完成清单写入，请检查后重试。',
+  plugin_import_publication_unconfirmed: '清单已写入，但目录结果尚未确认，请重新扫描。',
 } satisfies Record<PluginErrorCode, string>
 
 const SNAPSHOT_KEYS = [
@@ -71,6 +98,45 @@ const MANIFEST_KEYS = [
 const MUTATION_KEYS = ['schemaVersion', 'revision', 'catalogGeneration', 'plugin'] as const
 const LOCAL_DISCOVERY_KEYS = ['status', 'rejectedPackageCount'] as const
 const ERROR_KEYS = ['code', 'message'] as const
+const PREPARE_CANCELLED_KEYS = ['schemaVersion', 'status'] as const
+const PREPARE_READY_KEYS = [
+  'schemaVersion',
+  'status',
+  'token',
+  'expiresInSeconds',
+  'catalogGeneration',
+  'manifest',
+] as const
+const IMPORTED_KEYS = ['schemaVersion', 'status', 'pluginId', 'snapshot'] as const
+const NOT_IMPORTED_KEYS = [
+  'schemaVersion',
+  'status',
+  'disabledDecisionSaved',
+  'reasonCode',
+  'snapshot',
+] as const
+const IMPORTED_NOT_VISIBLE_KEYS = [
+  'schemaVersion',
+  'status',
+  'pluginId',
+  'reasonCode',
+  'snapshot',
+] as const
+
+const IMPORT_COMMIT_FAILURES = new Set<LocalManifestImportCommitFailure>([
+  'plugin_catalog_stale',
+  'plugin_catalog_invalid',
+  'plugin_catalog_generation_exhausted',
+  'plugin_state_unavailable',
+  'plugin_state_persist_failed',
+  'plugin_state_capacity_exceeded',
+  'plugin_revision_exhausted',
+  'plugin_import_id_conflict',
+  'plugin_import_discovery_unavailable',
+  'plugin_import_capacity_exceeded',
+  'plugin_import_staging_capacity_exceeded',
+  'plugin_import_write_failed',
+])
 
 function invalidResponse(): never {
   throw new Error(INVALID_RESPONSE_ERROR)
@@ -311,6 +377,124 @@ function parseLocalDiscovery(value: unknown): PluginLocalDiscoverySummary {
   return { status, rejectedPackageCount }
 }
 
+function requireImportToken(value: unknown): string {
+  const token = requireString(value)
+  if (!/^[0-9a-f]{32}$/.test(token)) invalidResponse()
+  return token
+}
+
+function parseImportCommitFailure(value: unknown): LocalManifestImportCommitFailure {
+  const reasonCode = requireString(value)
+  if (!IMPORT_COMMIT_FAILURES.has(reasonCode as LocalManifestImportCommitFailure)) {
+    invalidResponse()
+  }
+  return reasonCode as LocalManifestImportCommitFailure
+}
+
+function manifestsMatch(left: PluginManifestV1, right: PluginManifestV1): boolean {
+  return left.schemaVersion === right.schemaVersion
+    && left.id === right.id
+    && left.publisherId === right.publisherId
+    && left.publisher === right.publisher
+    && left.name === right.name
+    && left.description === right.description
+    && left.version === right.version
+    && left.contributions.length === right.contributions.length
+    && left.requestedCapabilities.length === right.requestedCapabilities.length
+}
+
+function parsePrepareImport(value: unknown): PrepareLocalManifestImportResult {
+  if (!isObject(value)) invalidResponse()
+
+  if (value.status === 'cancelled') {
+    const result = requireExactObject(value, PREPARE_CANCELLED_KEYS)
+    if (result.schemaVersion !== 1) invalidResponse()
+    return { schemaVersion: 1, status: 'cancelled' }
+  }
+
+  if (value.status === 'ready') {
+    const result = requireExactObject(value, PREPARE_READY_KEYS)
+    if (result.schemaVersion !== 1 || result.expiresInSeconds !== 300) invalidResponse()
+    return {
+      schemaVersion: 1,
+      status: 'ready',
+      token: requireImportToken(result.token),
+      expiresInSeconds: 300,
+      catalogGeneration: requireCanonicalRevision(result.catalogGeneration),
+      manifest: parseManifest(result.manifest),
+    }
+  }
+
+  return invalidResponse()
+}
+
+function parseCancelImport(value: unknown): CancelLocalManifestImportResult {
+  const result = requireExactObject(value, PREPARE_CANCELLED_KEYS)
+  if (result.schemaVersion !== 1 || result.status !== 'cancelled') invalidResponse()
+  return { schemaVersion: 1, status: 'cancelled' }
+}
+
+function parseCommitImport(
+  value: unknown,
+  expectedManifest: PluginManifestV1,
+): CommitLocalManifestImportResult {
+  if (!isObject(value)) invalidResponse()
+
+  if (value.status === 'imported') {
+    const result = requireExactObject(value, IMPORTED_KEYS)
+    if (result.schemaVersion !== 1) invalidResponse()
+    const pluginId = requireReverseDomainId(result.pluginId)
+    const snapshot = parseSnapshot(result.snapshot)
+    const matchingItems = snapshot.plugins.filter((plugin) => plugin.manifest.id === pluginId)
+    if (
+      pluginId !== expectedManifest.id
+      || snapshot.availability !== 'available'
+      || matchingItems.length !== 1
+      || matchingItems[0].source !== 'localDeclarative'
+      || matchingItems[0].status !== 'disabled'
+      || !manifestsMatch(matchingItems[0].manifest, expectedManifest)
+    ) invalidResponse()
+    return { schemaVersion: 1, status: 'imported', pluginId, snapshot }
+  }
+
+  if (value.status === 'notImported') {
+    const result = requireExactObject(value, NOT_IMPORTED_KEYS)
+    if (result.schemaVersion !== 1 || typeof result.disabledDecisionSaved !== 'boolean') {
+      invalidResponse()
+    }
+    const reasonCode = parseImportCommitFailure(result.reasonCode)
+    if (result.disabledDecisionSaved && reasonCode !== 'plugin_import_write_failed') {
+      invalidResponse()
+    }
+    return {
+      schemaVersion: 1,
+      status: 'notImported',
+      disabledDecisionSaved: result.disabledDecisionSaved,
+      reasonCode,
+      snapshot: parseSnapshot(result.snapshot),
+    }
+  }
+
+  if (value.status === 'importedNotVisible') {
+    const result = requireExactObject(value, IMPORTED_NOT_VISIBLE_KEYS)
+    if (
+      result.schemaVersion !== 1
+      || result.reasonCode !== 'plugin_import_publication_unconfirmed'
+    ) invalidResponse()
+    const pluginId = requireReverseDomainId(result.pluginId)
+    if (pluginId !== expectedManifest.id) invalidResponse()
+    return {
+      schemaVersion: 1,
+      status: 'importedNotVisible',
+      pluginId,
+      reasonCode: 'plugin_import_publication_unconfirmed',
+      snapshot: parseSnapshot(result.snapshot),
+    }
+  }
+
+  return invalidResponse()
+}
+
 export async function getPluginCatalog(): Promise<PluginCatalogSnapshot> {
   return parseSnapshot(await tauriInvoke<unknown>('get_plugin_catalog'))
 }
@@ -334,9 +518,34 @@ export async function setPluginEnabled(
   return result
 }
 
+export async function prepareLocalManifestImport(): Promise<PrepareLocalManifestImportResult> {
+  return parsePrepareImport(await tauriInvoke<unknown>('prepare_local_manifest_import'))
+}
+
+export async function cancelLocalManifestImport(
+  token: string,
+): Promise<CancelLocalManifestImportResult> {
+  return parseCancelImport(await tauriInvoke<unknown>('cancel_local_manifest_import', { token }))
+}
+
+export async function commitLocalManifestImport(
+  preview: ReadyLocalManifestImport,
+): Promise<CommitLocalManifestImportResult> {
+  const value = await tauriInvoke<unknown>('commit_local_manifest_import', {
+    token: preview.token,
+    expectedCatalogGeneration: preview.catalogGeneration,
+  })
+  return parseCommitImport(value, preview.manifest)
+}
+
+export function pluginErrorCode(error: unknown): PluginErrorCode | null {
+  if (!hasExactKeys(error, ERROR_KEYS)) return null
+  if (typeof error.code !== 'string' || typeof error.message !== 'string') return null
+  if (!Object.prototype.hasOwnProperty.call(ERROR_MESSAGES, error.code)) return null
+  return error.code as PluginErrorCode
+}
+
 export function pluginErrorMessage(error: unknown): string {
-  if (!hasExactKeys(error, ERROR_KEYS)) return GENERIC_ERROR
-  if (typeof error.code !== 'string' || typeof error.message !== 'string') return GENERIC_ERROR
-  if (!Object.prototype.hasOwnProperty.call(ERROR_MESSAGES, error.code)) return GENERIC_ERROR
-  return ERROR_MESSAGES[error.code as PluginErrorCode]
+  const code = pluginErrorCode(error)
+  return code === null ? GENERIC_ERROR : ERROR_MESSAGES[code]
 }

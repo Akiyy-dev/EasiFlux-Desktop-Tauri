@@ -22,6 +22,7 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -75,6 +76,9 @@ pub fn run() {
             get_plugin_catalog,
             reload_plugin_catalog,
             set_plugin_enabled,
+            prepare_local_manifest_import,
+            cancel_local_manifest_import,
+            commit_local_manifest_import,
             get_risk_status,
             update_risk_config,
             save_credentials,
@@ -157,7 +161,7 @@ mod capability_tests {
 
     #[test]
     fn main_window_can_force_close_after_chart_workspace_flush() {
-        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
 
         let access = context.runtime_authority_mut().resolve_access(
             "plugin:window|destroy",
@@ -175,7 +179,7 @@ mod capability_tests {
     // Catches granting the plugin control surface to another window or remote content.
     #[test]
     fn plugin_commands_are_available_only_to_the_local_main_webview() {
-        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
         let authority = context.runtime_authority_mut();
         let remote = Origin::Remote {
             url: "https://example.invalid".parse().unwrap(),
@@ -185,6 +189,9 @@ mod capability_tests {
             "get_plugin_catalog",
             "reload_plugin_catalog",
             "set_plugin_enabled",
+            "prepare_local_manifest_import",
+            "cancel_local_manifest_import",
+            "commit_local_manifest_import",
         ] {
             assert!(
                 authority
@@ -211,23 +218,72 @@ mod capability_tests {
                 "remote content must not resolve {command}"
             );
         }
+        assert!(
+            authority
+                .resolve_access("plugin:dialog|open", "main", "main", &Origin::Local)
+                .is_none(),
+            "the Rust-owned picker must not grant frontend dialog open access"
+        );
     }
 
     // Catches wildcard or path-scoped grants expanding this fixed IPC surface.
     #[test]
-    fn plugin_capability_grants_exactly_the_three_fixed_commands_without_scope() {
+    fn plugin_capability_grants_exactly_the_six_fixed_commands_without_scope() {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/plugin-runtime.json")).unwrap();
         assert_eq!(capability["webviews"], serde_json::json!(["main"]));
         assert!(capability.get("windows").is_none());
         assert!(capability.get("remote").is_none());
+        assert!(capability.get("scope").is_none());
         assert_eq!(
             capability["permissions"],
             serde_json::json!([
                 "allow-get-plugin-catalog",
                 "allow-reload-plugin-catalog",
-                "allow-set-plugin-enabled"
+                "allow-set-plugin-enabled",
+                "allow-prepare-local-manifest-import",
+                "allow-cancel-local-manifest-import",
+                "allow-commit-local-manifest-import"
             ])
+        );
+    }
+
+    // Catches another capability accidentally exposing the registered backend dialog/fs plugins.
+    #[test]
+    fn capability_union_has_no_frontend_dialog_or_filesystem_grant() {
+        let capabilities = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        let mut identifiers = Vec::new();
+        let mut files = 0usize;
+        for entry in std::fs::read_dir(capabilities).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+                continue;
+            }
+            files += 1;
+            let capability: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+            for permission in capability["permissions"].as_array().unwrap() {
+                let identifier = permission
+                    .as_str()
+                    .or_else(|| {
+                        permission
+                            .get("identifier")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .expect("capability permission identifier");
+                identifiers.push(identifier.to_owned());
+            }
+        }
+        assert!(
+            files > 0,
+            "capability scan must inspect at least one JSON file"
+        );
+        assert!(
+            identifiers
+                .iter()
+                .all(|identifier| !identifier.starts_with("dialog:")
+                    && !identifier.starts_with("fs:")),
+            "frontend dialog/fs capability found in union: {identifiers:?}"
         );
     }
 }

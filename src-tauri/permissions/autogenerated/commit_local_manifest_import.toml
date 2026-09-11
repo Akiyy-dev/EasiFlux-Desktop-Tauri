@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-commit-local-manifest-import"
+description = "Enables the commit_local_manifest_import command without any pre-configured scope."
+commands.allow = ["commit_local_manifest_import"]
+
+[[permission]]
+identifier = "deny-commit-local-manifest-import"
+description = "Denies the commit_local_manifest_import command without any pre-configured scope."
+commands.deny = ["commit_local_manifest_import"]

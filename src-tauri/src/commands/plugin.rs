@@ -1,8 +1,12 @@
 use std::sync::Arc;
 
-use tauri::State;
+use tauri::{State, WebviewWindow};
 
 use crate::error::AppResult;
+use crate::plugin::import::dialog::NativeLocalManifestSelector;
+use crate::plugin::import::{
+    CancelImportResult, CommitImportResult, LocalManifestSelector, PrepareImportResult,
+};
 use crate::plugin::manifest::{PluginCatalogMutationResult, PluginCatalogSnapshot};
 use crate::plugin::PluginRuntime;
 use crate::state::AppState;
@@ -20,13 +24,37 @@ pub(crate) async fn reload_plugin_catalog_from(
 }
 
 pub(crate) async fn set_plugin_enabled_from(
-    runtime: &PluginRuntime,
+    runtime: &Arc<PluginRuntime>,
     id: &str,
     enabled: bool,
     expected_catalog_generation: &str,
 ) -> AppResult<PluginCatalogMutationResult> {
     runtime
         .set_enabled(id, enabled, expected_catalog_generation)
+        .await
+}
+
+pub(crate) async fn prepare_local_manifest_import_from(
+    runtime: &Arc<PluginRuntime>,
+    selector: Arc<dyn LocalManifestSelector>,
+) -> AppResult<PrepareImportResult> {
+    runtime.prepare_import(selector).await
+}
+
+pub(crate) fn cancel_local_manifest_import_from(
+    runtime: &Arc<PluginRuntime>,
+    token: &str,
+) -> AppResult<CancelImportResult> {
+    runtime.cancel_import(token)
+}
+
+pub(crate) async fn commit_local_manifest_import_from(
+    runtime: &Arc<PluginRuntime>,
+    token: &str,
+    expected_catalog_generation: &str,
+) -> AppResult<CommitImportResult> {
+    runtime
+        .commit_import(token, expected_catalog_generation)
         .await
 }
 
@@ -47,17 +75,44 @@ pub async fn set_plugin_enabled(
     enabled: bool,
     expected_catalog_generation: String,
 ) -> AppResult<PluginCatalogMutationResult> {
-    set_plugin_enabled_from(
-        state.plugins.as_ref(),
-        &id,
-        enabled,
-        &expected_catalog_generation,
+    set_plugin_enabled_from(&state.plugins, &id, enabled, &expected_catalog_generation).await
+}
+
+#[tauri::command]
+pub async fn prepare_local_manifest_import(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<PrepareImportResult> {
+    prepare_local_manifest_import_from(
+        &state.plugins,
+        Arc::new(NativeLocalManifestSelector::new(window)),
     )
     .await
 }
 
+#[tauri::command]
+pub async fn cancel_local_manifest_import(
+    state: State<'_, AppState>,
+    token: String,
+) -> AppResult<CancelImportResult> {
+    cancel_local_manifest_import_from(&state.plugins, &token)
+}
+
+#[tauri::command]
+pub async fn commit_local_manifest_import(
+    state: State<'_, AppState>,
+    token: String,
+    expected_catalog_generation: String,
+) -> AppResult<CommitImportResult> {
+    commit_local_manifest_import_from(&state.plugins, &token, &expected_catalog_generation).await
+}
+
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use serde_json::{json, Value};
@@ -65,9 +120,15 @@ mod tests {
     use super::*;
     use crate::error::AppError;
     use crate::plugin::discovery::{LocalDiscoveryOutcome, LocalPluginDiscovery};
+    use crate::plugin::import::source::LocalManifestReader;
+    use crate::plugin::import::{
+        test_support::VALID, ImportCommitFailure, LocalManifestSelector, PrepareImportResult,
+        PreparedManifest, SelectedManifestSource,
+    };
     use crate::plugin::manifest::{PluginId, PluginManifestV1, PluginPublisherId, PluginSource};
     use crate::plugin::record::PluginRecord;
     use crate::plugin::PluginRegistry;
+    use crate::storage::local_plugin_import::{LocalManifestImportStorage, OwnedImportStage};
     use crate::storage::plugin_state::{
         PluginStateEntryV2, PluginStateFileV2, PluginStateLoad, PluginStatePersistence,
     };
@@ -159,6 +220,53 @@ mod tests {
         fn discover(&self) -> LocalDiscoveryOutcome {
             self.0.clone()
         }
+    }
+
+    struct FixedSelector(PathBuf);
+
+    impl LocalManifestSelector for FixedSelector {
+        fn select(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = AppResult<SelectedManifestSource>> + Send + '_>> {
+            let path = self.0.clone();
+            Box::pin(async move { Ok(SelectedManifestSource::Selected(path)) })
+        }
+    }
+
+    struct RecordingReader {
+        paths: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl LocalManifestReader for RecordingReader {
+        fn read(&self, path: &Path) -> AppResult<PreparedManifest> {
+            self.paths.lock().unwrap().push(path.to_path_buf());
+            PreparedManifest::parse(VALID)
+        }
+    }
+
+    struct CountingStorage(Arc<AtomicUsize>);
+
+    impl LocalManifestImportStorage for CountingStorage {
+        fn prepare_stage(
+            &self,
+            _bytes: &[u8],
+        ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(ImportCommitFailure::WriteFailed)
+        }
+    }
+
+    fn import_runtime_with(
+        persistence: &MemoryPersistence,
+        paths: Arc<Mutex<Vec<PathBuf>>>,
+        stage_calls: Arc<AtomicUsize>,
+    ) -> Arc<PluginRuntime> {
+        Arc::new(PluginRuntime::with_import_services(
+            persistence.registry(vec![]),
+            Arc::new(FixedDiscovery(LocalDiscoveryOutcome::available(vec![]))),
+            Arc::new(RecordingReader { paths }),
+            Arc::new(CountingStorage(stage_calls)),
+        ))
     }
 
     fn runtime_with(persistence: &MemoryPersistence) -> Arc<PluginRuntime> {
@@ -360,5 +468,119 @@ mod tests {
         assert_eq!(again.catalog_generation, "1");
         assert_eq!(again.revision, "1");
         assert_eq!(persistence.0.lock().unwrap().saves.len(), 1);
+    }
+
+    #[test]
+    fn public_import_command_signatures_expose_no_path_or_manifest_inputs() {
+        fn prepare_only(window: WebviewWindow, state: State<'_, AppState>) {
+            drop(prepare_local_manifest_import(window, state));
+        }
+        fn cancel_only(state: State<'_, AppState>, token: String) {
+            drop(cancel_local_manifest_import(state, token));
+        }
+        fn commit_only(
+            state: State<'_, AppState>,
+            token: String,
+            expected_catalog_generation: String,
+        ) {
+            drop(commit_local_manifest_import(
+                state,
+                token,
+                expected_catalog_generation,
+            ));
+        }
+
+        let _ = (prepare_only, cancel_only, commit_only);
+    }
+
+    #[tokio::test]
+    async fn prepare_command_helper_returns_only_canonical_content_not_source_details() {
+        let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let stage_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = import_runtime_with(&persistence, Arc::clone(&paths), stage_calls);
+        let private_path = PathBuf::from(r"C:\private-source\never-leak.json");
+
+        let result = prepare_local_manifest_import_from(
+            &runtime,
+            Arc::new(FixedSelector(private_path.clone())),
+        )
+        .await
+        .unwrap();
+        let wire = serde_json::to_value(&result).unwrap();
+        let keys = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "catalogGeneration",
+                "expiresInSeconds",
+                "manifest",
+                "schemaVersion",
+                "status",
+                "token",
+            ]
+        );
+        assert_eq!(*paths.lock().unwrap(), [private_path.clone()]);
+        let serialized = serde_json::to_string(&wire).unwrap();
+        assert!(!serialized.contains(private_path.to_string_lossy().as_ref()));
+        assert!(!wire.as_object().unwrap().contains_key("path"));
+        assert!(!wire.as_object().unwrap().contains_key("rawJson"));
+        assert!(!wire.as_object().unwrap().contains_key("source"));
+    }
+
+    #[tokio::test]
+    async fn commit_command_helper_forwards_expected_generation_unchanged() {
+        let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let stage_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = import_runtime_with(&persistence, paths, Arc::clone(&stage_calls));
+        let prepared = prepare_local_manifest_import_from(
+            &runtime,
+            Arc::new(FixedSelector(PathBuf::from(r"C:\selected.json"))),
+        )
+        .await
+        .unwrap();
+        let PrepareImportResult::Ready(preview) = prepared else {
+            panic!("ready preview required");
+        };
+        let noncanonical = format!("0{}", preview.catalog_generation);
+
+        let result = commit_local_manifest_import_from(&runtime, &preview.token, &noncanonical)
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(result).unwrap();
+        assert_eq!(wire["status"], "notImported");
+        assert_eq!(wire["reasonCode"], "plugin_catalog_stale");
+        assert_eq!(wire["disabledDecisionSaved"], false);
+        assert_eq!(stage_calls.load(Ordering::SeqCst), 0);
+        assert!(persistence.0.lock().unwrap().saves.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_command_helper_forwards_only_the_token() {
+        let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let runtime = import_runtime_with(&persistence, paths, Arc::new(AtomicUsize::new(0)));
+        let prepared = prepare_local_manifest_import_from(
+            &runtime,
+            Arc::new(FixedSelector(PathBuf::from(r"C:\selected.json"))),
+        )
+        .await
+        .unwrap();
+        let PrepareImportResult::Ready(preview) = prepared else {
+            panic!("ready preview required");
+        };
+
+        let result = cancel_local_manifest_import_from(&runtime, &preview.token).unwrap();
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({"schemaVersion": 1, "status": "cancelled"})
+        );
+        assert!(persistence.0.lock().unwrap().saves.is_empty());
     }
 }
