@@ -313,7 +313,7 @@ fn import_failure_event(operation: &'static str, error: &io::Error, ntstatus: Op
         diagnostics.events.push(event);
         let event = diagnostics.events.last().unwrap();
         // No paths, slots, object IDs, metadata, or manifest/receipt bytes.
-        eprintln!("local-package operation={} sequence={} checkpoint={:?} kind={:?} raw_os_error={:?} ntstatus={:?} evidence={diagnostics:?}", event.operation, event.sequence, event.checkpoint, event.kind, event.raw_os_error, event.ntstatus);
+        eprintln!("local-package operation={} sequence={} checkpoint={:?} kind={:?} raw_os_error={:?} ntstatus={:?} uuid_count={}", event.operation, event.sequence, event.checkpoint, event.kind, event.raw_os_error, event.ntstatus, diagnostics.uuid_count);
     });
 }
 #[cfg(test)]
