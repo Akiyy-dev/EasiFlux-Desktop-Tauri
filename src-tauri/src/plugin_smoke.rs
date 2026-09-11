@@ -95,6 +95,38 @@ fn bounded_detail(detail: &str) -> String {
 }
 #[derive(Default)]
 struct CompletionGate(Mutex<bool>);
+
+fn start_deadline_watchdogs(
+    deadline: std::time::Instant,
+    report: impl FnOnce() + Send + 'static,
+    hard_stop: impl FnOnce(i32) + Send + 'static,
+) {
+    // This thread never observes completion ownership or waits for reporting.
+    // Keep it free of logging, filesystem work and event-loop shutdown.
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+        hard_stop(1);
+    });
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+        report();
+    });
+}
+
+#[cfg(feature = "plugin-smoke")]
+fn force_stop_smoke_process(code: i32) {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        // SAFETY: only this dedicated process is targeted via its pseudo-handle.
+        // Bypass CRT/DLL/event-loop teardown that could itself be stalled.
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        TerminateProcess(GetCurrentProcess(), code as u32);
+    }
+    // Non-Windows execution is refused before watchdog creation. If Windows
+    // termination unexpectedly returns, fail without flushing or graceful cleanup.
+    std::process::abort();
+}
+
 impl CompletionGate {
     fn finish(
         &self,
@@ -209,18 +241,20 @@ pub fn run_plugin_smoke() -> Result<(), String> {
     if args.self_test {
         let profile = Arc::clone(&profile);
         let gate = Arc::clone(&gate);
-        // Starts before WebView construction, so a stalled WebView cannot evade the deadline.
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(90));
-            match gate.finish(&profile, false, "90-second self-test deadline exceeded") {
-                Ok(code) => std::process::exit(code),
-                Err(error) if error == "plugin smoke decision already accepted" => (),
-                Err(error) => {
-                    eprintln!("plugin smoke timeout report failure: {error}");
-                    std::process::exit(1);
+        // Both workers share one 90-second deadline before WebView construction.
+        // Evidence is best-effort: hard termination has priority over persistence.
+        start_deadline_watchdogs(
+            std::time::Instant::now() + Duration::from_secs(90),
+            move || {
+                eprintln!("plugin smoke hard deadline reached; timeout evidence is best-effort");
+                if let Err(error) =
+                    gate.finish(&profile, false, "90-second self-test deadline exceeded")
+                {
+                    eprintln!("plugin smoke timeout report unavailable: {error}");
                 }
-            }
-        });
+            },
+            force_stop_smoke_process,
+        );
     }
 
     let result: Result<(), String> = (|| {
@@ -319,6 +353,33 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<SmokeArgs, String> {
         SmokeArgs::parse(args.iter().map(OsString::from))
+    }
+
+    // Catches coupling hard termination to claimed/blocked reporting or shutdown.
+    #[test]
+    fn hard_deadline_stops_even_when_completion_is_claimed_and_reporting_stalls() {
+        use std::sync::{mpsc, Arc};
+        use std::time::{Duration, Instant};
+
+        for claimed in [false, true] {
+            let gate = Arc::new(CompletionGate(Mutex::new(claimed)));
+            let held = gate.0.lock().unwrap();
+            let report_gate = Arc::clone(&gate);
+            let (exit_tx, exit_rx) = mpsc::channel();
+            start_deadline_watchdogs(
+                Instant::now(),
+                move || {
+                    let _blocked_report = report_gate.0.lock().unwrap();
+                },
+                move |code| {
+                    exit_tx.send(code).unwrap();
+                },
+            );
+            let decision = exit_rx.recv_timeout(Duration::from_secs(1));
+            // Release the simulated stall even on RED; no test thread remains blocked.
+            drop(held);
+            assert_eq!(decision.unwrap(), 1, "completion claimed: {claimed}");
+        }
     }
 
     // Catches environment-based WebView2 user-data overrides, including mixed case.

@@ -68,7 +68,10 @@ The hidden `--self-test` lane uses a fixed native fixture selector. Real DOM con
 perform preview/cancel, managed import (disabled), enable/disable, removal/cancel,
 confirmed removal, and explicit reload/absence verification. Each condition has a
 15-second bound; mutations are dispatched once, not retried. The native deadline
-starts before WebView creation and is 90 seconds. The selector never receives a
+starts before WebView creation and is 90 seconds. At that deadline a dedicated
+thread force-terminates only this Windows process with nonzero status, independently
+of completion ownership, inspection, fsync, logging, or event-loop shutdown. A separate
+same-deadline worker attempts timeout evidence without delaying the hard stop. The selector never receives a
 frontend-supplied path, and the reader accepts only the fixture source.
 
 `source/manifest.json`, `plugins/`, absolute `webview2/`, and the fixed `report.json`
@@ -77,7 +80,11 @@ Completion is one-shot: UTF-8 detail is capped at 2,000 bytes; oversize detail f
 failure. The report independently checks unchanged source bytes, a retained disabled
 decision, empty ownership, and empty local/import/removal staging directories.
 Exit 0 requires both UI success and every native check. Timeouts, native-check failures,
-premature UI success and report-write errors cannot pass. Report writes use exclusive
+premature UI success and report-write errors cannot pass. A hard timeout can leave a
+partial or missing report/log if persistence stalls or termination wins the race; all
+available evidence is retained, with no retry or cleanup. If an earlier passing report
+was persisted but shutdown stalls, hard timeout still exits nonzero: require both a
+passing report and successful process exit. Report writes use exclusive
 creation and sync before exit; duplicates cannot replace the first decision.
 
 Without `--self-test`, the visible manual lane keeps the native picker and shows

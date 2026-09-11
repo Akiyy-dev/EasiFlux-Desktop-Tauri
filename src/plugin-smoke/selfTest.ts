@@ -70,7 +70,7 @@ export async function confirmRemovalReload(): Promise<void> {
 export async function runPluginSmokeSelfTest(): Promise<void> {
   const store = usePluginStore()
   let success = false
-  let detail = ''
+  let detail: string
   try {
     const fixture = () => store.catalog.find(item => item.manifest.id === fixtureId)
     await waitFor('initial catalog readiness', () => store.loadStatus === 'ready' && store.availability === 'available')
