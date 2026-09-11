@@ -68,7 +68,7 @@ assert!(!other.runtime().get_catalog().await.unwrap().plugins.iter()
     .any(|item| item.manifest.id.as_str() == "com.easiflux.smoke"));
 ```
 
-Confirm exact existing serialization field names against `plugin/import/mod.rs` before running; the test must exercise the production contract rather than change it to fit this example. Tests must also reject a non-fixture source before reading it; use an independent sentinel file in the fixture-owned parent, never real user data.
+Confirm exact existing serialization field names against `src-tauri/src/plugin/import.rs` before running; the test must exercise the production contract rather than change it to fit this example. Tests must also reject a non-fixture source before reading it; use an independent sentinel file in the fixture-owned parent, never real user data.
 
 - [ ] Run RED: `cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::smoke::tests --lib` from the worktree root, using the shared target-dir provided by the controller. Capture full failure output to a log if needed.
 - [ ] Add `plugin-smoke = []` feature and gate `plugin::smoke` with `cfg(any(test, feature = "plugin-smoke"))`. Do not alter lockfile dependencies.
@@ -98,6 +98,7 @@ Fixture JSON is literal:
 - Create: `src/plugin-smoke/main.ts`
 - Create: `src/plugin-smoke/PluginSmokeApp.vue`
 - Create: `src/plugin-smoke/selfTest.ts`
+- Create: `tests/frontend/pluginSmokeSelfTest.test.ts`
 - Create: `docs/plugin-native-smoke.md`
 - Modify: `.gitignore` only if a new frontend build-artifact directory needs an explicit ignore.
 
@@ -122,6 +123,7 @@ Do not compute expected test values by calling `passed()` itself. Independently 
 - [ ] Implement automatic real-DOM flow from the spec using existing `data-testid` selectors. For fixture item/card selection, use `data-plugin-id` if available; otherwise scope by the existing displayed fixture ID/name, without changing production component behavior. Require enabled controls and verify states/results between mutations; do not invoke another lifecycle mutation while waiting. Each condition has a 15-second maximum within the host's 90-second global deadline. Report any thrown error once as failure. The selected source is fixed host-side, never supplied by frontend IPC.
 - [ ] Completion validates the final native profile independently, writes the bounded fixed report once, prints profile/report locations to the local process log, and exits with its verified code. Duplicate completions cannot overwrite the first decision. Timeout writes failure evidence if no decision has been accepted and exits nonzero. Keep artifacts and source on all paths. Manual close must not claim an automatic pass.
 - [ ] Run focused GREEN, the affected default capability filter, typecheck and a dedicated Vite smoke build (not the whole frontend suite). Verify the default build excludes the smoke completion permission and that the smoke context denies it to remote/secondary webviews. Tests use Tauri authority resolution, not source-string matching.
+- [ ] Add one focused frontend driver failure-contract test with bounded/fake time: if initial catalog readiness never arrives, report failure once and never dispatch a lifecycle mutation. Transport mocks are allowed only in this unit test; the actual native smoke entry must retain real service/IPC. Run only this frontend file, not the whole suite.
 - [ ] Document exact launch commands and limitations. Developer setup is a separate local-only Vite process plus `cargo build --locked --manifest-path src-tauri/Cargo.toml --features plugin-smoke --bin plugin-smoke`, then that exact binary with `--parent <canonical workspace-owned directory> --self-test`. Do not launch the GUI during implementation; controller reviews isolation first, then authorizes one actual native run. No dependency install, production app launch, automatic package cleanup or unbounded retries.
 - [ ] Commit listed files and provide full report including focused evidence, build command, binary path and isolation checklist. Preserve any failure. Controller conducts scoped review, followed by the single native run and final integration review.
 
