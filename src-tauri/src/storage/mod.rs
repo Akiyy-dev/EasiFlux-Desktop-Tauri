@@ -1,3 +1,4 @@
+mod atomic_file;
 pub mod cache;
 pub mod chart_state_store;
 pub mod config;
@@ -6,6 +7,7 @@ pub mod credentials;
 pub mod kline_store;
 pub mod notification_store;
 pub mod order_submissions;
+pub(crate) mod plugin_state;
 pub mod risk_usage;
 pub mod trade_log;
 

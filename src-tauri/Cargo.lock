@@ -1014,6 +1014,8 @@ dependencies = [
  "keyring",
  "reqwest 0.12.28",
  "rust_decimal",
+ "rustix",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -1028,6 +1030,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

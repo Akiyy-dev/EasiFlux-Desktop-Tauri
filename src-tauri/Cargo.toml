@@ -35,6 +35,13 @@ url = "2"
 rust_decimal = { version = "1", features = ["serde"] }
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
+semver = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

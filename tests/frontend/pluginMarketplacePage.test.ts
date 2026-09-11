@@ -1,0 +1,754 @@
+import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia, setActivePinia, type Pinia } from 'pinia'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { nextTick } from 'vue'
+import AppShell from '../../src/components/layout/AppShell.vue'
+import NavigationRail from '../../src/components/layout/NavigationRail.vue'
+import PluginMarketplacePage from '../../src/components/plugins/PluginMarketplacePage.vue'
+import Sidebar from '../../src/components/layout/Sidebar.vue'
+import { usePluginStore } from '../../src/stores/plugin'
+import type {
+  PluginAvailabilityReason,
+  PluginCatalogItem,
+  PluginCatalogMutationResult,
+  PluginCatalogSnapshot,
+  PluginStatus,
+} from '../../src/types/plugin'
+import type { PluginSection } from '../../src/types/navigation'
+
+const serviceMocks = vi.hoisted(() => ({
+  getCatalog: vi.fn(),
+  reloadCatalog: vi.fn(),
+  setEnabled: vi.fn(),
+}))
+
+vi.mock('../../src/services/pluginService', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../src/services/pluginService')>(),
+  getPluginCatalog: serviceMocks.getCatalog,
+  reloadPluginCatalog: serviceMocks.reloadCatalog,
+  setPluginEnabled: serviceMocks.setEnabled,
+}))
+
+vi.mock('../../src/composables/useChartWorkspaceAutosaveHost', () => ({
+  useChartWorkspaceAutosaveHost: vi.fn(),
+}))
+
+vi.mock('../../src/services/chartWorkspaceFlushRegistry', () => ({
+  flushActiveChartWorkspace: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('../../src/components/market/KlineChart.vue', () => ({
+  default: { template: '<div />' },
+}))
+
+interface Deferred<T> {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (reason: unknown) => void
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+function pluginItem(
+  id: string,
+  name: string,
+  status: PluginStatus = 'disabled',
+  reason: PluginAvailabilityReason | null = status === 'blocked' ? 'stateUnavailable' : null,
+): PluginCatalogItem {
+  return {
+    manifest: {
+      schemaVersion: 1,
+      id,
+      name,
+      version: '1.0.0',
+      description: `${name} 的可信描述`,
+      publisherId: 'com.easiflux',
+      publisher: 'EasiFlux 团队',
+      contributions: [],
+      requestedCapabilities: [],
+    },
+    source: 'builtIn',
+    grantedCapabilities: [],
+    status,
+    canToggle: status !== 'blocked',
+    statusReasonCode: reason,
+  }
+}
+
+function availableSnapshot(
+  plugins: PluginCatalogItem[] = [
+    pluginItem('com.easiflux.alpha', 'Alpha 研究', 'enabled'),
+    pluginItem('com.easiflux.beta', 'Beta 交易', 'disabled'),
+  ],
+  revision = '1',
+): PluginCatalogSnapshot {
+  return {
+    schemaVersion: 2,
+    revision,
+    catalogGeneration: '1',
+    localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    availability: 'available',
+    availabilityReasonCode: null,
+    plugins,
+  }
+}
+
+function unavailableSnapshot(
+  plugins: PluginCatalogItem[] = [],
+  reason: PluginAvailabilityReason = 'stateUnavailable',
+): PluginCatalogSnapshot {
+  return {
+    schemaVersion: 2,
+    revision: '3',
+    catalogGeneration: '1',
+    localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    availability: 'unavailable',
+    availabilityReasonCode: reason,
+    plugins,
+  }
+}
+
+function mutation(
+  id: string,
+  enabled: boolean,
+): PluginCatalogMutationResult {
+  return {
+    schemaVersion: 2,
+    revision: '2',
+    catalogGeneration: '1',
+    plugin: pluginItem(id, 'Beta 交易', enabled ? 'enabled' : 'disabled'),
+  }
+}
+
+let pinia: Pinia
+
+function mountPage(section: PluginSection = 'installed', attachTo?: Element) {
+  return mount(PluginMarketplacePage, {
+    props: { section },
+    attachTo,
+    global: { plugins: [pinia] },
+  })
+}
+
+describe('PluginMarketplacePage local discovery', () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.reloadCatalog.mockReset()
+  })
+
+  const localPlugin: PluginCatalogItem = {
+    ...pluginItem('com.example.local', '本地声明示例'),
+    source: 'localDeclarative',
+  }
+
+  it('shows both sources in installed and manage but only built-ins in market', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([
+      pluginItem('com.easiflux.alpha', 'Alpha 研究'), localPlugin,
+    ]))
+    const wrapper = mountPage()
+    await flushPromises()
+
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+    expect(wrapper.text()).toContain('本地声明示例')
+    expect(wrapper.text()).toContain('本地声明式包 · 已发现，未执行')
+    await wrapper.setProps({ section: 'market' })
+    expect(wrapper.text()).not.toContain('本地声明示例')
+    expect(wrapper.text()).toContain('内置 · 随应用提供')
+    await wrapper.setProps({ section: 'manage' })
+    expect(wrapper.text()).toContain('本地声明示例')
+    expect(wrapper.text()).toContain('本地声明式包 · 已发现，未执行')
+    expect(wrapper.text()).toContain('内置 · 随应用提供')
+    expect(wrapper.get('[data-testid="disabled-count"]').text()).toContain('2')
+  })
+
+  it.each(['installed', 'market', 'manage'] as const)(
+    'provides a common explicit reload action in %s and disables it while loading',
+    async (section) => {
+      const initial = deferred<PluginCatalogSnapshot>()
+      const reloaded = deferred<PluginCatalogSnapshot>()
+      serviceMocks.getCatalog.mockReturnValueOnce(initial.promise)
+      serviceMocks.reloadCatalog.mockReturnValueOnce(reloaded.promise)
+      const wrapper = mountPage(section)
+      const reload = wrapper.findAll<HTMLButtonElement>('header button')
+        .find((button) => button.text() === '重新扫描本地插件')
+      expect(reload).toBeDefined()
+      expect(reload!.element.disabled).toBe(true)
+      initial.resolve(availableSnapshot())
+      await flushPromises()
+      expect(reload!.element.disabled).toBe(false)
+      const store = usePluginStore()
+      const reloadSpy = vi.spyOn(store, 'reload')
+      await reload!.trigger('click')
+      expect(reloadSpy).toHaveBeenCalledTimes(1)
+      expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(1)
+      expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(1)
+      expect(reload!.element.disabled).toBe(true)
+      expect(wrapper.get('[data-testid="plugin-reload-status"]').attributes('role')).toBe('status')
+      expect(wrapper.text()).toContain('Alpha 研究')
+      reloaded.resolve({ ...availableSnapshot([localPlugin], '2'), catalogGeneration: '2' })
+      await flushPromises()
+      expect(reload!.element.disabled).toBe(false)
+      expect(wrapper.find('[data-testid="plugin-reload-status"]').exists()).toBe(false)
+      expect(wrapper.text()).not.toContain('Alpha 研究')
+      if (section !== 'market') expect(wrapper.text()).toContain('本地声明示例')
+      expect(wrapper.findAll('button, a[href], [role="button"]').filter((control) => (
+        /安装|下载|更新|卸载/.test(`${control.text()} ${control.attributes('aria-label') ?? ''}`)
+      ))).toHaveLength(0)
+    },
+  )
+
+  it('announces only an aggregate rejected count for degraded local discovery', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...availableSnapshot(),
+      localDiscovery: { status: 'degraded', rejectedPackageCount: 3 },
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const notice = wrapper.find('[data-testid="plugin-local-discovery-status"]')
+    expect(notice.exists()).toBe(true)
+    expect(notice.attributes('role')).toBe('status')
+    expect(notice.text()).toBe('本地插件扫描已完成，已拒绝 3 个包。')
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+  })
+
+  it('announces unavailable local discovery separately from host availability', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...availableSnapshot(),
+      localDiscovery: { status: 'unavailable', rejectedPackageCount: 0 },
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const notice = wrapper.find('[data-testid="plugin-local-discovery-alert"]')
+    expect(notice.exists()).toBe(true)
+    expect(notice.attributes('role')).toBe('alert')
+    expect(notice.text()).toContain('本地插件发现暂时不可用')
+    expect(notice.text()).toContain('内置插件仍可使用')
+    expect(notice.text()).toContain('请重新扫描本地插件')
+    expect(wrapper.find('[data-testid="plugin-availability-alert"]').exists()).toBe(false)
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+  })
+
+  it('does not promise usable built-ins during simultaneous state and discovery failure', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...unavailableSnapshot([pluginItem('com.easiflux.alpha', 'Alpha 研究', 'blocked')]),
+      localDiscovery: { status: 'unavailable', rejectedPackageCount: 0 },
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+    const notice = wrapper.get('[data-testid="plugin-local-discovery-alert"]')
+    expect(notice.text()).toContain('本地插件发现暂时不可用')
+    expect(notice.text()).not.toContain('内置插件仍可使用')
+    expect(wrapper.get('[data-testid="plugin-availability-alert"]').text()).toContain('插件启停已暂停')
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(2)
+    wrapper.unmount()
+  })
+
+  it('never reinstates a stale load alert after a newer reload has recovered the page', async () => {
+    const initial = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(initial.promise)
+    const wrapper = mountPage()
+    const store = usePluginStore()
+    // A separate caller can explicitly reload while the initial page load is pending.
+    serviceMocks.reloadCatalog.mockResolvedValueOnce({ ...availableSnapshot(), catalogGeneration: '2' })
+    await store.reload()
+    await flushPromises()
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+    initial.reject({ code: 'plugin_state_unavailable', message: 'private-path' })
+    await flushPromises()
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+    expect(store.loadError).toBeNull()
+    expect(store.loadStatus).toBe('ready')
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+    expect(wrapper.get<HTMLButtonElement>('header button').element.disabled).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('preserves confirmed catalog and discovery on reload failure without exposing raw errors', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([localPlugin]))
+    serviceMocks.reloadCatalog.mockRejectedValueOnce(new Error(
+      'EACCES D:\\private\\rejected-secret-package\\manifest.json',
+    ))
+    const wrapper = mountPage()
+    await flushPromises()
+    const reload = wrapper.findAll<HTMLButtonElement>('header button')
+      .find((button) => button.text() === '重新扫描本地插件')
+    expect(reload).toBeDefined()
+    await reload!.trigger('click')
+    await flushPromises()
+
+    const alert = wrapper.get('[data-testid="plugin-reload-error"]')
+    expect(alert.attributes('role')).toBe('alert')
+    expect(alert.text()).toContain('插件操作失败，请重试。')
+    expect(wrapper.text()).toContain('本地声明示例')
+    expect(wrapper.text()).not.toMatch(/EACCES|private|rejected-secret-package|manifest.json|Error:/)
+    expect(usePluginStore().localDiscovery).toEqual({ status: 'available', rejectedPackageCount: 0 })
+    expect(reload!.element.disabled).toBe(false)
+    serviceMocks.reloadCatalog.mockResolvedValueOnce(availableSnapshot([localPlugin], '2'))
+    await reload!.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="plugin-reload-error"]').exists()).toBe(false)
+  })
+})
+
+describe('PluginMarketplacePage recovery precedence', () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.reloadCatalog.mockReset()
+  })
+
+  it.each([false, true])(
+    'deduplicates load and reload errors and recovers both domains (confirmed catalog: %s)',
+    async (confirmed) => {
+      const loadFailure = { code: 'plugin_state_unavailable', message: 'EACCES private-load-path' }
+      if (confirmed) serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot())
+      else serviceMocks.getCatalog.mockRejectedValueOnce(loadFailure)
+      const wrapper = mountPage()
+      await flushPromises()
+      const store = usePluginStore()
+      if (confirmed) {
+        serviceMocks.getCatalog.mockRejectedValueOnce(loadFailure)
+        await store.retry()
+        await nextTick()
+      }
+      expect(wrapper.findAll('[role="alert"]')).toHaveLength(1)
+      expect(wrapper.get('[role="alert"]').text()).toContain('插件状态暂不可用，请重试。')
+
+      serviceMocks.reloadCatalog.mockRejectedValueOnce(new Error('EIO private-reload-path'))
+      await wrapper.get('header button').trigger('click')
+      await flushPromises()
+
+      expect(wrapper.findAll('[role="alert"]')).toHaveLength(1)
+      const alert = wrapper.get('[role="alert"]')
+      expect(alert.get('p').text()).toBe('插件操作失败，请重试。')
+      expect(wrapper.find('[data-testid="plugin-load-error"]').exists()).toBe(false)
+      expect(wrapper.find('[data-testid="plugin-refresh-error"]').exists()).toBe(false)
+      expect(wrapper.text()).not.toMatch(/EACCES|EIO|private-load|private-reload/)
+      expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(confirmed ? 2 : 0)
+
+      const recovery = deferred<PluginCatalogSnapshot>()
+      serviceMocks.reloadCatalog.mockReturnValueOnce(recovery.promise)
+      const ordinaryLoads = serviceMocks.getCatalog.mock.calls.length
+      await alert.get('button').trigger('click')
+      expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
+      expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(ordinaryLoads)
+      expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+      expect(wrapper.findAll('[role="status"]')).toHaveLength(1)
+      expect(wrapper.get<HTMLButtonElement>('header button').element.disabled).toBe(true)
+      await wrapper.get('header button').trigger('click')
+      expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
+      recovery.resolve(availableSnapshot(undefined, '2'))
+      await flushPromises()
+
+      expect(store.loadError).toBeNull()
+      expect(store.reloadError).toBeNull()
+      expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+      expect(wrapper.findAll('[role="status"]')).toHaveLength(0)
+      expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+      expect(wrapper.get<HTMLButtonElement>('header button').element.disabled).toBe(false)
+    },
+  )
+
+  it('disables header reload throughout a deferred ordinary refresh', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot())
+    const wrapper = mountPage()
+    await flushPromises()
+    const refresh = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(refresh.promise)
+    const pending = usePluginStore().retry()
+    await nextTick()
+
+    const reload = wrapper.get<HTMLButtonElement>('header button')
+    expect(reload.text()).toBe('重新扫描本地插件')
+    expect(reload.element.disabled).toBe(true)
+    await reload.trigger('click')
+    expect(serviceMocks.reloadCatalog).not.toHaveBeenCalled()
+    refresh.resolve(availableSnapshot(undefined, '2'))
+    await pending
+    await nextTick()
+    expect(reload.element.disabled).toBe(false)
+  })
+
+  it('preserves distinct validated health alerts while deduplicating identical transport failures', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce({
+      ...unavailableSnapshot(),
+      localDiscovery: { status: 'unavailable', rejectedPackageCount: 0 },
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+    const failure = { code: 'plugin_state_unavailable', message: 'private-path' }
+    serviceMocks.getCatalog.mockRejectedValueOnce(failure)
+    await usePluginStore().retry()
+    serviceMocks.reloadCatalog.mockRejectedValueOnce(failure)
+    await wrapper.get('header button').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(3)
+    expect(wrapper.get('[data-testid="plugin-local-discovery-alert"]').attributes('role')).toBe('alert')
+    const subsystem = wrapper.get('[data-testid="plugin-availability-alert"]')
+    expect(subsystem.attributes('role')).toBe('alert')
+    expect(wrapper.get('[data-testid="plugin-reload-error"]').get('p').text())
+      .toBe('插件状态暂不可用，请重试。')
+    expect(wrapper.find('[data-testid="plugin-refresh-error"]').exists()).toBe(false)
+
+    const recovery = deferred<PluginCatalogSnapshot>()
+    serviceMocks.reloadCatalog.mockReturnValueOnce(recovery.promise)
+    await subsystem.get('button').trigger('click')
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(2)
+    expect(subsystem.get<HTMLButtonElement>('button').element.disabled).toBe(true)
+    await subsystem.get('button').trigger('click')
+    expect(serviceMocks.reloadCatalog).toHaveBeenCalledTimes(2)
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(2)
+    recovery.resolve(availableSnapshot(undefined, '4'))
+    await flushPromises()
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+  })
+
+  it('disables subsystem recovery during an ordinary retry without starting a second load', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(unavailableSnapshot())
+    const wrapper = mountPage()
+    await flushPromises()
+    const retry = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(retry.promise)
+    const recovery = wrapper.get<HTMLButtonElement>('[data-testid="plugin-availability-alert"] button')
+    await recovery.trigger('click')
+    expect(recovery.element.disabled).toBe(true)
+    await recovery.trigger('click')
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(2)
+    expect(serviceMocks.reloadCatalog).not.toHaveBeenCalled()
+    retry.resolve(availableSnapshot(undefined, '4'))
+    await flushPromises()
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+  })
+})
+
+describe('PluginMarketplacePage loading and section lifetime', () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.setEnabled.mockReset()
+  })
+
+  afterEach(() => {
+    document.body.replaceChildren()
+  })
+
+  it('loads once and preserves store-owned query and filter across section changes', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot())
+    const wrapper = mountPage()
+    await flushPromises()
+
+    await wrapper.get('#plugin-search').setValue('beta')
+    await wrapper.get('#plugin-status-filter').setValue('disabled')
+    await wrapper.setProps({ section: 'market' })
+    await wrapper.setProps({ section: 'manage' })
+    await wrapper.setProps({ section: 'installed' })
+
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(1)
+    expect(wrapper.get<HTMLInputElement>('#plugin-search').element.value).toBe('beta')
+    expect(wrapper.get<HTMLSelectElement>('#plugin-status-filter').element.value).toBe('disabled')
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(1)
+    expect(wrapper.text()).toContain('Beta 交易')
+  })
+
+  it('focuses the page heading once after an attached mount', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot())
+    const wrapper = mountPage('installed', document.body)
+    await flushPromises()
+    await nextTick()
+
+    const heading = wrapper.get('h1')
+    expect(heading.attributes('tabindex')).toBe('-1')
+    expect(document.activeElement).toBe(heading.element)
+
+    await wrapper.setProps({ section: 'market' })
+    expect(document.activeElement).toBe(heading.element)
+    wrapper.unmount()
+  })
+
+  it('announces initial loading and offers retry after a sanitized first-load failure', async () => {
+    const first = deferred<PluginCatalogSnapshot>()
+    serviceMocks.getCatalog.mockReturnValueOnce(first.promise)
+    const wrapper = mountPage()
+
+    expect(wrapper.get('[role="status"]').text()).toContain('正在加载插件目录')
+
+    first.reject({ code: 'plugin_state_unavailable', message: 'D:\\private\\state.json' })
+    await flushPromises()
+    const alert = wrapper.get('[role="alert"]')
+    expect(alert.text()).toContain('插件状态暂不可用，请重试。')
+    expect(alert.text()).not.toContain('private')
+
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([], '2'))
+    await alert.get('button').trigger('click')
+    await flushPromises()
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('[data-testid="plugin-load-error"]').exists()).toBe(false)
+  })
+
+  it('keeps confirmed cards visible when an explicit refresh fails', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot())
+    const wrapper = mountPage()
+    await flushPromises()
+    const store = usePluginStore()
+
+    serviceMocks.getCatalog.mockRejectedValueOnce({
+      code: 'plugin_catalog_invalid',
+      message: 'D:\\private\\catalog.json',
+    })
+    await store.retry()
+    await nextTick()
+
+    expect(wrapper.get('[data-testid="plugin-refresh-error"]').text())
+      .toContain('插件目录不可用，请稍后重试。')
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+    expect(wrapper.text()).not.toContain('private')
+  })
+})
+
+describe('PluginMarketplacePage catalog views', () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    serviceMocks.getCatalog.mockReset()
+    serviceMocks.setEnabled.mockReset()
+  })
+
+  it('shows an unavailable subsystem alert for an empty successful catalog', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(unavailableSnapshot())
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const alert = wrapper.get('[data-testid="plugin-availability-alert"]')
+    expect(alert.attributes('role')).toBe('alert')
+    expect(alert.text()).toContain('插件状态子系统暂时不可用')
+    expect(alert.text()).not.toContain('stateUnavailable')
+    expect(wrapper.get('[data-testid="plugin-catalog-empty"]').text())
+      .toContain('当前没有已安装插件')
+  })
+
+  it('recovers an unavailable snapshot only after its explicit retry action', async () => {
+    serviceMocks.getCatalog
+      .mockResolvedValueOnce(unavailableSnapshot())
+      .mockResolvedValueOnce(availableSnapshot([], '4'))
+    const firstEntry = mountPage()
+    await flushPromises()
+
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(1)
+    expect(firstEntry.get('[data-testid="plugin-availability-alert"]')
+      .get('button').text()).toContain('重试')
+
+    firstEntry.unmount()
+    const ordinaryReentry = mountPage()
+    await flushPromises()
+
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(1)
+    expect(ordinaryReentry.find('[data-testid="plugin-availability-alert"]').exists()).toBe(true)
+
+    await ordinaryReentry.get('[data-testid="plugin-availability-alert"]')
+      .get('button').trigger('click')
+    await flushPromises()
+
+    expect(serviceMocks.getCatalog).toHaveBeenCalledTimes(2)
+    expect(ordinaryReentry.find('[data-testid="plugin-availability-alert"]').exists()).toBe(false)
+    expect(ordinaryReentry.get('[data-testid="plugin-catalog-empty"]').text())
+      .toContain('当前没有已安装插件')
+  })
+
+  it('keeps unavailable catalog items visible as blocked cards', async () => {
+    const blocked = pluginItem(
+      'com.easiflux.alpha',
+      'Alpha 研究',
+      'blocked',
+      'catalogInvalid',
+    )
+    serviceMocks.getCatalog.mockResolvedValueOnce(unavailableSnapshot([blocked], 'catalogInvalid'))
+    const wrapper = mountPage()
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="plugin-availability-alert"]').text())
+      .toContain('插件目录校验失败')
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(1)
+    expect(wrapper.get('[data-testid="plugin-status"]').text()).toContain('已阻止')
+  })
+
+  it('intersects installed search and status filter and distinguishes no matches', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot())
+    const wrapper = mountPage()
+    await flushPromises()
+
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(2)
+    await wrapper.get('#plugin-search').setValue('alpha')
+    await wrapper.get('#plugin-status-filter').setValue('disabled')
+
+    expect(wrapper.findAllComponents({ name: 'PluginCard' })).toHaveLength(0)
+    expect(wrapper.get('[data-testid="plugin-no-match"]').text())
+      .toContain('没有符合当前条件的插件')
+    expect(wrapper.find('[data-testid="plugin-catalog-empty"]').exists()).toBe(false)
+  })
+
+  it('renders only built-in entries in a read-only marketplace', async () => {
+    const untrusted: PluginCatalogItem = {
+      ...pluginItem('com.example.local', '本地未受信条目'),
+      source: 'localDeclarative',
+    }
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([
+      pluginItem('com.easiflux.alpha', 'Alpha 研究'),
+      untrusted,
+    ]))
+    const wrapper = mountPage('market')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Alpha 研究')
+    expect(wrapper.text()).toContain('随应用提供')
+    expect(wrapper.text()).not.toContain('本地未受信条目')
+    expect(wrapper.find('[role="switch"]').exists()).toBe(false)
+    const prohibitedActions = wrapper.findAll('button, a[href], [role="button"]')
+      .filter((control) => /安装|下载|更新/.test(
+        `${control.text()} ${control.attributes('aria-label') ?? ''}`,
+      ))
+    expect(prohibitedActions).toHaveLength(0)
+  })
+
+  it('summarizes the complete catalog independently of installed filters', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([
+      pluginItem('com.easiflux.alpha', 'Alpha 研究', 'enabled'),
+      pluginItem('com.easiflux.beta', 'Beta 交易', 'disabled'),
+      pluginItem('com.easiflux.gamma', 'Gamma 风控', 'blocked'),
+    ]))
+    const wrapper = mountPage()
+    await flushPromises()
+    const store = usePluginStore()
+    store.setQuery('不存在')
+    store.setStatusFilter('enabled')
+
+    await wrapper.setProps({ section: 'manage' })
+
+    expect(wrapper.get('[data-testid="enabled-count"]').text()).toContain('1')
+    expect(wrapper.get('[data-testid="disabled-count"]').text()).toContain('1')
+    expect(wrapper.get('[data-testid="blocked-count"]').text()).toContain('1')
+    expect(wrapper.findAll('[data-testid="plugin-management-item"]')).toHaveLength(3)
+    expect(wrapper.findAll('[data-testid="management-requested-capabilities"]'))
+      .toHaveLength(3)
+    expect(wrapper.findAll('[data-testid="management-granted-capabilities"]'))
+      .toHaveLength(3)
+    expect(wrapper.text()).toContain('无需额外权限')
+  })
+
+  it('delegates a toggle without changing the confirmed status optimistically', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([
+      pluginItem('com.easiflux.beta', 'Beta 交易', 'disabled'),
+    ]))
+    const response = deferred<PluginCatalogMutationResult>()
+    serviceMocks.setEnabled.mockReturnValueOnce(response.promise)
+    const wrapper = mountPage()
+    await flushPromises()
+
+    wrapper.get<HTMLInputElement>('[role="switch"]').element.click()
+    await nextTick()
+
+    expect(serviceMocks.setEnabled).toHaveBeenCalledWith('com.easiflux.beta', true, '1')
+    expect(wrapper.get('[data-testid="plugin-status"]').text()).toContain('已停用')
+    expect(wrapper.get<HTMLInputElement>('[role="switch"]').element.disabled).toBe(true)
+
+    response.resolve(mutation('com.easiflux.beta', true))
+    await flushPromises()
+    expect(wrapper.get('[data-testid="plugin-status"]').text()).toContain('已启用')
+  })
+
+  it('keeps a native switch click confirmed through pending and rejected persistence', async () => {
+    serviceMocks.getCatalog.mockResolvedValueOnce(availableSnapshot([
+      pluginItem('com.easiflux.beta', 'Beta 交易', 'disabled'),
+    ]))
+    const response = deferred<PluginCatalogMutationResult>()
+    serviceMocks.setEnabled.mockReturnValueOnce(response.promise)
+    const wrapper = mountPage()
+    await flushPromises()
+    const control = wrapper.get<HTMLInputElement>('[role="switch"]')
+
+    control.element.click()
+    await nextTick()
+
+    expect(serviceMocks.setEnabled).toHaveBeenCalledTimes(1)
+    expect(serviceMocks.setEnabled).toHaveBeenCalledWith('com.easiflux.beta', true, '1')
+    expect(control.element.checked).toBe(false)
+    expect(control.element.disabled).toBe(true)
+
+    response.reject({
+      code: 'plugin_state_persist_failed',
+      message: 'D:\\private\\plugins\\state.json',
+    })
+    await flushPromises()
+
+    const confirmedControl = wrapper.get<HTMLInputElement>('[role="switch"]')
+    expect(confirmedControl.element.checked).toBe(false)
+    expect(confirmedControl.element.disabled).toBe(false)
+    expect(wrapper.get('[role="alert"]').text()).toContain('保存插件状态失败，请重试。')
+    expect(wrapper.text()).not.toContain('private')
+  })
+})
+
+describe('AppShell plugin integration', () => {
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
+
+  function mountShell() {
+    return mount(AppShell, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          TopBar: { template: '<div />' },
+          DashboardPage: { template: '<div />' },
+          TradingLayout: { props: ['active'], template: '<div />' },
+          ChartWorkspacePage: { props: ['active'], template: '<div />' },
+          SettingsCenterPage: { template: '<div />' },
+          PluginMarketplacePage: {
+            name: 'PluginMarketplacePage',
+            props: ['section'],
+            template: '<div data-testid="plugin-page-stub" :data-section="section" />',
+          },
+        },
+      },
+    })
+  }
+
+  it('replaces the placeholder, forwards all sections, and resets top-level plugin entry', async () => {
+    const wrapper = mountShell()
+    await wrapper.getComponent(NavigationRail).get('button[aria-label="插件"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="plugin-page-stub"]').attributes('data-section'))
+      .toBe('installed')
+    expect(wrapper.text()).not.toContain('该页面将在后续 PRD 中逐步迁移实现')
+
+    const sidebar = wrapper.getComponent(Sidebar)
+    await sidebar.findAll('button').find((button) => button.text() === '插件市场')!.trigger('click')
+    expect(wrapper.get('[data-testid="plugin-page-stub"]').attributes('data-section'))
+      .toBe('market')
+    await sidebar.findAll('button').find((button) => button.text() === '插件管理')!.trigger('click')
+    expect(wrapper.get('[data-testid="plugin-page-stub"]').attributes('data-section'))
+      .toBe('manage')
+
+    await wrapper.getComponent(NavigationRail).get('button[aria-label="首页"]').trigger('click')
+    await wrapper.getComponent(NavigationRail).get('button[aria-label="插件"]').trigger('click')
+    expect(wrapper.get('[data-testid="plugin-page-stub"]').attributes('data-section'))
+      .toBe('installed')
+  })
+})

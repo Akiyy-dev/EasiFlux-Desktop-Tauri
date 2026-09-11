@@ -1,0 +1,326 @@
+import { computed, ref } from 'vue'
+import { defineStore } from 'pinia'
+import {
+  getPluginCatalog,
+  pluginErrorMessage,
+  reloadPluginCatalog,
+  setPluginEnabled,
+} from '../services/pluginService'
+import type {
+  PluginAvailability,
+  PluginAvailabilityReason,
+  PluginCatalogItem,
+  PluginCatalogSnapshot,
+  PluginLocalDiscoverySummary,
+  PluginStatus,
+} from '../types/plugin'
+
+export type PluginLoadStatus = 'idle' | 'loading' | 'ready' | 'error'
+export type PluginStatusFilter = 'all' | PluginStatus
+
+function hasSameImmutableContent(current: PluginCatalogItem, returned: PluginCatalogItem): boolean {
+  const currentFields = Object.entries(current.manifest)
+  return current.source === returned.source
+    && currentFields.length === Object.keys(returned.manifest).length
+    && currentFields.every(([key, value]) => (
+      Object.prototype.hasOwnProperty.call(returned.manifest, key)
+      // Strictly parsed v1 values are scalars or empty arrays. Compare each field
+      // independently so equivalent manifest key insertion orders do not matter.
+      && JSON.stringify(value) === JSON.stringify(
+        returned.manifest[key as keyof PluginCatalogItem['manifest']],
+      )
+    ))
+    && JSON.stringify(current.grantedCapabilities) === JSON.stringify(returned.grantedCapabilities)
+}
+
+export const usePluginStore = defineStore('plugin', () => {
+  const catalog = ref<PluginCatalogItem[]>([])
+  const revision = ref('0')
+  const catalogGeneration = ref('0')
+  const localDiscovery = ref<PluginLocalDiscoverySummary | null>(null)
+  const availability = ref<PluginAvailability | null>(null)
+  const availabilityReasonCode = ref<PluginAvailabilityReason | null>(null)
+  const loadStatus = ref<PluginLoadStatus>('idle')
+  const loadError = ref<string | null>(null)
+  const reloadStatus = ref<PluginLoadStatus>('idle')
+  const reloadError = ref<string | null>(null)
+  const query = ref('')
+  const statusFilter = ref<PluginStatusFilter>('all')
+  const pendingIds = ref(new Set<string>())
+  const actionErrors = ref<Record<string, string>>({})
+
+  let loadFlight: Promise<void> | null = null
+  let reloadFlight: Promise<void> | null = null
+  let hasConfirmedSnapshot = false
+  let snapshotSequence = 0n
+  let confirmedSnapshotRevision = 0n
+  let confirmedSnapshotOrder = 0n
+  let latestAdoptedRequestOrder = 0n
+  let mutationSequence = 0
+  const mutationOwners = new Map<string, number>()
+  const confirmedItemRevisions = new Map<string, bigint>()
+
+  const visiblePlugins = computed(() => {
+    const normalizedQuery = query.value.trim().toLowerCase()
+    return catalog.value.filter((plugin) => {
+      if (statusFilter.value !== 'all' && plugin.status !== statusFilter.value) return false
+      if (normalizedQuery.length === 0) return true
+      const manifest = plugin.manifest
+      return [
+        manifest.name,
+        manifest.id,
+        manifest.publisher,
+        manifest.publisherId,
+        manifest.description,
+      ].some((value) => value.toLowerCase().includes(normalizedQuery))
+    })
+  })
+
+  function adoptGlobalRevision(nextRevision: string): void {
+    if (BigInt(nextRevision) > BigInt(revision.value)) revision.value = nextRevision
+  }
+
+  function adoptSnapshot(snapshot: PluginCatalogSnapshot, requestOrder: bigint): void {
+    const nextGeneration = BigInt(snapshot.catalogGeneration)
+    const currentGeneration = BigInt(catalogGeneration.value)
+    const snapshotRevision = BigInt(snapshot.revision)
+    if (nextGeneration < currentGeneration) return
+    if (nextGeneration > currentGeneration || !hasConfirmedSnapshot) {
+      // Membership and content identity belong to the generation, not the state revision.
+      catalog.value = snapshot.plugins
+      catalogGeneration.value = snapshot.catalogGeneration
+      revision.value = snapshot.revision
+      availability.value = snapshot.availability
+      availabilityReasonCode.value = snapshot.availabilityReasonCode
+      localDiscovery.value = snapshot.localDiscovery
+      confirmedSnapshotRevision = snapshotRevision
+      confirmedSnapshotOrder = requestOrder
+      if (requestOrder > latestAdoptedRequestOrder) latestAdoptedRequestOrder = requestOrder
+      confirmedItemRevisions.clear()
+      for (const plugin of snapshot.plugins) {
+        confirmedItemRevisions.set(plugin.manifest.id, snapshotRevision)
+      }
+      mutationOwners.clear()
+      pendingIds.value = new Set()
+      actionErrors.value = {}
+      return
+    }
+
+    // A full snapshot confirms every item at least at its revision. Compare against
+    // that confirmation, not the global revision that unrelated mutations can advance.
+    if (
+      snapshotRevision < confirmedSnapshotRevision
+      || (snapshotRevision === confirmedSnapshotRevision && requestOrder < confirmedSnapshotOrder)
+    ) return
+    confirmedSnapshotRevision = snapshotRevision
+    confirmedSnapshotOrder = requestOrder
+    if (requestOrder > latestAdoptedRequestOrder) latestAdoptedRequestOrder = requestOrder
+    const currentById = new Map(
+      catalog.value.map((plugin) => [plugin.manifest.id, plugin] as const),
+    )
+    const nextConfirmedRevisions = new Map<string, bigint>()
+
+    const nextCatalog = snapshot.plugins.map((plugin) => {
+      const id = plugin.manifest.id
+      const current = currentById.get(id)
+      const currentRevision = confirmedItemRevisions.get(id)
+      if (current && currentRevision !== undefined && currentRevision > snapshotRevision) {
+        nextConfirmedRevisions.set(id, currentRevision)
+        return current
+      }
+      nextConfirmedRevisions.set(id, snapshotRevision)
+      return plugin
+    })
+
+    const snapshotIds = new Set(snapshot.plugins.map((plugin) => plugin.manifest.id))
+    for (const [id, current] of currentById) {
+      const currentRevision = confirmedItemRevisions.get(id)
+      if (
+        !snapshotIds.has(id)
+        && currentRevision !== undefined
+        && currentRevision > snapshotRevision
+      ) {
+        nextCatalog.push(current)
+        nextConfirmedRevisions.set(id, currentRevision)
+      }
+    }
+    nextCatalog.sort((left, right) => {
+      if (left.manifest.id < right.manifest.id) return -1
+      if (left.manifest.id > right.manifest.id) return 1
+      return 0
+    })
+
+    confirmedItemRevisions.clear()
+    for (const [id, itemRevision] of nextConfirmedRevisions) {
+      confirmedItemRevisions.set(id, itemRevision)
+    }
+    catalog.value = nextCatalog
+    if (snapshotRevision >= BigInt(revision.value)) {
+      availability.value = snapshot.availability
+      availabilityReasonCode.value = snapshot.availabilityReasonCode
+      localDiscovery.value = snapshot.localDiscovery
+    }
+    adoptGlobalRevision(snapshot.revision)
+  }
+
+  function beginLoad(): Promise<void> {
+    const requestOrder = ++snapshotSequence
+    loadStatus.value = 'loading'
+    loadError.value = null
+
+    const request = (async () => {
+      try {
+        const snapshot = await getPluginCatalog()
+        adoptSnapshot(snapshot, requestOrder)
+        hasConfirmedSnapshot = true
+        loadStatus.value = 'ready'
+        loadError.value = null
+      } catch (error) {
+        // Separate flights can settle out of order. Only an adopted newer
+        // snapshot supersedes this failure; an ignored response does not.
+        if (requestOrder < latestAdoptedRequestOrder) {
+          loadStatus.value = 'ready'
+          return
+        }
+        loadError.value = pluginErrorMessage(error)
+        loadStatus.value = hasConfirmedSnapshot ? 'ready' : 'error'
+      }
+    })()
+    loadFlight = request
+    void request.finally(() => {
+      if (loadFlight === request) loadFlight = null
+    })
+    return request
+  }
+
+  function load(): Promise<void> {
+    if (loadFlight) return loadFlight
+    if (loadStatus.value !== 'idle') return Promise.resolve()
+    return beginLoad()
+  }
+
+  function retry(): Promise<void> {
+    if (loadFlight) return loadFlight
+    return beginLoad()
+  }
+
+  function reload(): Promise<void> {
+    if (reloadFlight) return reloadFlight
+    const requestOrder = ++snapshotSequence
+    reloadStatus.value = 'loading'
+    reloadError.value = null
+    const request = (async () => {
+      try {
+        const snapshot = await reloadPluginCatalog()
+        adoptSnapshot(snapshot, requestOrder)
+        hasConfirmedSnapshot = true
+        loadStatus.value = 'ready'
+        loadError.value = null
+        reloadStatus.value = 'ready'
+      } catch (error) {
+        if (requestOrder < latestAdoptedRequestOrder) {
+          reloadStatus.value = 'ready'
+          return
+        }
+        reloadError.value = pluginErrorMessage(error)
+        reloadStatus.value = 'error'
+      }
+    })()
+    reloadFlight = request
+    void request.finally(() => {
+      if (reloadFlight === request) reloadFlight = null
+    })
+    return request
+  }
+
+  function setQuery(value: string): void {
+    query.value = value
+  }
+
+  function setStatusFilter(value: PluginStatusFilter): void {
+    statusFilter.value = value
+  }
+
+  function replacePending(id: string, pending: boolean): void {
+    const next = new Set(pendingIds.value)
+    if (pending) next.add(id)
+    else next.delete(id)
+    pendingIds.value = next
+  }
+
+  function replaceActionError(id: string, error: string | null): void {
+    const next = { ...actionErrors.value }
+    if (error === null) delete next[id]
+    else next[id] = error
+    actionErrors.value = next
+  }
+
+  async function setEnabled(id: string, enabled: boolean): Promise<boolean> {
+    const existing = catalog.value.find((plugin) => plugin.manifest.id === id)
+    if (!existing || !existing.canToggle) return false
+
+    const owner = ++mutationSequence
+    const requestGeneration = catalogGeneration.value
+    mutationOwners.set(id, owner)
+    replacePending(id, true)
+    replaceActionError(id, null)
+
+    try {
+      const result = await setPluginEnabled(id, enabled, requestGeneration)
+      if (
+        mutationOwners.get(id) !== owner
+        || result.catalogGeneration !== requestGeneration
+        || catalogGeneration.value !== requestGeneration
+      ) return false
+
+      const resultRevision = BigInt(result.revision)
+      const confirmedRevision = confirmedItemRevisions.get(id)
+      const itemIndex = catalog.value.findIndex((plugin) => plugin.manifest.id === id)
+      if (
+        itemIndex === -1
+        || (confirmedRevision !== undefined && resultRevision < confirmedRevision)
+        || !hasSameImmutableContent(catalog.value[itemIndex], result.plugin)
+      ) return false
+      catalog.value = catalog.value.map((plugin, index) => (
+        index === itemIndex ? result.plugin : plugin
+      ))
+      confirmedItemRevisions.set(id, resultRevision)
+      adoptGlobalRevision(result.revision)
+      return true
+    } catch (error) {
+      if (mutationOwners.get(id) === owner && catalogGeneration.value === requestGeneration) {
+        replaceActionError(id, pluginErrorMessage(error))
+      }
+      return false
+    } finally {
+      if (mutationOwners.get(id) === owner) {
+        mutationOwners.delete(id)
+        replacePending(id, false)
+      }
+    }
+  }
+
+  return {
+    catalog,
+    revision,
+    catalogGeneration,
+    localDiscovery,
+    availability,
+    availabilityReasonCode,
+    loadStatus,
+    loadError,
+    reloadStatus,
+    reloadError,
+    query,
+    statusFilter,
+    pendingIds,
+    actionErrors,
+    visiblePlugins,
+    load,
+    retry,
+    reload,
+    setQuery,
+    setStatusFilter,
+    setEnabled,
+  }
+})

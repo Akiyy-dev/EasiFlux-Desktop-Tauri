@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue'
-import AppCard from '../ui/AppCard.vue'
 import TopBar from './TopBar.vue'
 import NavigationRail from './NavigationRail.vue'
 import Sidebar from './Sidebar.vue'
@@ -8,6 +7,7 @@ import TradingLayout from './TradingLayout.vue'
 import DashboardPage from '../dashboard/DashboardPage.vue'
 import ChartWorkspacePage from '../chart/ChartWorkspacePage.vue'
 import SettingsCenterPage from '../settings/SettingsCenterPage.vue'
+import PluginMarketplacePage from '../plugins/PluginMarketplacePage.vue'
 import { useChartWorkspaceAutosaveHost } from '../../composables/useChartWorkspaceAutosaveHost'
 import { flushActiveChartWorkspace } from '../../services/chartWorkspaceFlushRegistry'
 import { reportError } from '../../services/errorService'
@@ -191,20 +191,10 @@ function handleNotificationAction(action: NotificationUiAction): void {
           :initial-account-section="settingsTarget.accountSection"
           @back="returnToWorkspace"
         />
-        <AppCard
+        <PluginMarketplacePage
           v-if="activePage === 'plugins'"
-          :title="pageTitle"
-          class="placeholder"
-        >
-          <div class="placeholder-body">
-            <div class="muted">
-              该页面将在后续 PRD 中逐步迁移实现。
-            </div>
-            <div class="muted">
-              当前已保留交易功能入口：左侧选择“交易”。
-            </div>
-          </div>
-        </AppCard>
+          :section="activePluginSection"
+        />
       </section>
     </div>
   </div>

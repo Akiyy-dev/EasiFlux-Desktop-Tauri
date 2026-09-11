@@ -83,6 +83,11 @@ function mountShell() {
         NotificationSettingsPanel: {
           template: '<section data-testid="notification-settings-stub"><h2 id="notification-settings-title">通知设置</h2></section>',
         },
+        PluginMarketplacePage: {
+          name: 'PluginMarketplacePage',
+          props: ['section'],
+          template: '<div data-testid="plugin-marketplace-page-stub" :data-section="section" />',
+        },
       },
     },
   })
@@ -248,6 +253,8 @@ describe('AppShell settings navigation', () => {
     expect(wrapper.getComponent(NavigationRail).props('active')).toBe('plugins')
     expect(wrapper.findComponent(SettingsCenterPage).exists()).toBe(false)
     expect(wrapper.findComponent(Sidebar).exists()).toBe(true)
+    expect(wrapper.get('[data-testid="plugin-marketplace-page-stub"]').attributes('data-section'))
+      .toBe('installed')
   })
 
   it('mounts the generic Sidebar only for Home and Plugins', async () => {

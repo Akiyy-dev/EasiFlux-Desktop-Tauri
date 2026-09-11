@@ -7,6 +7,7 @@ pub mod connection;
 pub mod diagnostic;
 pub mod market;
 pub mod notification;
+pub mod plugin;
 pub mod risk;
 pub mod trading;
 
@@ -19,5 +20,6 @@ pub use connection::*;
 pub use diagnostic::*;
 pub use market::*;
 pub use notification::*;
+pub use plugin::*;
 pub use risk::*;
 pub use trading::*;
