@@ -263,11 +263,23 @@ pub(super) fn document_parent_synced(name: &str) {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+struct ImportFailureEvent {
+    operation: &'static str,
+    sequence: usize,
+    checkpoint: Option<ImportFsStep>,
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+    ntstatus: Option<i32>,
+}
+
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(super) struct ImportDiagnostics {
     steps: Vec<ImportFsStep>,
     uuid_count: usize,
     errors: Vec<(io::ErrorKind, Option<i32>)>,
+    events: Vec<ImportFailureEvent>,
 }
 #[cfg(test)]
 thread_local! {
@@ -278,12 +290,30 @@ pub(super) fn import_io_failure(error: &io::Error) {
     import_operation_failure("import-write-failed", error);
 }
 #[cfg(test)]
-pub(super) fn import_operation_failure(operation: &str, error: &io::Error) {
+pub(super) fn import_operation_failure(operation: &'static str, error: &io::Error) {
+    import_failure_event(operation, error, None);
+}
+#[cfg(all(test, windows))]
+fn import_native_failure(operation: &'static str, error: &io::Error, ntstatus: i32) {
+    import_failure_event(operation, error, Some(ntstatus));
+}
+#[cfg(test)]
+fn import_failure_event(operation: &'static str, error: &io::Error, ntstatus: Option<i32>) {
     IMPORT_DIAGNOSTICS.with(|diagnostics| {
         let mut diagnostics = diagnostics.borrow_mut();
         diagnostics.errors.push((error.kind(), error.raw_os_error()));
+        let event = ImportFailureEvent {
+            operation,
+            sequence: diagnostics.events.len() + 1,
+            checkpoint: diagnostics.steps.last().copied(),
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            ntstatus,
+        };
+        diagnostics.events.push(event);
+        let event = diagnostics.events.last().unwrap();
         // No paths, slots, object IDs, metadata, or manifest/receipt bytes.
-        eprintln!("local-package operation={operation} checkpoint={:?} kind={:?} raw_os_error={:?} evidence={diagnostics:?}", diagnostics.steps.last(), error.kind(), error.raw_os_error());
+        eprintln!("local-package operation={} sequence={} checkpoint={:?} kind={:?} raw_os_error={:?} ntstatus={:?} evidence={diagnostics:?}", event.operation, event.sequence, event.checkpoint, event.kind, event.raw_os_error, event.ntstatus);
     });
 }
 #[cfg(test)]

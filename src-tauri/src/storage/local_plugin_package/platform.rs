@@ -22,7 +22,7 @@ macro_rules! import_io {
         let result = $expression;
         #[cfg(test)]
         if let Err(error) = &result {
-            super::import_operation_failure($operation, error);
+            crate::storage::local_plugin_package::import_operation_failure($operation, error);
         }
         result
     }};
@@ -375,7 +375,7 @@ impl OwnedRemoval for Removal {
         let renamed = (|| {
             #[cfg(test)]
             if let Some(error) = self.parents.hooks.controls.rename_error {
-                return Err(error.into());
+                return import_io!("synthetic-removal-rename-error", Err(error.into()));
             }
             native::promote_exclusive(
                 &self.parents.local,
@@ -675,7 +675,7 @@ impl ImportDirectories {
         )?;
         #[cfg(test)]
         if let Some(error) = self.hooks.controls.rename_error {
-            return Err(error.into());
+            return import_io!("synthetic-import-rename-error", Err(error.into()));
         }
         #[cfg(unix)]
         if self.staging.open_stage(stage)?.identity()? != ids.directory {
@@ -789,11 +789,15 @@ fn verify_content(
     receipt: &[u8],
 ) -> io::Result<()> {
     let mut actual_manifest = Vec::new();
-    manifest_file
-        .take(16_385)
-        .read_to_end(&mut actual_manifest)?;
+    import_io!(
+        "manifest-read-to-end",
+        manifest_file.take(16_385).read_to_end(&mut actual_manifest)
+    )?;
     let mut actual_receipt = Vec::new();
-    receipt_file.take(4_097).read_to_end(&mut actual_receipt)?;
+    import_io!(
+        "receipt-read-to-end",
+        receipt_file.take(4_097).read_to_end(&mut actual_receipt)
+    )?;
     let parsed = PluginRecord::local_declarative(
         serde_json::from_slice(&actual_manifest).map_err(|_| rejected())?,
     )
@@ -1270,9 +1274,11 @@ pub(crate) mod native {
         pub(crate) fn entries(&self, limit: usize) -> io::Result<Vec<OsString>> {
             // Fixed ancestors deny delete sharing; the checked stage additionally
             // denies write sharing while enumerating this pinned path.
-            fs::read_dir(&self.path)?
+            import_io!("directory-read-dir-open", fs::read_dir(&self.path))?
                 .take(limit)
-                .map(|entry| entry.map(|entry| entry.file_name()))
+                .map(|entry| {
+                    import_io!("directory-read-dir-entry", entry).map(|entry| entry.file_name())
+                })
                 .collect()
         }
 
@@ -1373,14 +1379,26 @@ pub(crate) mod native {
         };
         if status < 0 {
             // SAFETY: translates the NTSTATUS value returned by NtCreateFile.
-            return Err(io::Error::from_raw_os_error(
-                unsafe { RtlNtStatusToDosError(status) } as i32,
-            ));
+            let error =
+                io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+            #[cfg(test)]
+            crate::storage::local_plugin_package::import_native_failure(
+                "native-ntcreatefile",
+                &error,
+                status,
+            );
+            return Err(error);
         }
         // SAFETY: the successful native call returned a new owned file handle.
         let file = unsafe { File::from_raw_handle(handle) };
-        crate::storage::windows_file_evidence::verify_opened_name(&file, name)?;
-        crate::storage::windows_file_evidence::no_named_streams(&file).map_err(|_| rejected())?;
+        import_io!(
+            "opened-name-validation",
+            crate::storage::windows_file_evidence::verify_opened_name(&file, name)
+        )?;
+        import_io!(
+            "named-stream-validation",
+            crate::storage::windows_file_evidence::no_named_streams(&file).map_err(|_| rejected())
+        )?;
         Ok(file)
     }
 
@@ -1396,7 +1414,10 @@ pub(crate) mod native {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return import_io!(
+                "get-file-information-by-handle-ex-file-id",
+                Err(io::Error::last_os_error())
+            );
         }
         Ok(FileIdentity {
             volume: info.VolumeSerialNumber,
@@ -1405,7 +1426,7 @@ pub(crate) mod native {
     }
 
     fn directory_identity(file: &File) -> io::Result<FileIdentity> {
-        let metadata = file.metadata()?;
+        let metadata = import_io!("directory-file-metadata", file.metadata())?;
         if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(rejected());
         }
@@ -1413,14 +1434,17 @@ pub(crate) mod native {
     }
 
     pub(crate) fn manifest_identity(file: &File) -> io::Result<FileIdentity> {
-        let metadata = file.metadata()?;
+        let metadata = import_io!("child-file-metadata", file.metadata())?;
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(rejected());
         }
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: file owns a live handle and info is a writable native struct.
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
+            return import_io!(
+                "get-file-information-by-handle-basic",
+                Err(io::Error::last_os_error())
+            );
         }
         if info.nNumberOfLinks != 1 {
             return Err(rejected());
@@ -1444,6 +1468,90 @@ pub(crate) mod native {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn windows_native_failure_diagnostics_preserve_status_and_error() {
+        use crate::storage::local_plugin_package::{
+            import_operation_failure, ImportDiagnostics, IMPORT_DIAGNOSTICS,
+        };
+
+        // Missing native recording, changed error mapping, accidental replacement,
+        // or a stale status on a synthetic event must each fail this real-I/O test.
+        let base = std::env::current_dir().unwrap().join("target");
+        let temp = tempfile::tempdir_in(base).unwrap();
+        let root = Directory::open_or_create_root(&temp.path().canonicalize().unwrap()).unwrap();
+        let staging = root.fixed_child("staging").unwrap();
+        let local = root.fixed_child("local").unwrap();
+        let source = staging.create_stage("source").unwrap();
+        let source_id = source.identity().unwrap();
+        let destination = local.create_stage("target").unwrap();
+        let destination_id = destination.identity().unwrap();
+        drop(destination);
+        IMPORT_DIAGNOSTICS.with(|diagnostics| {
+            *diagnostics.borrow_mut() = ImportDiagnostics::default();
+        });
+        Hooks::default()
+            .checkpoint(ImportFsStep::BeforePromotion)
+            .unwrap();
+
+        let create_error =
+            open_child(&local.file, OsStr::new("target"), true, FILE_CREATE, true).unwrap_err();
+        assert_eq!(create_error.kind(), io::ErrorKind::AlreadyExists);
+        let rename_error =
+            promote_exclusive(&staging, "source", &source, &local, "target").unwrap_err();
+        assert_eq!(rename_error.kind(), io::ErrorKind::AlreadyExists);
+        let synthetic = io::Error::from(io::ErrorKind::PermissionDenied);
+        import_operation_failure("synthetic-rename-error", &synthetic);
+
+        IMPORT_DIAGNOSTICS.with(|diagnostics| {
+            let diagnostics = diagnostics.borrow();
+            assert_eq!(diagnostics.events.len(), 3, "{diagnostics:?}");
+            for (index, (operation, error)) in [
+                ("native-ntcreatefile", &create_error),
+                ("native-ntsetinformationfile-rename", &rename_error),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let event = &diagnostics.events[index];
+                assert_eq!(event.operation, operation);
+                assert_eq!(event.sequence, index + 1);
+                assert_eq!(event.checkpoint, Some(ImportFsStep::BeforePromotion));
+                assert_eq!(event.kind, io::ErrorKind::AlreadyExists);
+                assert_eq!(event.raw_os_error, error.raw_os_error());
+                let status = event
+                    .ntstatus
+                    .expect("real native failure must retain NTSTATUS");
+                assert!(status < 0);
+                // Independent OS conversion, not the diagnostic recording helper.
+                assert_eq!(
+                    Some(unsafe { RtlNtStatusToDosError(status) } as i32),
+                    error.raw_os_error()
+                );
+            }
+            let synthetic_event = &diagnostics.events[2];
+            assert_eq!(synthetic_event.operation, "synthetic-rename-error");
+            assert_eq!(synthetic_event.sequence, 3);
+            assert_eq!(
+                synthetic_event.checkpoint,
+                Some(ImportFsStep::BeforePromotion)
+            );
+            assert_eq!(synthetic_event.kind, io::ErrorKind::PermissionDenied);
+            assert_eq!(synthetic_event.raw_os_error, None);
+            assert_eq!(synthetic_event.ntstatus, None);
+        });
+        assert_eq!(source.identity().unwrap(), source_id);
+        drop(source);
+        assert_eq!(
+            staging.open_stage("source").unwrap().identity().unwrap(),
+            source_id
+        );
+        assert_eq!(
+            local.open_stage("target").unwrap().identity().unwrap(),
+            destination_id
+        );
     }
 
     #[cfg(test)]
@@ -1592,9 +1700,14 @@ pub(crate) mod native {
                 FileRenameInformation,
             );
             if status < 0 {
-                return Err(io::Error::from_raw_os_error(
-                    RtlNtStatusToDosError(status) as i32
-                ));
+                let error = io::Error::from_raw_os_error(RtlNtStatusToDosError(status) as i32);
+                #[cfg(test)]
+                crate::storage::local_plugin_package::import_native_failure(
+                    "native-ntsetinformationfile-rename",
+                    &error,
+                    status,
+                );
+                return Err(error);
             }
         }
         Ok(())
