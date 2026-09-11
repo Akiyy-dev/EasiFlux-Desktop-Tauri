@@ -22,6 +22,8 @@ use crate::storage::managed_plugin_ownership::{
 use crate::storage::plugin_state::{PluginStatePersistence, PluginStateStore};
 
 const FIXTURE_MANIFEST_BYTES: &[u8] = br#"{"schemaVersion":1,"id":"com.easiflux.smoke","name":"Plugin Smoke Fixture","version":"1.0.0","description":"Isolated metadata-only fixture","publisherId":"com.easiflux","publisher":"EasiFlux smoke test","contributions":[],"requestedCapabilities":[]}"#;
+const OUTSIDE_ARTIFACT_ROOT: &str =
+    "plugin smoke parent is outside the build checkout target directory";
 
 pub(crate) struct PluginSmokeProfile {
     pub(crate) root: PathBuf,
@@ -42,12 +44,30 @@ impl PluginSmokeProfile {
         let parent = parent
             .canonicalize()
             .map_err(|error| format!("failed to canonicalize plugin smoke parent: {error}"))?;
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| "plugin smoke build checkout is unavailable".to_owned())?
+            .canonicalize()
+            .map_err(|error| format!("failed to canonicalize plugin smoke checkout: {error}"))?;
+        let artifact_root = checkout
+            .join("target")
+            .canonicalize()
+            .map_err(|error| format!("plugin smoke build target is unavailable: {error}"))?;
+        if !artifact_root.starts_with(&checkout) {
+            return Err("plugin smoke build target must remain within checkout".into());
+        }
+        if !parent.starts_with(&artifact_root) {
+            return Err(OUTSIDE_ARTIFACT_ROOT.into());
+        }
         let root = parent.join(format!("plugin-smoke-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root)
             .map_err(|error| format!("failed to reserve plugin smoke root: {error}"))?;
         let root = root
             .canonicalize()
             .map_err(|error| format!("failed to canonicalize plugin smoke root: {error}"))?;
+        if !root.starts_with(&checkout) {
+            return Err("plugin smoke profile root escaped build checkout".into());
+        }
         let source_dir = root.join("source");
         std::fs::create_dir(&source_dir)
             .map_err(|error| format!("failed to create plugin smoke source directory: {error}"))?;
@@ -198,7 +218,10 @@ mod tests {
     use super::*;
 
     fn fixture_parent() -> TempDir {
-        let base = std::env::current_dir().unwrap().join("target");
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("target");
         fs::create_dir_all(&base).unwrap();
         tempfile::Builder::new()
             .prefix("plugin-smoke-test-parent-")
@@ -218,11 +241,24 @@ mod tests {
             .collect()
     }
 
+    fn child_names(parent: &Path) -> Vec<std::ffi::OsString> {
+        let mut names = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     // Catches accepting an ambiguous parent before reserving a fresh owned child.
     #[test]
     fn create_rejects_relative_missing_and_non_directory_parents_without_child_creation() {
-        let relative = Path::new("relative-smoke-parent");
-        assert!(PluginSmokeProfile::create(relative).is_err());
+        let relative = Path::new("target");
+        fs::create_dir_all(relative).unwrap();
+        assert_eq!(
+            PluginSmokeProfile::create(relative).err().unwrap(),
+            "plugin smoke parent must be absolute"
+        );
 
         let missing_parent = fixture_parent();
         let missing = missing_parent.path().join("missing");
@@ -235,6 +271,21 @@ mod tests {
         assert!(PluginSmokeProfile::create(&file).is_err());
         assert!(smoke_children(file_parent.path()).is_empty());
         assert_eq!(fs::read(file).unwrap(), b"fixture-owned sentinel");
+    }
+
+    // Catches reserving a UUID child before rejecting an unsupported parent topology.
+    #[test]
+    fn create_rejects_system_temp_parent_as_out_of_workspace_without_writes() {
+        let parent = tempfile::tempdir().unwrap();
+        let before = child_names(parent.path());
+
+        let error = PluginSmokeProfile::create(parent.path()).err().unwrap();
+
+        assert_eq!(
+            error,
+            "plugin smoke parent is outside the build checkout target directory"
+        );
+        assert_eq!(child_names(parent.path()), before);
     }
 
     // Catches profile reuse or accidental sharing of one runtime/root.
