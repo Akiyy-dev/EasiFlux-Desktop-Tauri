@@ -9,8 +9,9 @@ use futures_util::FutureExt;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::error::{AppError, AppResult};
-use crate::storage::local_plugin_import::{
-    LocalManifestImportStorage, SystemLocalManifestImportStorage,
+use crate::storage::local_plugin_import::LocalManifestImportStorage;
+use crate::storage::local_plugin_package::{
+    ManagedLocalPluginRemovalStorage, SystemLocalPluginPackageStorage,
 };
 
 use super::discovery::{LocalDiscoveryOutcome, LocalPluginDiscovery, SystemLocalPluginDiscovery};
@@ -23,6 +24,7 @@ pub(crate) struct PluginRuntime {
     discovery: Arc<dyn LocalPluginDiscovery>,
     reader: Arc<dyn LocalManifestReader>,
     storage: Arc<dyn LocalManifestImportStorage>,
+    removal_storage: Arc<dyn ManagedLocalPluginRemovalStorage>,
     import_sessions: Arc<ImportSessions>,
     operation_gate: Arc<Mutex<()>>,
     initial_discovery_attempted: AtomicBool,
@@ -53,11 +55,13 @@ impl PluginRuntime {
         registry: PluginRegistry,
         discovery: Arc<dyn LocalPluginDiscovery>,
     ) -> Self {
-        Self::with_import_services(
+        let packages = Arc::new(SystemLocalPluginPackageStorage::new());
+        Self::with_lifecycle_services(
             registry,
             discovery,
             Arc::new(SystemLocalManifestReader),
-            Arc::new(SystemLocalManifestImportStorage::new()),
+            packages.clone(),
+            packages,
         )
     }
 
@@ -67,11 +71,28 @@ impl PluginRuntime {
         reader: Arc<dyn LocalManifestReader>,
         storage: Arc<dyn LocalManifestImportStorage>,
     ) -> Self {
+        Self::with_lifecycle_services(
+            registry,
+            discovery,
+            reader,
+            storage,
+            Arc::new(SystemLocalPluginPackageStorage::new()),
+        )
+    }
+
+    pub(crate) fn with_lifecycle_services(
+        registry: PluginRegistry,
+        discovery: Arc<dyn LocalPluginDiscovery>,
+        reader: Arc<dyn LocalManifestReader>,
+        storage: Arc<dyn LocalManifestImportStorage>,
+        removal_storage: Arc<dyn ManagedLocalPluginRemovalStorage>,
+    ) -> Self {
         Self {
             registry: RwLock::new(registry),
             discovery,
             reader,
             storage,
+            removal_storage,
             import_sessions: ImportSessions::new(),
             operation_gate: Arc::new(Mutex::new(())),
             initial_discovery_attempted: AtomicBool::new(false),
@@ -84,6 +105,10 @@ impl PluginRuntime {
         }
         {
             let registry = self.registry.read().await;
+            if registry.ownership_requires_retry() {
+                drop(registry);
+                return self.request_discovery(true).await;
+            }
             if !registry.state_requires_retry() {
                 return Ok(registry.catalog_snapshot());
             }
@@ -230,16 +255,21 @@ impl PluginRuntime {
                 tracing::warn!("local plugin discovery worker unavailable");
                 LocalDiscoveryOutcome::unavailable()
             });
-        let publication = {
-            let mut registry = self.registry.write().await;
-            let publication = registry.apply_local_discovery(outcome);
-            // Any completed scan counts, even an unavailable result or failed publish.
-            self.initial_discovery_attempted
-                .store(true, Ordering::Release);
-            publication
-        };
+        let runtime = Arc::clone(self);
+        // Reconciliation may safely rewrite an index; keep synchronous storage
+        // work off the async executor and publish under one write guard.
+        self.initial_discovery_attempted
+            .store(true, Ordering::Release);
+        let publication = tokio::task::spawn_blocking(move || {
+            runtime
+                .registry
+                .blocking_write()
+                .apply_local_discovery(outcome)
+        })
+        .await
+        .map_err(|_| runtime_error())?;
         publication?;
-        self.retry_state_and_snapshot().await
+        Ok(self.registry.read().await.catalog_snapshot())
     }
 }
 
@@ -248,6 +278,8 @@ fn runtime_error() -> AppError {
 }
 
 mod import;
+
+mod removal;
 
 #[cfg(test)]
 mod tests;

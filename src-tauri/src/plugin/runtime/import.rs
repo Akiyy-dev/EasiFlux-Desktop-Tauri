@@ -1,5 +1,5 @@
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,7 +16,7 @@ use crate::plugin::manifest::{
     PluginCatalogSnapshot,
 };
 use crate::plugin::record::PluginRecord;
-use crate::storage::local_plugin_import::{OwnedImportStage, Promotion};
+use crate::storage::local_plugin_import::{ImportPromotionState, OwnedImportStage};
 
 use super::{runtime_error, OperationReservation, PluginRuntime};
 
@@ -117,20 +117,55 @@ async fn run_commit(
     expected_catalog_generation: String,
 ) -> AppResult<CommitImportResult> {
     let _operation = reservation.enter().await;
-    let current_generation = runtime.registry.read().await.catalog_generation();
-    if !matches_generation(
-        &expected_catalog_generation,
-        lease.generation(),
-        current_generation,
-    ) {
-        return Ok(
-            snapshot_after_failure(&runtime, ImportCommitFailure::CatalogStale, false).await,
-        );
-    }
+    // The owned FIFO task retains admission for the complete blocking lifecycle.
+    // All filesystem work uses a private registry; no live registry guard crosses it.
+    tokio::task::spawn_blocking(move || {
+        let progress = CommitProgress::default();
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run_commit_blocking(&runtime, &lease, &expected_catalog_generation, &progress)
+        }))
+        .unwrap_or_else(|_| {
+            if progress.promotion_started.get() {
+                if !progress.postscan_started.get() {
+                    let _ = scan_for_import(&runtime);
+                }
+                Ok(unconfirmed_import(&runtime, lease.content().record()))
+            } else {
+                Err(runtime_error())
+            }
+        })
+    })
+    .await
+    .map_err(|_| runtime_error())?
+}
 
-    let prescan = scan_for_import(&runtime).await;
+#[derive(Default)]
+struct CommitProgress {
+    promotion_started: Cell<bool>,
+    postscan_started: Cell<bool>,
+}
+
+fn run_commit_blocking(
+    runtime: &Arc<PluginRuntime>,
+    lease: &CommitLease,
+    expected_generation: &str,
+    progress: &CommitProgress,
+) -> AppResult<CommitImportResult> {
+    let mut candidate = runtime.registry.blocking_read().clone();
+    if !matches_generation(
+        expected_generation,
+        lease.generation(),
+        candidate.catalog_generation(),
+    ) {
+        return Ok(failed_import(
+            runtime,
+            ImportCommitFailure::CatalogStale,
+            false,
+        ));
+    }
+    let prescan = scan_for_import(runtime);
     let usage = prescan.usage;
-    if let Err(error) = publish_import_outcome(&runtime, prescan).await {
+    if let Err(error) = candidate.apply_local_discovery(prescan) {
         if matches!(
             error,
             AppError::Plugin {
@@ -138,111 +173,178 @@ async fn run_commit(
                 ..
             }
         ) {
-            return Ok(snapshot_after_failure(
-                &runtime,
+            return Ok(failed_import(
+                runtime,
                 ImportCommitFailure::CatalogGenerationExhausted,
                 false,
-            )
-            .await);
-        }
-        tracing::error!("plugin import prescan publication failed");
-        return Err(runtime_error());
-    }
-    let current_generation = runtime.registry.read().await.catalog_generation();
-    if !matches_generation(
-        &expected_catalog_generation,
-        lease.generation(),
-        current_generation,
-    ) {
-        return Ok(
-            snapshot_after_failure(&runtime, ImportCommitFailure::CatalogStale, false).await,
-        );
-    }
-
-    let validation = match usage {
-        Some(usage) => runtime
-            .registry
-            .read()
-            .await
-            .validate_import(lease.content().record(), usage),
-        None => Err(ImportCommitFailure::DiscoveryUnavailable),
-    };
-    if let Err(reason) = validation {
-        return Ok(snapshot_after_failure(&runtime, reason, false).await);
-    }
-
-    let storage = Arc::clone(&runtime.storage);
-    let bytes = lease.content().bytes().to_vec();
-    let mut stage = match tokio::task::spawn_blocking(move || storage.prepare_stage(&bytes)).await {
-        Ok(Ok(stage)) => stage,
-        Ok(Err(reason)) => {
-            return Ok(snapshot_after_failure(&runtime, reason, false).await);
-        }
-        Err(_) => {
-            tracing::error!("plugin manifest staging worker unavailable");
-            return Err(runtime_error());
-        }
-    };
-
-    let record = lease.content().record().clone();
-    let state_runtime = Arc::clone(&runtime);
-    let persist = tokio::task::spawn_blocking(move || {
-        state_runtime
-            .registry
-            .blocking_write()
-            .persist_import_disabled(&record)
-    })
-    .await;
-    match persist {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            cleanup_owned_stage(stage).await;
-            return Ok(snapshot_after_failure(&runtime, import_state_failure(&error), false).await);
-        }
-        Err(_) => {
-            cleanup_owned_stage(stage).await;
-            tracing::error!("plugin import state worker unavailable");
-            return Err(runtime_error());
-        }
-    }
-
-    let promoted = tokio::task::spawn_blocking(move || {
-        let result = stage.promote();
-        (stage, result)
-    })
-    .await;
-    let promotion = match promoted {
-        Ok((_, Ok(promotion))) => promotion,
-        Ok((stage, Err(_))) => {
-            cleanup_owned_stage(stage).await;
-            return Ok(
-                snapshot_after_failure(&runtime, ImportCommitFailure::WriteFailed, true).await,
-            );
-        }
-        Err(_) => {
-            // Promotion is the commit point. A worker panic cannot prove which
-            // side of the rename it reached, so this is deliberately unknown.
-            tracing::error!("plugin manifest promotion worker unavailable");
-            return Err(runtime_error());
-        }
-    };
-
-    let postscan = scan_for_import(&runtime).await;
-    let snapshot = match publish_import_outcome(&runtime, postscan).await {
-        Ok(snapshot) => snapshot,
-        Err(_) => {
-            let snapshot = runtime.registry.read().await.catalog_snapshot();
-            return Ok(CommitImportResult::imported_not_visible(
-                lease.content().record().manifest().id.to_string(),
-                snapshot,
             ));
         }
+        return Err(runtime_error());
+    }
+    if !matches_generation(
+        expected_generation,
+        lease.generation(),
+        candidate.catalog_generation(),
+    ) {
+        // A changed preflight is itself a complete terminal result, never an
+        // intermediate publication on the successful import path.
+        runtime
+            .registry
+            .blocking_write()
+            .publish_import_candidate(candidate)?;
+        return Ok(failed_import(
+            runtime,
+            ImportCommitFailure::CatalogStale,
+            false,
+        ));
+    }
+    let validation = usage
+        .ok_or(ImportCommitFailure::DiscoveryUnavailable)
+        .and_then(|usage| {
+            candidate.validate_managed_import(lease.content().record(), usage, expected_generation)
+        });
+    if let Err(reason) = validation {
+        return Ok(failed_import(runtime, reason, false));
+    }
+    let record = lease.content().record();
+    let mut stage = match runtime
+        .storage
+        .prepare_stage(record, lease.content().bytes())
+    {
+        Ok(stage) => stage,
+        Err(reason) => return Ok(failed_import(runtime, reason, false)),
     };
+    let persisted = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        candidate.persist_import_disabled(record)
+    }));
+    runtime
+        .registry
+        .blocking_write()
+        .adopt_import_documents(&candidate);
+    match persisted {
+        Ok(Ok(())) => {}
+        Ok(Err(failure)) => {
+            // Preserve the owned stage and last complete catalog. Only the
+            // authoritative document is adopted, including committed errors.
+            return Ok(failed_import(
+                runtime,
+                import_state_failure(&failure.error),
+                crate::storage::safe_plugin_document::persist_outcome_committed(
+                    failure.persist_outcome,
+                ),
+            ));
+        }
+        Err(_) => {
+            cleanup_owned_stage(stage);
+            return Err(runtime_error());
+        }
+    }
+    progress.promotion_started.set(true);
+    let promoted = std::panic::catch_unwind(AssertUnwindSafe(|| stage.promote()));
+    let (promotion, mut uncertain) = match promoted {
+        Ok(Ok(promotion)) => (Some(promotion), false),
+        Ok(Err(_)) if stage.promotion_state() == ImportPromotionState::NotCommitted => {
+            progress.promotion_started.set(false);
+            cleanup_owned_stage(stage);
+            runtime
+                .registry
+                .blocking_write()
+                .publish_import_candidate(candidate)?;
+            return Ok(failed_import(
+                runtime,
+                ImportCommitFailure::WriteFailed,
+                true,
+            ));
+        }
+        // A returned error after a committed or unconfirmed promotion cannot
+        // authorize publication any more than a worker panic can.
+        Ok(Err(_)) => (None, true),
+        Err(_) => (None, true),
+    };
+    // No path below this point cleans the stage/package or says notImported.
+    let mut registered = false;
+    if let Some(proof) = &promotion {
+        let package = crate::plugin::discovery::DiscoveredLocalPlugin {
+            record: record.clone(),
+            locator: proof.locator.clone(),
+        };
+        if proof.entry.proves_managed(&package) {
+            let registration = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                candidate.register_managed_import(proof.entry.clone())
+            }));
+            match registration {
+                Ok(Ok(_)) => registered = true,
+                Ok(Err(failure)) => {
+                    // NotCommitted preserves the old index and may be classified
+                    // external, but a committed error is publication uncertainty.
+                    uncertain = failure.persist_outcome
+                        != crate::storage::safe_plugin_document::PersistOutcome::NotCommitted;
+                    tracing::warn!(
+                        code = failure.failure.as_code(),
+                        "plugin import ownership registration failed"
+                    );
+                }
+                Err(_) => uncertain = true,
+            }
+            runtime
+                .registry
+                .blocking_write()
+                .adopt_import_documents(&candidate);
+        }
+    }
+    progress.postscan_started.set(true);
+    let postscan = scan_for_import(runtime);
+    if postscan.summary.status == LocalDiscoveryStatus::Unavailable {
+        return Ok(unconfirmed_import(runtime, record));
+    }
+    // Exactly one final scan, and at most one complete public swap. Even when
+    // registration is uncertain the read is bounded; it never authorizes replay.
+    let publication = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        candidate.apply_local_discovery(postscan)
+    }));
+    if uncertain || !matches!(publication, Ok(Ok(_))) {
+        return Ok(unconfirmed_import(runtime, record));
+    }
+    let locator_confirmed = promotion
+        .as_ref()
+        .is_some_and(|proof| candidate.confirms_import_locator(record, &proof.locator));
+    // Exact boundary: the reconciled candidate exists but is not public yet.
+    #[cfg(test)]
+    crate::storage::local_plugin_package::crash_checkpoint("import", "candidate-built");
+    if runtime
+        .registry
+        .blocking_write()
+        .publish_import_candidate(candidate)
+        .is_err()
+    {
+        return Ok(unconfirmed_import(runtime, record));
+    }
+    let snapshot = runtime.registry.blocking_read().catalog_snapshot();
     Ok(classify_import_result(
-        lease.content().record(),
-        promotion,
+        record,
+        registered,
+        locator_confirmed,
         snapshot,
     ))
+}
+
+fn failed_import(
+    runtime: &Arc<PluginRuntime>,
+    failure: ImportCommitFailure,
+    saved: bool,
+) -> CommitImportResult {
+    CommitImportResult::not_imported(
+        failure,
+        saved,
+        runtime.registry.blocking_read().catalog_snapshot(),
+    )
+}
+
+fn unconfirmed_import(runtime: &Arc<PluginRuntime>, record: &PluginRecord) -> CommitImportResult {
+    CommitImportResult::imported_not_visible(
+        record.manifest().id.to_string(),
+        runtime.registry.blocking_read().catalog_snapshot(),
+    )
 }
 
 fn matches_generation(requested: &str, lease: u64, current: u64) -> bool {
@@ -269,59 +371,44 @@ fn ensure_import_available(snapshot: &PluginCatalogSnapshot) -> AppResult<()> {
     Ok(())
 }
 
-async fn scan_for_import(runtime: &Arc<PluginRuntime>) -> LocalDiscoveryOutcome {
-    let discovery = Arc::clone(&runtime.discovery);
-    tokio::task::spawn_blocking(move || discovery.discover())
-        .await
-        .unwrap_or_else(|_| {
+fn scan_for_import(runtime: &Arc<PluginRuntime>) -> LocalDiscoveryOutcome {
+    std::panic::catch_unwind(AssertUnwindSafe(|| runtime.discovery.discover())).unwrap_or_else(
+        |_| {
             tracing::warn!("local plugin import discovery worker unavailable");
             LocalDiscoveryOutcome::unavailable()
-        })
-}
-
-async fn snapshot_after_failure(
-    runtime: &Arc<PluginRuntime>,
-    failure: ImportCommitFailure,
-    disabled_decision_saved: bool,
-) -> CommitImportResult {
-    let snapshot = runtime.registry.read().await.catalog_snapshot();
-    CommitImportResult::not_imported(failure, disabled_decision_saved, snapshot)
-}
-
-async fn publish_import_outcome(
-    runtime: &Arc<PluginRuntime>,
-    outcome: LocalDiscoveryOutcome,
-) -> AppResult<PluginCatalogSnapshot> {
-    let publication = {
-        let mut registry = runtime.registry.write().await;
-        let publication = registry.apply_local_discovery(outcome);
-        runtime
-            .initial_discovery_attempted
-            .store(true, Ordering::Release);
-        publication.map(|_| registry.catalog_snapshot())
-    };
-    publication
+        },
+    )
 }
 
 fn classify_import_result(
     record: &PluginRecord,
-    promotion: Promotion,
+    registered: bool,
+    locator_confirmed: bool,
     snapshot: PluginCatalogSnapshot,
 ) -> CommitImportResult {
+    use crate::plugin::manifest::PluginManagement;
     let plugin_id = record.manifest().id.to_string();
     let expected = PluginCatalogItem::disabled(record.manifest().clone(), record.source());
-    if promotion.object_identity_verified
-        && snapshot.availability == PluginAvailability::Available
-        && snapshot.plugins.iter().any(|item| item == &expected)
-    {
-        CommitImportResult::imported(plugin_id, snapshot)
-    } else {
-        CommitImportResult::imported_not_visible(plugin_id, snapshot)
+    if snapshot.availability == PluginAvailability::Available {
+        if registered
+            && locator_confirmed
+            && snapshot
+                .plugins
+                .iter()
+                .any(|item| item == &expected.clone().with_management(PluginManagement::Managed))
+        {
+            return CommitImportResult::imported(plugin_id, snapshot);
+        }
+        if !registered && locator_confirmed && snapshot.plugins.iter().any(|item| item == &expected)
+        {
+            return CommitImportResult::imported_external(plugin_id, snapshot);
+        }
     }
+    CommitImportResult::imported_not_visible(plugin_id, snapshot)
 }
 
-async fn cleanup_owned_stage(mut stage: Box<dyn OwnedImportStage>) {
-    let _ = tokio::task::spawn_blocking(move || stage.cleanup()).await;
+fn cleanup_owned_stage(mut stage: Box<dyn OwnedImportStage>) {
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| stage.cleanup()));
 }
 
 fn import_state_failure(error: &AppError) -> ImportCommitFailure {

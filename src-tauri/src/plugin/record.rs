@@ -88,7 +88,6 @@ impl PluginRecord {
         self.source
     }
 
-    #[cfg(test)]
     pub(crate) fn approval_fingerprint(&self) -> &str {
         &self.approval_fingerprint
     }

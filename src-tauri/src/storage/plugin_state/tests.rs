@@ -1,6 +1,90 @@
 use super::*;
+
+#[test]
+fn destructive_state_save_exposes_platform_barrier() {
+    let fixture = Fixture::new();
+    let outcome = fixture
+        .store()
+        .save_before_destructive_rename(&state(1))
+        .unwrap();
+    assert!(crate::storage::safe_plugin_document::outcome_satisfies_destructive_barrier(outcome));
+}
+
+#[test]
+fn destructive_state_barrier_rejects_unconfirmed_outcomes_without_erasing_commit() {
+    use crate::storage::safe_plugin_document::{PersistFailure, PersistResult};
+    struct OutcomeStore(PersistOutcome);
+    impl PluginStatePersistence for OutcomeStore {
+        fn load(&self) -> AppResult<PluginStateLoad> {
+            unreachable!()
+        }
+        fn save(&self, _: &PluginStateFileV2) -> PersistResult {
+            Ok(self.0)
+        }
+    }
+    for outcome in [
+        PersistOutcome::NotCommitted,
+        PersistOutcome::CommittedProcessCrashSafe,
+        PersistOutcome::CommittedDurable,
+    ] {
+        let result = OutcomeStore(outcome).save_before_destructive_rename(&state(2));
+        let accepted = outcome == PersistOutcome::CommittedDurable
+            || (cfg!(windows) && outcome == PersistOutcome::CommittedProcessCrashSafe);
+        assert_eq!(result.is_ok(), accepted);
+        if let Err(PersistFailure { outcome: returned }) = result {
+            assert_eq!(returned, outcome);
+        }
+    }
+}
+
+#[test]
+fn destructive_state_save_rejects_unsafe_objects_at_all_five_names() {
+    for suffix in ["", ".tmp", ".bak", ".pending", ".bak.pending"] {
+        for shape in ["hardlink", "directory", "case", "symlink"] {
+            let fixture = Fixture::new();
+            fixture.write("", document(1));
+            if suffix.is_empty() {
+                fs::remove_file(fixture.path()).unwrap();
+            }
+            let path = sidecar(&fixture.path(), suffix);
+            let outside = fixture.0.join("untouched");
+            fs::write(&outside, b"untouched").unwrap();
+            match shape {
+                "hardlink" => fs::hard_link(&outside, &path).unwrap(),
+                "directory" => fs::create_dir(&path).unwrap(),
+                "case" => fs::write(
+                    path.with_file_name(path.file_name().unwrap().to_string_lossy().to_uppercase()),
+                    b"untouched",
+                )
+                .unwrap(),
+                _ => {
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&outside, &path).unwrap();
+                    #[cfg(windows)]
+                    if let Err(error) = std::os::windows::fs::symlink_file(&outside, &path) {
+                        if error.raw_os_error() == Some(1314) {
+                            continue;
+                        } else {
+                            panic!("{error}");
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                fixture
+                    .store()
+                    .save_before_destructive_rename(&state(2))
+                    .unwrap_err()
+                    .outcome,
+                PersistOutcome::NotCommitted,
+                "{suffix} {shape}"
+            );
+            assert_eq!(fs::read(outside).unwrap(), b"untouched");
+        }
+    }
+}
 use crate::error::AppError;
-use crate::storage::atomic_file::WriteStep;
+use crate::storage::safe_plugin_document::{PersistOutcome, SafeDocumentStep as WriteStep};
 use std::fs;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Barrier};
@@ -10,7 +94,12 @@ struct Fixture(PathBuf);
 
 impl Fixture {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!("plugin-state-{}", uuid::Uuid::new_v4())))
+        Self(
+            std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!("plugin-state-{}", uuid::Uuid::new_v4())),
+        )
     }
 
     fn path(&self) -> PathBuf {
@@ -262,7 +351,8 @@ fn future_primary_schema_never_falls_back_to_older_backup() {
     assert_plugin_code(fixture.store.load(), "plugin_state_unsupported_schema");
 }
 
-fn assert_sanitized(error: AppError) {
+fn assert_sanitized(error: impl Into<AppError>) {
+    let error = error.into();
     assert!(matches!(error, AppError::Plugin { .. }));
     for value in [
         error.to_string(),
@@ -722,10 +812,9 @@ fn stale_pending_is_never_read_as_current_and_does_not_block_save() {
 #[test]
 fn injected_write_rotation_promotion_and_restore_failures_never_publish_uncommitted_state() {
     for failures in [
-        vec![WriteStep::TempWrite],
-        vec![WriteStep::BackupRotation],
-        vec![WriteStep::Promotion],
-        vec![WriteStep::Promotion, WriteStep::Restore],
+        vec![WriteStep::WritePending],
+        vec![WriteStep::ReplaceBackup],
+        vec![WriteStep::ReplaceMain],
     ] {
         for prior in [None, Some(""), Some(".tmp"), Some(".bak")] {
             let fixture = Fixture::new();
@@ -733,7 +822,7 @@ fn injected_write_rotation_promotion_and_restore_failures_never_publish_uncommit
                 fixture.write(suffix, document(1));
             }
             // Rotation and restoration are meaningful only if a previous commit exists.
-            if prior.is_none() && failures.contains(&WriteStep::BackupRotation) {
+            if prior.is_none() && failures.contains(&WriteStep::ReplaceBackup) {
                 continue;
             }
             let mut store = fixture.store();
@@ -751,7 +840,7 @@ fn injected_write_rotation_promotion_and_restore_failures_never_publish_uncommit
             }));
             assert_sanitized(store.save(&state(2)).unwrap_err());
             for fault in requested {
-                if fault != WriteStep::Restore || prior.is_some() {
+                {
                     assert!(
                         observed.lock().unwrap().contains(&fault),
                         "requested fault {fault:?} did not run"
@@ -776,11 +865,10 @@ fn injected_write_rotation_promotion_and_restore_failures_never_publish_uncommit
 fn every_write_checkpoint_preserves_secondary_recovery_normalization() {
     for suffix in [".tmp", ".bak"] {
         for (failures, committed) in [
-            (vec![WriteStep::TempWrite], false),
-            (vec![WriteStep::BackupRotation], false),
-            (vec![WriteStep::Promotion], false),
-            (vec![WriteStep::Promotion, WriteStep::Restore], false),
-            (vec![WriteStep::PostCommitSync], true),
+            (vec![WriteStep::WritePending], false),
+            (vec![WriteStep::ReplaceBackup], false),
+            (vec![WriteStep::ReplaceMain], false),
+            (vec![WriteStep::SyncParent], true),
         ] {
             let fixture = Fixture::new();
             let mut recovered = state(41);
@@ -809,7 +897,10 @@ fn every_write_checkpoint_preserves_secondary_recovery_normalization() {
 
             let saved = store.save(&requested);
             if committed {
-                saved.unwrap();
+                assert_eq!(
+                    saved.unwrap_err().outcome,
+                    PersistOutcome::CommittedProcessCrashSafe
+                );
             } else {
                 assert_sanitized(saved.unwrap_err());
             }
@@ -853,7 +944,7 @@ fn real_io_failure_is_sanitized_and_keeps_previous_main() {
 // Catches a false rejected-save result after the rename commit point; the flag
 // ensures the intended post-commit fault actually ran, not just the happy path.
 #[test]
-fn post_commit_directory_sync_failure_keeps_the_save_successful() {
+fn post_commit_directory_sync_failure_exposes_committed_outcome() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let fixture = Fixture::new();
     fixture.write("", document(1));
@@ -861,13 +952,16 @@ fn post_commit_directory_sync_failure_keeps_the_save_successful() {
     let observed = Arc::clone(&injected);
     let mut store = fixture.store();
     store.file.hook = Some(Arc::new(move |step| {
-        if step == WriteStep::PostCommitSync {
+        if step == WriteStep::SyncParent {
             observed.store(true, Ordering::SeqCst);
             return Err(std::io::Error::other("raw-secret post-commit sync failure"));
         }
         Ok(())
     }));
-    store.save(&state(2)).unwrap();
+    assert_eq!(
+        store.save(&state(2)).unwrap_err().outcome,
+        PersistOutcome::CommittedProcessCrashSafe
+    );
     assert!(injected.load(Ordering::SeqCst));
     assert_eq!(fixture.store().load().unwrap().state.revision, 2);
 }
@@ -885,7 +979,7 @@ fn store_is_send_sync_and_load_and_save_share_the_full_transaction_lock() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut store = fixture.store();
     store.file.hook = Some(Arc::new(move |step| {
-        if step == WriteStep::Promotion
+        if step == WriteStep::ReplaceMain
             && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
         {
             entered_tx.send(()).unwrap();

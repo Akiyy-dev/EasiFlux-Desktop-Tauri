@@ -7,6 +7,7 @@ fn main() {
             "prepare_local_manifest_import",
             "cancel_local_manifest_import",
             "commit_local_manifest_import",
+            "remove_managed_local_plugin",
         ]),
     ))
     .expect("error while building Tauri application resources")

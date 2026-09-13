@@ -2,9 +2,13 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import PluginCard from './PluginCard.vue'
 import PluginImportDialog from './PluginImportDialog.vue'
+import PluginRemovalDialog from './PluginRemovalDialog.vue'
 import { pluginSourceLabel } from './pluginPresentation'
 import { usePluginStore, type PluginStatusFilter } from '../../stores/plugin'
-import type { LocalManifestImportCommitFailure } from '../../types/plugin'
+import type {
+  LocalManifestImportCommitFailure,
+  RemoveManagedLocalPluginFailure,
+} from '../../types/plugin'
 import type { PluginSection } from '../../types/navigation'
 
 const props = defineProps<{
@@ -20,6 +24,7 @@ const store = usePluginStore()
 const title = ref<{ focus: () => void } | null>(null)
 const importTrigger = ref<FocusControl | null>(null)
 const importDialogOpener = ref<FocusControl | null>(null)
+const removalDialogOpener = ref<FocusControl | null>(null)
 
 const importFailureCopy: Record<LocalManifestImportCommitFailure, string> = {
   plugin_catalog_stale: '插件目录已更新，请刷新后重试。',
@@ -34,6 +39,31 @@ const importFailureCopy: Record<LocalManifestImportCommitFailure, string> = {
   plugin_import_capacity_exceeded: '本地插件数量或读取预算已达上限。',
   plugin_import_staging_capacity_exceeded: '导入暂存区需要人工检查和清理。',
   plugin_import_write_failed: '无法完成清单写入，请检查后重试。',
+  plugin_ownership_unavailable: '所有权记录暂不可用，不能受管导入或移除。',
+  plugin_ownership_capacity_exceeded: '受管所有权记录已达上限。',
+  plugin_ownership_revision_exhausted: '受管所有权记录版本已达到上限，请联系支持。',
+}
+
+const removalFailureCopy: Record<RemoveManagedLocalPluginFailure, string> = {
+  plugin_catalog_stale: '插件目录已更新，本地包未被移除。请重新扫描后再决定。',
+  plugin_catalog_invalid: '插件目录不可用，本地包未被移除。',
+  plugin_catalog_generation_exhausted: '插件目录版本已达到上限，本地包未被移除。',
+  plugin_state_unavailable: '插件状态暂不可用，本地包未被移除。',
+  plugin_state_persist_failed: '无法保存停用状态，本地包未被移除。',
+  plugin_state_capacity_exceeded: '插件状态容量已达到上限，本地包未被移除。',
+  plugin_revision_exhausted: '插件状态版本已达到上限，本地包未被移除。',
+  plugin_ownership_unavailable: '所有权状态暂不可用，应用不会删除此本地包。',
+  plugin_ownership_persist_failed: '无法安全保存管理记录，本地包未被移除。',
+  plugin_ownership_capacity_exceeded: '管理记录容量已达到上限，本地包未被移除。',
+  plugin_ownership_revision_exhausted: '管理记录版本已达到上限，本地包未被移除。',
+  plugin_ownership_conflict: '管理记录不一致，应用不会删除此本地包。请退出应用后人工检查。',
+  plugin_remove_discovery_unavailable: '当前本地发现状态不足以确认目标，本地包未被移除。',
+  plugin_remove_not_managed: '此包当前不再由 EasiFlux 管理，因此不会被移除。',
+  plugin_remove_requires_disabled: '此插件仍处于启用状态，请先停用再移除。',
+  plugin_remove_storage_unavailable: '无法安全准备移除，本地包未被移除。',
+  plugin_remove_identity_changed: '确认后包内容或位置已经变化，本地包未被移除。请重新扫描。',
+  plugin_remove_staging_capacity_exceeded: '移除暂存区需要人工检查，本地包未被移除。请退出应用后维护。',
+  plugin_remove_write_failed: '未能安全移除本地包，请重新扫描并确认当前状态。',
 }
 
 const sectionCopy: Record<PluginSection, { title: string; description: string }> = {
@@ -61,11 +91,14 @@ const refreshing = computed(() => (
 ))
 const reloading = computed(() => store.reloadStatus === 'loading')
 const importEntryDisabled = computed(() => store.importStatus !== 'idle')
-const importedMessage = computed(() => (
-  store.importStatus === 'result' && store.importResult?.status === 'imported'
-    ? '清单已导入，默认停用。'
-    : null
-))
+const importedMessage = computed(() => {
+  if (store.importStatus !== 'result') return null
+  if (store.importResult?.status === 'imported') return '清单已导入，默认停用。'
+  if (store.importResult?.status === 'importedExternal') {
+    return '清单已导入，但管理登记未完成；该包保持外部放置，EasiFlux 不会移除。请勿重复导入同一插件 ID。'
+  }
+  return null
+})
 const importAlertMessage = computed(() => {
   if (store.importStatus !== 'result') return null
   if (store.importOutcomeUnknown) {
@@ -90,6 +123,40 @@ const importNeedsReload = computed(() => (
 const reloadDisabled = computed(() => (
   initialLoading.value || store.loadStatus === 'loading' || reloading.value
 ))
+const removalEntryDisabled = computed(() => store.removalStatus !== 'idle')
+const removalResultView = computed(() => {
+  if (store.removalStatus !== 'result') return null
+  if (store.removalOutcomeUnknown) {
+    return {
+      message: '移除结果尚未确认。请重新扫描；如仍有提示，请完全退出 EasiFlux 后人工检查。',
+      success: false,
+      reload: true,
+    }
+  }
+  const result = store.removalResult
+  if (!result) return null
+  if (result.status === 'removed') {
+    return { message: '本地包已移除。停用偏好已保留。', success: true, reload: false }
+  }
+  if (result.status === 'removedCleanupPending') {
+    return {
+      message: '本地包已离开插件发现范围，但仍有内容需要人工维护。请完全退出 EasiFlux 后检查移除暂存区。',
+      success: false,
+      reload: true,
+    }
+  }
+  if (result.status === 'removedCatalogUnconfirmed') {
+    return {
+      message: '移除可能已经完成，但当前目录结果尚未确认。请重新扫描；如仍有提示，请完全退出 EasiFlux 后人工检查。',
+      success: false,
+      reload: true,
+    }
+  }
+  const retained = result.disabledDecisionSaved
+    ? ' 停用偏好已确认保存并保留；即使应用意外退出也不会恢复为启用。'
+    : ''
+  return { message: `${removalFailureCopy[result.reasonCode]}${retained}`, success: false, reload: false }
+})
 // One transport failure surface: a reload failure takes precedence because only
 // a successful reload clears both error domains. Validated health stays separate.
 const transportError = computed(() => {
@@ -181,6 +248,27 @@ function togglePlugin(id: string, enabled: boolean): void {
   void store.setEnabled(id, enabled)
 }
 
+function beginRemoval(id: string, opener: FocusControl): void {
+  if (props.section === 'market' || removalEntryDisabled.value || !opener.isConnected) return
+  if (store.beginRemoval(id)) removalDialogOpener.value = opener
+}
+
+function cancelRemoval(): void {
+  store.cancelRemoval()
+}
+
+function confirmRemoval(): void {
+  void store.confirmRemoval()
+}
+
+function clearRemovalResult(): void {
+  store.clearRemovalResult()
+}
+
+function reloadRemovalResult(): void {
+  if (!reloadDisabled.value) void store.reload()
+}
+
 onMounted(() => {
   void store.load()
   void nextTick(() => title.value?.focus())
@@ -188,6 +276,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   store.releaseImportView()
+  store.releaseRemovalView()
 })
 </script>
 
@@ -236,6 +325,18 @@ onBeforeUnmount(() => {
       :opener="importDialogOpener"
       @confirm="commitImport"
       @cancel="cancelImport"
+    />
+
+    <PluginRemovalDialog
+      v-if="store.removalTarget && (
+        store.removalStatus === 'confirming' || store.removalStatus === 'removing'
+      )"
+      :plugin="store.removalTarget.plugin"
+      :submitting="store.removalStatus === 'removing'"
+      :stale="store.removalConfirmationStale"
+      :opener="removalDialogOpener"
+      @confirm="confirmRemoval"
+      @cancel="cancelRemoval"
     />
 
     <div
@@ -294,6 +395,39 @@ onBeforeUnmount(() => {
     </div>
 
     <div
+      v-if="removalResultView"
+      class="plugin-marketplace-page__notice"
+      :class="removalResultView.success
+        ? 'plugin-marketplace-page__notice--success'
+        : 'plugin-marketplace-page__notice--error'"
+      data-testid="plugin-removal-result"
+      :role="removalResultView.success ? 'status' : 'alert'"
+      :aria-live="removalResultView.success ? 'polite' : undefined"
+    >
+      <p>{{ removalResultView.message }}</p>
+      <div class="plugin-marketplace-page__notice-actions">
+        <button
+          v-if="removalResultView.reload"
+          class="ef-btn ef-btn-secondary ef-btn-sm"
+          data-testid="plugin-removal-result-reload"
+          type="button"
+          :disabled="reloadDisabled"
+          @click="reloadRemovalResult"
+        >
+          重新扫描本地插件
+        </button>
+        <button
+          class="ef-btn ef-btn-secondary ef-btn-sm"
+          data-testid="plugin-removal-result-dismiss"
+          type="button"
+          @click="clearRemovalResult"
+        >
+          关闭提示
+        </button>
+      </div>
+    </div>
+
+    <div
       v-if="reloading"
       class="plugin-marketplace-page__notice"
       data-testid="plugin-reload-status"
@@ -329,6 +463,39 @@ onBeforeUnmount(() => {
     </div>
 
     <template v-if="store.availability !== null">
+      <div
+        v-if="store.managedOwnership?.rollbackPendingCount"
+        class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
+        data-testid="plugin-removal-rollback-summary"
+        role="alert"
+      >
+        有 {{ store.managedOwnership.rollbackPendingCount }} 个移除准备已回退，受管包仍在本地。请完全退出 EasiFlux 后人工检查。
+      </div>
+      <div
+        v-if="store.managedOwnership?.cleanupPendingCount"
+        class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
+        data-testid="plugin-removal-cleanup-summary"
+        role="alert"
+      >
+        有 {{ store.managedOwnership.cleanupPendingCount }} 个包已离开插件发现范围，但仍需清理。请完全退出 EasiFlux 后人工维护。
+      </div>
+      <div
+        v-if="store.managedOwnership?.conflictingEntryCount"
+        class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
+        data-testid="plugin-removal-conflict-summary"
+        role="alert"
+      >
+        有 {{ store.managedOwnership.conflictingEntryCount }} 条管理记录不一致；应用不会删除相关本地包。请完全退出 EasiFlux 后人工检查。
+      </div>
+      <div
+        v-if="store.managedOwnership?.status === 'unavailable'"
+        class="plugin-marketplace-page__notice plugin-marketplace-page__notice--error"
+        data-testid="plugin-ownership-unavailable-summary"
+        role="alert"
+      >
+        所有权状态暂不可用，应用不会删除本地包。外部放置的包仍可浏览和启停。
+      </div>
+
       <div
         v-if="store.localDiscovery?.status === 'degraded'"
         class="plugin-marketplace-page__notice"
@@ -421,7 +588,9 @@ onBeforeUnmount(() => {
             :plugin="plugin"
             :pending="store.pendingIds.has(plugin.manifest.id)"
             :error="store.actionErrors[plugin.manifest.id] ?? null"
+            :removal-disabled="removalEntryDisabled"
             @toggle="togglePlugin"
+            @remove="beginRemoval"
           />
         </div>
       </section>
@@ -478,25 +647,17 @@ onBeforeUnmount(() => {
           当前没有可管理的插件。
         </p>
         <div v-else class="plugin-management-list">
-          <article
+          <PluginCard
             v-for="plugin in store.catalog"
             :key="plugin.manifest.id"
-            class="plugin-management-item ef-card"
+            :plugin="plugin"
+            :pending="store.pendingIds.has(plugin.manifest.id)"
+            :error="store.actionErrors[plugin.manifest.id] ?? null"
+            :removal-disabled="removalEntryDisabled"
             data-testid="plugin-management-item"
-          >
-            <header>
-              <h2>{{ plugin.manifest.name }}</h2>
-              <span>{{ plugin.manifest.id }}</span>
-            </header>
-            <p>来源：{{ pluginSourceLabel(plugin.source) }}</p>
-            <p>当前状态：{{ plugin.status === 'enabled' ? '已启用' : plugin.status === 'disabled' ? '已停用' : '已阻止' }}</p>
-            <p data-testid="management-requested-capabilities">
-              <strong>请求权限：</strong>无需额外权限
-            </p>
-            <p data-testid="management-granted-capabilities">
-              <strong>已授予权限：</strong>无需额外权限
-            </p>
-          </article>
+            @toggle="togglePlugin"
+            @remove="beginRemoval"
+          />
         </div>
       </section>
     </template>

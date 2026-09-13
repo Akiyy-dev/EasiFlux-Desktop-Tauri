@@ -7,6 +7,7 @@ import {
   pluginErrorCode,
   prepareLocalManifestImport,
   reloadPluginCatalog,
+  removeManagedLocalPlugin,
   pluginErrorMessage,
   setPluginEnabled,
 } from '../../src/services/pluginService'
@@ -47,6 +48,9 @@ function validItem(
   return {
     manifest: validManifest(id),
     source: 'builtIn',
+    management: 'builtIn',
+    canRemove: false,
+    toggleBlockReasonCode: null,
     status,
     statusReasonCode: null,
     canToggle: true,
@@ -61,6 +65,9 @@ function blockedItem(
   return {
     manifest: validManifest(id),
     source: 'builtIn',
+    management: 'builtIn',
+    canRemove: false,
+    toggleBlockReasonCode: null,
     status: 'blocked',
     statusReasonCode: reason,
     canToggle: false,
@@ -70,10 +77,11 @@ function blockedItem(
 
 function validSnapshot(): WireObject {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision: '42',
     catalogGeneration: '2',
     localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
     availability: 'available',
     availabilityReasonCode: null,
     plugins: [
@@ -87,10 +95,11 @@ function unavailableSnapshot(
   reason: 'stateUnavailable' | 'catalogInvalid' = 'stateUnavailable',
 ): WireObject {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision: '42',
     catalogGeneration: '2',
     localDiscovery: { status: 'available', rejectedPackageCount: 0 },
+    managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
     availability: 'unavailable',
     availabilityReasonCode: reason,
     plugins: [blockedItem('com.easiflux.analytics', reason)],
@@ -101,7 +110,7 @@ function validMutation(
   id = 'com.easiflux.analytics',
   status: 'enabled' | 'disabled' = 'enabled',
 ): WireObject {
-  return { schemaVersion: 2, revision: '43', catalogGeneration: '2', plugin: validItem(id, status) }
+  return { schemaVersion: 3, revision: '43', catalogGeneration: '2', plugin: validItem(id, status) }
 }
 
 function readyImport(
@@ -123,6 +132,9 @@ function importedItem(
   return {
     manifest,
     source: 'localDeclarative',
+    management: 'managed',
+    canRemove: true,
+    toggleBlockReasonCode: null,
     status: 'disabled',
     statusReasonCode: null,
     canToggle: true,
@@ -135,13 +147,14 @@ function importSnapshot(
   localDiscoveryStatus: 'available' | 'degraded' = 'available',
 ): WireObject {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision: '43',
     catalogGeneration: '3',
     localDiscovery: {
       status: localDiscoveryStatus,
       rejectedPackageCount: localDiscoveryStatus === 'degraded' ? 1 : 0,
     },
+    managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
     availability: 'available',
     availabilityReasonCode: null,
     plugins: [importedItem(manifest)],
@@ -152,7 +165,7 @@ function importedResult(
   manifest: WireObject = validManifest('com.example.notes', 'com.example'),
 ): WireObject {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: 'imported',
     pluginId: 'com.example.notes',
     snapshot: importSnapshot(manifest),
@@ -164,7 +177,7 @@ function notImportedResult(
   disabledDecisionSaved = false,
 ): WireObject {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: 'notImported',
     disabledDecisionSaved,
     reasonCode,
@@ -174,7 +187,7 @@ function notImportedResult(
 
 function importedNotVisibleResult(snapshot: WireObject = validSnapshot()): WireObject {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: 'importedNotVisible',
     pluginId: 'com.example.notes',
     reasonCode: 'plugin_import_publication_unconfirmed',
@@ -240,13 +253,14 @@ describe('plugin service transport validation', () => {
 
   it('accepts local declarative records and uses the fixed explicit reload command', async () => {
     const snapshotV2 = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: '4',
       catalogGeneration: '2',
       availability: 'available',
       availabilityReasonCode: null,
       localDiscovery: { status: 'degraded', rejectedPackageCount: 1 },
-      plugins: [{ ...validItem('com.example.alpha'), source: 'localDeclarative' }],
+      managedOwnership: { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0 },
+      plugins: [{ ...validItem('com.example.alpha'), source: 'localDeclarative', management: 'external' }],
     }
     vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshotV2)
     await expect(reloadPluginCatalog()).resolves.toEqual(snapshotV2)
@@ -274,6 +288,7 @@ describe('plugin service transport validation', () => {
       const snapshot = availability === 'available' ? validSnapshot() : unavailableSnapshot()
       snapshot.localDiscovery = { status: 'unavailable', rejectedPackageCount: 0 }
       firstItem(snapshot).source = 'localDeclarative'
+      firstItem(snapshot).management = 'external'
       vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
       await expect(request()).rejects.toThrow(INVALID_RESPONSE_ERROR)
     })
@@ -292,6 +307,7 @@ describe('plugin service transport validation', () => {
       const snapshot = unavailableSnapshot()
       snapshot.localDiscovery = summary
       firstItem(snapshot).source = 'localDeclarative'
+      firstItem(snapshot).management = 'external'
       vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
       await expect(request()).resolves.toEqual(snapshot)
     })
@@ -368,6 +384,7 @@ describe('plugin service transport validation', () => {
     const mutation = validMutation('com.example.alpha')
     const localItem = mutation.plugin as WireObject
     localItem.source = 'localDeclarative'
+    localItem.management = 'external'
     vi.mocked(tauriInvoke).mockResolvedValueOnce(mutation)
     await expect(setPluginEnabled('com.example.alpha', true, '2')).resolves.toEqual(mutation)
     expect(tauriInvoke).toHaveBeenCalledWith('set_plugin_enabled', {
@@ -724,9 +741,9 @@ describe('local manifest import transport validation', () => {
     },
   )
 
-  it('accepts the sole partial notImported result after a disabled write decision', async () => {
+  it.each(['plugin_state_persist_failed', 'plugin_import_write_failed'] as const)('accepts partial notImported %s after a disabled write decision', async (reasonCode) => {
     const preview = await parseReadyThroughPrepare(readyImport())
-    const result = notImportedResult('plugin_import_write_failed', true)
+    const result = notImportedResult(reasonCode, true)
     vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
 
     await expect(commitLocalManifestImport(preview)).resolves.toEqual(result)
@@ -865,11 +882,11 @@ describe('local manifest import transport validation', () => {
     ['null envelope', null],
     ['array envelope', []],
     ['unknown status', { schemaVersion: 1, status: 'unknown' }],
-    ['imported with wrong schema', { ...importedResult(), schemaVersion: 2 }],
-    ['notImported with wrong schema', { ...notImportedResult(), schemaVersion: 2 }],
+    ['imported with wrong schema', { ...importedResult(), schemaVersion: 1 }],
+    ['notImported with wrong schema', { ...notImportedResult(), schemaVersion: 1 }],
     [
       'importedNotVisible with wrong schema',
-      { ...importedNotVisibleResult(), schemaVersion: 2 },
+      { ...importedNotVisibleResult(), schemaVersion: 1 },
     ],
   ])('rejects a malformed commit result: %s', async (_label, value) => {
     await expectCommitRejected(value)
@@ -938,7 +955,6 @@ describe('local manifest import transport validation', () => {
     'plugin_catalog_invalid',
     'plugin_catalog_generation_exhausted',
     'plugin_state_unavailable',
-    'plugin_state_persist_failed',
     'plugin_state_capacity_exceeded',
     'plugin_revision_exhausted',
     'plugin_import_id_conflict',
@@ -998,6 +1014,327 @@ describe('local manifest import transport validation', () => {
 
     await expect(commitLocalManifestImport(preview)).rejects.toBe(backendError)
     expect(tauriInvoke).toHaveBeenCalledTimes(2)
+  })
+})
+
+function ownershipSummary(overrides: WireObject = {}): WireObject {
+  return { status: 'available', conflictingEntryCount: 0, rollbackPendingCount: 0, cleanupPendingCount: 0, ...overrides }
+}
+
+function localItem(management: string, status = 'disabled'): WireObject {
+  return {
+    ...validItem('com.example.notes'),
+    source: 'localDeclarative', management, status,
+    canRemove: management === 'managed' && status === 'disabled',
+    canToggle: management !== 'removalPending',
+    toggleBlockReasonCode: management === 'removalPending' ? 'removalPending' : null,
+  }
+}
+
+function externalImportResult(): WireObject {
+  const result = importedResult()
+  const item = firstItem(result.snapshot as WireObject)
+  item.management = 'external'
+  item.canRemove = false
+  return { ...result, status: 'importedExternal', reasonCode: 'plugin_import_ownership_not_registered' }
+}
+
+const FALSE_ONLY_REMOVE_CODES = [
+  'plugin_catalog_stale', 'plugin_catalog_invalid', 'plugin_catalog_generation_exhausted',
+  'plugin_state_unavailable', 'plugin_state_persist_failed', 'plugin_state_capacity_exceeded',
+  'plugin_revision_exhausted', 'plugin_ownership_unavailable', 'plugin_ownership_capacity_exceeded',
+  'plugin_ownership_revision_exhausted', 'plugin_ownership_conflict',
+  'plugin_remove_discovery_unavailable', 'plugin_remove_not_managed', 'plugin_remove_requires_disabled',
+  'plugin_remove_storage_unavailable', 'plugin_remove_staging_capacity_exceeded',
+] as const
+const TRUE_ONLY_REMOVE_CODES = ['plugin_ownership_persist_failed', 'plugin_remove_write_failed'] as const
+
+function notRemoved(reasonCode = 'plugin_catalog_stale', disabledDecisionSaved = false): WireObject {
+  return { schemaVersion: 1, status: 'notRemoved', reasonCode, disabledDecisionSaved, snapshot: validSnapshot() }
+}
+
+function removed(status = 'removed'): WireObject {
+  const snapshot = validSnapshot()
+  if (status === 'removedCleanupPending') {
+    snapshot.managedOwnership = ownershipSummary({ status: 'degraded', cleanupPendingCount: 1 })
+  }
+  return {
+    schemaVersion: 1, status, pluginId: 'com.example.notes', snapshot,
+    ...(status === 'removedCatalogUnconfirmed' ? { reasonCode: 'plugin_remove_publication_unconfirmed' } : {}),
+  }
+}
+
+async function expectRemoveRejected(value: unknown): Promise<void> {
+  vi.mocked(tauriInvoke).mockResolvedValueOnce(value)
+  await expect(removeManagedLocalPlugin('com.example.notes', '2')).rejects.toThrow(INVALID_RESPONSE_ERROR)
+}
+
+async function expectRemoveAccepted(value: unknown): Promise<void> {
+  vi.mocked(tauriInvoke).mockResolvedValueOnce(value)
+  await expect(removeManagedLocalPlugin('com.example.notes', '2')).resolves.toEqual(value)
+}
+
+describe('catalog v3 ownership invariants', () => {
+  beforeEach(() => vi.mocked(tauriInvoke).mockReset())
+
+  it.each(['management', 'canRemove', 'toggleBlockReasonCode'])('requires item %s', async (key) => {
+    const snapshot = validSnapshot()
+    delete firstItem(snapshot)[key]
+    await expectCatalogRejected(snapshot)
+  })
+
+  it('requires v3 and the ownership summary on snapshots and mutations', async () => {
+    await expectCatalogRejected({ ...validSnapshot(), schemaVersion: 2 })
+    await expectMutationRejected({ ...validMutation(), schemaVersion: 2 })
+    const snapshot = validSnapshot()
+    delete snapshot.managedOwnership
+    await expectCatalogRejected(snapshot)
+  })
+
+  it.each(['status', 'conflictingEntryCount', 'rollbackPendingCount', 'cleanupPendingCount'])('requires summary %s', async (key) => {
+    const summary = ownershipSummary()
+    delete summary[key]
+    await expectCatalogRejected({ ...validSnapshot(), managedOwnership: summary })
+  })
+
+  it.each([
+    null, [], {}, ownershipSummary({ extra: true }), ownershipSummary({ status: 'unknown' }),
+    ownershipSummary({ status: 'degraded' }), ownershipSummary({ cleanupPendingCount: 1 }),
+    ownershipSummary({ status: 'unavailable', conflictingEntryCount: 1 }),
+    ...['conflictingEntryCount', 'rollbackPendingCount', 'cleanupPendingCount'].flatMap((field) => (
+      [-1, 0.5, NaN, Infinity, '1', null, Number.MAX_SAFE_INTEGER + 1].map((count) => ownershipSummary({ status: 'degraded', [field]: count }))
+    )),
+    ownershipSummary({ status: 'degraded', conflictingEntryCount: 177 }),
+    ownershipSummary({ status: 'degraded', rollbackPendingCount: 161 }),
+    ownershipSummary({ status: 'degraded', cleanupPendingCount: 161 }),
+    ownershipSummary({ status: 'degraded', rollbackPendingCount: 160, cleanupPendingCount: 17 }),
+  ])('rejects malformed or inconsistent ownership summary %j', async (summary) => {
+    await expectCatalogRejected({ ...validSnapshot(), managedOwnership: summary })
+  })
+
+  it.each([
+    ownershipSummary(), ownershipSummary({ status: 'unavailable' }),
+    ownershipSummary({ status: 'degraded', conflictingEntryCount: 176 }),
+    ownershipSummary({ status: 'degraded', rollbackPendingCount: 160 }),
+    ownershipSummary({ status: 'degraded', cleanupPendingCount: 160 }),
+    ownershipSummary({ status: 'degraded', conflictingEntryCount: 16, rollbackPendingCount: 80, cleanupPendingCount: 80 }),
+  ])('accepts bounded summary %j independently of plugin-state health', async (summary) => {
+    for (const snapshot of [validSnapshot(), unavailableSnapshot()]) {
+      snapshot.managedOwnership = summary
+      vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
+      await expect(getPluginCatalog()).resolves.toEqual(snapshot)
+    }
+  })
+
+  it.each(['managed', 'external', 'ownershipConflict', 'ownershipUnavailable', 'removalPending'])('accepts local %s and the exact toggle/remove rules', async (management) => {
+    for (const status of management === 'removalPending' ? ['disabled'] : ['enabled', 'disabled']) {
+      const snapshot = { ...validSnapshot(), plugins: [localItem(management, status)] }
+      vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
+      await expect(getPluginCatalog()).resolves.toEqual(snapshot)
+    }
+  })
+
+  it.each([
+    { management: 'unknown' }, { management: 'external' }, { source: 'localDeclarative' },
+    { canRemove: true }, { canRemove: 'false' }, { toggleBlockReasonCode: 'other' },
+    { toggleBlockReasonCode: 'removalPending', canToggle: false },
+  ])('rejects inconsistent built-in fields %j', async (fields) => {
+    await expectCatalogRejected({ ...validSnapshot(), plugins: [{ ...validItem(), ...fields }] })
+  })
+
+  it.each([
+    { management: 'managed', status: 'disabled', canRemove: false },
+    { management: 'managed', status: 'enabled', canRemove: true },
+    { management: 'external', canRemove: true },
+    { management: 'ownershipConflict', canRemove: true },
+    { management: 'ownershipUnavailable', canRemove: true },
+    { management: 'removalPending', canRemove: true },
+    { management: 'removalPending', toggleBlockReasonCode: null },
+    { management: 'removalPending', canToggle: true },
+    { management: 'removalPending', status: 'enabled' },
+    { management: 'managed', toggleBlockReasonCode: 'removalPending', canToggle: false },
+  ])('rejects inconsistent local ownership %j', async (fields) => {
+    await expectCatalogRejected({ ...validSnapshot(), plugins: [{ ...localItem(fields.management), ...fields }] })
+  })
+
+  it.each(['managed', 'external', 'ownershipConflict', 'ownershipUnavailable'])('enforces global unavailable state for %s', async (management) => {
+    const item = { ...localItem(management), status: 'blocked', statusReasonCode: 'stateUnavailable', canToggle: false, canRemove: false }
+    const snapshot = { ...unavailableSnapshot(), plugins: [item] }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot)
+    await expect(getPluginCatalog()).resolves.toEqual(snapshot)
+    await expectCatalogRejected({ ...validSnapshot(), plugins: [item] })
+    await expectCatalogRejected({ ...snapshot, plugins: [{ ...item, canRemove: true }] })
+  })
+
+  it('rejects removalPending unless disabled, including globally unavailable snapshots', async () => {
+    const pending = { ...localItem('removalPending'), status: 'blocked', statusReasonCode: 'stateUnavailable' }
+    await expectCatalogRejected({ ...unavailableSnapshot(), plugins: [pending] })
+  })
+
+  it('rejects a mutation that changes generation and permits status-derived canRemove at the same generation', async () => {
+    await expectMutationRejected({ ...validMutation(), catalogGeneration: '3' })
+    for (const enabled of [false, true]) {
+      const result = { schemaVersion: 3, revision: enabled ? '45' : '44', catalogGeneration: '2', plugin: localItem('managed', enabled ? 'enabled' : 'disabled') }
+      vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
+      await expect(setPluginEnabled('com.example.notes', enabled, '2')).resolves.toEqual(result)
+    }
+  })
+
+  it('rejects a toggle-blocked mutation', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ ...validMutation(), plugin: localItem('removalPending') })
+    await expect(setPluginEnabled('com.example.notes', false, '2')).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+})
+
+describe('import v2 ownership outcomes', () => {
+  beforeEach(() => vi.mocked(tauriInvoke).mockReset())
+
+  it('accepts the exact external import outcome', async () => {
+    const preview = await parseReadyThroughPrepare(readyImport())
+    const result = externalImportResult()
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
+    await expect(commitLocalManifestImport(preview)).resolves.toEqual(result)
+  })
+
+  it.each(['plugin_ownership_unavailable', 'plugin_ownership_capacity_exceeded', 'plugin_ownership_revision_exhausted'] as const)('permits preflight %s only before the disabled decision', async (reasonCode) => {
+    const preview = await parseReadyThroughPrepare(readyImport())
+    const result = { ...notImportedResult(), reasonCode }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
+    await expect(commitLocalManifestImport(preview)).resolves.toEqual(result)
+    await expectCommitRejected({ ...result, disabledDecisionSaved: true })
+  })
+
+  it.each(['plugin_ownership_persist_failed', 'plugin_import_ownership_not_registered'])('rejects post-promotion %s from notImported', async (reasonCode) => {
+    for (const disabledDecisionSaved of [false, true]) {
+      await expectCommitRejected({ ...notImportedResult(), reasonCode, disabledDecisionSaved })
+    }
+  })
+
+  it('rejects interchangeable managed/external claims even with individually valid snapshots', async () => {
+    const external = externalImportResult()
+    await expectCommitRejected({ ...importedResult(), snapshot: external.snapshot })
+    await expectCommitRejected({ ...external, snapshot: importedResult().snapshot })
+  })
+
+  it('requires every exact external branch key and rejects extras, schema 1, wrong reason, target and manifest', async () => {
+    for (const key of Object.keys(externalImportResult())) {
+      const value = externalImportResult()
+      delete value[key]
+      await expectCommitRejected(value)
+    }
+    for (const fields of [
+      { extra: true }, { schemaVersion: 1 }, { reasonCode: 'plugin_import_publication_unconfirmed' },
+      { pluginId: 'com.example.other' }, { snapshot: validSnapshot() },
+    ]) await expectCommitRejected({ ...externalImportResult(), ...fields })
+    const value = externalImportResult()
+    manifestFromItem(firstItem(value.snapshot as WireObject)).version = '9.0.0'
+    await expectCommitRejected(value)
+    const invalidNested = externalImportResult()
+    ;(invalidNested.snapshot as WireObject).managedOwnership = ownershipSummary({ status: 'degraded' })
+    await expectCommitRejected(invalidNested)
+  })
+})
+
+describe('removal v1 transport validation', () => {
+  beforeEach(() => vi.mocked(tauriInvoke).mockReset())
+
+  it('invokes only the removal command with the exact ID and generation payload', async () => {
+    await expectRemoveAccepted(removed())
+    expect(tauriInvoke).toHaveBeenCalledExactlyOnceWith('remove_managed_local_plugin', { id: 'com.example.notes', expectedCatalogGeneration: '2' })
+  })
+
+  it('accepts every legal closed failure pairing', async () => {
+    for (const code of FALSE_ONLY_REMOVE_CODES) await expectRemoveAccepted(notRemoved(code, false))
+    for (const code of TRUE_ONLY_REMOVE_CODES) await expectRemoveAccepted(notRemoved(code, true))
+    await expectRemoveAccepted(notRemoved('plugin_remove_identity_changed', false))
+    await expectRemoveAccepted(notRemoved('plugin_remove_identity_changed', true))
+  })
+
+  it('rejects every illegal remove code and disabledDecisionSaved pairing', async () => {
+    for (const code of FALSE_ONLY_REMOVE_CODES) await expectRemoveRejected(notRemoved(code, true))
+    for (const code of TRUE_ONLY_REMOVE_CODES) await expectRemoveRejected(notRemoved(code, false))
+    for (const code of ['plugin_remove_publication_unconfirmed', 'plugin_import_write_failed', 'plugin_remove_other', 'plugin_not_found']) {
+      for (const saved of [false, true]) await expectRemoveRejected(notRemoved(code, saved))
+    }
+  })
+
+  it.each([null, 'false', 0])('rejects non-boolean disabledDecisionSaved %j', async (saved) => {
+    await expectRemoveRejected({ ...notRemoved(), disabledDecisionSaved: saved })
+  })
+
+  it.each(['removed', 'removedCleanupPending', 'removedCatalogUnconfirmed', 'notRemoved'])('validates every exact %s branch and all nested snapshot fields atomically', async (status) => {
+    const makeResult = () => status === 'notRemoved' ? notRemoved() : removed(status)
+    await expectRemoveAccepted(makeResult())
+    await expectRemoveRejected({ ...makeResult(), extra: true })
+    await expectRemoveRejected({ ...makeResult(), schemaVersion: 2 })
+    for (const key of Object.keys(makeResult())) {
+      const value = makeResult()
+      delete value[key]
+      await expectRemoveRejected(value)
+    }
+    for (const fields of [{ catalogGeneration: '00' }, { schemaVersion: 2 }, { managedOwnership: ownershipSummary({ status: 'degraded' }) }]) {
+      const value = makeResult()
+      value.snapshot = { ...(value.snapshot as WireObject), ...fields }
+      await expectRemoveRejected(value)
+    }
+  })
+
+  it('forbids pluginId on notRemoved and binds every other branch to the requested ID', async () => {
+    await expectRemoveRejected({ ...notRemoved(), pluginId: 'com.example.notes' })
+    for (const status of ['removed', 'removedCleanupPending', 'removedCatalogUnconfirmed']) {
+      await expectRemoveRejected({ ...removed(status), pluginId: 'com.example.other' })
+      await expectRemoveRejected({ ...removed(status), pluginId: 'invalid' })
+    }
+  })
+
+  it('rejects a same-ID managed or removalPending item in confirmed outcomes but permits external replacement', async () => {
+    for (const status of ['removed', 'removedCleanupPending']) {
+      for (const management of ['managed', 'removalPending', 'external']) {
+        const value = removed(status)
+        ;(value.snapshot as WireObject).plugins = [localItem(management)]
+        if (management === 'external') await expectRemoveAccepted(value)
+        else await expectRemoveRejected(value)
+      }
+    }
+  })
+
+  it('requires a nonzero cleanup count and the sole unconfirmed publication reason', async () => {
+    await expectRemoveRejected({ ...removed('removedCleanupPending'), snapshot: validSnapshot() })
+    for (const reasonCode of ['plugin_remove_write_failed', 'plugin_import_publication_unconfirmed', null]) {
+      await expectRemoveRejected({ ...removed('removedCatalogUnconfirmed'), reasonCode })
+    }
+    const value = removed('removedCatalogUnconfirmed')
+    ;(value.snapshot as WireObject).plugins = [localItem('managed')]
+    await expectRemoveAccepted(value)
+  })
+
+  it.each([null, [], {}, { schemaVersion: 1, status: 'unknown' }])('rejects invalid envelopes %j', async (value) => {
+    await expectRemoveRejected(value)
+  })
+
+  it('does not retry transport failure or adopt an invalid result snapshot', async () => {
+    const failure = { code: 'plugin_remove_write_failed', message: 'private path' }
+    vi.mocked(tauriInvoke).mockRejectedValueOnce(failure)
+    await expect(removeManagedLocalPlugin('com.example.notes', '2')).rejects.toBe(failure)
+    const adopt = vi.fn()
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ ...removed(), extra: 'private path' })
+    await expect(removeManagedLocalPlugin('com.example.notes', '2').then(adopt)).rejects.toThrow(INVALID_RESPONSE_ERROR)
+    expect(adopt).not.toHaveBeenCalled()
+    expect(tauriInvoke).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('ownership and removal error sanitization', () => {
+  it.each([
+    ...FALSE_ONLY_REMOVE_CODES, ...TRUE_ONLY_REMOVE_CODES, 'plugin_remove_identity_changed',
+    'plugin_remove_publication_unconfirmed', 'plugin_import_ownership_not_registered',
+  ])('maps %s locally without exposing backend messages', (code) => {
+    expect(pluginErrorCode({ code, message: 'C:\\secret\\receipt.json' })).toBe(code)
+    const message = pluginErrorMessage({ code, message: 'C:\\secret\\receipt.json' })
+    expect(message).not.toBe(GENERIC_ERROR)
+    expect(message).toMatch(/[\u4e00-\u9fff]/)
+    expect(message).not.toContain('secret')
+    expect(pluginErrorCode({ code, message: 'secret', extra: true })).toBeNull()
   })
 })
 

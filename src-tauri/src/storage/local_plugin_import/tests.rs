@@ -7,6 +7,25 @@ use std::sync::{
 };
 use std::{fs, io, path::PathBuf};
 
+// RED: the old importer writes only a manifest and cannot bind a host receipt.
+#[test]
+fn promoted_import_contains_exact_receipt_and_manifest_bound_to_entry() {
+    let (_temp, root) = root();
+    let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
+    stage.promote().unwrap();
+    let target = children(&root.join("local")).pop().unwrap();
+    assert_eq!(children(&target).len(), 2);
+    let receipt = crate::plugin::ownership::OwnershipReceiptV1::parse(
+        &fs::read(target.join("ownership-receipt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        receipt.package_slot().as_str(),
+        target.file_name().unwrap().to_str().unwrap()
+    );
+}
+
 fn root() -> (tempfile::TempDir, PathBuf) {
     // Like discovery's fixtures, avoid the sandbox-restricted user-home chain.
     let base = std::env::current_dir().unwrap().join("target");
@@ -42,7 +61,7 @@ fn supplied(ids: Vec<u128>) -> (TestControls, Arc<AtomicUsize>) {
     (
         TestControls {
             uuid: Some(Arc::new(move || {
-                uuid::Uuid::from_u128(ids[used.fetch_add(1, Ordering::SeqCst)])
+                fixture_uuid(ids[used.fetch_add(1, Ordering::SeqCst)])
             })),
             ..Default::default()
         },
@@ -72,15 +91,18 @@ fn stage_is_invisible_until_exclusive_promotion() {
     let (_temp, root) = root();
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
     assert!(!root.exists());
-    let mut stage = storage.prepare_stage(VALID).unwrap();
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
     assert!(children(&root.join("local")).is_empty());
     let pending = children(&root.join("import-staging"));
     assert_eq!(pending.len(), 1);
-    assert_eq!(children(&pending[0]).len(), 1);
-    assert_eq!(fs::read(pending[0].join("manifest.json")).unwrap(), VALID);
-    assert!(stage.promote().unwrap().object_identity_verified);
+    assert_eq!(children(&pending[0]).len(), 2);
+    assert_eq!(
+        fs::read(pending[0].join("manifest.json")).unwrap(),
+        canonical()
+    );
+    assert!(stage.promote().is_ok());
     let target = children(&root.join("local")).pop().unwrap();
-    assert_eq!(fs::read(target.join("manifest.json")).unwrap(), VALID);
+    assert_eq!(fs::read(target.join("manifest.json")).unwrap(), canonical());
     assert!(children(&root.join("import-staging")).is_empty());
     assert!(stage.cleanup().is_err());
     assert!(stage.promote().is_err());
@@ -96,7 +118,7 @@ fn stage_cap_counts_unknown_entries() {
     }
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
     assert_eq!(
-        storage.prepare_stage(VALID).err(),
+        storage.prepare_stage(&record(), &canonical()).err(),
         Some(ImportCommitFailure::StagingCapacityExceeded)
     );
     let entries = children(&root.join("import-staging"));
@@ -111,7 +133,9 @@ fn four_target_collisions_never_replace() {
     let (_temp, root) = root();
     fs::create_dir_all(root.join("local")).unwrap();
     for n in 1..=4 {
-        let target = root.join("local").join(format!("pkg-{n:032x}"));
+        let target = root
+            .join("local")
+            .join(format!("pkg-{}", fixture_uuid(n).simple()));
         // Include an empty directory: ordinary Unix rename would replace it.
         if n == 1 {
             fs::create_dir(&target).unwrap();
@@ -122,25 +146,34 @@ fn four_target_collisions_never_replace() {
             fs::write(target.join("unknown"), b"occupied").unwrap();
         }
     }
-    let (controls, attempts) = supplied(vec![100, 1, 2, 3, 4]);
+    let (controls, attempts) = supplied(vec![100, 200, 1, 101, 201, 2, 102, 202, 3, 103, 203, 4]);
     let storage =
         SystemLocalManifestImportStorage::with_plugins_root(root.clone()).with_controls(controls);
-    let mut stage = storage.prepare_stage(VALID).unwrap();
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
     assert_eq!(
         stage.promote().err(),
         Some(ImportCommitFailure::WriteFailed)
     );
-    assert_eq!(attempts.load(Ordering::SeqCst), 5); // one stage + four distinct target attempts
-    assert!(children(&root.join("local").join(format!("pkg-{:032x}", 1))).is_empty());
+    assert_eq!(attempts.load(Ordering::SeqCst), 12); // four complete stage/receipt/slot attempts
+    assert!(children(
+        &root
+            .join("local")
+            .join(format!("pkg-{}", fixture_uuid(1).simple()))
+    )
+    .is_empty());
     assert_eq!(
-        fs::read(root.join("local").join(format!("pkg-{:032x}", 2))).unwrap(),
+        fs::read(
+            root.join("local")
+                .join(format!("pkg-{}", fixture_uuid(2).simple()))
+        )
+        .unwrap(),
         b"occupied file"
     );
     for n in 3..=4 {
         assert_eq!(
             fs::read(
                 root.join("local")
-                    .join(format!("pkg-{n:032x}"))
+                    .join(format!("pkg-{}", fixture_uuid(n).simple()))
                     .join("unknown")
             )
             .unwrap(),
@@ -157,19 +190,20 @@ fn four_stage_collisions_are_bounded() {
     fs::create_dir_all(root.join("import-staging")).unwrap();
     for n in 1..=4 {
         fs::write(
-            root.join("import-staging").join(format!("stage-{n:032x}")),
+            root.join("import-staging")
+                .join(format!("stage-{}", fixture_uuid(n).simple())),
             b"occupied",
         )
         .unwrap();
     }
-    let (controls, attempts) = supplied(vec![1, 2, 3, 4]);
+    let (controls, attempts) = supplied(vec![1, 101, 201, 2, 102, 202, 3, 103, 203, 4, 104, 204]);
     let storage =
         SystemLocalManifestImportStorage::with_plugins_root(root.clone()).with_controls(controls);
     assert_eq!(
-        storage.prepare_stage(VALID).err(),
+        storage.prepare_stage(&record(), &canonical()).err(),
         Some(ImportCommitFailure::WriteFailed)
     );
-    assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(attempts.load(Ordering::SeqCst), 12);
     for entry in children(&root.join("import-staging")) {
         assert_eq!(fs::read(entry).unwrap(), b"occupied");
     }
@@ -182,7 +216,7 @@ fn already_exists_after_stage_creation_is_not_a_stage_name_collision() {
     let used = attempts.clone();
     let controls = TestControls {
         uuid: Some(Arc::new(move || {
-            uuid::Uuid::from_u128(used.fetch_add(1, Ordering::SeqCst) as u128 + 1)
+            fixture_uuid(used.fetch_add(1, Ordering::SeqCst) as u128 + 1)
         })),
         hook: Some(Arc::new(|step| {
             if step == ImportFsStep::WriteManifest {
@@ -196,10 +230,10 @@ fn already_exists_after_stage_creation_is_not_a_stage_name_collision() {
     let storage =
         SystemLocalManifestImportStorage::with_plugins_root(root.clone()).with_controls(controls);
     assert_eq!(
-        storage.prepare_stage(VALID).err(),
+        storage.prepare_stage(&record(), &canonical()).err(),
         Some(ImportCommitFailure::WriteFailed)
     );
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
     assert!(children(&root.join("import-staging")).is_empty());
 }
 
@@ -211,10 +245,10 @@ fn staging_capacity_allows_sixteenth_and_never_reads_past_seventeenth() {
         fs::write(root.join("import-staging").join(n.to_string()), b"unknown").unwrap();
     }
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
-    let mut stage = storage.prepare_stage(VALID).unwrap();
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
     assert_eq!(children(&root.join("import-staging")).len(), 16);
     assert_eq!(
-        storage.prepare_stage(VALID).err(),
+        storage.prepare_stage(&record(), &canonical()).err(),
         Some(ImportCommitFailure::StagingCapacityExceeded)
     );
     stage.cleanup().unwrap();
@@ -229,22 +263,31 @@ fn staging_capacity_allows_sixteenth_and_never_reads_past_seventeenth() {
 #[test]
 fn target_collision_retries_and_then_promotes_to_a_new_independent_name() {
     let (_temp, root) = root();
-    fs::create_dir_all(root.join("local").join(format!("pkg-{:032x}", 1))).unwrap();
-    let (controls, attempts) = supplied(vec![100, 1, 2]);
+    fs::create_dir_all(
+        root.join("local")
+            .join(format!("pkg-{}", fixture_uuid(1).simple())),
+    )
+    .unwrap();
+    let (controls, attempts) = supplied(vec![100, 200, 1, 101, 201, 2]);
     let storage =
         SystemLocalManifestImportStorage::with_plugins_root(root.clone()).with_controls(controls);
-    let mut stage = storage.prepare_stage(VALID).unwrap();
-    assert!(stage.promote().unwrap().object_identity_verified);
-    assert_eq!(attempts.load(Ordering::SeqCst), 3);
-    assert!(children(&root.join("local").join(format!("pkg-{:032x}", 1))).is_empty());
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
+    assert!(stage.promote().is_ok());
+    assert_eq!(attempts.load(Ordering::SeqCst), 6);
+    assert!(children(
+        &root
+            .join("local")
+            .join(format!("pkg-{}", fixture_uuid(1).simple()))
+    )
+    .is_empty());
     assert_eq!(
         fs::read(
             root.join("local")
-                .join(format!("pkg-{:032x}", 2))
+                .join(format!("pkg-{}", fixture_uuid(2).simple()))
                 .join("manifest.json")
         )
         .unwrap(),
-        VALID
+        canonical()
     );
 }
 
@@ -253,7 +296,7 @@ fn prepromotion_failure_preserves_stage_and_no_target() {
     let (_temp, root) = root();
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
         .with_controls(failing(ImportFsStep::BeforePromotion));
-    let mut stage = storage.prepare_stage(VALID).unwrap();
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
     assert_eq!(
         stage.promote().err(),
         Some(ImportCommitFailure::WriteFailed)
@@ -295,7 +338,7 @@ fn every_filesystem_checkpoint_respects_the_directory_commit_boundary() {
                 ..Default::default()
             });
         assert_eq!(
-            storage.prepare_stage(VALID).err(),
+            storage.prepare_stage(&record(), &canonical()).err(),
             Some(ImportCommitFailure::WriteFailed)
         );
         assert!(observed.lock().unwrap().contains(&step));
@@ -318,7 +361,7 @@ fn every_filesystem_checkpoint_respects_the_directory_commit_boundary() {
             })),
             ..Default::default()
         });
-    let mut stage = storage.prepare_stage(VALID).unwrap();
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
     assert_eq!(
         stage.promote().err(),
         Some(ImportCommitFailure::WriteFailed)
@@ -331,9 +374,9 @@ fn every_filesystem_checkpoint_respects_the_directory_commit_boundary() {
     assert_eq!(children(&before_root.join("import-staging")).len(), 1);
     stage.cleanup().unwrap();
 
-    for (step, identity_verified) in [
-        (ImportFsStep::AfterPromotion, false),
-        (ImportFsStep::SyncDestinationDirectory, true),
+    for step in [
+        ImportFsStep::AfterPromotion,
+        ImportFsStep::SyncDestinationDirectory,
     ] {
         let (_temp, root) = root();
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -350,12 +393,13 @@ fn every_filesystem_checkpoint_respects_the_directory_commit_boundary() {
                 })),
                 ..Default::default()
             });
-        let mut stage = storage.prepare_stage(VALID).unwrap();
-        let promotion = stage.promote().unwrap();
+        let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
+        let promotion = stage.promote();
         assert!(observed.lock().unwrap().contains(&step));
-        assert_eq!(promotion.object_identity_verified, identity_verified);
+        assert!(promotion.is_err());
+        assert_eq!(stage.promotion_state(), ImportPromotionState::Committed);
         let target = children(&root.join("local")).pop().unwrap();
-        assert_eq!(fs::read(target.join("manifest.json")).unwrap(), VALID);
+        assert_eq!(fs::read(target.join("manifest.json")).unwrap(), canonical());
         assert!(children(&root.join("import-staging")).is_empty());
         assert!(stage.cleanup().is_err());
     }
@@ -372,7 +416,7 @@ fn prepare_failures_clean_only_created_objects() {
         let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
             .with_controls(failing(step));
         assert_eq!(
-            storage.prepare_stage(VALID).err(),
+            storage.prepare_stage(&record(), &canonical()).err(),
             Some(ImportCommitFailure::WriteFailed)
         );
         assert!(children(&root.join("local")).is_empty());
@@ -398,7 +442,7 @@ fn partial_prepare_failure_preserves_unknown_content() {
     let storage =
         SystemLocalManifestImportStorage::with_plugins_root(root.clone()).with_controls(controls);
     assert_eq!(
-        storage.prepare_stage(VALID).err(),
+        storage.prepare_stage(&record(), &canonical()).err(),
         Some(ImportCommitFailure::WriteFailed)
     );
     let stage = children(&root.join("import-staging")).pop().unwrap();
@@ -423,12 +467,12 @@ fn prepare_refuses_an_unknown_entry_added_during_write() {
     let storage =
         SystemLocalManifestImportStorage::with_plugins_root(root.clone()).with_controls(controls);
     assert_eq!(
-        storage.prepare_stage(VALID).err(),
+        storage.prepare_stage(&record(), &canonical()).err(),
         Some(ImportCommitFailure::WriteFailed)
     );
     let stage = children(&root.join("import-staging")).pop().unwrap();
     assert_eq!(fs::read(stage.join("unknown")).unwrap(), b"preserve");
-    assert_eq!(fs::read(stage.join("manifest.json")).unwrap(), VALID);
+    assert_eq!(fs::read(stage.join("manifest.json")).unwrap(), canonical());
 }
 
 #[cfg(unix)]
@@ -442,7 +486,7 @@ fn unix_staging_parent_sync_failure_is_prepared_error() {
         let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
             .with_controls(failing(step));
         assert_eq!(
-            storage.prepare_stage(VALID).err(),
+            storage.prepare_stage(&record(), &canonical()).err(),
             Some(ImportCommitFailure::WriteFailed)
         );
         assert!(children(&root.join("local")).is_empty());
@@ -455,10 +499,11 @@ fn postpromotion_sync_error_is_committed() {
     let (_temp, root) = root();
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
         .with_controls(failing(ImportFsStep::SyncDestinationDirectory));
-    let mut stage = storage.prepare_stage(VALID).unwrap();
-    assert!(stage.promote().unwrap().object_identity_verified);
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
+    assert!(stage.promote().is_err());
+    assert_eq!(stage.promotion_state(), ImportPromotionState::Committed);
     let target = children(&root.join("local")).pop().unwrap();
-    assert_eq!(fs::read(target.join("manifest.json")).unwrap(), VALID);
+    assert_eq!(fs::read(target.join("manifest.json")).unwrap(), canonical());
     assert!(stage.cleanup().is_err());
 }
 
@@ -478,12 +523,13 @@ fn postpromotion_identity_error_is_committed_but_unverified() {
     };
     let storage =
         SystemLocalManifestImportStorage::with_plugins_root(root.clone()).with_controls(controls);
-    let mut stage = storage.prepare_stage(VALID).unwrap();
-    assert!(!stage.promote().unwrap().object_identity_verified);
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
+    assert!(stage.promote().is_err());
+    assert_eq!(stage.promotion_state(), ImportPromotionState::Committed);
     assert!(stage.cleanup().is_err());
     let target = children(&root.join("local")).pop().unwrap();
     assert_eq!(fs::read(target.join("unknown")).unwrap(), b"preserve");
-    assert_eq!(fs::read(target.join("manifest.json")).unwrap(), VALID);
+    assert_eq!(fs::read(target.join("manifest.json")).unwrap(), canonical());
 }
 
 #[test]
@@ -491,8 +537,9 @@ fn postpromotion_hook_error_never_reports_precommit_failure() {
     let (_temp, root) = root();
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
         .with_controls(failing(ImportFsStep::AfterPromotion));
-    let mut stage = storage.prepare_stage(VALID).unwrap();
-    assert!(!stage.promote().unwrap().object_identity_verified);
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
+    assert!(stage.promote().is_err());
+    assert_eq!(stage.promotion_state(), ImportPromotionState::Committed);
     assert_eq!(children(&root.join("local")).len(), 1);
     assert!(stage.cleanup().is_err());
 }
@@ -502,7 +549,7 @@ fn cleanup_refuses_unknown_file_or_replaced_identity() {
     for replace in [0, 1, 2] {
         let (_temp, root) = root();
         let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
-        let mut stage = storage.prepare_stage(VALID).unwrap();
+        let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
         let path = children(&root.join("import-staging")).pop().unwrap();
         if replace == 0 {
             fs::write(path.join("unknown"), b"preserve").unwrap();
@@ -541,51 +588,54 @@ fn cleanup_refuses_unknown_file_or_replaced_identity() {
 fn cleanup_refuses_hardlinked_manifest() {
     let (_temp, root) = root();
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
-    let mut stage = storage.prepare_stage(VALID).unwrap();
+    let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
     let path = children(&root.join("import-staging")).pop().unwrap();
     fs::hard_link(path.join("manifest.json"), root.join("outside-link")).unwrap();
     assert!(stage.cleanup().is_err());
     assert!(stage.promote().is_err());
-    assert_eq!(fs::read(root.join("outside-link")).unwrap(), VALID);
-    assert_eq!(fs::read(path.join("manifest.json")).unwrap(), VALID);
+    assert_eq!(fs::read(root.join("outside-link")).unwrap(), canonical());
+    assert_eq!(fs::read(path.join("manifest.json")).unwrap(), canonical());
 }
 
 #[test]
 fn restart_never_cleans_old_stages() {
     let (_temp, root) = root();
     let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
-    drop(storage.prepare_stage(VALID).unwrap());
+    drop(storage.prepare_stage(&record(), &canonical()).unwrap());
     drop(storage);
     let old = children(&root.join("import-staging")).pop().unwrap();
     for n in 0..15 {
         fs::write(root.join("import-staging").join(n.to_string()), b"unknown").unwrap();
     }
     let restarted = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
-    assert_eq!(fs::read(old.join("manifest.json")).unwrap(), VALID);
+    assert_eq!(fs::read(old.join("manifest.json")).unwrap(), canonical());
     assert_eq!(
-        restarted.prepare_stage(VALID).err(),
+        restarted.prepare_stage(&record(), &canonical()).err(),
         Some(ImportCommitFailure::StagingCapacityExceeded)
     );
-    assert_eq!(fs::read(old.join("manifest.json")).unwrap(), VALID);
+    assert_eq!(fs::read(old.join("manifest.json")).unwrap(), canonical());
 }
 
 #[test]
 fn cross_volume_or_unsupported_exclusive_rename_has_no_copy_fallback() {
     for kind in [io::ErrorKind::CrossesDevices, io::ErrorKind::Unsupported] {
         let (_temp, root) = root();
-        let (mut controls, attempts) = supplied(vec![100, 1]);
+        let (mut controls, attempts) = supplied(vec![100, 200, 1]);
         controls.rename_error = Some(kind);
         let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone())
             .with_controls(controls);
-        let mut stage = storage.prepare_stage(VALID).unwrap();
+        let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
         assert_eq!(
             stage.promote().err(),
             Some(ImportCommitFailure::WriteFailed)
         );
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert!(children(&root.join("local")).is_empty());
         let pending = children(&root.join("import-staging")).pop().unwrap();
-        assert_eq!(fs::read(pending.join("manifest.json")).unwrap(), VALID);
+        assert_eq!(
+            fs::read(pending.join("manifest.json")).unwrap(),
+            canonical()
+        );
         stage.cleanup().unwrap();
     }
 }
@@ -594,7 +644,7 @@ fn cross_volume_or_unsupported_exclusive_rename_has_no_copy_fallback() {
 #[test]
 fn fixed_roots_refuse_symlink_ancestors_and_children() {
     use std::os::unix::fs::symlink;
-    for component in ["plugins", "local", "import-staging"] {
+    for component in ["plugins", "local", "import-staging", "removal-staging"] {
         let (_temp, root) = root();
         let outside = root.parent().unwrap().join("outside");
         fs::create_dir(&outside).unwrap();
@@ -607,7 +657,7 @@ fn fixed_roots_refuse_symlink_ancestors_and_children() {
         symlink(&outside, link).unwrap();
         let storage = SystemLocalManifestImportStorage::with_plugins_root(root);
         assert_eq!(
-            storage.prepare_stage(VALID).err(),
+            storage.prepare_stage(&record(), &canonical()).err(),
             Some(ImportCommitFailure::WriteFailed)
         );
         assert!(children(&outside).is_empty());
@@ -630,7 +680,7 @@ fn invalid_relative_or_parent_traversal_root_is_rejected_without_writes() {
     ] {
         let storage = SystemLocalManifestImportStorage::with_plugins_root(invalid);
         assert_eq!(
-            storage.prepare_stage(VALID).err(),
+            storage.prepare_stage(&record(), &canonical()).err(),
             Some(ImportCommitFailure::WriteFailed)
         );
     }
@@ -656,7 +706,7 @@ mod windows {
 
     #[test]
     fn fixed_roots_refuse_junction_ancestors_and_children() {
-        for component in ["plugins", "local", "import-staging"] {
+        for component in ["plugins", "local", "import-staging", "removal-staging"] {
             let (_temp, root) = root();
             let outside = root.parent().unwrap().join("outside");
             fs::create_dir(&outside).unwrap();
@@ -669,7 +719,7 @@ mod windows {
             junction(&link, &outside);
             let storage = SystemLocalManifestImportStorage::with_plugins_root(root);
             assert_eq!(
-                storage.prepare_stage(VALID).err(),
+                storage.prepare_stage(&record(), &canonical()).err(),
                 Some(ImportCommitFailure::WriteFailed)
             );
             assert!(children(&outside).is_empty());
@@ -681,7 +731,7 @@ mod windows {
     fn cleanup_refuses_replaced_stage_junction() {
         let (_temp, root) = root();
         let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
-        let mut stage = storage.prepare_stage(VALID).unwrap();
+        let mut stage = storage.prepare_stage(&record(), &canonical()).unwrap();
         let path = children(&root.join("import-staging")).pop().unwrap();
         let original = root.join("original");
         fs::rename(&path, &original).unwrap();
@@ -692,7 +742,10 @@ mod windows {
         assert!(stage.cleanup().is_err());
         assert!(stage.promote().is_err());
         assert_eq!(fs::read(outside.join("manifest.json")).unwrap(), b"unknown");
-        assert_eq!(fs::read(original.join("manifest.json")).unwrap(), VALID);
+        assert_eq!(
+            fs::read(original.join("manifest.json")).unwrap(),
+            canonical()
+        );
         fs::remove_dir(path).unwrap();
     }
 
@@ -700,7 +753,7 @@ mod windows {
     fn fixed_parent_handles_pin_rename_until_stage_is_dropped() {
         let (_temp, root) = root();
         let storage = SystemLocalManifestImportStorage::with_plugins_root(root.clone());
-        let stage = storage.prepare_stage(VALID).unwrap();
+        let stage = storage.prepare_stage(&record(), &canonical()).unwrap();
         for path in [
             root.clone(),
             root.join("import-staging"),
@@ -724,10 +777,23 @@ mod windows {
             raw.push(suffix);
             let storage = SystemLocalManifestImportStorage::with_plugins_root(PathBuf::from(raw));
             assert_eq!(
-                storage.prepare_stage(VALID).err(),
+                storage.prepare_stage(&record(), &canonical()).err(),
                 Some(ImportCommitFailure::WriteFailed)
             );
         }
         assert!(!root.exists());
     }
+}
+
+fn record() -> PluginRecord {
+    PluginRecord::local_declarative(serde_json::from_slice(VALID).unwrap()).unwrap()
+}
+fn canonical() -> Vec<u8> {
+    record().canonical_manifest_bytes().unwrap()
+}
+fn fixture_uuid(n: u128) -> uuid::Uuid {
+    uuid::Builder::from_u128(n)
+        .with_variant(uuid::Variant::RFC4122)
+        .with_version(uuid::Version::Random)
+        .into_uuid()
 }
