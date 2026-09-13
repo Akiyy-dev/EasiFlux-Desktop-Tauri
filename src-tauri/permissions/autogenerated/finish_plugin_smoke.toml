@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-finish-plugin-smoke"
+description = "Enables the finish_plugin_smoke command without any pre-configured scope."
+commands.allow = ["finish_plugin_smoke"]
+
+[[permission]]
+identifier = "deny-finish-plugin-smoke"
+description = "Denies the finish_plugin_smoke command without any pre-configured scope."
+commands.deny = ["finish_plugin_smoke"]

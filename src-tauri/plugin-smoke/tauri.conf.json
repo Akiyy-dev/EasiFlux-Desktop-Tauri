@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "EasiFlux Isolated Plugin Smoke",
+  "version": "0.1.0",
+  "identifier": "io.easiflux.plugin-smoke",
+  "build": { "devUrl": "http://127.0.0.1:1430" },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:1430; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'",
+      "capabilities": [
+        "plugin-runtime",
+        {
+          "identifier": "plugin-smoke-completion",
+          "description": "Isolated automatic smoke result; local main only",
+          "local": true,
+          "webviews": ["main"],
+          "permissions": ["allow-finish-plugin-smoke"]
+        }
+      ]
+    }
+  },
+  "bundle": { "active": false, "icon": ["../icons/icon.ico"] }
+}
