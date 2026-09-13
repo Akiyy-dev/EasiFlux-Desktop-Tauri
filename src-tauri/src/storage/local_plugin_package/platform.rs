@@ -1474,7 +1474,8 @@ pub(crate) mod native {
     #[test]
     fn windows_native_failure_diagnostics_preserve_status_and_error() {
         use crate::storage::local_plugin_package::{
-            import_operation_failure, ImportDiagnostics, IMPORT_DIAGNOSTICS,
+            import_operation_failure, DiagnosticCheckpoint, DiagnosticLifecycle, ImportDiagnostics,
+            IMPORT_DIAGNOSTICS,
         };
 
         // Missing native recording, changed error mapping, accidental replacement,
@@ -1518,7 +1519,11 @@ pub(crate) mod native {
                 let event = &diagnostics.events[index];
                 assert_eq!(event.operation, operation);
                 assert_eq!(event.sequence, index + 1);
-                assert_eq!(event.checkpoint, Some(ImportFsStep::BeforePromotion));
+                assert_eq!(event.lifecycle, Some(DiagnosticLifecycle::Import));
+                assert_eq!(
+                    event.checkpoint,
+                    Some(DiagnosticCheckpoint::Import(ImportFsStep::BeforePromotion))
+                );
                 assert_eq!(event.kind, io::ErrorKind::AlreadyExists);
                 assert_eq!(event.raw_os_error, error.raw_os_error());
                 let status = event
@@ -1534,9 +1539,10 @@ pub(crate) mod native {
             let synthetic_event = &diagnostics.events[2];
             assert_eq!(synthetic_event.operation, "synthetic-rename-error");
             assert_eq!(synthetic_event.sequence, 3);
+            assert_eq!(synthetic_event.lifecycle, Some(DiagnosticLifecycle::Import));
             assert_eq!(
                 synthetic_event.checkpoint,
-                Some(ImportFsStep::BeforePromotion)
+                Some(DiagnosticCheckpoint::Import(ImportFsStep::BeforePromotion))
             );
             assert_eq!(synthetic_event.kind, io::ErrorKind::PermissionDenied);
             assert_eq!(synthetic_event.raw_os_error, None);

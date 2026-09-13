@@ -113,6 +113,110 @@ fn removal_fixture() -> (
     (temp, root, promoted, storage)
 }
 
+#[cfg(windows)]
+#[test]
+fn diagnostic_context_enters_removal_before_prepare_io() {
+    let (_temp, root, promoted, storage) = removal_fixture();
+    fs::remove_dir_all(
+        root.join("local")
+            .join(promoted.entry.package_slot().as_str()),
+    )
+    .unwrap();
+
+    assert!(storage.prepare(&promoted.locator, &promoted.entry).is_err());
+    IMPORT_DIAGNOSTICS.with(|diagnostics| {
+        let diagnostics = diagnostics.borrow();
+        let event = diagnostics
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.operation == "native-ntcreatefile")
+            .expect("failed removal preparation must retain its native failure");
+        assert_eq!(event.lifecycle, Some(DiagnosticLifecycle::Removal));
+        assert_eq!(event.checkpoint, None);
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn diagnostic_context_tracks_current_removal_checkpoint() {
+    let (_temp, root, promoted, mut storage) = removal_fixture();
+    let injected = root.clone();
+    let generated = uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap();
+    storage.hooks.controls.uuid = Some(Arc::new(move || generated));
+    storage.hooks.controls.removal_hook = Some(Arc::new(move |step| {
+        if step == RemovalFsStep::BeforeNativeRename {
+            fs::create_dir(
+                injected
+                    .join("removal-staging")
+                    .join(format!("remove-{}", generated.simple())),
+            )?;
+        }
+        Ok(())
+    }));
+    let mut removal = storage.prepare(&promoted.locator, &promoted.entry).unwrap();
+
+    assert!(matches!(
+        removal.quarantine_once(),
+        QuarantineRenameOutcome::ProvenNotCommitted(_)
+    ));
+    IMPORT_DIAGNOSTICS.with(|diagnostics| {
+        let diagnostics = diagnostics.borrow();
+        let event = diagnostics
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.operation == "native-ntsetinformationfile-rename")
+            .expect("failed removal rename must retain its native failure");
+        assert_eq!(event.lifecycle, Some(DiagnosticLifecycle::Removal));
+        assert_eq!(
+            event.checkpoint,
+            Some(DiagnosticCheckpoint::Removal(
+                RemovalFsStep::BeforeNativeRename
+            ))
+        );
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn diagnostic_context_switches_back_to_import_before_io() {
+    let (_temp, root, promoted, storage) = removal_fixture();
+    fs::remove_dir_all(
+        root.join("local")
+            .join(promoted.entry.package_slot().as_str()),
+    )
+    .unwrap();
+    assert!(storage.prepare(&promoted.locator, &promoted.entry).is_err());
+
+    let generated = uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap();
+    fs::create_dir(
+        root.join("import-staging")
+            .join(format!("stage-{}", generated.simple())),
+    )
+    .unwrap();
+    let record = PluginRecord::local_declarative(serde_json::from_slice(VALID).unwrap()).unwrap();
+    let bytes = record.canonical_manifest_bytes().unwrap();
+    let import =
+        SystemLocalManifestImportStorage::with_plugins_root(root).with_controls(TestControls {
+            uuid: Some(Arc::new(move || generated)),
+            ..TestControls::default()
+        });
+
+    assert!(import.prepare_stage(&record, &bytes).is_err());
+    IMPORT_DIAGNOSTICS.with(|diagnostics| {
+        let diagnostics = diagnostics.borrow();
+        let event = diagnostics
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.operation == "native-ntcreatefile")
+            .expect("failed subsequent import must retain its native failure");
+        assert_eq!(event.lifecycle, Some(DiagnosticLifecycle::Import));
+        assert_eq!(event.checkpoint, None);
+    });
+}
+
 #[test]
 fn prepare_requires_exact_receipt_manifest_and_three_entry_identities() {
     for drift in 0..6 {

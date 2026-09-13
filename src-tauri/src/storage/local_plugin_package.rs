@@ -104,6 +104,8 @@ impl ManagedLocalPluginRemovalStorage for SystemLocalPluginPackageStorage {
         locator: &LocalPackageLocator,
         entry: &ManagedOwnershipEntryV1,
     ) -> Result<Box<dyn OwnedRemoval>, RemovalStorageFailure> {
+        #[cfg(test)]
+        enter_diagnostic_lifecycle(DiagnosticLifecycle::Removal);
         let parents = self
             .open()
             .map_err(|_| RemovalStorageFailure::Unavailable)?;
@@ -160,14 +162,25 @@ pub(super) struct Hooks {
 impl Hooks {
     pub(super) fn removal_checkpoint(&self, _step: RemovalFsStep) -> io::Result<()> {
         #[cfg(test)]
-        match _step {
-            RemovalFsStep::AfterRename => crash_checkpoint("removal", "rename-returned"),
-            RemovalFsStep::AfterManifestRemoval => crash_checkpoint("removal", "manifest-removed"),
-            RemovalFsStep::AfterReceiptRemoval => crash_checkpoint("removal", "receipt-removed"),
-            RemovalFsStep::AfterDirectoryRemoval => {
-                crash_checkpoint("removal", "directory-removed")
+        {
+            IMPORT_DIAGNOSTICS.with(|diagnostics| {
+                let mut diagnostics = diagnostics.borrow_mut();
+                diagnostics.lifecycle = Some(DiagnosticLifecycle::Removal);
+                diagnostics.checkpoint = Some(DiagnosticCheckpoint::Removal(_step));
+            });
+            match _step {
+                RemovalFsStep::AfterRename => crash_checkpoint("removal", "rename-returned"),
+                RemovalFsStep::AfterManifestRemoval => {
+                    crash_checkpoint("removal", "manifest-removed")
+                }
+                RemovalFsStep::AfterReceiptRemoval => {
+                    crash_checkpoint("removal", "receipt-removed")
+                }
+                RemovalFsStep::AfterDirectoryRemoval => {
+                    crash_checkpoint("removal", "directory-removed")
+                }
+                _ => (),
             }
-            _ => (),
         }
         #[cfg(test)]
         if let Some(hook) = &self.controls.removal_hook {
@@ -178,7 +191,12 @@ impl Hooks {
     pub(super) fn checkpoint(&self, _step: ImportFsStep) -> io::Result<()> {
         #[cfg(test)]
         {
-            IMPORT_DIAGNOSTICS.with(|diagnostics| diagnostics.borrow_mut().steps.push(_step));
+            IMPORT_DIAGNOSTICS.with(|diagnostics| {
+                let mut diagnostics = diagnostics.borrow_mut();
+                diagnostics.lifecycle = Some(DiagnosticLifecycle::Import);
+                diagnostics.checkpoint = Some(DiagnosticCheckpoint::Import(_step));
+                diagnostics.steps.push(_step);
+            });
             match _step {
                 ImportFsStep::AfterPromotion => crash_checkpoint("import", "promotion-returned"),
                 ImportFsStep::SyncDestinationDirectory => {
@@ -267,10 +285,25 @@ pub(super) fn document_parent_synced(name: &str) {
 struct ImportFailureEvent {
     operation: &'static str,
     sequence: usize,
-    checkpoint: Option<ImportFsStep>,
+    lifecycle: Option<DiagnosticLifecycle>,
+    checkpoint: Option<DiagnosticCheckpoint>,
     kind: io::ErrorKind,
     raw_os_error: Option<i32>,
     ntstatus: Option<i32>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticLifecycle {
+    Import,
+    Removal,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticCheckpoint {
+    Import(ImportFsStep),
+    Removal(RemovalFsStep),
 }
 
 #[cfg(test)]
@@ -280,10 +313,24 @@ pub(super) struct ImportDiagnostics {
     uuid_count: usize,
     errors: Vec<(io::ErrorKind, Option<i32>)>,
     events: Vec<ImportFailureEvent>,
+    lifecycle: Option<DiagnosticLifecycle>,
+    checkpoint: Option<DiagnosticCheckpoint>,
 }
 #[cfg(test)]
 thread_local! {
     pub(super) static IMPORT_DIAGNOSTICS: std::cell::RefCell<ImportDiagnostics> = Default::default();
+}
+#[cfg(test)]
+fn enter_diagnostic_lifecycle(lifecycle: DiagnosticLifecycle) {
+    IMPORT_DIAGNOSTICS.with(|diagnostics| {
+        let mut diagnostics = diagnostics.borrow_mut();
+        diagnostics.lifecycle = Some(lifecycle);
+        diagnostics.checkpoint = None;
+    });
+}
+#[cfg(test)]
+pub(super) fn enter_import_diagnostics() {
+    enter_diagnostic_lifecycle(DiagnosticLifecycle::Import);
 }
 #[cfg(test)]
 pub(super) fn import_io_failure(error: &io::Error) {
@@ -305,7 +352,8 @@ fn import_failure_event(operation: &'static str, error: &io::Error, ntstatus: Op
         let event = ImportFailureEvent {
             operation,
             sequence: diagnostics.events.len() + 1,
-            checkpoint: diagnostics.steps.last().copied(),
+            lifecycle: diagnostics.lifecycle,
+            checkpoint: diagnostics.checkpoint,
             kind: error.kind(),
             raw_os_error: error.raw_os_error(),
             ntstatus,
@@ -313,7 +361,7 @@ fn import_failure_event(operation: &'static str, error: &io::Error, ntstatus: Op
         diagnostics.events.push(event);
         let event = diagnostics.events.last().unwrap();
         // No paths, slots, object IDs, metadata, or manifest/receipt bytes.
-        eprintln!("local-package operation={} sequence={} checkpoint={:?} kind={:?} raw_os_error={:?} ntstatus={:?} uuid_count={}", event.operation, event.sequence, event.checkpoint, event.kind, event.raw_os_error, event.ntstatus, diagnostics.uuid_count);
+        eprintln!("local-package operation={} sequence={} lifecycle={:?} checkpoint={:?} kind={:?} raw_os_error={:?} ntstatus={:?} uuid_count={}", event.operation, event.sequence, event.lifecycle, event.checkpoint, event.kind, event.raw_os_error, event.ntstatus, diagnostics.uuid_count);
     });
 }
 #[cfg(test)]

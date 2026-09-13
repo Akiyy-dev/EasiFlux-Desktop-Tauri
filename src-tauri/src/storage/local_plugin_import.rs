@@ -59,6 +59,8 @@ impl LocalManifestImportStorage for SystemLocalManifestImportStorage {
         record: &PluginRecord,
         bytes: &[u8],
     ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
+        #[cfg(test)]
+        super::local_plugin_package::enter_import_diagnostics();
         self.packages.prepare_stage(record, bytes)
     }
 }
@@ -69,6 +71,8 @@ impl LocalManifestImportStorage for SystemLocalPluginPackageStorage {
         record: &PluginRecord,
         bytes: &[u8],
     ) -> Result<Box<dyn OwnedImportStage>, ImportCommitFailure> {
+        #[cfg(test)]
+        super::local_plugin_package::enter_import_diagnostics();
         if record.source() != crate::plugin::manifest::PluginSource::LocalDeclarative
             || bytes.len() > 16_384
             || record
