@@ -34,6 +34,30 @@ fn valid_manifest(id: &str) -> Vec<u8> {
     format!(r#"{{"schemaVersion":1,"id":"{id}","publisherId":"com.example","publisher":"Example","name":"Example","description":"Metadata","version":"1.0.0","contributions":[],"requestedCapabilities":[]}}"#).into_bytes()
 }
 
+fn valid_v2_manifest(id: &str) -> Vec<u8> {
+    format!(r#"{{"schemaVersion":2,"id":"{id}","publisherId":"com.example","publisher":"Example","name":"Guide","description":"Read-only guide","version":"1.0.0","contributions":[{{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{{"title":"Guide","text":"Read-only guide"}}}}],"requestedCapabilities":[]}}"#).into_bytes()
+}
+
+// Catches discovery continuing to treat a valid v2 local manifest as a rejected package.
+#[test]
+fn discovery_accepts_a_v2_local_declarative_command_manifest() {
+    let fixture = Fixture::new();
+    let outcome = parse_package_scan(fixture.scan(&[valid_v2_manifest("com.example.guide")]));
+
+    assert_eq!(outcome.summary, LocalDiscoverySummary::available());
+    assert_eq!(outcome.plugins.len(), 1);
+    let record = &outcome.plugins[0].record;
+    assert_eq!(
+        record.source(),
+        super::super::manifest::PluginSource::LocalDeclarative
+    );
+    assert_eq!(record.manifest().schema_version, 2);
+    assert_eq!(
+        record.manifest().contributions[0].params.text,
+        "Read-only guide"
+    );
+}
+
 // Rejecting the exact two-file shape loses a valid external candidate.
 #[test]
 fn scanner_returns_external_and_receipted_candidates_with_internal_identity() {

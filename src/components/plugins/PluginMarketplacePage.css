@@ -454,3 +454,29 @@
     flex-direction: column-reverse;
   }
 }
+.plugin-commands {
+  margin-block: 12px;
+}
+
+.plugin-commands__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.plugin-commands__result {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+
+.plugin-commands__attribution {
+  font-size: 12px;
+}
+
+.plugin-commands__text {
+  white-space: pre-wrap;
+  unicode-bidi: plaintext;
+}

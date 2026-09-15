@@ -35,6 +35,29 @@ function restoreDialogMethod(
 }
 
 describe('PluginImportDialog', () => {
+  it('previews v2 command names as text without executing them', () => {
+    const wrapper = mount(PluginImportDialog, {
+      props: {
+        preview: {
+          ...readyPreview,
+          manifest: {
+            ...readyPreview.manifest, schemaVersion: 2,
+            contributions: [{
+              kind: 'command', contributionId: 'guide.overview', title: '<b>Guide</b>',
+              actionId: 'host.showInfo', params: { title: 'Info', text: 'Read only' },
+            }],
+          },
+        },
+        committing: false, stale: false,
+      },
+    })
+    expect(wrapper.get('[data-testid="plugin-import-commands"]').text()).toContain('<b>Guide</b>')
+    expect(wrapper.find('b').exists()).toBe(false)
+    expect(wrapper.text()).toContain('启用后提供只读命令')
+    expect(wrapper.find('[data-testid="plugin-command-button"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   beforeEach(() => {
     showModalDescriptor = Object.getOwnPropertyDescriptor(
       HTMLDialogElement.prototype,

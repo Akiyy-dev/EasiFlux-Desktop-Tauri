@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod contribution;
 pub(crate) mod discovery;
 pub(crate) mod import;
 pub mod manifest;

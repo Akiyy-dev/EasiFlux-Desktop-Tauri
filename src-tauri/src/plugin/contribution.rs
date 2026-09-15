@@ -1,0 +1,238 @@
+use serde::{Deserialize, Deserializer, Serialize};
+
+use super::manifest::{deserialize_object, validate_display_text, PluginId};
+
+const MAX_COMMAND_TITLE_LENGTH: usize = 80;
+const MAX_COMMAND_TEXT_LENGTH: usize = 2_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginContributionKind {
+    Command,
+}
+
+impl<'de> Deserialize<'de> for PluginContributionKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "command" => Ok(Self::Command),
+            value => Err(serde::de::Error::unknown_variant(value, &["command"])),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum PluginCommandActionId {
+    #[serde(rename = "host.showInfo")]
+    HostShowInfo,
+}
+
+impl<'de> Deserialize<'de> for PluginCommandActionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "host.showInfo" => Ok(Self::HostShowInfo),
+            value => Err(serde::de::Error::unknown_variant(value, &["host.showInfo"])),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInfoParams {
+    pub title: String,
+    pub text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginInfoParamsWire {
+    title: String,
+    text: String,
+}
+
+impl<'de> Deserialize<'de> for PluginInfoParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = deserialize_object::<D, PluginInfoParamsWire>(deserializer)?;
+        let params = Self {
+            title: wire.title,
+            text: wire.text,
+        };
+        params.validate().map_err(serde::de::Error::custom)?;
+        Ok(params)
+    }
+}
+
+impl PluginInfoParams {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_display_text(
+            "command params title",
+            &self.title,
+            MAX_COMMAND_TITLE_LENGTH,
+        )?;
+        validate_display_text("command params text", &self.text, MAX_COMMAND_TEXT_LENGTH)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCommandContribution {
+    pub kind: PluginContributionKind,
+    pub contribution_id: PluginId,
+    pub title: String,
+    pub action_id: PluginCommandActionId,
+    pub params: PluginInfoParams,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginCommandContributionWire {
+    kind: PluginContributionKind,
+    contribution_id: PluginId,
+    title: String,
+    action_id: PluginCommandActionId,
+    params: PluginInfoParams,
+}
+
+impl<'de> Deserialize<'de> for PluginCommandContribution {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = deserialize_object::<D, PluginCommandContributionWire>(deserializer)?;
+        let contribution = Self {
+            kind: wire.kind,
+            contribution_id: wire.contribution_id,
+            title: wire.title,
+            action_id: wire.action_id,
+            params: wire.params,
+        };
+        contribution.validate().map_err(serde::de::Error::custom)?;
+        Ok(contribution)
+    }
+}
+
+impl PluginCommandContribution {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_display_text("command title", &self.title, MAX_COMMAND_TITLE_LENGTH)?;
+        self.params.validate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::manifest::PluginManifestV1;
+    use serde_json::{json, Value};
+
+    const VALID: &str = r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}"#;
+
+    fn manifest(schema_version: u32, contributions: Vec<Value>) -> Value {
+        json!({
+            "schemaVersion": schema_version,
+            "id": "com.example.guide",
+            "publisherId": "com.example",
+            "publisher": "Example",
+            "name": "Guide",
+            "description": "Read-only guide",
+            "version": "1.0.0",
+            "contributions": contributions,
+            "requestedCapabilities": []
+        })
+    }
+
+    // Catches permissive object, action, or parameter decoding at the contribution boundary.
+    #[test]
+    fn contribution_rejects_non_objects_unknown_or_duplicate_fields_and_unknown_literals() {
+        serde_json::from_str::<PluginCommandContribution>(VALID).unwrap();
+        let invalid = [
+            r#"["command","guide.overview","Guide","host.showInfo",{"title":"Guide","text":"Read-only guide"}]"#,
+            r#"{"kind":"menu","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}"#,
+            r#"{"kind":{"command":null},"contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}"#,
+            r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.navigate","params":{"title":"Guide","text":"Read-only guide"}}"#,
+            r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":{"host.showInfo":null},"params":{"title":"Guide","text":"Read-only guide"}}"#,
+            r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","extra":true,"params":{"title":"Guide","text":"Read-only guide"}}"#,
+            r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide","html":"<b>guide</b>"}}"#,
+            r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":["Guide","Read-only guide"]}"#,
+            r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide","text":"again"}}"#,
+            r#"{"kind":"command","contributionId":"guide.overview","contributionId":"guide.other","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}"#,
+        ];
+        for document in invalid {
+            assert!(
+                serde_json::from_str::<PluginCommandContribution>(document).is_err(),
+                "accepted {document}"
+            );
+        }
+    }
+
+    // Catches character-count limits, whitespace-only text, or skipping trusted validation.
+    #[test]
+    fn contribution_text_uses_utf8_byte_limits_and_existing_blank_rule() {
+        let exact_title = format!("{}aa", "界".repeat(26));
+        let exact_text = format!("{}aa", "界".repeat(666));
+        assert_eq!(exact_title.len(), 80);
+        assert_eq!(exact_text.len(), 2_000);
+        let mut valid: Value = serde_json::from_str(VALID).unwrap();
+        valid["title"] = json!(exact_title);
+        valid["params"]["title"] = json!("x".repeat(80));
+        valid["params"]["text"] = json!(exact_text);
+        serde_json::from_value::<PluginCommandContribution>(valid).unwrap();
+
+        for (field, value) in [
+            ("title", "界".repeat(27)),
+            ("title", " \u{feff}\t".to_owned()),
+            ("params.title", "x".repeat(81)),
+            ("params.title", "\u{feff}".to_owned()),
+            ("params.text", "界".repeat(667)),
+            ("params.text", " \u{feff}\n".to_owned()),
+        ] {
+            let mut document: Value = serde_json::from_str(VALID).unwrap();
+            match field {
+                "title" => document["title"] = json!(value),
+                "params.title" => document["params"]["title"] = json!(value),
+                "params.text" => document["params"]["text"] = json!(value),
+                _ => unreachable!(),
+            }
+            assert!(
+                serde_json::from_value::<PluginCommandContribution>(document).is_err(),
+                "accepted invalid {field}"
+            );
+        }
+
+        let mut trusted: PluginCommandContribution = serde_json::from_str(VALID).unwrap();
+        trusted.params.text = "\u{feff}".to_owned();
+        assert!(trusted.validate().is_err());
+    }
+
+    // Catches schema/cardinality drift, duplicate IDs, or capabilities becoming an escape hatch.
+    #[test]
+    fn manifest_versions_enforce_command_cardinality_identity_and_no_capabilities() {
+        let command: Value = serde_json::from_str(VALID).unwrap();
+        let mut sixteen = Vec::new();
+        for index in 0..16 {
+            let mut item = command.clone();
+            item["contributionId"] = json!(format!("guide.item-{index}"));
+            sixteen.push(item);
+        }
+        serde_json::from_value::<PluginManifestV1>(manifest(2, sixteen)).unwrap();
+
+        let mut with_capability = manifest(2, vec![command.clone()]);
+        with_capability["requestedCapabilities"] = json!(["network"]);
+        for invalid in [
+            manifest(1, vec![command.clone()]),
+            manifest(2, vec![]),
+            manifest(2, vec![command.clone(); 17]),
+            manifest(2, vec![command.clone(), command]),
+            with_capability,
+        ] {
+            assert!(serde_json::from_value::<PluginManifestV1>(invalid).is_err());
+        }
+    }
+}

@@ -36,8 +36,31 @@ export interface PluginManifestV1 {
   requestedCapabilities: []
 }
 
+export interface PluginCommandContribution {
+  kind: 'command'
+  contributionId: string
+  title: string
+  actionId: 'host.showInfo'
+  params: { title: string; text: string }
+}
+
+export interface PluginManifestV2 extends Omit<PluginManifestV1, 'schemaVersion' | 'contributions'> {
+  schemaVersion: 2
+  contributions: PluginCommandContribution[]
+}
+
+export type PluginManifest = PluginManifestV1 | PluginManifestV2
+
+export interface PluginCommandInfo {
+  pluginId: string
+  pluginName: string
+  contributionId: string
+  title: string
+  text: string
+}
+
 export interface PluginCatalogItem {
-  manifest: PluginManifestV1
+  manifest: PluginManifest
   source: PluginSource
   management: PluginManagement
   canRemove: boolean
@@ -94,7 +117,7 @@ export type PrepareLocalManifestImportResult =
       token: string
       expiresInSeconds: 300
       catalogGeneration: string
-      manifest: PluginManifestV1
+      manifest: PluginManifest
     }
 
 export type ReadyLocalManifestImport = Extract<

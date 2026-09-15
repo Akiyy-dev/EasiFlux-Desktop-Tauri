@@ -18,6 +18,7 @@ import type {
   PluginAvailabilityReason,
   PluginCatalogItem,
   PluginCatalogSnapshot,
+  PluginCommandInfo,
   PluginLocalDiscoverySummary,
   PluginStatus,
   ReadyLocalManifestImport,
@@ -41,8 +42,8 @@ function hasSameImmutableContent(current: PluginCatalogItem, returned: PluginCat
     && currentFields.length === Object.keys(returned.manifest).length
     && currentFields.every(([key, value]) => (
       Object.prototype.hasOwnProperty.call(returned.manifest, key)
-      // Strictly parsed v1 values are scalars or empty arrays. Compare each field
-      // independently so equivalent manifest key insertion orders do not matter.
+      // The service normalizes nested v2 command/parameter key order. Compare
+      // fields independently so top-level insertion order does not matter.
       && JSON.stringify(value) === JSON.stringify(
         returned.manifest[key as keyof PluginCatalogItem['manifest']],
       )
@@ -65,11 +66,15 @@ function hasSameManagedOwnership(
 function cloneCatalogItem(plugin: PluginCatalogItem): PluginCatalogItem {
   return {
     ...plugin,
-    manifest: {
-      ...plugin.manifest,
-      contributions: [],
-      requestedCapabilities: [],
-    },
+    manifest: plugin.manifest.schemaVersion === 2
+      ? {
+          ...plugin.manifest,
+          contributions: plugin.manifest.contributions.map((command) => ({
+            ...command, params: { ...command.params },
+          })),
+          requestedCapabilities: [],
+        }
+      : { ...plugin.manifest, contributions: [], requestedCapabilities: [] },
     grantedCapabilities: [],
   }
 }
@@ -103,6 +108,48 @@ export const usePluginStore = defineStore('plugin', () => {
   const removalError = ref<string | null>(null)
   const removalResult = shallowRef<RemoveManagedLocalPluginResult | null>(null)
   const removalOutcomeUnknown = ref(false)
+  // Separate from presentation pendingIds: a new generation can clear that set
+  // while an old IPC mutation still has an unknown outcome.
+  const activeCommandMutations = ref(0)
+  const activeSnapshotRequests = ref(0)
+  const commandAuthorityConfirmed = ref(false)
+  const commandEpoch = ref(0)
+
+  const commandsAvailable = computed(() => (
+    commandAuthorityConfirmed.value
+    && loadStatus.value === 'ready' && loadError.value === null
+    && reloadStatus.value !== 'loading' && reloadStatus.value !== 'error'
+    && reloadError.value === null && availability.value === 'available'
+    && activeCommandMutations.value === 0 && activeSnapshotRequests.value === 0
+    && pendingIds.value.size === 0
+    && !['choosing', 'preview', 'committing'].includes(importStatus.value)
+    && !['confirming', 'removing'].includes(removalStatus.value)
+    && !importOutcomeUnknown.value && !removalOutcomeUnknown.value
+  ))
+  const commandContextKey = computed(() => (
+    `${commandEpoch.value}:${catalogGeneration.value}:${revision.value}:${commandsAvailable.value}`
+  ))
+
+  function invalidateCommandAuthority(): number {
+    commandAuthorityConfirmed.value = false
+    return ++commandEpoch.value
+  }
+
+  function runCommand(pluginId: string, contributionId: string): PluginCommandInfo | null {
+    if (!commandsAvailable.value) return null
+    const plugin = catalog.value.find((candidate) => candidate.manifest.id === pluginId)
+    if (!plugin || plugin.source !== 'localDeclarative' || plugin.manifest.schemaVersion !== 2
+      || plugin.status !== 'enabled' || !plugin.canToggle
+      || plugin.toggleBlockReasonCode !== null || plugin.statusReasonCode !== null) return null
+    const command = plugin.manifest.contributions.find(
+      (candidate) => candidate.contributionId === contributionId,
+    )
+    if (!command || command.kind !== 'command' || command.actionId !== 'host.showInfo') return null
+    return {
+      pluginId, pluginName: plugin.manifest.name, contributionId,
+      title: command.params.title, text: command.params.text,
+    }
+  }
 
   let loadFlight: Promise<void> | null = null
   let reloadFlight: Promise<void> | null = null
@@ -283,10 +330,17 @@ export const usePluginStore = defineStore('plugin', () => {
   function confirmAuthoritativeSnapshot(
     snapshot: PluginCatalogSnapshot,
     requestOrder: bigint,
+    requestCommandEpoch: number,
+    finishingMutation = false,
   ): void {
     if (adoptSnapshot(snapshot, requestOrder)) {
       markReadyPreviewStaleAfterAdoption()
       markOpenRemovalConfirmationStaleAfterAdoption()
+      // Authority belongs to this adopted snapshot, not a previous catalog.
+      // An older epoch must revoke a newer confirmation if it replaces content.
+      commandAuthorityConfirmed.value = requestCommandEpoch === commandEpoch.value
+        && activeCommandMutations.value === (finishingMutation ? 1 : 0)
+        && snapshot.revision === revision.value
     }
     hasConfirmedSnapshot = true
     loadStatus.value = 'ready'
@@ -295,13 +349,15 @@ export const usePluginStore = defineStore('plugin', () => {
 
   function beginLoad(): Promise<void> {
     const requestOrder = ++snapshotSequence
+    const requestCommandEpoch = invalidateCommandAuthority()
+    activeSnapshotRequests.value++
     loadStatus.value = 'loading'
     loadError.value = null
 
     const request = (async () => {
       try {
         const snapshot = await getPluginCatalog()
-        confirmAuthoritativeSnapshot(snapshot, requestOrder)
+        confirmAuthoritativeSnapshot(snapshot, requestOrder, requestCommandEpoch)
       } catch (error) {
         // Separate flights can settle out of order. Only an adopted newer
         // snapshot supersedes this failure; an ignored response does not.
@@ -311,6 +367,8 @@ export const usePluginStore = defineStore('plugin', () => {
         }
         loadError.value = pluginErrorMessage(error)
         loadStatus.value = hasConfirmedSnapshot ? 'ready' : 'error'
+      } finally {
+        activeSnapshotRequests.value--
       }
     })()
     loadFlight = request
@@ -334,12 +392,14 @@ export const usePluginStore = defineStore('plugin', () => {
   function reload(): Promise<void> {
     if (reloadFlight) return reloadFlight
     const requestOrder = ++snapshotSequence
+    const requestCommandEpoch = invalidateCommandAuthority()
+    activeSnapshotRequests.value++
     reloadStatus.value = 'loading'
     reloadError.value = null
     const request = (async () => {
       try {
         const snapshot = await reloadPluginCatalog()
-        confirmAuthoritativeSnapshot(snapshot, requestOrder)
+        confirmAuthoritativeSnapshot(snapshot, requestOrder, requestCommandEpoch)
         reloadStatus.value = 'ready'
       } catch (error) {
         if (requestOrder < latestAdoptedRequestOrder) {
@@ -348,6 +408,8 @@ export const usePluginStore = defineStore('plugin', () => {
         }
         reloadError.value = pluginErrorMessage(error)
         reloadStatus.value = 'error'
+      } finally {
+        activeSnapshotRequests.value--
       }
     })()
     reloadFlight = request
@@ -395,6 +457,7 @@ export const usePluginStore = defineStore('plugin', () => {
 
   async function prepareImport(): Promise<void> {
     if (importStatus.value !== 'idle') return
+    commandEpoch.value++
 
     const owner = ++importOwnerSequence
     activeImportOwner = owner
@@ -452,6 +515,8 @@ export const usePluginStore = defineStore('plugin', () => {
     }
 
     importStatus.value = 'committing'
+    activeCommandMutations.value++
+    const requestCommandEpoch = invalidateCommandAuthority()
     importError.value = null
     importResult.value = null
     importOutcomeUnknown.value = false
@@ -459,10 +524,12 @@ export const usePluginStore = defineStore('plugin', () => {
     const request = (async () => {
       try {
         const result = await commitLocalManifestImport(preview)
-        confirmAuthoritativeSnapshot(result.snapshot, requestOrder)
+        confirmAuthoritativeSnapshot(result.snapshot, requestOrder, requestCommandEpoch, true)
+        if (result.status === 'importedNotVisible') invalidateCommandAuthority()
         importResult.value = result
         importOutcomeUnknown.value = false
       } catch (error) {
+        invalidateCommandAuthority()
         const code = pluginErrorCode(error)
         if (code === 'plugin_import_token_invalid' || code === 'plugin_import_busy') {
           importOutcomeUnknown.value = false
@@ -472,6 +539,7 @@ export const usePluginStore = defineStore('plugin', () => {
           importError.value = '结果尚未确认，请重新扫描。'
         }
       } finally {
+        activeCommandMutations.value--
         activeImportOwner = null
         clearReadyImportState()
         importStatus.value = 'result'
@@ -537,6 +605,7 @@ export const usePluginStore = defineStore('plugin', () => {
     ) return false
 
     const owner = ++removalOwnerSequence
+    commandEpoch.value++
     activeRemovalOwner = owner
     clearRemovalState()
     removalTarget.value = {
@@ -571,6 +640,8 @@ export const usePluginStore = defineStore('plugin', () => {
     }
 
     removalStatus.value = 'removing'
+    activeCommandMutations.value++
+    const requestCommandEpoch = invalidateCommandAuthority()
     removalError.value = null
     removalResult.value = null
     removalOutcomeUnknown.value = false
@@ -584,13 +655,16 @@ export const usePluginStore = defineStore('plugin', () => {
           target.catalogGeneration,
         )
         if (activeRemovalOwner !== owner) return
-        confirmAuthoritativeSnapshot(result.snapshot, requestOrder)
+        confirmAuthoritativeSnapshot(result.snapshot, requestOrder, requestCommandEpoch, true)
+        if (result.status === 'removedCatalogUnconfirmed') invalidateCommandAuthority()
         removalResult.value = result
       } catch {
+        invalidateCommandAuthority()
         if (activeRemovalOwner !== owner) return
         removalOutcomeUnknown.value = true
         removalError.value = '移除结果尚未确认，请重新扫描。'
       } finally {
+        activeCommandMutations.value--
         if (activeRemovalOwner === owner) {
           activeRemovalOwner = null
           removalStatus.value = 'result'
@@ -617,6 +691,9 @@ export const usePluginStore = defineStore('plugin', () => {
   async function setEnabled(id: string, enabled: boolean): Promise<boolean> {
     const existing = catalog.value.find((plugin) => plugin.manifest.id === id)
     if (!existing || !existing.canToggle) return false
+    activeCommandMutations.value++
+    commandEpoch.value++
+    let confirmed = false
 
     const owner = ++mutationSequence
     const requestGeneration = catalogGeneration.value
@@ -646,6 +723,7 @@ export const usePluginStore = defineStore('plugin', () => {
       confirmedItemRevisions.set(id, resultRevision)
       adoptGlobalRevision(result.revision)
       markOpenRemovalConfirmationStaleAfterAdoption()
+      confirmed = true
       return true
     } catch (error) {
       if (mutationOwners.get(id) === owner && catalogGeneration.value === requestGeneration) {
@@ -653,6 +731,8 @@ export const usePluginStore = defineStore('plugin', () => {
       }
       return false
     } finally {
+      if (!confirmed) invalidateCommandAuthority()
+      activeCommandMutations.value--
       if (mutationOwners.get(id) === owner) {
         mutationOwners.delete(id)
         replacePending(id, false)
@@ -690,6 +770,9 @@ export const usePluginStore = defineStore('plugin', () => {
     removalResult,
     removalOutcomeUnknown,
     visiblePlugins,
+    commandsAvailable,
+    commandContextKey,
+    runCommand,
     load,
     retry,
     reload,
