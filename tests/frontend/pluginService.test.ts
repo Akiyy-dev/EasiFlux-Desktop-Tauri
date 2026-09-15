@@ -24,6 +24,82 @@ const U64_MAX = '18446744073709551615'
 const GENERIC_ERROR = '插件操作失败，请重试。'
 const INVALID_RESPONSE_ERROR = '插件服务返回的数据无效，请重试。'
 
+describe('v2 command manifests', () => {
+  function command() {
+    return {
+      kind: 'command', contributionId: 'guide.overview', title: 'Show guide',
+      actionId: 'host.showInfo', params: { title: 'Guide', text: 'Read-only guide' },
+    }
+  }
+
+  function localV2(contributions: unknown = [command()]): WireObject {
+    return {
+      ...validItem(), source: 'localDeclarative', management: 'external',
+      manifest: { ...validManifest(), schemaVersion: 2, contributions },
+    }
+  }
+
+  it('round trips v2 with normalized nested keys and no mutable transport aliases', async () => {
+    const wire = localV2([{
+      params: { text: 'Read-only guide', title: 'Guide' }, actionId: 'host.showInfo',
+      title: 'Show guide', contributionId: 'guide.overview', kind: 'command',
+    }])
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ ...validSnapshot(), plugins: [wire] })
+    const parsed = await getPluginCatalog()
+    expect(parsed.plugins[0].manifest.contributions).toEqual([command()])
+    expect(Object.keys(parsed.plugins[0].manifest.contributions[0] ?? {}))
+      .toEqual(['kind', 'contributionId', 'title', 'actionId', 'params'])
+    expect(parsed.plugins[0].manifest).not.toBe(wire.manifest)
+  })
+
+  it.each([
+    [], Array.from({ length: 17 }, (_, i) => ({ ...command(), contributionId: `guide.c${i}` })),
+    [command(), command()], [{ ...command(), contributionId: 'INVALID' }],
+    [{ ...command(), actionId: 'host.navigate' }], [{ ...command(), kind: 'script' }],
+    [{ ...command(), actionId: { 'host.showInfo': null } }],
+    [{ ...command(), kind: { command: null } }],
+    [{ ...command(), title: '界'.repeat(27) }], [{ ...command(), title: '\uFEFF' }],
+    [{ ...command(), params: { title: 'x', text: '界'.repeat(667) } }],
+    [{ ...command(), params: { title: '界'.repeat(27), text: 'x' } }],
+    [{ ...command(), params: { title: 'x', text: '\u0085\uFEFF' } }],
+    [{ ...command(), params: ['Guide', 'text'] }],
+    [{ ...command(), params: { title: 'x', text: 'x', url: 'https://example.com' } }],
+    [{ ...command(), extra: true }], [Object.values(command())],
+  ].map((contributions) => [contributions]))('rejects invalid v2 contributions %#', async (contributions) => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      ...validSnapshot(), plugins: [localV2(contributions)],
+    })
+    await expect(getPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+
+  it('rejects v2 builtins and requested capabilities', async () => {
+    const builtIn = { ...localV2(), source: 'builtIn', management: 'builtIn' }
+    const capability = localV2()
+    ;(capability.manifest as WireObject).requestedCapabilities = ['network']
+    for (const plugin of [builtIn, capability]) {
+      vi.mocked(tauriInvoke).mockResolvedValueOnce({ ...validSnapshot(), plugins: [plugin] })
+      await expect(getPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+    }
+  })
+
+  it('binds a v2 imported result to all preview command semantics, not just command count', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(readyImport(localV2().manifest as WireObject))
+    const preview = await prepareLocalManifestImport()
+    if (preview.status !== 'ready') throw new Error('expected preview')
+    const result = (plugin: WireObject) => ({
+      schemaVersion: 2, status: 'importedExternal', pluginId: 'com.easiflux.analytics',
+      reasonCode: 'plugin_import_ownership_not_registered',
+      snapshot: { ...validSnapshot(), plugins: [plugin] },
+    })
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(result(localV2()))
+    expect((await commitLocalManifestImport(preview)).status).toBe('importedExternal')
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(result(localV2([{
+      ...command(), params: { title: 'Guide', text: 'Substituted after preview' },
+    }])))
+    await expect(commitLocalManifestImport(preview)).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+})
+
 function validManifest(
   id = 'com.easiflux.analytics',
   publisherId = 'com.easiflux',

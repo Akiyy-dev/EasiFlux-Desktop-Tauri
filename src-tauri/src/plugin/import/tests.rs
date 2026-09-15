@@ -5,7 +5,9 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::error::{AppError, AppResult};
-use crate::plugin::manifest::{LocalDiscoverySummary, PluginAvailability, PluginCatalogSnapshot};
+use crate::plugin::manifest::{
+    LocalDiscoverySummary, PluginAvailability, PluginCatalogSnapshot, PluginManifestV1,
+};
 
 fn assert_code<T>(result: AppResult<T>, expected: &str) {
     let error = result.err().expect("operation must fail");
@@ -31,6 +33,59 @@ fn ready(sessions: &std::sync::Arc<ImportSessions>, now: Instant) -> ImportPrevi
             now,
         )
         .unwrap()
+}
+
+// Catches dropping typed v2 contributions at either the manifest or import boundary.
+#[test]
+fn v2_manifest_and_prepared_import_preserve_declared_command_text() {
+    let contribution = r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}"#;
+    let json = format!(
+        r#"{{"schemaVersion":2,"id":"com.example.guide","publisherId":"com.example","publisher":"Example","name":"Guide","description":"Read-only guide","version":"1.0.0","contributions":[{contribution}],"requestedCapabilities":[]}}"#
+    );
+    let manifest: PluginManifestV1 = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        serde_json::to_value(&manifest).unwrap()["contributions"][0]["params"]["text"],
+        "Read-only guide"
+    );
+
+    let prepared = PreparedManifest::parse(json.as_bytes()).unwrap();
+    assert_eq!(
+        serde_json::to_value(prepared.record().manifest()).unwrap()["contributions"][0]["params"]
+            ["text"],
+        "Read-only guide"
+    );
+}
+
+// Catches the per-manifest command limit bypassing the existing 16 KiB import budget.
+#[test]
+fn v2_command_count_does_not_override_import_byte_budget() {
+    let mut contributions = Vec::new();
+    for index in 0..16 {
+        contributions.push(serde_json::json!({
+            "kind": "command",
+            "contributionId": format!("guide.item-{index}"),
+            "title": "Guide",
+            "actionId": "host.showInfo",
+            "params": {"title": "Guide", "text": "x".repeat(2_000)}
+        }));
+    }
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "id": "com.example.guide",
+        "publisherId": "com.example",
+        "publisher": "Example",
+        "name": "Guide",
+        "description": "Read-only guide",
+        "version": "1.0.0",
+        "contributions": contributions,
+        "requestedCapabilities": []
+    }))
+    .unwrap();
+    assert!(bytes.len() > 16_384);
+    assert_code(
+        PreparedManifest::parse(&bytes),
+        "plugin_import_manifest_invalid",
+    );
 }
 
 // Catches noncanonical installation bytes or a changed fingerprint domain/order.

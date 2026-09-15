@@ -115,8 +115,22 @@ onUnmounted(() => {
       </dl>
 
       <p id="plugin-import-warning" class="plugin-import-dialog__warning">
-        发布者信息由清单作者填写，未经认证。本次只复制元数据，不运行代码或授予权限。导入后默认停用，启用仅记录宿主偏好。
+        发布者信息由清单作者填写，未经认证。本次只复制清单，不运行代码或授予权限。导入后默认停用，{{ props.preview.manifest.schemaVersion === 2
+          ? '启用后提供只读命令，仅由宿主显示普通文本。'
+          : '启用仅记录宿主偏好。' }}
       </p>
+      <div
+        v-if="props.preview.manifest.schemaVersion === 2"
+        class="plugin-import-dialog__hint"
+        data-testid="plugin-import-commands"
+      >
+        <p>只读命令（host.showInfo）：</p>
+        <ul>
+          <li v-for="command in props.preview.manifest.contributions" :key="command.contributionId">
+            <bdi>{{ command.title }}</bdi>
+          </li>
+        </ul>
+      </div>
       <p class="plugin-import-dialog__hint">
         此预览为一次性确认，预览将在五分钟后失效；到期后请重新选择清单。
       </p>

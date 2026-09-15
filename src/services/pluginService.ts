@@ -10,7 +10,8 @@ import type {
   PluginCatalogMutationResult,
   PluginCatalogSnapshot,
   PluginLocalDiscoverySummary,
-  PluginManifestV1,
+  PluginManifest,
+  PluginCommandContribution,
   PluginManagement,
   PluginStatus,
   PrepareLocalManifestImportResult,
@@ -304,9 +305,25 @@ function isSemVer(value: string): boolean {
     ))
 }
 
-function parseManifest(value: unknown): PluginManifestV1 {
+function parseCommand(value: unknown): PluginCommandContribution {
+  const command = requireExactObject(value, ['kind', 'contributionId', 'title', 'actionId', 'params'])
+  if (command.kind !== 'command' || command.actionId !== 'host.showInfo') invalidResponse()
+  const params = requireExactObject(command.params, ['title', 'text'])
+  return {
+    kind: 'command',
+    contributionId: requireReverseDomainId(command.contributionId),
+    title: requireDisplayText(command.title, 80),
+    actionId: 'host.showInfo',
+    params: {
+      title: requireDisplayText(params.title, 80),
+      text: requireDisplayText(params.text, 2000),
+    },
+  }
+}
+
+function parseManifest(value: unknown): PluginManifest {
   const manifest = requireExactObject(value, MANIFEST_KEYS)
-  if (manifest.schemaVersion !== 1) invalidResponse()
+  if (manifest.schemaVersion !== 1 && manifest.schemaVersion !== 2) invalidResponse()
   const id = requireReverseDomainId(manifest.id)
   const publisherId = requireReverseDomainId(manifest.publisherId)
   const publisher = requireDisplayText(manifest.publisher, 80)
@@ -314,20 +331,26 @@ function parseManifest(value: unknown): PluginManifestV1 {
   const description = requireDisplayText(manifest.description, 500)
   const version = requireDisplayText(manifest.version, 64)
   if (!isSemVer(version)) invalidResponse()
-  requireEmptyArray(manifest.contributions)
   requireEmptyArray(manifest.requestedCapabilities)
-
-  return {
-    schemaVersion: 1,
+  const metadata = {
     id,
     publisherId,
     publisher,
     name,
     description,
     version,
-    contributions: [],
-    requestedCapabilities: [],
   }
+  if (manifest.schemaVersion === 1) {
+    requireEmptyArray(manifest.contributions)
+    return { schemaVersion: 1, ...metadata, contributions: [], requestedCapabilities: [] }
+  }
+  if (!Array.isArray(manifest.contributions)
+    || manifest.contributions.length < 1 || manifest.contributions.length > 16) invalidResponse()
+  const contributions = manifest.contributions.map(parseCommand)
+  if (new Set(contributions.map((command) => command.contributionId)).size !== contributions.length) {
+    invalidResponse()
+  }
+  return { schemaVersion: 2, ...metadata, contributions, requestedCapabilities: [] }
 }
 
 function parseReason(value: unknown): PluginAvailabilityReason | null {
@@ -358,6 +381,7 @@ function parseManagement(value: unknown): PluginManagement {
 function parseCatalogItem(value: unknown): PluginCatalogItem {
   const item = requireExactObject(value, ITEM_KEYS)
   const manifest = parseManifest(item.manifest)
+  if (manifest.schemaVersion === 2 && item.source !== 'localDeclarative') invalidResponse()
   if (item.source !== 'builtIn' && item.source !== 'localDeclarative') invalidResponse()
   const status = parseStatus(item.status)
   const statusReasonCode = parseReason(item.statusReasonCode)
@@ -495,7 +519,7 @@ function parseImportCommitFailure(value: unknown): LocalManifestImportCommitFail
   return requireMember(value, IMPORT_COMMIT_FAILURES)
 }
 
-function manifestsMatch(left: PluginManifestV1, right: PluginManifestV1): boolean {
+function manifestsMatch(left: PluginManifest, right: PluginManifest): boolean {
   return left.schemaVersion === right.schemaVersion
     && left.id === right.id
     && left.publisherId === right.publisherId
@@ -503,7 +527,8 @@ function manifestsMatch(left: PluginManifestV1, right: PluginManifestV1): boolea
     && left.name === right.name
     && left.description === right.description
     && left.version === right.version
-    && left.contributions.length === right.contributions.length
+    // Both sides are strictly parsed with normalized nested command keys.
+    && JSON.stringify(left.contributions) === JSON.stringify(right.contributions)
     && left.requestedCapabilities.length === right.requestedCapabilities.length
 }
 
@@ -540,7 +565,7 @@ function parseCancelImport(value: unknown): CancelLocalManifestImportResult {
 
 function parseCommitImport(
   value: unknown,
-  expectedManifest: PluginManifestV1,
+  expectedManifest: PluginManifest,
 ): CommitLocalManifestImportResult {
   if (!isObject(value)) invalidResponse()
 
