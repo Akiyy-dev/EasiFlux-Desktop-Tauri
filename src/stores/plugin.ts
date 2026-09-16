@@ -18,7 +18,9 @@ import type {
   PluginAvailabilityReason,
   PluginCatalogItem,
   PluginCatalogSnapshot,
+  PluginCommandContribution,
   PluginCommandInfo,
+  PluginCommandSummary,
   PluginLocalDiscoverySummary,
   PluginStatus,
   ReadyLocalManifestImport,
@@ -135,7 +137,10 @@ export const usePluginStore = defineStore('plugin', () => {
     return ++commandEpoch.value
   }
 
-  function runCommand(pluginId: string, contributionId: string): PluginCommandInfo | null {
+  function selectAvailableCommand(pluginId: string, contributionId: string): {
+    plugin: PluginCatalogItem
+    command: PluginCommandContribution
+  } | null {
     if (!commandsAvailable.value) return null
     const plugin = catalog.value.find((candidate) => candidate.manifest.id === pluginId)
     if (!plugin || plugin.source !== 'localDeclarative' || plugin.manifest.schemaVersion !== 2
@@ -145,6 +150,30 @@ export const usePluginStore = defineStore('plugin', () => {
       (candidate) => candidate.contributionId === contributionId,
     )
     if (!command || command.kind !== 'command' || command.actionId !== 'host.showInfo') return null
+    return { plugin, command }
+  }
+
+  const availableCommands = computed<PluginCommandSummary[]>(() => {
+    if (!commandsAvailable.value) return []
+    return catalog.value.flatMap((plugin) => {
+      if (plugin.manifest.schemaVersion !== 2) return []
+      return plugin.manifest.contributions.flatMap((command) => {
+        const selected = selectAvailableCommand(plugin.manifest.id, command.contributionId)
+        if (!selected) return []
+        return [{
+          pluginId: selected.plugin.manifest.id,
+          pluginName: selected.plugin.manifest.name,
+          contributionId: selected.command.contributionId,
+          title: selected.command.title,
+        }]
+      })
+    })
+  })
+
+  function runCommand(pluginId: string, contributionId: string): PluginCommandInfo | null {
+    const selected = selectAvailableCommand(pluginId, contributionId)
+    if (!selected) return null
+    const { plugin, command } = selected
     return {
       pluginId, pluginName: plugin.manifest.name, contributionId,
       title: command.params.title, text: command.params.text,
@@ -771,6 +800,7 @@ export const usePluginStore = defineStore('plugin', () => {
     removalOutcomeUnknown,
     visiblePlugins,
     commandsAvailable,
+    availableCommands,
     commandContextKey,
     runCommand,
     load,

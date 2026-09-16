@@ -226,6 +226,23 @@
   gap: var(--ef-space-4);
 }
 
+.plugin-marketplace-page__view-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ef-space-2);
+}
+
+.plugin-marketplace-page__view-switch button[aria-pressed="true"] {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.plugin-marketplace-page__view-switch button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
 .plugin-marketplace-page__controls {
   display: flex;
   align-items: end;
@@ -416,13 +433,134 @@
   color: var(--muted-foreground);
 }
 
+.plugin-command-workbench {
+  display: grid;
+  gap: var(--ef-space-4);
+  min-width: 0;
+}
+
+.plugin-command-workbench__header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: var(--ef-space-3);
+}
+
+.plugin-command-workbench__header > div {
+  display: grid;
+  gap: var(--ef-space-1);
+}
+
+.plugin-command-workbench__header h2,
+.plugin-command-workbench__header p,
+.plugin-command-workbench__item h3,
+.plugin-command-workbench__item p {
+  margin: 0;
+}
+
+.plugin-command-workbench__header h2,
+.plugin-command-workbench__item h3 {
+  font-size: var(--ef-text-lg);
+}
+
+.plugin-command-workbench__header p,
+.plugin-command-workbench__count,
+.plugin-command-workbench__item p,
+.plugin-command-workbench__item dt {
+  color: var(--muted-foreground);
+}
+
+.plugin-command-workbench__count {
+  flex-shrink: 0;
+}
+
+.plugin-command-workbench__search {
+  display: grid;
+  gap: var(--ef-space-1);
+  color: var(--muted-foreground);
+  font-size: var(--ef-text-sm);
+  font-weight: var(--ef-text-label-weight);
+}
+
+.plugin-command-workbench__search input {
+  min-height: var(--ef-control-md);
+  padding: 0 var(--ef-space-3);
+  border: 1px solid var(--input);
+  border-radius: var(--ef-radius-md);
+  background: var(--card);
+  color: var(--foreground);
+  font: inherit;
+}
+
+.plugin-command-workbench__search input:focus-visible,
+.plugin-command-workbench__item button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.plugin-command-workbench__list {
+  display: grid;
+  gap: var(--ef-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plugin-command-workbench__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ef-space-4);
+  min-width: 0;
+  padding: var(--ef-space-4);
+}
+
+.plugin-command-workbench__identity {
+  display: grid;
+  gap: var(--ef-space-2);
+  min-width: 0;
+}
+
+.plugin-command-workbench__item dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ef-space-2) var(--ef-space-4);
+  margin: 0;
+}
+
+.plugin-command-workbench__item dl > div {
+  display: flex;
+  gap: var(--ef-space-1);
+  min-width: 0;
+}
+
+.plugin-command-workbench__item dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.plugin-command-workbench__item button {
+  flex-shrink: 0;
+}
+
 @media (max-width: 720px) {
   .plugin-marketplace-page__controls,
+  .plugin-command-workbench__header,
+  .plugin-command-workbench__item,
   .plugin-card__header,
   .plugin-market-entry > header,
   .plugin-management-item > header {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .plugin-command-workbench__count {
+    flex-shrink: 1;
+  }
+
+  .plugin-command-workbench__item button {
+    align-self: stretch;
   }
 
   .plugin-marketplace-page__controls label:last-child {
