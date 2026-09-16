@@ -2,15 +2,17 @@ use semver::Version;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::plugin::contribution::PluginCommandContribution;
 use crate::plugin::manifest::{
-    PluginId, PluginManifestV1, PluginPublisherId, PluginSource, APPROVAL_FINGERPRINT_NONE,
+    PluginId, PluginManifest, PluginPublisherId, PluginSource, APPROVAL_FINGERPRINT_NONE,
+    PLUGIN_MANIFEST_SCHEMA_VERSION_V1,
 };
 
 const LOCAL_FINGERPRINT_DOMAIN: &[u8] = b"EasiFlux.localDeclarative.manifest.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginRecord {
-    manifest: PluginManifestV1,
+    manifest: PluginManifest,
     source: PluginSource,
     approval_fingerprint: String,
 }
@@ -33,12 +35,12 @@ struct CanonicalManifestV1<'a> {
     name: &'a str,
     description: &'a str,
     version: &'a Version,
-    contributions: &'a [serde_json::Value],
+    contributions: &'a [PluginCommandContribution],
     requested_capabilities: &'a [String],
 }
 
-impl<'a> From<&'a PluginManifestV1> for CanonicalManifestV1<'a> {
-    fn from(manifest: &'a PluginManifestV1) -> Self {
+impl<'a> From<&'a PluginManifest> for CanonicalManifestV1<'a> {
+    fn from(manifest: &'a PluginManifest) -> Self {
         Self {
             schema_version: manifest.schema_version,
             id: &manifest.id,
@@ -54,8 +56,11 @@ impl<'a> From<&'a PluginManifestV1> for CanonicalManifestV1<'a> {
 }
 
 impl PluginRecord {
-    pub(crate) fn built_in(manifest: PluginManifestV1) -> Result<Self, String> {
+    pub(crate) fn built_in(manifest: PluginManifest) -> Result<Self, String> {
         manifest.validate()?;
+        if manifest.schema_version != PLUGIN_MANIFEST_SCHEMA_VERSION_V1 {
+            return Err("built-in plugins require manifest schema v1".into());
+        }
         Ok(Self {
             manifest,
             source: PluginSource::BuiltIn,
@@ -63,7 +68,7 @@ impl PluginRecord {
         })
     }
 
-    pub(crate) fn local_declarative(manifest: PluginManifestV1) -> Result<Self, String> {
+    pub(crate) fn local_declarative(manifest: PluginManifest) -> Result<Self, String> {
         manifest.validate()?;
         let bytes = canonical_manifest_bytes(&manifest)?;
         let mut digest = Sha256::new();
@@ -76,7 +81,7 @@ impl PluginRecord {
         })
     }
 
-    pub(crate) fn manifest(&self) -> &PluginManifestV1 {
+    pub(crate) fn manifest(&self) -> &PluginManifest {
         &self.manifest
     }
 
@@ -102,7 +107,7 @@ impl PluginRecord {
     }
 }
 
-fn canonical_manifest_bytes(manifest: &PluginManifestV1) -> Result<Vec<u8>, String> {
+fn canonical_manifest_bytes(manifest: &PluginManifest) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&CanonicalManifestV1::from(manifest))
         .map_err(|_| "manifest fingerprint failed".to_owned())
 }
@@ -170,5 +175,51 @@ mod tests {
             record.identity().approval_fingerprint,
             APPROVAL_FINGERPRINT_NONE
         );
+    }
+
+    // Catches v2 contributions inheriting the unhashed built-in trust path.
+    #[test]
+    fn built_in_record_rejects_v2_manifests() {
+        let contribution = r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}"#;
+        let json = format!(
+            r#"{{"schemaVersion":2,"id":"com.example.guide","publisherId":"com.example","publisher":"Example","name":"Guide","description":"Read-only guide","version":"1.0.0","contributions":[{contribution}],"requestedCapabilities":[]}}"#
+        );
+        let manifest: PluginManifestV1 = serde_json::from_str(&json).unwrap();
+
+        assert!(PluginRecord::built_in(manifest).is_err());
+    }
+
+    // Catches any change to the pre-v2 canonical identity envelope.
+    #[test]
+    fn v1_canonical_bytes_and_digest_are_golden() {
+        let manifest: PluginManifestV1 = serde_json::from_str(VALID_MANIFEST_JSON).unwrap();
+        let record = PluginRecord::local_declarative(manifest).unwrap();
+        assert_eq!(
+            record.canonical_manifest_bytes().unwrap(),
+            br#"{"schemaVersion":1,"id":"com.example.alpha","publisherId":"com.example","publisher":"Example","name":"Alpha","description":"Metadata","version":"1.0.0","contributions":[],"requestedCapabilities":[]}"#
+        );
+        assert_eq!(
+            record.approval_fingerprint(),
+            "v1:sha256:2bb266f48b0c74e5a74708ea4442a56ad8fe583be81f93e27483a21d4e860ee3"
+        );
+    }
+
+    // Catches hashing v2 JSON layout or omitting nested command semantics.
+    #[test]
+    fn v2_fingerprint_ignores_nested_key_order_and_binds_params() {
+        let first = r#"{"schemaVersion":2,"id":"com.example.guide","publisherId":"com.example","publisher":"Example","name":"Guide","description":"Read-only guide","version":"1.0.0","contributions":[{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}],"requestedCapabilities":[]}"#;
+        let reordered = r#"{"requestedCapabilities":[],"contributions":[{"params":{"text":"Read-only guide","title":"Guide"},"actionId":"host.showInfo","title":"Guide","contributionId":"guide.overview","kind":"command"}],"version":"1.0.0","description":"Read-only guide","name":"Guide","publisher":"Example","publisherId":"com.example","id":"com.example.guide","schemaVersion":2}"#;
+        let first = PluginRecord::local_declarative(serde_json::from_str(first).unwrap()).unwrap();
+        let reordered =
+            PluginRecord::local_declarative(serde_json::from_str(reordered).unwrap()).unwrap();
+        assert_eq!(
+            first.approval_fingerprint(),
+            reordered.approval_fingerprint()
+        );
+
+        let mut changed = reordered.manifest().clone();
+        changed.contributions[0].params.text = "Changed guide".into();
+        let changed = PluginRecord::local_declarative(changed).unwrap();
+        assert_ne!(first.approval_fingerprint(), changed.approval_fingerprint());
     }
 }

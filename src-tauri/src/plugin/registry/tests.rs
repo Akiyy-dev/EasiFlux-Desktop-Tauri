@@ -1520,6 +1520,28 @@ fn local(id: &str, name: &str) -> PluginRecord {
     PluginRecord::local_declarative(manifest).unwrap()
 }
 
+fn v2_local(text: &str) -> PluginRecord {
+    let manifest: PluginManifestV1 = serde_json::from_value(json!({
+        "schemaVersion": 2,
+        "id": "com.example.guide",
+        "publisherId": "com.example",
+        "publisher": "Example",
+        "name": "Guide",
+        "description": "Read-only guide",
+        "version": "1.0.0",
+        "contributions": [{
+            "kind": "command",
+            "contributionId": "guide.overview",
+            "title": "Guide",
+            "actionId": "host.showInfo",
+            "params": {"title": "Guide", "text": text}
+        }],
+        "requestedCapabilities": []
+    }))
+    .unwrap();
+    PluginRecord::local_declarative(manifest).unwrap()
+}
+
 fn local_entry(record: &PluginRecord, enabled: bool) -> PluginStateEntryV2 {
     let identity = record.identity();
     PluginStateEntryV2 {
@@ -1703,6 +1725,30 @@ fn content_replacement_defaults_disabled_and_exact_identity_recovers() {
     let result = registry.set_enabled("com.alpha", false, "3").unwrap();
     assert_eq!(result.revision, "8");
     assert_eq!(result.catalog_generation, "3");
+}
+
+// Catches v2 discovery enabling without a decision or reusing approval after command changes.
+#[test]
+fn v2_discovery_defaults_disabled_and_changed_command_content_revokes_enablement() {
+    let original = v2_local("Original guide");
+    let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = persistence.registry(vec![]);
+
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![original]))
+        .unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["status"], "disabled");
+    registry
+        .set_enabled("com.example.guide", true, "1")
+        .unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["status"], "enabled");
+
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![v2_local(
+            "Changed guide",
+        )]))
+        .unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["status"], "disabled");
 }
 
 // Catches skipping explicit disabled cleanup, retaining old publisher approvals, or pruning other sources.

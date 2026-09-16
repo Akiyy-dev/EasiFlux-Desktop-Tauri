@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import PluginCard from './PluginCard.vue'
+import PluginCommands from './PluginCommands.vue'
 import PluginImportDialog from './PluginImportDialog.vue'
 import PluginRemovalDialog from './PluginRemovalDialog.vue'
 import { pluginSourceLabel } from './pluginPresentation'
@@ -69,7 +70,7 @@ const removalFailureCopy: Record<RemoveManagedLocalPluginFailure, string> = {
 const sectionCopy: Record<PluginSection, { title: string; description: string }> = {
   installed: {
     title: '已安装插件',
-    description: '查看内置插件与已发现的本地声明式包，并管理宿主启用偏好。',
+    description: '查看内置插件与本地声明式包，管理启用偏好并使用已启用的只读命令。',
   },
   market: {
     title: '插件市场',
@@ -591,7 +592,11 @@ onBeforeUnmount(() => {
             :removal-disabled="removalEntryDisabled"
             @toggle="togglePlugin"
             @remove="beginRemoval"
-          />
+          >
+            <template #commands>
+              <PluginCommands :plugin="plugin" />
+            </template>
+          </PluginCard>
         </div>
       </section>
 
@@ -657,7 +662,11 @@ onBeforeUnmount(() => {
             data-testid="plugin-management-item"
             @toggle="togglePlugin"
             @remove="beginRemoval"
-          />
+          >
+            <template #commands>
+              <PluginCommands :plugin="plugin" />
+            </template>
+          </PluginCard>
         </div>
       </section>
     </template>

@@ -4,8 +4,11 @@ use semver::Version;
 use serde::de::{value::MapAccessDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::contribution::PluginCommandContribution;
+
 pub const APPROVAL_FINGERPRINT_NONE: &str = "v1:none";
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V1: u32 = 1;
+pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V2: u32 = 2;
 
 const CATALOG_TRANSPORT_SCHEMA_VERSION: u8 = 3;
 
@@ -86,7 +89,7 @@ fn validate_reverse_domain(value: &str) -> Result<(), String> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginManifestV1 {
+pub struct PluginManifest {
     pub schema_version: u32,
     pub id: PluginId,
     pub publisher_id: PluginPublisherId,
@@ -94,13 +97,13 @@ pub struct PluginManifestV1 {
     pub name: String,
     pub description: String,
     pub version: Version,
-    pub contributions: Vec<serde_json::Value>,
+    pub contributions: Vec<PluginCommandContribution>,
     pub requested_capabilities: Vec<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PluginManifestV1Wire {
+struct PluginManifestWire {
     schema_version: u32,
     id: PluginId,
     publisher_id: PluginPublisherId,
@@ -108,23 +111,23 @@ struct PluginManifestV1Wire {
     name: String,
     description: String,
     version: Version,
-    contributions: Vec<serde_json::Value>,
+    contributions: Vec<PluginCommandContribution>,
     requested_capabilities: Vec<String>,
 }
 
-impl<'de> Deserialize<'de> for PluginManifestV1 {
+impl<'de> Deserialize<'de> for PluginManifest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(PluginManifestV1Visitor)
+        deserializer.deserialize_map(PluginManifestVisitor)
     }
 }
 
-struct PluginManifestV1Visitor;
+struct PluginManifestVisitor;
 
-impl<'de> Visitor<'de> for PluginManifestV1Visitor {
-    type Value = PluginManifestV1;
+impl<'de> Visitor<'de> for PluginManifestVisitor {
+    type Value = PluginManifest;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a plugin manifest object")
@@ -134,8 +137,8 @@ impl<'de> Visitor<'de> for PluginManifestV1Visitor {
     where
         A: MapAccess<'de>,
     {
-        let wire = PluginManifestV1Wire::deserialize(MapAccessDeserializer::new(map))?;
-        let manifest = PluginManifestV1 {
+        let wire = PluginManifestWire::deserialize(MapAccessDeserializer::new(map))?;
+        let manifest = PluginManifest {
             schema_version: wire.schema_version,
             id: wire.id,
             publisher_id: wire.publisher_id,
@@ -151,19 +154,26 @@ impl<'de> Visitor<'de> for PluginManifestV1Visitor {
     }
 }
 
-impl PluginManifestV1 {
+impl PluginManifest {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != PLUGIN_MANIFEST_SCHEMA_VERSION_V1 {
-            return Err("unsupported plugin manifest schema".into());
+        match self.schema_version {
+            PLUGIN_MANIFEST_SCHEMA_VERSION_V1 if self.contributions.is_empty() => {}
+            PLUGIN_MANIFEST_SCHEMA_VERSION_V2 if (1..=16).contains(&self.contributions.len()) => {
+                let mut contribution_ids = std::collections::BTreeSet::new();
+                for contribution in &self.contributions {
+                    contribution.validate()?;
+                    if !contribution_ids.insert(&contribution.contribution_id) {
+                        return Err("duplicate plugin contribution id".into());
+                    }
+                }
+            }
+            _ => return Err("unsupported plugin manifest schema or contributions".into()),
         }
         validate_display_text("publisher", &self.publisher, MAX_PUBLISHER_DISPLAY_LENGTH)?;
         validate_display_text("name", &self.name, MAX_NAME_LENGTH)?;
         validate_display_text("description", &self.description, MAX_DESCRIPTION_LENGTH)?;
         if self.version.to_string().len() > MAX_VERSION_LENGTH {
             return Err("plugin version exceeds 64 bytes".into());
-        }
-        if !self.contributions.is_empty() {
-            return Err("plugin contributions are reserved".into());
         }
         if !self.requested_capabilities.is_empty() {
             return Err("plugin requested capabilities are reserved".into());
@@ -172,7 +182,14 @@ impl PluginManifestV1 {
     }
 }
 
-fn validate_display_text(label: &str, value: &str, max_length: usize) -> Result<(), String> {
+/// Compatibility alias retained for callers written against the v1-only manifest API.
+pub type PluginManifestV1 = PluginManifest;
+
+pub(crate) fn validate_display_text(
+    label: &str,
+    value: &str,
+    max_length: usize,
+) -> Result<(), String> {
     // Shared with the frontend: Unicode White_Space plus ECMAScript's U+FEFF.
     if value
         .chars()
@@ -421,7 +438,7 @@ where
     Option::deserialize(deserializer)
 }
 
-fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,

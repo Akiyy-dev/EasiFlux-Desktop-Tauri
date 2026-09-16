@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 2,
+  "id": "com.example.workspace-guide",
+  "publisherId": "com.example",
+  "publisher": "Example 示例作者（未经认证）",
+  "name": "工作区指南（示例插件）",
+  "description": "手动导入的只读命令示例，介绍插件使用流程与安全边界。",
+  "version": "1.0.0",
+  "contributions": [
+    {
+      "kind": "command",
+      "contributionId": "guide.overview",
+      "title": "查看插件使用流程",
+      "actionId": "host.showInfo",
+      "params": {
+        "title": "插件使用流程",
+        "text": "手动导入清单后，插件默认停用。核对作者与命令名称，再明确启用。点击卡片上的命令按钮可查看只读信息；停用后按钮与已显示的信息都会撤销。"
+      }
+    },
+    {
+      "kind": "command",
+      "contributionId": "guide.safety",
+      "title": "查看安全边界",
+      "actionId": "host.showInfo",
+      "params": {
+        "title": "安全边界",
+        "text": "本示例不运行插件代码，不联网、不跳转、不读写业务数据，也不申请权限。文本由示例作者提供，未经认证，不代表宿主背书。加载、重扫或操作结果未确认时，命令不可用。"
+      }
+    }
+  ],
+  "requestedCapabilities": []
+}
