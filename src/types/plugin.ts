@@ -59,6 +59,13 @@ export interface PluginCommandInfo {
   text: string
 }
 
+export interface PluginCommandSummary {
+  pluginId: string
+  pluginName: string
+  contributionId: string
+  title: string
+}
+
 export interface PluginCatalogItem {
   manifest: PluginManifest
   source: PluginSource

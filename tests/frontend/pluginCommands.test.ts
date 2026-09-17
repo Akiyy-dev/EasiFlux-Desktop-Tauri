@@ -1,10 +1,12 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { nextTick } from 'vue'
+import { effectScope, nextTick, ref } from 'vue'
 import PluginMarketplacePage from '../../src/components/plugins/PluginMarketplacePage.vue'
+import { usePluginCommandResult } from '../../src/composables/usePluginCommandResult'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { usePluginStore } from '../../src/stores/plugin'
+import type { PluginCatalogItem } from '../../src/types/plugin'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
 
@@ -22,6 +24,21 @@ function item(status = 'disabled', text = 'Read-only guide') {
     source: 'localDeclarative', management: 'managed', canRemove: status === 'disabled',
     toggleBlockReasonCode: null, status, statusReasonCode: null, canToggle: true,
     grantedCapabilities: [],
+  }
+}
+
+function secondItem() {
+  return {
+    ...item('enabled', 'Second content'),
+    manifest: {
+      ...item().manifest,
+      id: 'com.example.second',
+      name: 'Second guide',
+      contributions: [{
+        kind: 'command', contributionId: 'guide.overview', title: 'Second guide',
+        actionId: 'host.showInfo', params: { title: 'Second result', text: 'Second content' },
+      }],
+    },
   }
 }
 
@@ -54,6 +71,110 @@ beforeEach(() => {
 })
 
 describe('declarative commands with real service and store', () => {
+  it('projects only authorized commands by plugin identity and revokes them through unknown results', async () => {
+    const guide = item('enabled', 'Guide content')
+    const second = secondItem()
+    const disabled = {
+      ...item('disabled'),
+      manifest: { ...item().manifest, id: 'com.example.disabled', name: 'Disabled guide' },
+    }
+    const legacy = {
+      ...item('enabled'),
+      manifest: {
+        ...item().manifest,
+        schemaVersion: 1,
+        id: 'com.example.legacy',
+        name: 'Legacy guide',
+        contributions: [],
+      },
+    }
+    const enabledSnapshot = {
+      ...snapshot('enabled'),
+      plugins: [disabled, guide, legacy, second],
+    }
+    const store = usePluginStore()
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(enabledSnapshot)
+
+    await store.load()
+
+    expect(store.availableCommands.map(({ pluginId, contributionId, title }) => (
+      [pluginId, contributionId, title]
+    ))).toEqual([
+      ['com.example.guide', 'guide.overview', 'Show guide'],
+      ['com.example.second', 'guide.overview', 'Second guide'],
+    ])
+    expect(store.availableCommands.every((command) => !('text' in command))).toBe(true)
+    expect(store.runCommand('com.example.guide', 'guide.overview')?.text).toBe('Guide content')
+    expect(store.runCommand('com.example.second', 'guide.overview')?.text).toBe('Second content')
+
+    const disable = deferred()
+    vi.mocked(tauriInvoke).mockReturnValueOnce(disable.promise)
+    const flight = store.setEnabled('com.example.second', false)
+    expect(store.availableCommands).toEqual([])
+    disable.reject(new Error('unknown result'))
+    await flight
+    expect(store.availableCommands).toEqual([])
+
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ ...enabledSnapshot, revision: '2' })
+    await store.retry()
+    expect(store.availableCommands.map(({ pluginId }) => pluginId)).toEqual([
+      'com.example.guide',
+      'com.example.second',
+    ])
+  })
+
+  it('resolves shared contribution IDs through each mounted plugin card', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      ...snapshot('enabled'),
+      plugins: [item('enabled', 'Guide content'), secondItem()],
+    })
+    const wrapper = mount(PluginMarketplacePage, { props: { section: 'installed' } })
+    await flushPromises()
+    const cards = wrapper.findAll('.plugin-card')
+    expect(cards).toHaveLength(2)
+
+    await cards[0].get('[data-testid="plugin-command-button"]').trigger('click')
+    const guideResult = cards[0].get('[data-testid="plugin-command-result"]')
+    expect(guideResult.text()).toContain('Workspace guide（com.example.guide）')
+    expect(guideResult.text()).toContain('Guide content')
+    expect(cards[1].find('[data-testid="plugin-command-result"]').exists()).toBe(false)
+
+    await cards[1].get('[data-testid="plugin-command-button"]').trigger('click')
+    const secondResult = cards[1].get('[data-testid="plugin-command-result"]')
+    expect(secondResult.text()).toContain('Second guide（com.example.second）')
+    expect(secondResult.text()).toContain('Second content')
+    expect(guideResult.text()).not.toContain('Second content')
+    expect(secondResult.text()).not.toContain('Guide content')
+    wrapper.unmount()
+  })
+
+  it('synchronously clears a command result when its explicit plugin source changes', async () => {
+    const store = usePluginStore()
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot('enabled', '1', '1', 'Authoritative text'))
+    await store.load()
+    const pluginSource = ref(item('enabled', 'Detached source'))
+    expect(pluginSource.value).not.toBe(store.catalog[0])
+    const scope = effectScope()
+
+    try {
+      const lifecycle = scope.run(() => usePluginCommandResult(
+        () => pluginSource.value as PluginCatalogItem,
+      ))!
+      lifecycle.run('com.example.guide', 'guide.overview')
+      expect(lifecycle.result.value?.text).toBe('Authoritative text')
+
+      pluginSource.value.manifest.contributions[0].params.text = 'Changed in place'
+      expect(lifecycle.result.value).toBeNull()
+
+      lifecycle.run('com.example.guide', 'guide.overview')
+      expect(lifecycle.result.value?.text).toBe('Authoritative text')
+      pluginSource.value = item('enabled', 'Replacement source')
+      expect(lifecycle.result.value).toBeNull()
+    } finally {
+      scope.stop()
+    }
+  })
+
   it('retains contributions, enables only confirmed commands and fails closed after a failed disable', async () => {
     const store = usePluginStore()
     vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot())

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import PluginCard from './PluginCard.vue'
+import PluginCommandWorkbench from './PluginCommandWorkbench.vue'
 import PluginCommands from './PluginCommands.vue'
 import PluginImportDialog from './PluginImportDialog.vue'
 import PluginRemovalDialog from './PluginRemovalDialog.vue'
@@ -26,6 +27,13 @@ const title = ref<{ focus: () => void } | null>(null)
 const importTrigger = ref<FocusControl | null>(null)
 const importDialogOpener = ref<FocusControl | null>(null)
 const removalDialogOpener = ref<FocusControl | null>(null)
+const installedView = ref<'plugins' | 'commands'>('plugins')
+
+watch(
+  () => props.section,
+  () => { installedView.value = 'plugins' },
+  { flush: 'sync' },
+)
 
 const importFailureCopy: Record<LocalManifestImportCommitFailure, string> = {
   plugin_catalog_stale: '插件目录已更新，请刷新后重试。',
@@ -542,62 +550,87 @@ onBeforeUnmount(() => {
       </div>
 
       <section v-if="props.section === 'installed'" class="plugin-marketplace-page__section">
-        <div class="plugin-marketplace-page__controls">
-          <label for="plugin-search">
-            <span>搜索已安装插件</span>
-            <input
-              id="plugin-search"
-              type="search"
-              :value="store.query"
-              placeholder="名称、ID、发布者或描述"
-              @input="updateQuery"
-            >
-          </label>
-          <label for="plugin-status-filter">
-            <span>按状态筛选</span>
-            <select
-              id="plugin-status-filter"
-              :value="store.statusFilter"
-              @change="updateStatusFilter"
-            >
-              <option value="all">全部状态</option>
-              <option value="enabled">已启用</option>
-              <option value="disabled">已停用</option>
-              <option value="blocked">已阻止</option>
-            </select>
-          </label>
+        <div class="plugin-marketplace-page__view-switch" role="group" aria-label="已安装插件视图">
+          <button
+            class="ef-btn ef-btn-secondary ef-btn-sm"
+            data-testid="plugin-list-view"
+            type="button"
+            :aria-pressed="installedView === 'plugins'"
+            @click="installedView = 'plugins'"
+          >
+            插件列表
+          </button>
+          <button
+            class="ef-btn ef-btn-secondary ef-btn-sm"
+            data-testid="plugin-command-view"
+            type="button"
+            :aria-pressed="installedView === 'commands'"
+            @click="installedView = 'commands'"
+          >
+            命令工作台
+          </button>
         </div>
 
-        <p
-          v-if="store.catalog.length === 0"
-          class="plugin-marketplace-page__empty"
-          data-testid="plugin-catalog-empty"
-        >
-          当前没有已安装插件，也没有发现可用的本地声明式包。
-        </p>
-        <p
-          v-else-if="store.visiblePlugins.length === 0"
-          class="plugin-marketplace-page__empty"
-          data-testid="plugin-no-match"
-        >
-          没有符合当前条件的插件，请调整搜索或状态筛选。
-        </p>
-        <div v-else class="plugin-marketplace-page__grid">
-          <PluginCard
-            v-for="plugin in store.visiblePlugins"
-            :key="plugin.manifest.id"
-            :plugin="plugin"
-            :pending="store.pendingIds.has(plugin.manifest.id)"
-            :error="store.actionErrors[plugin.manifest.id] ?? null"
-            :removal-disabled="removalEntryDisabled"
-            @toggle="togglePlugin"
-            @remove="beginRemoval"
+        <PluginCommandWorkbench v-if="installedView === 'commands'" />
+
+        <template v-else>
+          <div class="plugin-marketplace-page__controls">
+            <label for="plugin-search">
+              <span>搜索已安装插件</span>
+              <input
+                id="plugin-search"
+                type="search"
+                :value="store.query"
+                placeholder="名称、ID、发布者或描述"
+                @input="updateQuery"
+              >
+            </label>
+            <label for="plugin-status-filter">
+              <span>按状态筛选</span>
+              <select
+                id="plugin-status-filter"
+                :value="store.statusFilter"
+                @change="updateStatusFilter"
+              >
+                <option value="all">全部状态</option>
+                <option value="enabled">已启用</option>
+                <option value="disabled">已停用</option>
+                <option value="blocked">已阻止</option>
+              </select>
+            </label>
+          </div>
+
+          <p
+            v-if="store.catalog.length === 0"
+            class="plugin-marketplace-page__empty"
+            data-testid="plugin-catalog-empty"
           >
-            <template #commands>
-              <PluginCommands :plugin="plugin" />
-            </template>
-          </PluginCard>
-        </div>
+            当前没有已安装插件，也没有发现可用的本地声明式包。
+          </p>
+          <p
+            v-else-if="store.visiblePlugins.length === 0"
+            class="plugin-marketplace-page__empty"
+            data-testid="plugin-no-match"
+          >
+            没有符合当前条件的插件，请调整搜索或状态筛选。
+          </p>
+          <div v-else class="plugin-marketplace-page__grid">
+            <PluginCard
+              v-for="plugin in store.visiblePlugins"
+              :key="plugin.manifest.id"
+              :plugin="plugin"
+              :pending="store.pendingIds.has(plugin.manifest.id)"
+              :error="store.actionErrors[plugin.manifest.id] ?? null"
+              :removal-disabled="removalEntryDisabled"
+              @toggle="togglePlugin"
+              @remove="beginRemoval"
+            >
+              <template #commands>
+                <PluginCommands :plugin="plugin" />
+              </template>
+            </PluginCard>
+          </div>
+        </template>
       </section>
 
       <section v-else-if="props.section === 'market'" class="plugin-marketplace-page__section">
