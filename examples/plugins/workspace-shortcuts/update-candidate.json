@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 3,
+  "id": "com.easiflux.examples.workspace-shortcuts",
+  "publisherId": "com.easiflux.examples",
+  "publisher": "EasiFlux 示例（未经认证）",
+  "name": "工作区快捷入口",
+  "description": "用于演示同 ID 清单的版本、目标、命令增删与顺序比较；不会自动替换已导入版本。",
+  "version": "1.1.0",
+  "contributions": [
+    {
+      "kind": "command",
+      "contributionId": "workspace.notifications",
+      "title": "打开通知设置",
+      "actionId": "host.openPage",
+      "params": { "destination": "settings.notifications" }
+    },
+    {
+      "kind": "command",
+      "contributionId": "workspace.charts",
+      "title": "打开首页（目标变更示例）",
+      "actionId": "host.openPage",
+      "params": { "destination": "home" }
+    },
+    {
+      "kind": "command",
+      "contributionId": "workspace.general",
+      "title": "打开通用设置",
+      "actionId": "host.openPage",
+      "params": { "destination": "settings.general" }
+    },
+    {
+      "kind": "command",
+      "contributionId": "workspace.help",
+      "title": "查看快捷入口说明",
+      "actionId": "host.showInfo",
+      "params": {
+        "title": "工作区快捷入口说明",
+        "text": "只有点击明确标注目标的打开页面按钮才会导航。页面仍按宿主自己的规则加载数据，插件不会收到这些数据，也不能读取密钥、修改设置或提交交易。停用本插件后，快捷命令将不可用。"
+      }
+    }
+  ],
+  "requestedCapabilities": []
+}
