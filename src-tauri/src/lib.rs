@@ -168,6 +168,77 @@ pub fn run() {
 mod capability_tests {
     use tauri::ipc::Origin;
 
+    // Use the registered IPC surface as inputs to the real generated authority, not the
+    // permission list itself: a newly registered command must not silently lack a grant.
+    fn registered_app_commands() -> Vec<&'static str> {
+        let source = include_str!("lib.rs");
+        let (_, handler) = source
+            .split_once(".invoke_handler(tauri::generate_handler![")
+            .expect("production invoke handler");
+        let (commands, _) = handler.split_once("])").expect("end of invoke handler");
+        let commands = commands
+            .split(',')
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .collect::<Vec<_>>();
+        assert!(
+            commands.contains(&"get_config"),
+            "must inspect the application handler"
+        );
+        commands
+    }
+
+    // Catches enabling application ACL while omitting existing page/host command grants.
+    #[test]
+    fn main_pages_can_invoke_all_registered_app_commands() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
+        let authority = context.runtime_authority_mut();
+        let blocked = registered_app_commands()
+            .into_iter()
+            .filter(|command| {
+                authority
+                    .resolve_access(command, "main", "main", &Origin::Local)
+                    .is_none()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            blocked.is_empty(),
+            "main page commands blocked by ACL: {blocked:?}"
+        );
+    }
+
+    // Catches broadening a host grant to other webviews or remote content.
+    #[test]
+    fn app_command_grants_do_not_escape_the_local_main_webview() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
+        let authority = context.runtime_authority_mut();
+        let remote = Origin::Remote {
+            url: "https://example.invalid".parse().unwrap(),
+        };
+        for command in registered_app_commands() {
+            for (window, webview, origin) in [
+                ("main", "secondary", &Origin::Local),
+                ("secondary", "secondary", &Origin::Local),
+                ("main", "main", &remote),
+            ] {
+                assert!(
+                    authority
+                        .resolve_access(command, window, webview, origin)
+                        .is_none(),
+                    "{command} must not be exposed outside the local main webview"
+                );
+            }
+        }
+        for command in ["finish_plugin_smoke", "unregistered_host_command"] {
+            assert!(
+                authority
+                    .resolve_access(command, "main", "main", &Origin::Local)
+                    .is_none(),
+                "production main must not resolve {command}"
+            );
+        }
+    }
+
     #[test]
     fn main_window_can_force_close_after_chart_workspace_flush() {
         let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
