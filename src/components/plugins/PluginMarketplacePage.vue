@@ -13,8 +13,12 @@ import type {
 } from '../../types/plugin'
 import type { PluginSection } from '../../types/navigation'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   section: PluginSection
+  navigationAvailable?: boolean
+}>(), { navigationAvailable: false })
+const emit = defineEmits<{
+  'open-page': [intent: { pluginId: string; contributionId: string }]
 }>()
 
 interface FocusControl {
@@ -78,7 +82,7 @@ const removalFailureCopy: Record<RemoveManagedLocalPluginFailure, string> = {
 const sectionCopy: Record<PluginSection, { title: string; description: string }> = {
   installed: {
     title: '已安装插件',
-    description: '查看内置插件与本地声明式包，管理启用偏好并使用已启用的只读命令。',
+    description: '查看内置插件与本地声明式包，管理启用偏好并使用已启用的宿主命令。',
   },
   market: {
     title: '插件市场',
@@ -571,7 +575,11 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <PluginCommandWorkbench v-if="installedView === 'commands'" />
+        <PluginCommandWorkbench
+          v-if="installedView === 'commands'"
+          :navigation-available="props.navigationAvailable"
+          @open-page="emit('open-page', $event)"
+        />
 
         <template v-else>
           <div class="plugin-marketplace-page__controls">
@@ -626,7 +634,11 @@ onBeforeUnmount(() => {
               @remove="beginRemoval"
             >
               <template #commands>
-                <PluginCommands :plugin="plugin" />
+                <PluginCommands
+                  :plugin="plugin"
+                  :navigation-available="props.navigationAvailable"
+                  @open-page="emit('open-page', $event)"
+                />
               </template>
             </PluginCard>
           </div>
@@ -697,7 +709,11 @@ onBeforeUnmount(() => {
             @remove="beginRemoval"
           >
             <template #commands>
-              <PluginCommands :plugin="plugin" />
+              <PluginCommands
+                :plugin="plugin"
+                :navigation-available="props.navigationAvailable"
+                @open-page="emit('open-page', $event)"
+              />
             </template>
           </PluginCard>
         </div>

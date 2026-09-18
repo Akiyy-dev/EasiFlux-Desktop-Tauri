@@ -3,18 +3,28 @@ import { computed } from 'vue'
 import { usePluginCommandResult } from '../../composables/usePluginCommandResult'
 import { usePluginStore } from '../../stores/plugin'
 import type { PluginCatalogItem } from '../../types/plugin'
+import { pluginPageLabel } from '../../services/pluginNavigation'
 import PluginCommandResult from './PluginCommandResult.vue'
 
-const props = defineProps<{ plugin: PluginCatalogItem }>()
+const props = withDefaults(defineProps<{
+  plugin: PluginCatalogItem
+  navigationAvailable?: boolean
+}>(), { navigationAvailable: false })
+const emit = defineEmits<{
+  'open-page': [intent: { pluginId: string; contributionId: string }]
+}>()
 const store = usePluginStore()
-const { result, run, clear } = usePluginCommandResult(() => props.plugin)
+const { result, run, clear } = usePluginCommandResult(
+  () => props.plugin,
+  (intent) => emit('open-page', intent),
+)
 const commands = computed(() => store.availableCommands.filter(
   (command) => command.pluginId === props.plugin.manifest.id,
 ))
 </script>
 
 <template>
-  <section v-if="commands.length" class="plugin-commands" aria-label="插件只读命令">
+  <section v-if="commands.length" class="plugin-commands" aria-label="插件命令">
     <div class="plugin-commands__actions">
       <button
         v-for="command in commands"
@@ -22,11 +32,20 @@ const commands = computed(() => store.availableCommands.filter(
         class="ef-btn ef-btn-secondary ef-btn-sm"
         data-testid="plugin-command-button"
         type="button"
-        @click="run(command.pluginId, command.contributionId)"
+        :disabled="command.actionId === 'host.openPage' && !props.navigationAvailable"
+        @click="run(command.pluginId, command.contributionId, props.navigationAvailable)"
       >
-        {{ command.title }}
+        {{ command.actionId === 'host.showInfo'
+          ? `显示信息：${command.title}`
+          : `打开页面：${pluginPageLabel(command.destination)}` }}
       </button>
     </div>
+    <p
+      v-if="!props.navigationAvailable && commands.some((command) => command.actionId === 'host.openPage')"
+      class="plugin-commands__navigation-unavailable"
+    >
+      当前宿主不提供页面导航；信息显示命令仍可使用。
+    </p>
     <PluginCommandResult
       v-if="result"
       :result="result"

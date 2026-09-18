@@ -1542,6 +1542,28 @@ fn v2_local(text: &str) -> PluginRecord {
     PluginRecord::local_declarative(manifest).unwrap()
 }
 
+fn v3_navigation_local(destination: &str) -> PluginRecord {
+    let manifest: PluginManifestV1 = serde_json::from_value(json!({
+        "schemaVersion": 3,
+        "id": "com.example.shortcuts",
+        "publisherId": "com.example",
+        "publisher": "Example",
+        "name": "Shortcuts",
+        "description": "Workspace shortcuts",
+        "version": "1.0.0",
+        "contributions": [{
+            "kind": "command",
+            "contributionId": "workspace.open",
+            "title": "Open workspace",
+            "actionId": "host.openPage",
+            "params": { "destination": destination }
+        }],
+        "requestedCapabilities": []
+    }))
+    .unwrap();
+    PluginRecord::local_declarative(manifest).unwrap()
+}
+
 fn local_entry(record: &PluginRecord, enabled: bool) -> PluginStateEntryV2 {
     let identity = record.identity();
     PluginStateEntryV2 {
@@ -1746,6 +1768,29 @@ fn v2_discovery_defaults_disabled_and_changed_command_content_revokes_enablement
     registry
         .apply_local_discovery(LocalDiscoveryOutcome::available(vec![v2_local(
             "Changed guide",
+        )]))
+        .unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["status"], "disabled");
+}
+
+// Catches destination changes reusing an enabled decision for different host navigation.
+#[test]
+fn v3_destination_change_revokes_enablement() {
+    let original = v3_navigation_local("charts");
+    let persistence = MemoryPersistence::new(PluginStateFileV2::empty());
+    let mut registry = persistence.registry(vec![]);
+
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![original]))
+        .unwrap();
+    registry
+        .set_enabled("com.example.shortcuts", true, "1")
+        .unwrap();
+    assert_eq!(snapshot(&registry)["plugins"][0]["status"], "enabled");
+
+    registry
+        .apply_local_discovery(LocalDiscoveryOutcome::available(vec![v3_navigation_local(
+            "trading",
         )]))
         .unwrap();
     assert_eq!(snapshot(&registry)["plugins"][0]["status"], "disabled");

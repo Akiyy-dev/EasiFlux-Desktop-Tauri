@@ -52,10 +52,12 @@ fn discovery_accepts_a_v2_local_declarative_command_manifest() {
         super::super::manifest::PluginSource::LocalDeclarative
     );
     assert_eq!(record.manifest().schema_version, 2);
-    assert_eq!(
-        record.manifest().contributions[0].params.text,
-        "Read-only guide"
-    );
+    let crate::plugin::contribution::PluginCommandParams::ShowInfo(params) =
+        &record.manifest().contributions[0].params
+    else {
+        panic!("expected showInfo params");
+    };
+    assert_eq!(params.text, "Read-only guide");
 }
 
 // Rejecting the exact two-file shape loses a valid external candidate.

@@ -8,7 +8,7 @@ import { usePluginStore } from '../../src/stores/plugin'
 import type {
   PluginCatalogItem,
   PluginCatalogSnapshot,
-  PluginCommandContribution,
+  PluginShowInfoCommandContribution,
   PluginStatus,
 } from '../../src/types/plugin'
 
@@ -19,7 +19,7 @@ function command(
   title: string,
   resultTitle: string,
   text: string,
-): PluginCommandContribution {
+): PluginShowInfoCommandContribution {
   return {
     kind: 'command',
     contributionId,
@@ -33,7 +33,7 @@ function commandPlugin(
   id: string,
   name: string,
   status: PluginStatus,
-  contributions: PluginCommandContribution[],
+  contributions: PluginShowInfoCommandContribution[],
   reason: 'stateUnavailable' | null = null,
 ): PluginCatalogItem {
   return {
@@ -274,7 +274,7 @@ describe('installed plugin command workbench', () => {
       legacyPlugin(),
     ]))
     await noEnabled.get('[data-testid="plugin-command-view"]').trigger('click')
-    expect(noEnabled.get('[data-testid="plugin-command-empty"]').text()).toContain('没有已启用的只读命令')
+    expect(noEnabled.get('[data-testid="plugin-command-empty"]').text()).toContain('没有已启用的宿主命令')
     noEnabled.unmount()
 
     const unavailable = await mountLoaded(unavailableSnapshot())

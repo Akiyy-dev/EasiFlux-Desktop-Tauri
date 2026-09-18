@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { ReadyLocalManifestImport } from '../../types/plugin'
+import { pluginPageLabel } from '../../services/pluginNavigation'
 
 interface DialogControl {
   readonly open: boolean
@@ -115,19 +116,23 @@ onUnmounted(() => {
       </dl>
 
       <p id="plugin-import-warning" class="plugin-import-dialog__warning">
-        发布者信息由清单作者填写，未经认证。本次只复制清单，不运行代码或授予权限。导入后默认停用，{{ props.preview.manifest.schemaVersion === 2
-          ? '启用后提供只读命令，仅由宿主显示普通文本。'
+        发布者信息由清单作者填写，未经认证。本次只复制清单，不运行代码或授予权限。导入后默认停用，{{ props.preview.manifest.schemaVersion !== 1
+          ? props.preview.manifest.schemaVersion === 3
+            ? '启用后可显示普通文本，或由宿主打开白名单页面。'
+            : '启用后提供只读命令，仅由宿主显示普通文本。'
           : '启用仅记录宿主偏好。' }}
       </p>
       <div
-        v-if="props.preview.manifest.schemaVersion === 2"
+        v-if="props.preview.manifest.schemaVersion !== 1"
         class="plugin-import-dialog__hint"
         data-testid="plugin-import-commands"
       >
-        <p>只读命令（host.showInfo）：</p>
+        <p>声明式宿主命令：</p>
         <ul>
           <li v-for="command in props.preview.manifest.contributions" :key="command.contributionId">
-            <bdi>{{ command.title }}</bdi>
+            <bdi>{{ command.actionId === 'host.showInfo'
+              ? `显示信息：${command.title}`
+              : `打开页面：${pluginPageLabel(command.params.destination)}` }}</bdi>
           </li>
         </ul>
       </div>

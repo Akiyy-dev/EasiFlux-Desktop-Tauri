@@ -6,7 +6,7 @@ import PluginMarketplacePage from '../../src/components/plugins/PluginMarketplac
 import { usePluginCommandResult } from '../../src/composables/usePluginCommandResult'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import { usePluginStore } from '../../src/stores/plugin'
-import type { PluginCatalogItem } from '../../src/types/plugin'
+import type { PluginCatalogItem, PluginCommandExecution } from '../../src/types/plugin'
 
 vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
 
@@ -65,6 +65,10 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
+function infoText(execution: PluginCommandExecution | null): string | null {
+  return execution?.actionId === 'host.showInfo' ? execution.info.text : null
+}
+
 beforeEach(() => {
   vi.resetAllMocks()
   setActivePinia(createPinia())
@@ -104,8 +108,8 @@ describe('declarative commands with real service and store', () => {
       ['com.example.second', 'guide.overview', 'Second guide'],
     ])
     expect(store.availableCommands.every((command) => !('text' in command))).toBe(true)
-    expect(store.runCommand('com.example.guide', 'guide.overview')?.text).toBe('Guide content')
-    expect(store.runCommand('com.example.second', 'guide.overview')?.text).toBe('Second content')
+    expect(infoText(store.runCommand('com.example.guide', 'guide.overview'))).toBe('Guide content')
+    expect(infoText(store.runCommand('com.example.second', 'guide.overview'))).toBe('Second content')
 
     const disable = deferred()
     vi.mocked(tauriInvoke).mockReturnValueOnce(disable.promise)
@@ -183,7 +187,7 @@ describe('declarative commands with real service and store', () => {
     expect(store.runCommand('com.example.guide', 'guide.overview')).toBeNull()
     vi.mocked(tauriInvoke).mockResolvedValueOnce(mutation('enabled'))
     expect(await store.setEnabled('com.example.guide', true)).toBe(true)
-    expect(store.runCommand('com.example.guide', 'guide.overview')?.text).toBe('Read-only guide')
+    expect(infoText(store.runCommand('com.example.guide', 'guide.overview'))).toBe('Read-only guide')
     expect(store.runCommand('com.other.guide', 'guide.overview')).toBeNull()
     expect(store.runCommand('com.example.guide', 'guide.missing')).toBeNull()
     const disable = deferred()
@@ -195,7 +199,7 @@ describe('declarative commands with real service and store', () => {
     expect(store.runCommand('com.example.guide', 'guide.overview')).toBeNull()
     vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot('enabled', '2'))
     await store.retry()
-    expect(store.runCommand('com.example.guide', 'guide.overview')?.text).toBe('Read-only guide')
+    expect(infoText(store.runCommand('com.example.guide', 'guide.overview'))).toBe('Read-only guide')
     // Removal confirmation owns a deep copy, not an emptied or mutable contribution list.
     vi.mocked(tauriInvoke).mockResolvedValueOnce(mutation('disabled', '3'))
     await store.setEnabled('com.example.guide', false)
@@ -268,7 +272,7 @@ describe('declarative commands with real service and store', () => {
     expect(store.runCommand('com.example.guide', 'guide.overview')).toBeNull()
     vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot('enabled', '1', '2', 'Old request replacement'))
     await store.retry()
-    expect(store.runCommand('com.example.guide', 'guide.overview')?.text).toBe('Old request replacement')
+    expect(infoText(store.runCommand('com.example.guide', 'guide.overview'))).toBe('Old request replacement')
   })
 
   it('cannot authorize from a reload while an import is in flight, or by dismissing an unknown import', async () => {

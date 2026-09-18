@@ -19,7 +19,7 @@ import type {
   PluginCatalogItem,
   PluginCatalogSnapshot,
   PluginCommandContribution,
-  PluginCommandInfo,
+  PluginCommandExecution,
   PluginCommandSummary,
   PluginLocalDiscoverySummary,
   PluginStatus,
@@ -66,17 +66,28 @@ function hasSameManagedOwnership(
 }
 
 function cloneCatalogItem(plugin: PluginCatalogItem): PluginCatalogItem {
-  return {
-    ...plugin,
-    manifest: plugin.manifest.schemaVersion === 2
+  const manifest = plugin.manifest.schemaVersion === 1
+    ? { ...plugin.manifest, contributions: [] as [], requestedCapabilities: [] as [] }
+    : plugin.manifest.schemaVersion === 2
       ? {
           ...plugin.manifest,
           contributions: plugin.manifest.contributions.map((command) => ({
             ...command, params: { ...command.params },
           })),
-          requestedCapabilities: [],
+          requestedCapabilities: [] as [],
         }
-      : { ...plugin.manifest, contributions: [], requestedCapabilities: [] },
+      : {
+          ...plugin.manifest,
+          contributions: plugin.manifest.contributions.map((command): PluginCommandContribution => (
+            command.actionId === 'host.showInfo'
+              ? { ...command, params: { ...command.params } }
+              : { ...command, params: { ...command.params } }
+          )),
+          requestedCapabilities: [] as [],
+        }
+  return {
+    ...plugin,
+    manifest,
     grantedCapabilities: [],
   }
 }
@@ -143,40 +154,63 @@ export const usePluginStore = defineStore('plugin', () => {
   } | null {
     if (!commandsAvailable.value) return null
     const plugin = catalog.value.find((candidate) => candidate.manifest.id === pluginId)
-    if (!plugin || plugin.source !== 'localDeclarative' || plugin.manifest.schemaVersion !== 2
+    if (!plugin || plugin.source !== 'localDeclarative' || plugin.manifest.schemaVersion === 1
       || plugin.status !== 'enabled' || !plugin.canToggle
       || plugin.toggleBlockReasonCode !== null || plugin.statusReasonCode !== null) return null
     const command = plugin.manifest.contributions.find(
       (candidate) => candidate.contributionId === contributionId,
     )
-    if (!command || command.kind !== 'command' || command.actionId !== 'host.showInfo') return null
+    if (!command || command.kind !== 'command') return null
     return { plugin, command }
   }
 
   const availableCommands = computed<PluginCommandSummary[]>(() => {
     if (!commandsAvailable.value) return []
-    return catalog.value.flatMap((plugin) => {
-      if (plugin.manifest.schemaVersion !== 2) return []
-      return plugin.manifest.contributions.flatMap((command) => {
+    const summaries: PluginCommandSummary[] = []
+    for (const plugin of catalog.value) {
+      if (plugin.manifest.schemaVersion === 1) continue
+      for (const command of plugin.manifest.contributions) {
         const selected = selectAvailableCommand(plugin.manifest.id, command.contributionId)
-        if (!selected) return []
-        return [{
+        if (!selected) continue
+        const base = {
           pluginId: selected.plugin.manifest.id,
           pluginName: selected.plugin.manifest.name,
           contributionId: selected.command.contributionId,
           title: selected.command.title,
-        }]
-      })
-    })
+        }
+        if (selected.command.actionId === 'host.showInfo') {
+          summaries.push({ ...base, actionId: 'host.showInfo' })
+        } else {
+          summaries.push({
+            ...base,
+            actionId: 'host.openPage',
+            destination: selected.command.params.destination,
+          })
+        }
+      }
+    }
+    return summaries
   })
 
-  function runCommand(pluginId: string, contributionId: string): PluginCommandInfo | null {
+  function runCommand(pluginId: string, contributionId: string): PluginCommandExecution | null {
     const selected = selectAvailableCommand(pluginId, contributionId)
     if (!selected) return null
     const { plugin, command } = selected
+    if (command.actionId === 'host.showInfo') {
+      return {
+        actionId: 'host.showInfo',
+        info: {
+          pluginId, pluginName: plugin.manifest.name, contributionId,
+          title: command.params.title, text: command.params.text,
+        },
+      }
+    }
     return {
-      pluginId, pluginName: plugin.manifest.name, contributionId,
-      title: command.params.title, text: command.params.text,
+      actionId: 'host.openPage',
+      pluginId,
+      pluginName: plugin.manifest.name,
+      contributionId,
+      destination: command.params.destination,
     }
   }
 

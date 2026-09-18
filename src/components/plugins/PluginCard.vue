@@ -131,8 +131,10 @@ function requestRemoval(event: RemovalClickEvent): void {
     </dl>
 
     <p v-if="plugin.source === 'localDeclarative'" class="plugin-card__local-note">
-      {{ plugin.manifest.schemaVersion === 2
-        ? '启用后提供只读命令，不会运行插件代码'
+      {{ plugin.manifest.schemaVersion !== 1
+        ? plugin.manifest.schemaVersion === 3
+          ? '启用后可显示信息或请求宿主打开白名单页面，不会运行插件代码'
+          : '启用后提供只读命令，不会运行插件代码'
         : '启用仅记录宿主偏好，不会运行插件代码' }}
     </p>
 

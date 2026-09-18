@@ -77,6 +77,27 @@ describe('PluginCard', () => {
     expect(control.element.checked).toBe(false)
   })
 
+  it('discloses the bounded v3 host actions without implying plugin code execution', () => {
+    const wrapper = mountCard(pluginFixture('enabled', {
+      source: 'localDeclarative',
+      management: 'external',
+      manifest: {
+        ...pluginFixture().manifest,
+        schemaVersion: 3,
+        contributions: [{
+          kind: 'command',
+          contributionId: 'workspace.charts',
+          title: 'Open charts',
+          actionId: 'host.openPage',
+          params: { destination: 'charts' },
+        }],
+      },
+    }))
+
+    expect(wrapper.text()).toContain('显示信息或请求宿主打开白名单页面')
+    expect(wrapper.text()).toContain('不会运行插件代码')
+  })
+
   it.each([
     ['enabled', '已启用', true],
     ['disabled', '已停用', false],

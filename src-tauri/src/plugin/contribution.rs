@@ -27,6 +27,8 @@ impl<'de> Deserialize<'de> for PluginContributionKind {
 pub enum PluginCommandActionId {
     #[serde(rename = "host.showInfo")]
     HostShowInfo,
+    #[serde(rename = "host.openPage")]
+    HostOpenPage,
 }
 
 impl<'de> Deserialize<'de> for PluginCommandActionId {
@@ -36,7 +38,54 @@ impl<'de> Deserialize<'de> for PluginCommandActionId {
     {
         match String::deserialize(deserializer)?.as_str() {
             "host.showInfo" => Ok(Self::HostShowInfo),
-            value => Err(serde::de::Error::unknown_variant(value, &["host.showInfo"])),
+            "host.openPage" => Ok(Self::HostOpenPage),
+            value => Err(serde::de::Error::unknown_variant(
+                value,
+                &["host.showInfo", "host.openPage"],
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum PluginPageDestination {
+    #[serde(rename = "home")]
+    Home,
+    #[serde(rename = "trading")]
+    Trading,
+    #[serde(rename = "charts")]
+    Charts,
+    #[serde(rename = "settings.general")]
+    SettingsGeneral,
+    #[serde(rename = "settings.notifications")]
+    SettingsNotifications,
+    #[serde(rename = "settings.about")]
+    SettingsAbout,
+}
+
+impl<'de> Deserialize<'de> for PluginPageDestination {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "home" => Ok(Self::Home),
+            "trading" => Ok(Self::Trading),
+            "charts" => Ok(Self::Charts),
+            "settings.general" => Ok(Self::SettingsGeneral),
+            "settings.notifications" => Ok(Self::SettingsNotifications),
+            "settings.about" => Ok(Self::SettingsAbout),
+            value => Err(serde::de::Error::unknown_variant(
+                value,
+                &[
+                    "home",
+                    "trading",
+                    "charts",
+                    "settings.general",
+                    "settings.notifications",
+                    "settings.about",
+                ],
+            )),
         }
     }
 }
@@ -83,12 +132,43 @@ impl PluginInfoParams {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PluginOpenPageParams {
+    pub destination: PluginPageDestination,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginOpenPageParamsWire {
+    destination: PluginPageDestination,
+}
+
+impl<'de> Deserialize<'de> for PluginOpenPageParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = deserialize_object::<D, PluginOpenPageParamsWire>(deserializer)?;
+        Ok(Self {
+            destination: wire.destination,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PluginCommandParams {
+    ShowInfo(PluginInfoParams),
+    OpenPage(PluginOpenPageParams),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginCommandContribution {
     pub kind: PluginContributionKind,
     pub contribution_id: PluginId,
     pub title: String,
     pub action_id: PluginCommandActionId,
-    pub params: PluginInfoParams,
+    pub params: PluginCommandParams,
 }
 
 #[derive(Deserialize)]
@@ -98,7 +178,7 @@ struct PluginCommandContributionWire {
     contribution_id: PluginId,
     title: String,
     action_id: PluginCommandActionId,
-    params: PluginInfoParams,
+    params: PluginCommandParams,
 }
 
 impl<'de> Deserialize<'de> for PluginCommandContribution {
@@ -122,7 +202,13 @@ impl<'de> Deserialize<'de> for PluginCommandContribution {
 impl PluginCommandContribution {
     pub fn validate(&self) -> Result<(), String> {
         validate_display_text("command title", &self.title, MAX_COMMAND_TITLE_LENGTH)?;
-        self.params.validate()
+        match (&self.action_id, &self.params) {
+            (PluginCommandActionId::HostShowInfo, PluginCommandParams::ShowInfo(params)) => {
+                params.validate()
+            }
+            (PluginCommandActionId::HostOpenPage, PluginCommandParams::OpenPage(_)) => Ok(()),
+            _ => Err("plugin command action does not match params".into()),
+        }
     }
 }
 
@@ -133,6 +219,7 @@ mod tests {
     use serde_json::{json, Value};
 
     const VALID: &str = r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}"#;
+    const VALID_NAVIGATION: &str = r#"{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":{"destination":"charts"}}"#;
 
     fn manifest(schema_version: u32, contributions: Vec<Value>) -> Value {
         json!({
@@ -172,6 +259,55 @@ mod tests {
         }
     }
 
+    // Catches accepting navigation without the v3 typed action/parameter contract.
+    #[test]
+    fn contribution_accepts_allowlisted_navigation_and_rejects_inexact_navigation_params() {
+        serde_json::from_str::<PluginCommandContribution>(VALID_NAVIGATION).unwrap();
+
+        let invalid = [
+            r#"{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":{"destination":"settings.account"}}"#,
+            r#"{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":{"destination":"charts","title":"Mixed"}}"#,
+            r#"{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":["charts"]}"#,
+            r#"{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":{"destination":"charts","destination":"trading"}}"#,
+            r#"{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":{"destination":{"page":"charts"}}}"#,
+            r#"{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":{"title":"Guide","text":"Read-only guide"}}"#,
+            r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"destination":"charts"}}"#,
+        ];
+        for document in invalid {
+            assert!(
+                serde_json::from_str::<PluginCommandContribution>(document).is_err(),
+                "accepted {document}"
+            );
+        }
+    }
+
+    // Catches schema v3 admission drift or permitting v2 to use the navigation action.
+    #[test]
+    fn manifest_v3_accepts_mixed_commands_but_v2_rejects_navigation() {
+        let info: Value = serde_json::from_str(VALID).unwrap();
+        let navigation: Value = serde_json::from_str(VALID_NAVIGATION).unwrap();
+        serde_json::from_value::<PluginManifestV1>(manifest(3, vec![navigation.clone(), info]))
+            .unwrap();
+
+        assert!(serde_json::from_value::<PluginManifestV1>(manifest(2, vec![navigation])).is_err());
+    }
+
+    // Keeps the shipped author example on the same strict production deserializer path.
+    #[test]
+    fn workspace_shortcuts_example_is_a_valid_v3_manifest() {
+        let manifest: PluginManifestV1 = serde_json::from_str(include_str!(
+            "../../../examples/plugins/workspace-shortcuts/manifest.json"
+        ))
+        .unwrap();
+
+        assert_eq!(manifest.schema_version, 3);
+        assert_eq!(
+            manifest.id.as_str(),
+            "com.easiflux.examples.workspace-shortcuts"
+        );
+        assert_eq!(manifest.contributions.len(), 4);
+    }
+
     // Catches character-count limits, whitespace-only text, or skipping trusted validation.
     #[test]
     fn contribution_text_uses_utf8_byte_limits_and_existing_blank_rule() {
@@ -207,7 +343,10 @@ mod tests {
         }
 
         let mut trusted: PluginCommandContribution = serde_json::from_str(VALID).unwrap();
-        trusted.params.text = "\u{feff}".to_owned();
+        let PluginCommandParams::ShowInfo(params) = &mut trusted.params else {
+            panic!("expected showInfo params");
+        };
+        params.text = "\u{feff}".to_owned();
         assert!(trusted.validate().is_err());
     }
 

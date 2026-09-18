@@ -12,6 +12,7 @@ import type {
   PluginLocalDiscoverySummary,
   PluginManifest,
   PluginCommandContribution,
+  PluginPageDestination,
   PluginManagement,
   PluginStatus,
   PrepareLocalManifestImportResult,
@@ -305,25 +306,45 @@ function isSemVer(value: string): boolean {
     ))
 }
 
-function parseCommand(value: unknown): PluginCommandContribution {
+const PLUGIN_PAGE_DESTINATIONS: readonly PluginPageDestination[] = [
+  'home',
+  'trading',
+  'charts',
+  'settings.general',
+  'settings.notifications',
+  'settings.about',
+]
+
+function parseCommand(value: unknown, schemaVersion: 2 | 3): PluginCommandContribution {
   const command = requireExactObject(value, ['kind', 'contributionId', 'title', 'actionId', 'params'])
-  if (command.kind !== 'command' || command.actionId !== 'host.showInfo') invalidResponse()
-  const params = requireExactObject(command.params, ['title', 'text'])
+  if (command.kind !== 'command') invalidResponse()
+  const contributionId = requireReverseDomainId(command.contributionId)
+  const title = requireDisplayText(command.title, 80)
+  if (command.actionId === 'host.showInfo') {
+    const params = requireExactObject(command.params, ['title', 'text'])
+    return {
+      kind: 'command', contributionId, title, actionId: 'host.showInfo',
+      params: {
+        title: requireDisplayText(params.title, 80),
+        text: requireDisplayText(params.text, 2000),
+      },
+    }
+  }
+  if (schemaVersion !== 3 || command.actionId !== 'host.openPage') invalidResponse()
+  const params = requireExactObject(command.params, ['destination'])
+  const destination = requireString(params.destination)
+  if (!PLUGIN_PAGE_DESTINATIONS.includes(destination as PluginPageDestination)) invalidResponse()
   return {
-    kind: 'command',
-    contributionId: requireReverseDomainId(command.contributionId),
-    title: requireDisplayText(command.title, 80),
-    actionId: 'host.showInfo',
-    params: {
-      title: requireDisplayText(params.title, 80),
-      text: requireDisplayText(params.text, 2000),
-    },
+    kind: 'command', contributionId, title, actionId: 'host.openPage',
+    params: { destination: destination as PluginPageDestination },
   }
 }
 
 function parseManifest(value: unknown): PluginManifest {
   const manifest = requireExactObject(value, MANIFEST_KEYS)
-  if (manifest.schemaVersion !== 1 && manifest.schemaVersion !== 2) invalidResponse()
+  if (manifest.schemaVersion !== 1
+    && manifest.schemaVersion !== 2
+    && manifest.schemaVersion !== 3) invalidResponse()
   const id = requireReverseDomainId(manifest.id)
   const publisherId = requireReverseDomainId(manifest.publisherId)
   const publisher = requireDisplayText(manifest.publisher, 80)
@@ -346,11 +367,12 @@ function parseManifest(value: unknown): PluginManifest {
   }
   if (!Array.isArray(manifest.contributions)
     || manifest.contributions.length < 1 || manifest.contributions.length > 16) invalidResponse()
-  const contributions = manifest.contributions.map(parseCommand)
+  const schemaVersion = manifest.schemaVersion
+  const contributions = manifest.contributions.map((command) => parseCommand(command, schemaVersion))
   if (new Set(contributions.map((command) => command.contributionId)).size !== contributions.length) {
     invalidResponse()
   }
-  return { schemaVersion: 2, ...metadata, contributions, requestedCapabilities: [] }
+  return { schemaVersion, ...metadata, contributions, requestedCapabilities: [] } as PluginManifest
 }
 
 function parseReason(value: unknown): PluginAvailabilityReason | null {
@@ -381,8 +403,8 @@ function parseManagement(value: unknown): PluginManagement {
 function parseCatalogItem(value: unknown): PluginCatalogItem {
   const item = requireExactObject(value, ITEM_KEYS)
   const manifest = parseManifest(item.manifest)
-  if (manifest.schemaVersion === 2 && item.source !== 'localDeclarative') invalidResponse()
   if (item.source !== 'builtIn' && item.source !== 'localDeclarative') invalidResponse()
+  if (manifest.schemaVersion !== 1 && item.source !== 'localDeclarative') invalidResponse()
   const status = parseStatus(item.status)
   const statusReasonCode = parseReason(item.statusReasonCode)
   const management = parseManagement(item.management)

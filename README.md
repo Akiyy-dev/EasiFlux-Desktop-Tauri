@@ -67,6 +67,15 @@ tests/               前端与 Rust 测试
 - 用户配置：`%APPDATA%/EasiFlux Desktop/config.toml`（与旧版客户端 schema 兼容）
 - API 凭据：系统 Keyring（service 名 `easiflux_desktop_tauri`）
 
+## 本地插件
+
+支持单文件清单导入、启用/停用、受管副本移除和命令工作台。v2 清单提供只读文本，Phase 1F 的 v3 清单增加固定页面快捷入口；不是在线市场或脚本运行时。
+
+- [插件作者指南](docs/plugin-authoring.md)
+- [本地清单格式与安全边界](docs/plugin-local-manifests.md)
+- [只读指南示例（v2）](examples/plugins/workspace-guide/README.md)
+- [工作区快捷入口示例（v3，需要包含 Phase 1F 的构建）](examples/plugins/workspace-shortcuts/README.md)
+
 ## 版本与发布
 
 本项目使用 [release-please](https://github.com/googleapis/release-please) 管理版本与变更日志。提交请遵循 [Conventional Commits](https://www.conventionalcommits.org/) 规范，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
