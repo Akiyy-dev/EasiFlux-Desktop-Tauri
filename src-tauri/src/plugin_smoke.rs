@@ -559,6 +559,10 @@ mod tests {
                 .is_none());
         }
         for command in [
+            "get_config",
+            "list_account_profiles",
+            "list_notifications",
+            "place_order",
             "plugin:window|destroy",
             "plugin:opener|open_url",
             "plugin:dialog|open",
