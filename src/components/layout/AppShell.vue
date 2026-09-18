@@ -11,6 +11,8 @@ import PluginMarketplacePage from '../plugins/PluginMarketplacePage.vue'
 import { useChartWorkspaceAutosaveHost } from '../../composables/useChartWorkspaceAutosaveHost'
 import { flushActiveChartWorkspace } from '../../services/chartWorkspaceFlushRegistry'
 import { reportError } from '../../services/errorService'
+import { pluginNavigationTarget } from '../../services/pluginNavigation'
+import { usePluginStore } from '../../stores/plugin'
 import type {
   AccountSettingsSection,
   HomeSection,
@@ -36,6 +38,7 @@ const settingsTarget = ref({
   accountSection: 'api' as AccountSettingsSection,
 })
 const sidebarCollapsed = ref(false)
+const pluginStore = usePluginStore()
 
 useChartWorkspaceAutosaveHost()
 const sidebarTarget = computed<SidebarTarget | null>(() => {
@@ -151,6 +154,14 @@ function handleNotificationAction(action: NotificationUiAction): void {
       focusNotificationSettingsHeading()
   }
 }
+
+function handlePluginOpenPage(intent: { pluginId: string; contributionId: string }): void {
+  if (activePage.value !== 'plugins') return
+  const command = pluginStore.runCommand(intent.pluginId, intent.contributionId)
+  if (command?.actionId !== 'host.openPage') return
+  const target = pluginNavigationTarget(command.destination)
+  if (target) void navigateTo(target)
+}
 </script>
 
 <template>
@@ -194,6 +205,8 @@ function handleNotificationAction(action: NotificationUiAction): void {
         <PluginMarketplacePage
           v-if="activePage === 'plugins'"
           :section="activePluginSection"
+          navigation-available
+          @open-page="handlePluginOpenPage"
         />
       </section>
     </div>

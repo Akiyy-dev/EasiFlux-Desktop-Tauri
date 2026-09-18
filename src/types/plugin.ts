@@ -36,7 +36,15 @@ export interface PluginManifestV1 {
   requestedCapabilities: []
 }
 
-export interface PluginCommandContribution {
+export type PluginPageDestination =
+  | 'home'
+  | 'trading'
+  | 'charts'
+  | 'settings.general'
+  | 'settings.notifications'
+  | 'settings.about'
+
+export interface PluginShowInfoCommandContribution {
   kind: 'command'
   contributionId: string
   title: string
@@ -44,12 +52,29 @@ export interface PluginCommandContribution {
   params: { title: string; text: string }
 }
 
+export interface PluginOpenPageCommandContribution {
+  kind: 'command'
+  contributionId: string
+  title: string
+  actionId: 'host.openPage'
+  params: { destination: PluginPageDestination }
+}
+
+export type PluginCommandContribution =
+  | PluginShowInfoCommandContribution
+  | PluginOpenPageCommandContribution
+
 export interface PluginManifestV2 extends Omit<PluginManifestV1, 'schemaVersion' | 'contributions'> {
   schemaVersion: 2
+  contributions: PluginShowInfoCommandContribution[]
+}
+
+export interface PluginManifestV3 extends Omit<PluginManifestV1, 'schemaVersion' | 'contributions'> {
+  schemaVersion: 3
   contributions: PluginCommandContribution[]
 }
 
-export type PluginManifest = PluginManifestV1 | PluginManifestV2
+export type PluginManifest = PluginManifestV1 | PluginManifestV2 | PluginManifestV3
 
 export interface PluginCommandInfo {
   pluginId: string
@@ -59,12 +84,29 @@ export interface PluginCommandInfo {
   text: string
 }
 
-export interface PluginCommandSummary {
+interface PluginCommandSummaryBase {
   pluginId: string
   pluginName: string
   contributionId: string
   title: string
 }
+
+export type PluginCommandSummary =
+  | (PluginCommandSummaryBase & { actionId: 'host.showInfo' })
+  | (PluginCommandSummaryBase & {
+      actionId: 'host.openPage'
+      destination: PluginPageDestination
+    })
+
+export type PluginCommandExecution =
+  | { actionId: 'host.showInfo'; info: PluginCommandInfo }
+  | {
+      actionId: 'host.openPage'
+      pluginId: string
+      pluginName: string
+      contributionId: string
+      destination: PluginPageDestination
+    }
 
 export interface PluginCatalogItem {
   manifest: PluginManifest

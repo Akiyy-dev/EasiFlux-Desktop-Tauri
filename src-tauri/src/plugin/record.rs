@@ -189,6 +189,15 @@ mod tests {
         assert!(PluginRecord::built_in(manifest).is_err());
     }
 
+    // Catches the new v3 action surface inheriting the unhashed built-in trust path.
+    #[test]
+    fn built_in_record_rejects_v3_manifests() {
+        let json = r#"{"schemaVersion":3,"id":"com.example.shortcuts","publisherId":"com.example","publisher":"Example","name":"Shortcuts","description":"Workspace shortcuts","version":"1.0.0","contributions":[{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":{"destination":"charts"}}],"requestedCapabilities":[]}"#;
+        let manifest: PluginManifestV1 = serde_json::from_str(json).unwrap();
+
+        assert!(PluginRecord::built_in(manifest).is_err());
+    }
+
     // Catches any change to the pre-v2 canonical identity envelope.
     #[test]
     fn v1_canonical_bytes_and_digest_are_golden() {
@@ -213,12 +222,21 @@ mod tests {
         let reordered =
             PluginRecord::local_declarative(serde_json::from_str(reordered).unwrap()).unwrap();
         assert_eq!(
+            first.canonical_manifest_bytes().unwrap(),
+            br#"{"schemaVersion":2,"id":"com.example.guide","publisherId":"com.example","publisher":"Example","name":"Guide","description":"Read-only guide","version":"1.0.0","contributions":[{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}],"requestedCapabilities":[]}"#
+        );
+        assert_eq!(
             first.approval_fingerprint(),
             reordered.approval_fingerprint()
         );
 
         let mut changed = reordered.manifest().clone();
-        changed.contributions[0].params.text = "Changed guide".into();
+        let crate::plugin::contribution::PluginCommandParams::ShowInfo(params) =
+            &mut changed.contributions[0].params
+        else {
+            panic!("expected showInfo params");
+        };
+        params.text = "Changed guide".into();
         let changed = PluginRecord::local_declarative(changed).unwrap();
         assert_ne!(first.approval_fingerprint(), changed.approval_fingerprint());
     }

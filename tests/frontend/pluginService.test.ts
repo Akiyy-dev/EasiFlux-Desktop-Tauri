@@ -100,6 +100,79 @@ describe('v2 command manifests', () => {
   })
 })
 
+describe('v3 host navigation manifests', () => {
+  function infoCommand() {
+    return {
+      kind: 'command', contributionId: 'guide.overview', title: 'Show guide',
+      actionId: 'host.showInfo', params: { title: 'Guide', text: 'Read-only guide' },
+    }
+  }
+
+  function navigationCommand(destination: unknown = 'charts') {
+    return {
+      kind: 'command', contributionId: 'workspace.charts', title: 'Open charts',
+      actionId: 'host.openPage', params: { destination },
+    }
+  }
+
+  function localManifest(schemaVersion: 2 | 3, contributions: unknown): WireObject {
+    return {
+      ...validItem(), source: 'localDeclarative', management: 'external',
+      manifest: { ...validManifest(), schemaVersion, contributions },
+    }
+  }
+
+  it('accepts mixed v3 commands and normalizes action-specific parameter keys', async () => {
+    const navigation = navigationCommand('settings.notifications')
+    const wire = localManifest(3, [
+      { ...navigation, params: { destination: 'settings.notifications' } },
+      infoCommand(),
+    ])
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ ...validSnapshot(), plugins: [wire] })
+
+    const parsed = await getPluginCatalog()
+
+    expect(parsed.plugins[0].manifest).toEqual({
+      ...validManifest(),
+      schemaVersion: 3,
+      contributions: [navigation, infoCommand()],
+    })
+  })
+
+  it('rejects navigation in v2 and v3 navigation on built-ins', async () => {
+    for (const plugin of [
+      localManifest(2, [navigationCommand()]),
+      { ...localManifest(3, [navigationCommand()]), source: 'builtIn', management: 'builtIn' },
+    ]) {
+      vi.mocked(tauriInvoke).mockResolvedValueOnce({ ...validSnapshot(), plugins: [plugin] })
+      await expect(getPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+    }
+  })
+
+  it.each([
+    'https://example.com', 'settings.account', 'unknown', 7, null, ['charts'], { page: 'charts' },
+  ])('rejects an invalid navigation destination %j', async (destination) => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      ...validSnapshot(), plugins: [localManifest(3, [navigationCommand(destination)])],
+    })
+    await expect(getPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+
+  it.each([
+    { ...navigationCommand(), params: { destination: 'charts', title: 'Mixed' } },
+    { ...navigationCommand(), params: ['charts'] },
+    { ...navigationCommand(), params: { title: 'Guide', text: 'Read-only guide' } },
+    { ...infoCommand(), params: { destination: 'charts' } },
+    { ...navigationCommand(), actionId: { 'host.openPage': null } },
+    { ...navigationCommand(), actionId: 'host.navigate' },
+  ])('rejects mismatched or inexact v3 action parameters %#', async (command) => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      ...validSnapshot(), plugins: [localManifest(3, [command])],
+    })
+    await expect(getPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+})
+
 function validManifest(
   id = 'com.easiflux.analytics',
   publisherId = 'com.easiflux',

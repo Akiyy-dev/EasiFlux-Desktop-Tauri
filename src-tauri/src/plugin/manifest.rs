@@ -4,11 +4,12 @@ use semver::Version;
 use serde::de::{value::MapAccessDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::contribution::PluginCommandContribution;
+use super::contribution::{PluginCommandActionId, PluginCommandContribution};
 
 pub const APPROVAL_FINGERPRINT_NONE: &str = "v1:none";
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V1: u32 = 1;
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V2: u32 = 2;
+pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V3: u32 = 3;
 
 const CATALOG_TRANSPORT_SCHEMA_VERSION: u8 = 3;
 
@@ -158,10 +159,17 @@ impl PluginManifest {
     pub fn validate(&self) -> Result<(), String> {
         match self.schema_version {
             PLUGIN_MANIFEST_SCHEMA_VERSION_V1 if self.contributions.is_empty() => {}
-            PLUGIN_MANIFEST_SCHEMA_VERSION_V2 if (1..=16).contains(&self.contributions.len()) => {
+            version @ (PLUGIN_MANIFEST_SCHEMA_VERSION_V2 | PLUGIN_MANIFEST_SCHEMA_VERSION_V3)
+                if (1..=16).contains(&self.contributions.len()) =>
+            {
                 let mut contribution_ids = std::collections::BTreeSet::new();
                 for contribution in &self.contributions {
                     contribution.validate()?;
+                    if version == PLUGIN_MANIFEST_SCHEMA_VERSION_V2
+                        && contribution.action_id != PluginCommandActionId::HostShowInfo
+                    {
+                        return Err("plugin manifest v2 only supports host.showInfo".into());
+                    }
                     if !contribution_ids.insert(&contribution.contribution_id) {
                         return Err("duplicate plugin contribution id".into());
                     }
@@ -559,7 +567,10 @@ impl PluginCatalogItem {
         }
     }
     fn validate(&self) -> Result<(), &'static str> {
-        if (self.source == PluginSource::BuiltIn) != (self.management == PluginManagement::BuiltIn)
+        if (self.source == PluginSource::BuiltIn
+            && self.manifest.schema_version != PLUGIN_MANIFEST_SCHEMA_VERSION_V1)
+            || (self.source == PluginSource::BuiltIn)
+                != (self.management == PluginManagement::BuiltIn)
             || (self.status == PluginStatus::Blocked) != self.status_reason_code.is_some()
             || self.can_toggle
                 != (self.status != PluginStatus::Blocked && self.toggle_block_reason_code.is_none())

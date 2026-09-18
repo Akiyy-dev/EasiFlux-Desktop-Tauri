@@ -58,6 +58,36 @@ describe('PluginImportDialog', () => {
     wrapper.unmount()
   })
 
+  it('previews v3 actions with host-owned navigation labels', () => {
+    const wrapper = mount(PluginImportDialog, {
+      props: {
+        preview: {
+          ...readyPreview,
+          manifest: {
+            ...readyPreview.manifest, schemaVersion: 3,
+            contributions: [
+              {
+                kind: 'command', contributionId: 'workspace.charts', title: '作者标题',
+                actionId: 'host.openPage', params: { destination: 'charts' },
+              },
+              {
+                kind: 'command', contributionId: 'guide.overview', title: '说明',
+                actionId: 'host.showInfo', params: { title: 'Info', text: 'Read only' },
+              },
+            ],
+          },
+        },
+        committing: false, stale: false,
+      },
+    })
+
+    const preview = wrapper.get('[data-testid="plugin-import-commands"]')
+    expect(preview.text()).toContain('打开页面：图表工作区')
+    expect(preview.text()).toContain('显示信息：说明')
+    expect(wrapper.text()).toContain('由宿主打开白名单页面')
+    wrapper.unmount()
+  })
+
   beforeEach(() => {
     showModalDescriptor = Object.getOwnPropertyDescriptor(
       HTMLDialogElement.prototype,

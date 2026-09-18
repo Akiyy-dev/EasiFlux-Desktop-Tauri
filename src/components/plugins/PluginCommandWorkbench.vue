@@ -2,11 +2,21 @@
 import { computed, ref, watch } from 'vue'
 import { usePluginCommandResult } from '../../composables/usePluginCommandResult'
 import { usePluginStore } from '../../stores/plugin'
+import { pluginPageLabel } from '../../services/pluginNavigation'
 import PluginCommandResult from './PluginCommandResult.vue'
 
+const props = withDefaults(defineProps<{ navigationAvailable?: boolean }>(), {
+  navigationAvailable: false,
+})
+const emit = defineEmits<{
+  'open-page': [intent: { pluginId: string; contributionId: string }]
+}>()
 const store = usePluginStore()
 const query = ref('')
-const { result, run, clear } = usePluginCommandResult()
+const { result, run, clear } = usePluginCommandResult(
+  undefined,
+  (intent) => emit('open-page', intent),
+)
 
 const matches = computed(() => {
   const needle = query.value.trim().toLowerCase()
@@ -30,7 +40,7 @@ watch(query, clear, { flush: 'sync' })
         <h2 id="plugin-command-workbench-title">
           命令工作台
         </h2>
-        <p>集中查找当前已启用插件提供的只读命令；只有点击后才会显示信息。</p>
+        <p>集中查找当前已启用插件提供的显示信息与页面导航命令；只有点击后才会执行。</p>
       </div>
       <p
         class="plugin-command-workbench__count"
@@ -65,7 +75,7 @@ watch(query, clear, { flush: 'sync' })
       class="plugin-marketplace-page__empty"
       data-testid="plugin-command-empty"
     >
-      当前没有已启用的只读命令。启用受支持的本地声明式插件后，可在此处明确点击使用。
+      当前没有已启用的宿主命令。启用受支持的本地声明式插件后，可在此处明确点击使用。
     </p>
     <p
       v-else-if="matches.length === 0"
@@ -98,13 +108,23 @@ watch(query, clear, { flush: 'sync' })
           class="ef-btn ef-btn-secondary ef-btn-sm"
           data-testid="plugin-workbench-command"
           type="button"
-          :aria-label="`显示信息：${command.title}，插件 ${command.pluginName}（${command.pluginId}），贡献 ${command.contributionId}`"
-          @click="run(command.pluginId, command.contributionId)"
+          :disabled="command.actionId === 'host.openPage' && !props.navigationAvailable"
+          :aria-label="`${command.actionId === 'host.showInfo' ? `显示信息：${command.title}` : `打开页面：${pluginPageLabel(command.destination)}，命令 ${command.title}`}，插件 ${command.pluginName}（${command.pluginId}），贡献 ${command.contributionId}`"
+          @click="run(command.pluginId, command.contributionId, props.navigationAvailable)"
         >
-          显示信息
+          {{ command.actionId === 'host.showInfo'
+            ? '显示信息'
+            : `打开页面：${pluginPageLabel(command.destination)}` }}
         </button>
       </li>
     </ul>
+
+    <p
+      v-if="!props.navigationAvailable && store.availableCommands.some((command) => command.actionId === 'host.openPage')"
+      class="plugin-marketplace-page__empty"
+    >
+      当前宿主不提供页面导航；信息显示命令仍可使用。
+    </p>
 
     <PluginCommandResult
       v-if="result"
