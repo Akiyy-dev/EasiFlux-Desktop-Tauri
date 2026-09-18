@@ -110,6 +110,6 @@ Use normal Vite config loader (existing __dirname), approved elevated lane for d
 ## Controller handoff
 
 - [x] Update author/local-manifest docs and same-ID update example; clearly separate comparison from actual update/rollback.
-- [ ] Task-scoped review, then whole-branch review; record evidence and final merge baseline.
+- [x] Task-scoped review, then whole-branch review; record evidence and final merge baseline. The whole-branch identity-context finding was fixed and approved by a scoped re-review; see [verification](../verification/2026-09-19-plugin-update-preflight.md).
 - [ ] Publish source/tests/docs/examples to the already authorized repository as a new PR, without assuming the authorization to merge PR #37 automatically covers this new PR.
 - [ ] Report PR #37 merged and this actual next-phase scope, limitations and validation.
