@@ -1255,7 +1255,7 @@ async fn remove_import_toggle_reload_are_fifo() {
         .import_sessions
         .reserve_prepare(now)
         .unwrap()
-        .publish(PreparedManifest::parse(VALID).unwrap(), 1, now)
+        .publish(PreparedManifest::parse(VALID).unwrap(), 1, &[], now)
         .unwrap();
     let guard = fixture.runtime.operation_gate.clone().lock_owned().await;
     let mut remove = Box::pin(
@@ -1511,7 +1511,7 @@ async fn authoritative_import_prescan_can_reconcile_unresolved_removal_authority
         .import_sessions
         .reserve_prepare(now)
         .unwrap()
-        .publish(PreparedManifest::parse(VALID).unwrap(), 1, now)
+        .publish(PreparedManifest::parse(VALID).unwrap(), 1, &[], now)
         .unwrap();
     assert_eq!(
         fixture.remove().await["status"],

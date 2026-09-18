@@ -576,6 +576,7 @@ export const usePluginStore = defineStore('plugin', () => {
     if (importStatus.value !== 'preview' || !preview || importPreviewStale.value) {
       return Promise.resolve()
     }
+    if (preview.assessment.kind === 'existingId') return Promise.resolve()
 
     importStatus.value = 'committing'
     activeCommandMutations.value++

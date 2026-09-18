@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { ReadyLocalManifestImport } from '../../types/plugin'
 import { pluginPageLabel } from '../../services/pluginNavigation'
+import PluginManifestComparison from './PluginManifestComparison.vue'
 
 interface DialogControl {
   readonly open: boolean
@@ -30,6 +31,7 @@ const dialog = ref<DialogControl | null>(null)
 const cancelButton = ref<FocusControl | null>(null)
 const actionRequested = ref(false)
 let returnFocusTarget: FocusControl | null = null
+const isComparison = computed(() => props.preview.assessment.kind === 'existingId')
 
 function requestCancel(event?: { preventDefault: () => void }): void {
   event?.preventDefault()
@@ -39,7 +41,7 @@ function requestCancel(event?: { preventDefault: () => void }): void {
 }
 
 function requestConfirm(): void {
-  if (props.committing || props.stale || actionRequested.value) return
+  if (isComparison.value || props.committing || props.stale || actionRequested.value) return
   actionRequested.value = true
   emit('confirm')
 }
@@ -84,11 +86,26 @@ onUnmounted(() => {
           本地声明式清单
         </p>
         <h2 id="plugin-import-title">
-          确认导入此清单
+          {{ isComparison ? '比较现有插件清单' : '确认导入此清单' }}
         </h2>
       </header>
 
-      <dl class="plugin-import-dialog__metadata">
+      <p
+        v-if="isComparison"
+        id="plugin-import-warning"
+        class="plugin-import-dialog__warning"
+        data-testid="plugin-import-comparison-notice"
+      >
+        已发现相同插件 ID。此比较不会覆盖、更新或回滚现有插件，也不会写入插件目录；如需变更，请按文档手动处理。
+      </p>
+      <PluginManifestComparison
+        v-if="props.preview.assessment.kind === 'existingId'"
+        :current="props.preview.assessment.current"
+        :incoming="props.preview.manifest"
+        :version-relation="props.preview.assessment.versionRelation"
+      />
+
+      <dl v-if="!isComparison" class="plugin-import-dialog__metadata">
         <div>
           <dt>名称</dt>
           <dd><bdi>{{ props.preview.manifest.name }}</bdi></dd>
@@ -115,15 +132,15 @@ onUnmounted(() => {
         </div>
       </dl>
 
-      <p id="plugin-import-warning" class="plugin-import-dialog__warning">
-        发布者信息由清单作者填写，未经认证。本次只复制清单，不运行代码或授予权限。导入后默认停用，{{ props.preview.manifest.schemaVersion !== 1
+      <p v-if="!isComparison" id="plugin-import-warning" class="plugin-import-dialog__warning">
+        目录中未发现相同插件 ID；确认后将作为新清单导入。发布者信息由清单作者填写，未经认证。本次只复制清单，不运行代码或授予权限。导入后默认停用，{{ props.preview.manifest.schemaVersion !== 1
           ? props.preview.manifest.schemaVersion === 3
             ? '启用后可显示普通文本，或由宿主打开白名单页面。'
             : '启用后提供只读命令，仅由宿主显示普通文本。'
           : '启用仅记录宿主偏好。' }}
       </p>
       <div
-        v-if="props.preview.manifest.schemaVersion !== 1"
+        v-if="!isComparison && props.preview.manifest.schemaVersion !== 1"
         class="plugin-import-dialog__hint"
         data-testid="plugin-import-commands"
       >
@@ -165,16 +182,16 @@ onUnmounted(() => {
           :disabled="props.committing"
           @click="requestCancel"
         >
-          取消
+          {{ isComparison ? '关闭' : '取消' }}
         </button>
         <button
           class="ef-btn ef-btn-primary"
           data-testid="plugin-import-confirm"
           type="button"
-          :disabled="props.committing || props.stale"
+          :disabled="isComparison || props.committing || props.stale"
           @click="requestConfirm"
         >
-          确认导入
+          {{ isComparison ? '仅供比较' : '确认导入' }}
         </button>
       </footer>
     </div>

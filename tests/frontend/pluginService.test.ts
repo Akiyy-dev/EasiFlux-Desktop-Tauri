@@ -266,12 +266,13 @@ function readyImport(
   manifest: WireObject = validManifest('com.example.notes', 'com.example'),
 ): WireObject {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: 'ready',
     token: 'a'.repeat(32),
     expiresInSeconds: 300,
     catalogGeneration: '2',
     manifest,
+    assessment: { kind: 'notInCatalog' },
   }
 }
 
@@ -837,12 +838,13 @@ describe('local manifest import transport validation', () => {
   it('commits only a preview token and its bound generation', async () => {
     const manifest = validManifest('com.example.notes', 'com.example')
     const preview = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: 'ready',
       token: 'a'.repeat(32),
       expiresInSeconds: 300,
       catalogGeneration: '2',
       manifest,
+      assessment: { kind: 'notInCatalog' },
     }
     const parsed = await parseReadyThroughPrepare(preview)
     const result = notImportedResult()
@@ -918,7 +920,7 @@ describe('local manifest import transport validation', () => {
     ['array envelope', []],
     ['unknown status', { schemaVersion: 1, status: 'unknown' }],
     ['cancelled with wrong schema', { schemaVersion: 2, status: 'cancelled' }],
-    ['ready with wrong schema', { ...readyImport(), schemaVersion: 2 }],
+    ['ready with wrong schema', { ...readyImport(), schemaVersion: 1 }],
   ])('rejects a malformed prepare result: %s', async (_label, value) => {
     await expectPrepareRejected(value)
   })
@@ -939,6 +941,7 @@ describe('local manifest import transport validation', () => {
     'expiresInSeconds',
     'catalogGeneration',
     'manifest',
+    'assessment',
   ])('rejects a missing prepare-ready %s', async (key) => {
     const value = readyImport()
     delete value[key]

@@ -280,11 +280,12 @@ describe('declarative commands with real service and store', () => {
     vi.mocked(tauriInvoke).mockResolvedValueOnce(snapshot('enabled'))
     await store.load()
     const preview = {
-      schemaVersion: 1, status: 'ready', token: 'a'.repeat(32), expiresInSeconds: 300,
+      schemaVersion: 2, status: 'ready', token: 'a'.repeat(32), expiresInSeconds: 300,
       catalogGeneration: '1',
       manifest: {
         ...item().manifest, schemaVersion: 1, id: 'com.example.new', contributions: [],
       },
+      assessment: { kind: 'notInCatalog' },
     }
     vi.mocked(tauriInvoke).mockResolvedValueOnce(preview)
     await store.prepareImport()

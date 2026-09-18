@@ -5,7 +5,7 @@ import PluginImportDialog from '../../src/components/plugins/PluginImportDialog.
 import type { ReadyLocalManifestImport } from '../../src/types/plugin'
 
 const readyPreview = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   status: 'ready',
   token: 'a'.repeat(32),
   expiresInSeconds: 300,
@@ -20,6 +20,70 @@ const readyPreview = {
     version: '1.2.3',
     contributions: [],
     requestedCapabilities: [],
+  },
+  assessment: { kind: 'notInCatalog' },
+} satisfies ReadyLocalManifestImport
+
+const currentComparisonItem = {
+  manifest: {
+    schemaVersion: 3,
+    id: 'com.example.notes',
+    publisherId: 'com.example',
+    publisher: 'Example 作者',
+    name: '本地笔记',
+    description: '当前描述',
+    version: '1.0.0+old',
+    contributions: [
+      {
+        kind: 'command', contributionId: 'workspace.charts', title: '打开图表',
+        actionId: 'host.openPage', params: { destination: 'charts' },
+      },
+      {
+        kind: 'command', contributionId: 'workspace.trading', title: '打开交易',
+        actionId: 'host.openPage', params: { destination: 'trading' },
+      },
+      {
+        kind: 'command', contributionId: 'workspace.help', title: '查看说明',
+        actionId: 'host.showInfo', params: { title: '说明', text: '当前文本' },
+      },
+    ],
+    requestedCapabilities: [],
+  },
+  source: 'localDeclarative',
+  management: 'external',
+  canRemove: false,
+  toggleBlockReasonCode: null,
+  status: 'enabled',
+  statusReasonCode: null,
+  canToggle: true,
+  grantedCapabilities: [],
+} as const
+
+const comparisonPreview = {
+  ...readyPreview,
+  manifest: {
+    ...currentComparisonItem.manifest,
+    description: '候选描述',
+    version: '1.0.0+new',
+    contributions: [
+      {
+        kind: 'command', contributionId: 'workspace.help', title: '查看说明',
+        actionId: 'host.showInfo', params: { title: '说明', text: '<img src=x> 候选文本' },
+      },
+      {
+        kind: 'command', contributionId: 'workspace.charts', title: '打开首页',
+        actionId: 'host.openPage', params: { destination: 'home' },
+      },
+      {
+        kind: 'command', contributionId: 'workspace.notifications', title: '打开通知',
+        actionId: 'host.openPage', params: { destination: 'settings.notifications' },
+      },
+    ],
+  },
+  assessment: {
+    kind: 'existingId',
+    current: currentComparisonItem,
+    versionRelation: 'samePrecedence',
   },
 } satisfies ReadyLocalManifestImport
 
@@ -201,6 +265,62 @@ describe('PluginImportDialog', () => {
       .toContain('预览已失效')
     await confirm.trigger('click')
     expect(wrapper.emitted('confirm')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('renders an advisory existing-ID comparison and independently blocks confirmation', async () => {
+    const wrapper = mount(PluginImportDialog, {
+      attachTo: document.body,
+      props: { preview: comparisonPreview, committing: false, stale: false },
+    })
+    await nextTick()
+
+    expect(wrapper.get('#plugin-import-title').text()).toContain('比较现有插件清单')
+    expect(wrapper.get('[data-testid="plugin-import-comparison-notice"]').text())
+      .toMatch(/不会.*覆盖.*更新.*回滚/)
+    expect(wrapper.text()).toContain('本地声明式包 · 已发现，未执行')
+    expect(wrapper.text()).toContain('本地声明式包 · 外部放置，应用不会删除')
+    expect(wrapper.text()).toContain('已启用')
+    expect(wrapper.text()).toContain('当前描述')
+    expect(wrapper.text()).toContain('候选描述')
+    expect(wrapper.text()).toContain('1.0.0+old')
+    expect(wrapper.text()).toContain('1.0.0+new')
+    expect(wrapper.get('[data-testid="plugin-import-version-relation"]').text())
+      .toContain('版本优先级相同')
+    expect(wrapper.text()).toContain('新增命令')
+    expect(wrapper.text()).toContain('移除命令')
+    expect(wrapper.text()).toContain('变更命令')
+    expect(wrapper.text()).toContain('公共命令的相对顺序已变化')
+    expect(wrapper.text()).toContain('打开页面：首页')
+    expect(wrapper.text()).toContain('打开页面：通知设置')
+    expect(wrapper.text()).toContain('<img src=x> 候选文本')
+    expect(wrapper.find('img').exists()).toBe(false)
+    expect(wrapper.findAll('details').length).toBeGreaterThan(0)
+
+    const confirm = wrapper.get<HTMLButtonElement>('[data-testid="plugin-import-confirm"]')
+    expect(confirm.element.disabled).toBe(true)
+    expect(wrapper.get('[data-testid="plugin-import-cancel"]').text()).toBe('关闭')
+    confirm.element.disabled = false
+    await confirm.trigger('click')
+    expect(wrapper.emitted('confirm')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('states clearly when an existing-ID manifest has unchanged content', () => {
+    const preview = {
+      ...comparisonPreview,
+      manifest: currentComparisonItem.manifest,
+      assessment: {
+        ...comparisonPreview.assessment,
+        current: currentComparisonItem,
+      },
+    } satisfies ReadyLocalManifestImport
+    const wrapper = mount(PluginImportDialog, {
+      props: { preview, committing: false, stale: false },
+    })
+
+    expect(wrapper.get('[data-testid="plugin-manifest-unchanged"]').text())
+      .toContain('清单内容未变化')
     wrapper.unmount()
   })
 

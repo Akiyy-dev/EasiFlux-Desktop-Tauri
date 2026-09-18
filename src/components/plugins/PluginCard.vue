@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { PluginCatalogItem } from '../../types/plugin'
-import { pluginManagementLabel } from './pluginPresentation'
+import { pluginManagementLabel, pluginStatusLabel } from './pluginPresentation'
 
 interface RemovalOpener {
   readonly isConnected: boolean
@@ -24,18 +24,12 @@ const emit = defineEmits<{
   remove: [id: string, opener: RemovalOpener]
 }>()
 
-const statusLabels = {
-  enabled: '已启用',
-  disabled: '已停用',
-  blocked: '已阻止',
-} as const
-
 const reasonLabels = {
   stateUnavailable: '插件状态暂时不可用，请稍后重试。',
   catalogInvalid: '插件目录校验失败，暂时无法启用。',
 } as const
 
-const statusLabel = computed(() => statusLabels[props.plugin.status])
+const statusLabel = computed(() => pluginStatusLabel(props.plugin.status))
 const statusId = computed(() => `plugin-card-${props.plugin.manifest.id}-status`)
 const errorId = computed(() => `plugin-card-${props.plugin.manifest.id}-error`)
 const describedBy = computed(() => (

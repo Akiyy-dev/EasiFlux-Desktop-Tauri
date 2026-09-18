@@ -106,7 +106,8 @@ async fn run_prepare(
         (registry.catalog_snapshot(), registry.catalog_generation())
     };
     ensure_import_available(&snapshot)?;
-    let preview: ImportPreview = lease.publish(content, generation, Instant::now())?;
+    let preview: ImportPreview =
+        lease.publish(content, generation, &snapshot.plugins, Instant::now())?;
     Ok(PrepareImportResult::Ready(preview))
 }
 

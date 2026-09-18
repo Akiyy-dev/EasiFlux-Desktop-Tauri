@@ -133,12 +133,13 @@ function mutation(
 }
 
 const preview = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   status: 'ready',
   token: 'a'.repeat(32),
   expiresInSeconds: 300,
   catalogGeneration: '1',
   manifest: item('com.example.notes').manifest,
+  assessment: { kind: 'notInCatalog' },
 } satisfies ReadyLocalManifestImport
 
 function importedItem(
@@ -244,6 +245,34 @@ describe('plugin store manifest import ownership and arbitration', () => {
     expect(store.importPreviewStale).toBe(true)
     await store.commitImport()
     expect(serviceMocks.commitImport).not.toHaveBeenCalled()
+  })
+
+  it('keeps existing-ID comparison read-only before committing authority or IPC', async () => {
+    const current = managedDisabledItem()
+    const existingPreview = {
+      ...preview,
+      assessment: {
+        kind: 'existingId',
+        current,
+        versionRelation: 'incomingHigher',
+      },
+    } satisfies ReadyLocalManifestImport
+    const store = await loadedStoreWith(current)
+    serviceMocks.prepareImport.mockResolvedValueOnce(existingPreview)
+    serviceMocks.cancelImport.mockResolvedValueOnce({ schemaVersion: 1, status: 'cancelled' })
+    await store.prepareImport()
+    const catalogBefore = store.catalog
+
+    await store.commitImport()
+
+    expect(store.importStatus).toBe('preview')
+    expect(store.importPreview).toBe(existingPreview)
+    expect(store.catalog).toBe(catalogBefore)
+    expect(store.importError).toBeNull()
+    expect(serviceMocks.commitImport).not.toHaveBeenCalled()
+    await store.cancelImport()
+    expect(serviceMocks.cancelImport).toHaveBeenCalledExactlyOnceWith(existingPreview.token)
+    expect(store.catalog).toBe(catalogBefore)
   })
 
   it('late_prepare_after_view_release_cancels_returned_token', async () => {

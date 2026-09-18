@@ -2,6 +2,7 @@ import { tauriInvoke } from '../composables/useTauriCommand'
 import type {
   CancelLocalManifestImportResult,
   CommitLocalManifestImportResult,
+  ImportAssessment,
   LocalManifestImportCommitFailure,
   ManagedOwnershipSummary,
   PluginAvailability,
@@ -147,7 +148,10 @@ const PREPARE_READY_KEYS = [
   'expiresInSeconds',
   'catalogGeneration',
   'manifest',
+  'assessment',
 ] as const
+const IMPORT_ASSESSMENT_NOT_IN_CATALOG_KEYS = ['kind'] as const
+const IMPORT_ASSESSMENT_EXISTING_ID_KEYS = ['kind', 'current', 'versionRelation'] as const
 const IMPORTED_KEYS = ['schemaVersion', 'status', 'pluginId', 'snapshot'] as const
 const NOT_IMPORTED_KEYS = [
   'schemaVersion',
@@ -181,6 +185,9 @@ const IMPORT_COMMIT_FAILURES = new Set<LocalManifestImportCommitFailure>([
   'plugin_ownership_capacity_exceeded',
   'plugin_ownership_revision_exhausted',
 ])
+const IMPORT_VERSION_RELATIONS = new Set<
+  Extract<ImportAssessment, { kind: 'existingId' }>['versionRelation']
+>(['incomingLower', 'samePrecedence', 'incomingHigher'])
 
 const FALSE_ONLY_REMOVE_CODES = new Set<RemoveManagedLocalPluginFailure>([
   'plugin_catalog_stale', 'plugin_catalog_invalid', 'plugin_catalog_generation_exhausted',
@@ -541,6 +548,28 @@ function parseImportCommitFailure(value: unknown): LocalManifestImportCommitFail
   return requireMember(value, IMPORT_COMMIT_FAILURES)
 }
 
+function parseImportAssessment(
+  value: unknown,
+  incoming: PluginManifest,
+): ImportAssessment {
+  if (!isObject(value)) invalidResponse()
+  if (value.kind === 'notInCatalog') {
+    requireExactObject(value, IMPORT_ASSESSMENT_NOT_IN_CATALOG_KEYS)
+    return { kind: 'notInCatalog' }
+  }
+  if (value.kind === 'existingId') {
+    const assessment = requireExactObject(value, IMPORT_ASSESSMENT_EXISTING_ID_KEYS)
+    const current = parseCatalogItem(assessment.current)
+    if (current.manifest.id !== incoming.id) invalidResponse()
+    return {
+      kind: 'existingId',
+      current,
+      versionRelation: requireMember(assessment.versionRelation, IMPORT_VERSION_RELATIONS),
+    }
+  }
+  return invalidResponse()
+}
+
 function manifestsMatch(left: PluginManifest, right: PluginManifest): boolean {
   return left.schemaVersion === right.schemaVersion
     && left.id === right.id
@@ -565,14 +594,18 @@ function parsePrepareImport(value: unknown): PrepareLocalManifestImportResult {
 
   if (value.status === 'ready') {
     const result = requireExactObject(value, PREPARE_READY_KEYS)
-    if (result.schemaVersion !== 1 || result.expiresInSeconds !== 300) invalidResponse()
+    if (result.schemaVersion !== 2 || result.expiresInSeconds !== 300) invalidResponse()
+    const token = requireImportToken(result.token)
+    const catalogGeneration = requireCanonicalRevision(result.catalogGeneration)
+    const manifest = parseManifest(result.manifest)
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: 'ready',
-      token: requireImportToken(result.token),
+      token,
       expiresInSeconds: 300,
-      catalogGeneration: requireCanonicalRevision(result.catalogGeneration),
-      manifest: parseManifest(result.manifest),
+      catalogGeneration,
+      manifest,
+      assessment: parseImportAssessment(result.assessment, manifest),
     }
   }
 
