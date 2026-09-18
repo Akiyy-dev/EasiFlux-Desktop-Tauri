@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.6.0...easiflux-desktop-tauri-v0.6.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **plugin:** restore host command ACL for main application ([f76c8fa](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/f76c8fad4313f2b7c1f108d23b53674edc4a95b7))
+* **plugin:** restore main webview host command permissions ([d9940fb](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/d9940fbc1e1ef26085b3a77313cf8bca57f68c0d))
+
 ## [0.6.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.5.0...easiflux-desktop-tauri-v0.6.0) (2026-09-17)
 
 
