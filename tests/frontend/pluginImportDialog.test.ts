@@ -306,10 +306,62 @@ describe('PluginImportDialog', () => {
     wrapper.unmount()
   })
 
-  it('states clearly when an existing-ID manifest has unchanged content', () => {
+  it('keeps exact current and candidate identity visible for an unchanged manifest as text', () => {
+    const identicalManifest = {
+      ...currentComparisonItem.manifest,
+      name: '同名 <strong>笔记</strong>',
+      publisher: '作者 <a href="https://example.invalid">链接</a>',
+      publisherId: 'com.example.publisher.identity',
+      version: '1.0.0+identity',
+    } as const
     const preview = {
       ...comparisonPreview,
-      manifest: currentComparisonItem.manifest,
+      manifest: identicalManifest,
+      assessment: {
+        ...comparisonPreview.assessment,
+        current: { ...currentComparisonItem, manifest: identicalManifest },
+      },
+    } satisfies ReadyLocalManifestImport
+    const wrapper = mount(PluginImportDialog, {
+      props: { preview, committing: false, stale: false },
+    })
+
+    expect(wrapper.get('[data-testid="plugin-manifest-unchanged"]').text())
+      .toContain('清单内容未变化')
+    expect(wrapper.get('[data-testid="plugin-import-shared-id"]').text())
+      .toBe('com.example.notes')
+    for (const side of ['current', 'candidate']) {
+      expect(wrapper.get(`[data-testid="plugin-import-${side}-identity"]`).findAll('dd')
+        .map((value) => value.text())).toEqual([
+        '同名 <strong>笔记</strong>',
+        '1.0.0+identity',
+        '作者 <a href="https://example.invalid">链接</a>',
+        'com.example.publisher.identity',
+      ])
+    }
+    expect(wrapper.get('[data-testid="plugin-import-publisher-notice"]').text())
+      .toContain('由清单作者填写，未经认证')
+    expect(wrapper.find('a').exists()).toBe(false)
+    expect(wrapper.find('strong').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="plugin-command-button"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('keeps unchanged identity visible for a same-version command-only change as text', () => {
+    const preview = {
+      ...comparisonPreview,
+      manifest: {
+        ...currentComparisonItem.manifest,
+        contributions: currentComparisonItem.manifest.contributions.map((command) => (
+          command.contributionId === 'workspace.help'
+            ? {
+                ...command,
+                title: '变更 <a href="https://example.invalid">说明</a>',
+                params: { ...command.params, text: '候选 <button>运行</button>' },
+              }
+            : command
+        )),
+      },
       assessment: {
         ...comparisonPreview.assessment,
         current: currentComparisonItem,
@@ -319,8 +371,24 @@ describe('PluginImportDialog', () => {
       props: { preview, committing: false, stale: false },
     })
 
-    expect(wrapper.get('[data-testid="plugin-manifest-unchanged"]').text())
-      .toContain('清单内容未变化')
+    expect(wrapper.get('[data-testid="plugin-import-shared-id"]').text())
+      .toBe('com.example.notes')
+    for (const side of ['current', 'candidate']) {
+      expect(wrapper.get(`[data-testid="plugin-import-${side}-identity"]`).findAll('dd')
+        .map((value) => value.text())).toEqual([
+        '本地笔记',
+        '1.0.0+old',
+        'Example 作者',
+        'com.example',
+      ])
+    }
+    expect(wrapper.get('[data-testid="plugin-import-publisher-notice"]').text())
+      .toContain('由清单作者填写，未经认证')
+    expect(wrapper.text()).toContain('变更 <a href="https://example.invalid">说明</a>')
+    expect(wrapper.text()).toContain('候选 <button>运行</button>')
+    expect(wrapper.find('a').exists()).toBe(false)
+    expect(wrapper.find('button:not([data-testid])').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="plugin-command-button"]').exists()).toBe(false)
     wrapper.unmount()
   })
 

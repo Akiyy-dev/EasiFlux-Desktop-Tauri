@@ -82,6 +82,49 @@ function commandDetails(
       <div><dt>当前管理方式</dt><dd><bdi>{{ pluginManagementLabel(props.current.management) }}</bdi></dd></div>
       <div><dt>当前状态</dt><dd><bdi>{{ pluginStatusLabel(props.current.status) }}</bdi></dd></div>
     </dl>
+    <section class="plugin-manifest-comparison__identity">
+      <h3>插件身份</h3>
+      <dl>
+        <div>
+          <dt>插件 ID</dt>
+          <dd data-testid="plugin-import-shared-id">
+            <bdi>{{ props.incoming.id }}</bdi>
+          </dd>
+        </div>
+      </dl>
+      <div class="plugin-manifest-comparison__identity-pair">
+        <section
+          class="plugin-manifest-comparison__identity-card"
+          data-testid="plugin-import-current-identity"
+        >
+          <h4>当前清单</h4>
+          <dl>
+            <div><dt>名称</dt><dd><bdi>{{ props.current.manifest.name }}</bdi></dd></div>
+            <div><dt>版本</dt><dd><bdi>{{ props.current.manifest.version }}</bdi></dd></div>
+            <div><dt>发布者</dt><dd><bdi>{{ props.current.manifest.publisher }}</bdi></dd></div>
+            <div><dt>发布者 ID</dt><dd><bdi>{{ props.current.manifest.publisherId }}</bdi></dd></div>
+          </dl>
+        </section>
+        <section
+          class="plugin-manifest-comparison__identity-card"
+          data-testid="plugin-import-candidate-identity"
+        >
+          <h4>候选清单</h4>
+          <dl>
+            <div><dt>名称</dt><dd><bdi>{{ props.incoming.name }}</bdi></dd></div>
+            <div><dt>版本</dt><dd><bdi>{{ props.incoming.version }}</bdi></dd></div>
+            <div><dt>发布者</dt><dd><bdi>{{ props.incoming.publisher }}</bdi></dd></div>
+            <div><dt>发布者 ID</dt><dd><bdi>{{ props.incoming.publisherId }}</bdi></dd></div>
+          </dl>
+        </section>
+      </div>
+      <p
+        class="plugin-manifest-comparison__publisher-notice"
+        data-testid="plugin-import-publisher-notice"
+      >
+        当前与候选清单中的发布者名称和发布者 ID 均由清单作者填写，未经认证。
+      </p>
+    </section>
     <p data-testid="plugin-import-version-relation">
       {{ versionRelationCopy[props.versionRelation] }}
     </p>
