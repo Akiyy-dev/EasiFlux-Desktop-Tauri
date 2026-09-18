@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.6.1...easiflux-desktop-tauri-v0.7.0) (2026-09-18)
+
+
+### Features
+
+* **plugins:** add controlled host navigation commands ([3caae28](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/3caae283312b0beddaaf7079bc259a12647fbd65))
+* **plugins:** Phase 1F 受控页面快捷命令与作者指南 ([b42f45b](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/b42f45b9cc8fc77622cc998662071ab3fb7d1497))
+
 ## [0.6.1](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.6.0...easiflux-desktop-tauri-v0.6.1) (2026-09-18)
 
 
