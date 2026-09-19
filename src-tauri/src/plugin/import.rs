@@ -8,9 +8,11 @@ use crate::plugin::{
     record::PluginRecord,
 };
 
+mod assessment;
 pub(crate) mod dialog;
 mod session;
 pub(crate) mod source;
+pub(crate) use assessment::ImportAssessment;
 pub(crate) use session::{CommitLease, ImportSessions, PrepareLease};
 pub(crate) use source::{LocalManifestReader, SystemLocalManifestReader};
 
@@ -76,17 +78,24 @@ pub(crate) struct ImportPreview {
     expires_in_seconds: u16,
     pub(crate) catalog_generation: String,
     pub(crate) manifest: PluginManifestV1,
+    assessment: ImportAssessment,
 }
 
 impl ImportPreview {
-    fn new(token: String, generation: u64, manifest: PluginManifestV1) -> Self {
+    fn new(
+        token: String,
+        generation: u64,
+        manifest: PluginManifestV1,
+        assessment: ImportAssessment,
+    ) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             status: "ready",
             token,
             expires_in_seconds: 300,
             catalog_generation: generation.to_string(),
             manifest,
+            assessment,
         }
     }
 }

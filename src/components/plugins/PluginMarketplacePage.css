@@ -156,6 +156,11 @@
 }
 
 .plugin-import-dialog__metadata,
+.plugin-manifest-comparison__context,
+.plugin-manifest-comparison__identity > dl,
+.plugin-manifest-comparison__identity-card dl,
+.plugin-manifest-comparison__fields,
+.plugin-manifest-comparison details dl,
 .plugin-removal-dialog__metadata {
   display: grid;
   gap: var(--ef-space-2);
@@ -163,6 +168,11 @@
 }
 
 .plugin-import-dialog__metadata > div,
+.plugin-manifest-comparison__context > div,
+.plugin-manifest-comparison__identity > dl > div,
+.plugin-manifest-comparison__identity-card dl > div,
+.plugin-manifest-comparison__fields > div,
+.plugin-manifest-comparison details dl > div,
 .plugin-removal-dialog__metadata > div {
   display: grid;
   grid-template-columns: minmax(6rem, 0.25fr) minmax(0, 1fr);
@@ -170,15 +180,105 @@
 }
 
 .plugin-import-dialog__metadata dt,
+.plugin-manifest-comparison dt,
 .plugin-removal-dialog__metadata dt {
   color: var(--muted-foreground);
 }
 
 .plugin-import-dialog__metadata dd,
+.plugin-manifest-comparison dd,
 .plugin-removal-dialog__metadata dd {
   min-width: 0;
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.plugin-manifest-comparison {
+  display: grid;
+  gap: var(--ef-space-3);
+}
+
+.plugin-manifest-comparison__section {
+  display: grid;
+  gap: var(--ef-space-2);
+}
+
+.plugin-manifest-comparison__identity {
+  display: grid;
+  gap: var(--ef-space-2);
+}
+
+.plugin-manifest-comparison__identity-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--ef-space-3);
+}
+
+.plugin-manifest-comparison__identity-card {
+  min-width: 0;
+  max-height: 18rem;
+  overflow: auto;
+  padding: var(--ef-space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-md);
+}
+
+.plugin-manifest-comparison__identity-card dl {
+  margin-top: var(--ef-space-2);
+}
+
+.plugin-manifest-comparison__section h3,
+.plugin-manifest-comparison__identity h3,
+.plugin-manifest-comparison__identity h4,
+.plugin-manifest-comparison__publisher-notice,
+.plugin-manifest-comparison__command-change h4,
+.plugin-manifest-comparison__unchanged,
+.plugin-manifest-comparison__warning,
+.plugin-manifest-comparison__order {
+  margin: 0;
+}
+
+.plugin-manifest-comparison__fields dd {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--ef-space-1) var(--ef-space-2);
+}
+
+.plugin-manifest-comparison__fields dd > span {
+  color: var(--muted-foreground);
+  font-size: var(--ef-text-xs);
+}
+
+.plugin-manifest-comparison details {
+  max-height: 18rem;
+  overflow: auto;
+  padding: var(--ef-space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--ef-radius-md);
+}
+
+.plugin-manifest-comparison summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.plugin-manifest-comparison details dl,
+.plugin-manifest-comparison__command-change {
+  margin-top: var(--ef-space-2);
+}
+
+.plugin-manifest-comparison__command-change {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--ef-space-3);
+}
+
+.plugin-manifest-comparison__warning {
+  color: var(--danger);
+}
+
+.plugin-manifest-comparison__publisher-notice {
+  color: var(--muted-foreground);
 }
 
 .plugin-import-dialog__warning,
@@ -584,6 +684,10 @@
   .plugin-removal-dialog__metadata > div {
     grid-template-columns: 1fr;
     gap: var(--ef-space-1);
+  }
+
+  .plugin-manifest-comparison__identity-pair {
+    grid-template-columns: 1fr;
   }
 
   .plugin-import-dialog__actions,

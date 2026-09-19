@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use super::super::PluginRuntime;
 use crate::error::{AppError, AppResult};
@@ -89,6 +89,62 @@ impl LocalManifestSelector for FixedSelector {
                 Some(path) => SelectedManifestSource::Selected(path),
                 None => SelectedManifestSource::Cancelled,
             })
+        })
+    }
+}
+
+struct WaitingSelector {
+    path: PathBuf,
+    started: Mutex<Option<oneshot::Sender<()>>>,
+    release: AsyncMutex<Option<oneshot::Receiver<()>>>,
+}
+
+struct WaitingSelectorControl {
+    started: oneshot::Receiver<()>,
+    release: Option<oneshot::Sender<()>>,
+}
+
+impl WaitingSelectorControl {
+    async fn wait_started(&mut self) {
+        tokio::time::timeout(WATCHDOG, &mut self.started)
+            .await
+            .expect("picker must start")
+            .unwrap();
+    }
+
+    fn release(&mut self) {
+        self.release.take().unwrap().send(()).unwrap();
+    }
+}
+
+fn waiting_selector(path: PathBuf) -> (Arc<WaitingSelector>, WaitingSelectorControl) {
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    (
+        Arc::new(WaitingSelector {
+            path,
+            started: Mutex::new(Some(started_tx)),
+            release: AsyncMutex::new(Some(release_rx)),
+        }),
+        WaitingSelectorControl {
+            started: started_rx,
+            release: Some(release_tx),
+        },
+    )
+}
+
+impl LocalManifestSelector for WaitingSelector {
+    fn select(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = AppResult<SelectedManifestSource>> + Send + '_>> {
+        Box::pin(async move {
+            let started = self.started.lock().unwrap().take();
+            if let Some(started) = started {
+                let _ = started.send(());
+            }
+            let release = self.release.lock().await.take().expect("one picker call");
+            release.await.expect("picker release must be sent");
+            Ok(SelectedManifestSource::Selected(self.path.clone()))
         })
     }
 }
@@ -1565,6 +1621,59 @@ async fn prepare_cancellation_has_no_filesystem_writes() {
 }
 
 #[tokio::test]
+async fn prepare_assessment_and_generation_come_from_the_same_post_picker_snapshot() {
+    let fixture = ImportFixture::new().await;
+    fs::write(
+        &fixture.source,
+        include_bytes!("../../../../../examples/plugins/workspace-shortcuts/update-candidate.json"),
+    )
+    .unwrap();
+    let (selector, mut picker) = waiting_selector(fixture.source.clone());
+    let runtime = Arc::clone(&fixture.runtime);
+    let preparing = tokio::spawn(async move { runtime.prepare_import(selector).await });
+    picker.wait_started().await;
+
+    write_package(
+        &fixture.local_root,
+        "pkg-00000000000000000000000000000001",
+        include_bytes!("../../../../../examples/plugins/workspace-shortcuts/manifest.json"),
+    );
+    let published = fixture.runtime.reload_catalog().await.unwrap();
+    let saves_after_publication = fixture.persistence.saves.load(Ordering::SeqCst);
+    fixture.clear_events();
+    picker.release();
+
+    let preview = match preparing.await.unwrap().unwrap() {
+        PrepareImportResult::Ready(preview) => preview,
+        PrepareImportResult::Cancelled(_) => panic!("ready preview required"),
+    };
+    let wire = serde_json::to_value(&preview).unwrap();
+    assert_eq!(preview.catalog_generation, published.catalog_generation);
+    assert_eq!(wire["schemaVersion"], 2);
+    assert_eq!(wire["manifest"]["version"], "1.1.0");
+    assert_eq!(wire["assessment"]["kind"], "existingId");
+    assert_eq!(wire["assessment"]["versionRelation"], "incomingHigher");
+    assert_eq!(
+        wire["assessment"]["current"]["manifest"]["version"],
+        "1.0.0"
+    );
+    assert_eq!(wire["assessment"]["current"]["management"], "external");
+    assert!(fixture.events.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.persistence.saves.load(Ordering::SeqCst),
+        saves_after_publication
+    );
+    assert_eq!(
+        fixture
+            .storage_controls
+            .promote_calls
+            .load(Ordering::SeqCst),
+        0
+    );
+    fixture.runtime.cancel_import(&preview.token).unwrap();
+}
+
+#[tokio::test]
 async fn cancelling_ready_is_idempotent_without_gate_or_storage() {
     let fixture = ImportFixture::new().await;
     let preview = fixture.prepare_valid().await;
@@ -2154,7 +2263,12 @@ async fn expired_or_replayed_token_never_writes() {
         .import_sessions
         .reserve_prepare(past)
         .unwrap()
-        .publish(PreparedManifest::parse(VALID).unwrap(), generation, past)
+        .publish(
+            PreparedManifest::parse(VALID).unwrap(),
+            generation,
+            &[],
+            past,
+        )
         .unwrap();
     expired.clear_events();
     let error = expect_commit_error(

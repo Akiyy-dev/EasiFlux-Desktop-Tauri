@@ -146,7 +146,7 @@ function mutation(
 }
 
 const readyPreview = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   status: 'ready',
   token: 'a'.repeat(32),
   expiresInSeconds: 300,
@@ -162,6 +162,7 @@ const readyPreview = {
     contributions: [],
     requestedCapabilities: [],
   },
+  assessment: { kind: 'notInCatalog' },
 } satisfies ReadyLocalManifestImport
 
 function importedSnapshot(): PluginCatalogSnapshot {

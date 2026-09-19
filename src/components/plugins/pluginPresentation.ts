@@ -1,4 +1,4 @@
-import type { PluginManagement, PluginSource } from '../../types/plugin'
+import type { PluginManagement, PluginSource, PluginStatus } from '../../types/plugin'
 
 export const pluginSourceLabels: Record<PluginSource, string> = {
   builtIn: '内置 · 随应用提供',
@@ -20,4 +20,14 @@ export const pluginManagementLabels: Record<PluginManagement, string> = {
 
 export function pluginManagementLabel(management: PluginManagement): string {
   return pluginManagementLabels[management]
+}
+
+export const pluginStatusLabels: Record<PluginStatus, string> = {
+  enabled: '已启用',
+  disabled: '已停用',
+  blocked: '已阻止',
+}
+
+export function pluginStatusLabel(status: PluginStatus): string {
+  return pluginStatusLabels[status]
 }
