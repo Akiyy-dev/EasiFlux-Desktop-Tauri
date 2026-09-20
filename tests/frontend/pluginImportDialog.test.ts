@@ -1,8 +1,11 @@
 import { mount } from '@vue/test-utils'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 import PluginImportDialog from '../../src/components/plugins/PluginImportDialog.vue'
+import { tauriInvoke } from '../../src/composables/useTauriCommand'
 import type { ReadyLocalManifestImport } from '../../src/types/plugin'
+
+vi.mock('../../src/composables/useTauriCommand', () => ({ tauriInvoke: vi.fn() }))
 
 const readyPreview = {
   schemaVersion: 2,
@@ -153,6 +156,7 @@ describe('PluginImportDialog', () => {
   })
 
   beforeEach(() => {
+    vi.mocked(tauriInvoke).mockReset()
     showModalDescriptor = Object.getOwnPropertyDescriptor(
       HTMLDialogElement.prototype,
       'showModal',
@@ -297,8 +301,16 @@ describe('PluginImportDialog', () => {
     expect(wrapper.text()).toContain('输入和结果仅保存在内存中')
     expect(wrapper.get('[data-testid="plugin-import-commands"]').text())
       .toContain('运行计算：计算平均值')
+    const details = wrapper.get('[data-testid="plugin-import-compute-details"]')
+    expect(details.text()).toContain('运行时wasm-v1')
+    expect(details.text()).toContain('ABIseries-f64-v1')
+    expect(details.text()).toContain('代码模块8 字节')
+    expect(details.text()).toContain('参数名称窗口')
+    expect(details.text()).toContain('参数默认值3')
+    expect(details.text()).toContain('参数范围1 至 10')
     expect(wrapper.text()).toContain('未经认证')
     expect(wrapper.text()).not.toContain('AGFzbQEAAAA=')
+    expect(tauriInvoke).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 
@@ -323,6 +335,10 @@ describe('PluginImportDialog', () => {
 
     expect(wrapper.text()).toContain('不运行代码')
     expect(wrapper.text()).not.toContain('包含可执行的本地 WebAssembly 代码')
+    expect(wrapper.get('[data-testid="plugin-import-commands"]').text())
+      .toContain('打开页面：图表工作区')
+    expect(wrapper.find('[data-testid="plugin-import-compute-details"]').exists()).toBe(false)
+    expect(tauriInvoke).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 

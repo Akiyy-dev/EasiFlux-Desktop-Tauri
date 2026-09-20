@@ -244,25 +244,46 @@ async fn reload_invalidates_even_unchanged_catalog_and_busy_slot_stays_owned() {
     assert_eq!(runtime.execute_compute(request).await.unwrap().value, 4.);
 }
 
-#[tokio::test]
-async fn completed_worker_cannot_publish_after_reload_before_ipc_resumes() {
-    let (runtime, mut request) = fixture().await;
-    enable(&runtime, &mut request).await;
-    let mut pending = Box::pin(runtime.execute_compute(request));
-    assert!(futures_util::poll!(pending.as_mut()).is_pending());
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            if let Ok(lease) = runtime.compute_slot.acquire("probe") {
-                drop(lease);
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    runtime.reload_catalog().await.unwrap();
-    assert_eq!(code(pending.await), "plugin_compute_cancelled");
+#[test]
+fn completed_worker_cannot_publish_after_reload_before_ipc_resumes() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (runtime, mut request) = fixture().await;
+            enable(&runtime, &mut request).await;
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                held.recv().unwrap();
+            });
+            ready.await.unwrap();
+
+            // Occupy this test runtime's only blocking thread so the actual
+            // compute worker cannot complete during the first IPC poll.
+            let mut pending = Box::pin(runtime.execute_compute(request));
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if let Ok(lease) = runtime.compute_slot.acquire("probe") {
+                        drop(lease);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // The real worker has exited, but pending has deliberately not been
+            // polled again: its queued output must fail after unchanged reload.
+            runtime.reload_catalog().await.unwrap();
+            assert_eq!(code(pending.await), "plugin_compute_cancelled");
+        });
 }
 
 #[tokio::test]

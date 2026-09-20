@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { PluginCommandContribution, ReadyLocalManifestImport } from '../../types/plugin'
+import { pluginComputeModuleByteLength } from '../../services/pluginManifestDiff'
 import { pluginPageLabel } from '../../services/pluginNavigation'
 import PluginManifestComparison from './PluginManifestComparison.vue'
 
@@ -168,6 +169,25 @@ onUnmounted(() => {
         <ul>
           <li v-for="command in props.preview.manifest.contributions" :key="command.contributionId">
             <bdi>{{ commandPreviewLabel(command) }}</bdi>
+            <dl
+              v-if="command.actionId === 'sandbox.computeSeries'"
+              data-testid="plugin-import-compute-details"
+            >
+              <div><dt>运行时</dt><dd><bdi>{{ command.params.runtime }}</bdi></dd></div>
+              <div><dt>ABI</dt><dd><bdi>{{ command.params.abi }}</bdi></dd></div>
+              <div>
+                <dt>代码模块</dt>
+                <dd><bdi>{{ pluginComputeModuleByteLength(command) }} 字节</bdi></dd>
+              </div>
+              <div><dt>参数名称</dt><dd><bdi>{{ command.params.parameter.label }}</bdi></dd></div>
+              <div><dt>参数默认值</dt><dd><bdi>{{ command.params.parameter.default }}</bdi></dd></div>
+              <div>
+                <dt>参数范围</dt>
+                <dd>
+                  <bdi>{{ command.params.parameter.min }} 至 {{ command.params.parameter.max }}</bdi>
+                </dd>
+              </div>
+            </dl>
           </li>
         </ul>
       </div>
