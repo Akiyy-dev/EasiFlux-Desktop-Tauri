@@ -14,14 +14,15 @@ onMounted(() => {
 <template>
   <main class="plugin-smoke-host">
     <aside role="note">
-      Isolated fixture profile only. Source: select only an exact manifest path printed in the host log.
+      Isolated fixture profile only. Select only a manifest identified in the host log;
+      resolve the v5 relative path under the printed smoke profile.
       A synthetic in-memory account host is injected for the v5 workflow; no AppState, real account,
       credential store, scheduler, provider client, or network connection is started.
       <p v-if="automatic">
         Automatic fixture test; native picker and whole app are not tested.
       </p>
       <p v-else>
-        Manual lane: import, enable/disable, and remove only the printed v4/v5 fixtures. Synthetic
+        Manual lane: import, enable/disable, and remove only those v4/v5 fixtures. Synthetic
         confirmations mutate counters only. Closing does not record an automatic pass.
       </p>
     </aside>
