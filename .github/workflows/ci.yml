@@ -24,6 +24,8 @@ jobs:
       - run: pnpm install
       - run: pnpm lint
       - run: pnpm test
+      - name: Verify packaged account workflow guests with synthetic data
+        run: node examples/plugins/account-workflow/verify.mjs
       - run: pnpm build
 
   rust:
@@ -44,6 +46,9 @@ jobs:
         with:
           workspaces: src-tauri
       - run: cargo test --locked --all-targets
+        working-directory: src-tauri
+      - name: Verify account workflow Wasm matches its readable sources
+        run: cargo run --locked --example build_account_workflow_manifest -- --check
         working-directory: src-tauri
       - run: cargo clippy --locked --all-targets
         working-directory: src-tauri

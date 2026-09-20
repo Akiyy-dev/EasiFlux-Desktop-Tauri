@@ -3,7 +3,8 @@ import { usePluginStore } from '../stores/plugin'
 import { tauriInvoke } from '../composables/useTauriCommand'
 import { pluginErrorCode } from '../services/pluginService'
 
-const fixtureId = 'com.easiflux.examples.series-sma'
+const legacyFixtureId = 'com.easiflux.examples.series-sma'
+const accountFixtureId = 'com.easiflux.examples.account-workflow'
 const testId = (id: string) => `[data-testid="${id}"]`
 
 async function waitFor(label: string, condition: () => boolean): Promise<void> {
@@ -33,14 +34,14 @@ async function click(selector: string, scope: () => ParentNode = () => document)
   control(selector, scope())!.click()
 }
 
-function fixtureCard(): HTMLElement | null {
+function fixtureCard(fixtureId = legacyFixtureId): HTMLElement | null {
   // Production cards already display the full fixture ID; do not add harness selectors there.
   return [...document.querySelectorAll<HTMLElement>(testId('plugin-management-item'))]
     .find(card => [...card.querySelectorAll('dd')].some(item => item.textContent?.trim() === fixtureId)) ?? null
 }
 
-function requireCard(): HTMLElement {
-  const card = fixtureCard()
+function requireCard(fixtureId = legacyFixtureId): HTMLElement {
+  const card = fixtureCard(fixtureId)
   if (!card) throw new Error('Fixture card disappeared')
   return card
 }
@@ -57,6 +58,23 @@ function detailWithinLimit(error: unknown): string {
     bytes += size
   }
   return result
+}
+
+function commandButton(title: string, fixtureId: string): HTMLButtonElement | null {
+  return [...requireCard(fixtureId).querySelectorAll<HTMLButtonElement>(testId('plugin-command-button'))]
+    .find(button => button.textContent?.includes(title) && !button.disabled) ?? null
+}
+
+async function clickCommand(title: string, fixtureId: string): Promise<void> {
+  await waitFor(`command ${title}`, () => commandButton(title, fixtureId) !== null)
+  commandButton(title, fixtureId)!.click()
+}
+
+function setText(selector: string, value: string): void {
+  const input = textControl(selector)
+  if (!input) throw new Error(`Text control unavailable: ${selector}`)
+  input.value = value
+  input.dispatchEvent(new Event('input', { bubbles: true }))
 }
 
 async function expectPluginRejection(
@@ -92,7 +110,7 @@ async function confirmForbiddenWebviewIpc(): Promise<void> {
 function computeRequest(store: ReturnType<typeof usePluginStore>, requestId: string) {
   return {
     requestId,
-    pluginId: fixtureId,
+    pluginId: legacyFixtureId,
     contributionId: 'series.sma',
     expectedCatalogGeneration: store.catalogGeneration,
     expectedRevision: store.revision,
@@ -103,13 +121,15 @@ function computeRequest(store: ReturnType<typeof usePluginStore>, requestId: str
 
 export function isExpectedSmaOutput(result: string, provenance: string): boolean {
   return result.trim() === '结果：4'
-    && provenance.includes(fixtureId)
+    && provenance.includes(legacyFixtureId)
     && provenance.includes('series.sma')
     && provenance.includes('输入 5 个')
     && provenance.includes('Period 3')
 }
 
-export async function confirmRemovalReload(): Promise<void> {
+export async function confirmRemovalReload(
+  removedFixtureIds: string[] = [legacyFixtureId],
+): Promise<void> {
   const store = usePluginStore()
   // This production reload control has no test ID; use its exact visible label.
   const reload = [...document.querySelectorAll<HTMLButtonElement>('.plugin-marketplace-page__actions button')]
@@ -119,7 +139,9 @@ export async function confirmRemovalReload(): Promise<void> {
   if (store.reloadStatus !== 'loading') throw new Error('Explicit reload did not start')
   await waitFor('explicit reload confirms absence', () => store.reloadStatus === 'ready'
     && !store.reloadError
-    && !store.catalog.some(item => item.manifest.id === fixtureId) && !fixtureCard())
+    && removedFixtureIds.every(fixtureId => (
+      !store.catalog.some(item => item.manifest.id === fixtureId) && !fixtureCard(fixtureId)
+    )))
 }
 
 // Real rendered controls -> production component/store/service -> real native IPC.
@@ -129,18 +151,22 @@ export async function runPluginSmokeSelfTest(): Promise<void> {
   let success = false
   let detail: string
   try {
-    const fixture = () => store.catalog.find(item => item.manifest.id === fixtureId)
+    const fixture = (fixtureId = legacyFixtureId) => (
+      store.catalog.find(item => item.manifest.id === fixtureId)
+    )
     await waitFor('initial catalog readiness', () => store.loadStatus === 'ready' && store.availability === 'available')
-    if (fixture() || fixtureCard()) throw new Error('Fixture unexpectedly existed before import')
+    if (fixture() || fixtureCard() || fixture(accountFixtureId) || fixtureCard(accountFixtureId)) {
+      throw new Error('Fixture unexpectedly existed before import')
+    }
 
     await click(testId('plugin-import-button'))
-    await waitFor('first fixture preview', () => store.importStatus === 'preview' && store.importPreview?.manifest.id === fixtureId)
+    await waitFor('first fixture preview', () => store.importStatus === 'preview' && store.importPreview?.manifest.id === legacyFixtureId)
     await click(testId('plugin-import-cancel'))
     await waitFor('cancelled preview without import', () => store.importStatus === 'idle'
       && !document.querySelector(testId('plugin-import-confirm')) && !fixture() && !fixtureCard())
 
     await click(testId('plugin-import-button'))
-    await waitFor('second fixture preview', () => store.importStatus === 'preview' && store.importPreview?.manifest.id === fixtureId)
+    await waitFor('second fixture preview', () => store.importStatus === 'preview' && store.importPreview?.manifest.id === legacyFixtureId)
     await click(testId('plugin-import-confirm'))
     await waitFor('managed disabled import', () => store.importResult?.status === 'imported'
       && fixture()?.management === 'managed' && fixture()?.status === 'disabled'
@@ -156,17 +182,17 @@ export async function runPluginSmokeSelfTest(): Promise<void> {
       'plugin_compute_disabled',
     )
 
-    await click('input[role="switch"]', requireCard)
+    await click('input[role="switch"]', () => requireCard())
     await waitFor('fixture enabled', () => {
       const card = fixtureCard()
       const toggle = card?.querySelector<HTMLInputElement>('input[role="switch"]')
       return fixture()?.status === 'enabled'
-        && !store.pendingIds.has(fixtureId) && !store.actionErrors[fixtureId]
+        && !store.pendingIds.has(legacyFixtureId) && !store.actionErrors[legacyFixtureId]
         && toggle?.checked === true && !toggle.disabled
         && !!card?.querySelector(testId('plugin-status'))?.textContent?.includes('已启用')
     })
 
-    await click(testId('plugin-command-button'), requireCard)
+    await click(testId('plugin-command-button'), () => requireCard())
     await waitFor('compute form opens without execution', () => {
       return !!document.querySelector(testId('plugin-compute-dialog'))
         && textControl(testId('plugin-compute-input')) !== null
@@ -185,12 +211,12 @@ export async function runPluginSmokeSelfTest(): Promise<void> {
     await click(testId('plugin-compute-close'))
     await waitFor('completed compute form closes', () => !document.querySelector(testId('plugin-compute-dialog')))
 
-    await click('input[role="switch"]', requireCard)
+    await click('input[role="switch"]', () => requireCard())
     await waitFor('fixture disabled', () => {
       const card = fixtureCard()
       const toggle = card?.querySelector<HTMLInputElement>('input[role="switch"]')
       return fixture()?.status === 'disabled'
-        && !store.pendingIds.has(fixtureId) && !store.actionErrors[fixtureId]
+        && !store.pendingIds.has(legacyFixtureId) && !store.actionErrors[legacyFixtureId]
         && toggle?.checked === false && !toggle.disabled
         && !!card?.querySelector(testId('plugin-status'))?.textContent?.includes('已停用')
     })
@@ -203,21 +229,132 @@ export async function runPluginSmokeSelfTest(): Promise<void> {
     )
     await confirmForbiddenWebviewIpc()
 
-    await click(testId('plugin-remove-button'), requireCard)
-    await waitFor('first removal confirmation', () => store.removalStatus === 'confirming' && store.removalTarget?.plugin.manifest.id === fixtureId)
+    await click(testId('plugin-remove-button'), () => requireCard())
+    await waitFor('first removal confirmation', () => store.removalStatus === 'confirming' && store.removalTarget?.plugin.manifest.id === legacyFixtureId)
     await click(testId('plugin-removal-cancel'))
     await waitFor('cancelled removal retains fixture', () => store.removalStatus === 'idle'
       && !!fixtureCard() && fixture()?.status === 'disabled' && !document.querySelector(testId('plugin-removal-confirm')))
 
-    await click(testId('plugin-remove-button'), requireCard)
-    await waitFor('second removal confirmation', () => store.removalStatus === 'confirming' && store.removalTarget?.plugin.manifest.id === fixtureId)
+    await click(testId('plugin-remove-button'), () => requireCard())
+    await waitFor('second removal confirmation', () => store.removalStatus === 'confirming' && store.removalTarget?.plugin.manifest.id === legacyFixtureId)
     await click(testId('plugin-removal-confirm'))
     await waitFor('successful removal', () => store.removalResult?.status === 'removed'
       && !fixture() && !fixtureCard() && document.querySelector(testId('plugin-removal-result'))?.getAttribute('role') === 'status')
 
-    await confirmRemovalReload()
+    await confirmRemovalReload([legacyFixtureId])
+    await click(testId('plugin-removal-result-dismiss'))
+    await waitFor('legacy removal result dismissed', () => store.removalStatus === 'idle')
+
+    await click(testId('plugin-import-button'))
+    await waitFor('account workflow preview', () => store.importStatus === 'preview'
+      && store.importPreview?.manifest.id === accountFixtureId)
+    await click(testId('plugin-import-confirm'))
+    await waitFor('account workflow managed disabled import', () => (
+      store.importResult?.status === 'imported'
+      && fixture(accountFixtureId)?.management === 'managed'
+      && fixture(accountFixtureId)?.status === 'disabled'
+      && !!fixtureCard(accountFixtureId)
+    ))
+    await click(testId('plugin-import-dismiss'))
+    await waitFor('account workflow import result dismissed', () => store.importStatus === 'idle')
+
+    await click('input[role="switch"]', () => requireCard(accountFixtureId))
+    await waitFor('account workflow enabled', () => {
+      const card = fixtureCard(accountFixtureId)
+      const toggle = card?.querySelector<HTMLInputElement>('input[role="switch"]')
+      return fixture(accountFixtureId)?.status === 'enabled'
+        && !store.pendingIds.has(accountFixtureId) && !store.actionErrors[accountFixtureId]
+        && toggle?.checked === true && !toggle.disabled
+    })
+
+    await clickCommand('Prepare example limit order', accountFixtureId)
+    await waitFor('workflow access with no grants', () => {
+      const capabilities = [...document.querySelectorAll<HTMLInputElement>(testId('workflow-capability'))]
+      return !!document.querySelector(testId('workflow-account'))
+        && capabilities.length === 5
+        && capabilities.every(capability => !capability.checked)
+        && control(testId('workflow-run')) === null
+    })
+    for (const capability of [
+      'account.read', 'balances.read', 'orders.read', 'trade.place', 'trade.cancel',
+    ]) {
+      const checkbox = document.querySelector<HTMLInputElement>(
+        `${testId('workflow-capability')}[value="${capability}"]`,
+      )
+      if (!checkbox || checkbox.disabled) throw new Error(`Capability unavailable: ${capability}`)
+      checkbox.click()
+    }
+    await click(testId('workflow-save-grants'))
+    await waitFor('workflow grants saved', () => (
+      [...document.querySelectorAll<HTMLInputElement>(testId('workflow-capability'))]
+        .every(capability => capability.checked)
+      && control(testId('workflow-run')) !== null
+    ))
+    setText(testId('workflow-input'), JSON.stringify({
+      kind: 'placeOrder',
+      order: {
+        symbol: 'BTCUSDT', side: 'Buy', orderType: 'Limit', qty: '0.002',
+        price: '49000', timeInForce: 'GTC', positionIdx: 1, reduceOnly: false,
+      },
+    }))
+    await click(testId('workflow-run'))
+    await waitFor('place proposal without receipt', () => (
+      !!document.querySelector(testId('workflow-snapshot'))
+      && !!document.querySelector(testId('workflow-confirmation'))
+      && !document.querySelector(testId('workflow-receipt-accepted'))
+    ))
+    await click(testId('workflow-confirm'))
+    await waitFor('place accepted exactly once', () => (
+      !!document.querySelector(testId('workflow-receipt-accepted'))
+      && !document.querySelector(testId('workflow-confirm'))
+    ))
+    await click(testId('workflow-close'))
+    await waitFor('place workflow closes', () => !document.querySelector(testId('plugin-workflow-dialog')))
+
+    await clickCommand('Prepare cancellation of first captured order', accountFixtureId)
+    await waitFor('cancel workflow keeps session grants', () => (
+      !!document.querySelector(testId('workflow-account'))
+      && control(testId('workflow-run')) !== null
+    ))
+    await click(testId('workflow-run'))
+    await waitFor('cancel proposal without receipt', () => (
+      document.querySelector(testId('workflow-confirmation'))?.textContent
+        ?.includes('plugin-smoke-open-order') === true
+      && !document.querySelector(testId('workflow-receipt-accepted'))
+    ))
+    await click(testId('workflow-confirm'))
+    await waitFor('cancel accepted exactly once', () => (
+      !!document.querySelector(testId('workflow-receipt-accepted'))
+      && !document.querySelector(testId('workflow-confirm'))
+    ))
+    await click(testId('workflow-revoke'))
+    await waitFor('revocation blocks another run', () => (
+      [...document.querySelectorAll<HTMLInputElement>(testId('workflow-capability'))]
+        .every(capability => !capability.checked)
+      && control(testId('workflow-run')) === null
+      && !document.querySelector(testId('workflow-snapshot'))
+    ))
+    await click(testId('workflow-close'))
+    await waitFor('revoked workflow closes', () => !document.querySelector(testId('plugin-workflow-dialog')))
+
+    await click('input[role="switch"]', () => requireCard(accountFixtureId))
+    await waitFor('account workflow disabled', () => (
+      fixture(accountFixtureId)?.status === 'disabled'
+      && fixtureCard(accountFixtureId)?.querySelector<HTMLInputElement>('input[role="switch"]')
+        ?.checked === false
+    ))
+    await confirmForbiddenWebviewIpc()
+    await click(testId('plugin-remove-button'), () => requireCard(accountFixtureId))
+    await waitFor('account workflow removal confirmation', () => (
+      store.removalStatus === 'confirming'
+      && store.removalTarget?.plugin.manifest.id === accountFixtureId
+    ))
+    await click(testId('plugin-removal-confirm'))
+    await waitFor('account workflow removed', () => store.removalResult?.status === 'removed'
+      && !fixture(accountFixtureId) && !fixtureCard(accountFixtureId))
+    await confirmRemovalReload([legacyFixtureId, accountFixtureId])
     success = true
-    detail = 'Real DOM: preview cancel, managed v4 import, disabled rejections, enable, guest SMA 4, disable, forbidden IPC, removal and reload verified'
+    detail = 'Real DOM: v4 SMA preserved; v5 no-grant, explicit grant, place/cancel separate confirmations, revoke, disable, forbidden IPC, removal and reload verified against injected synthetic host'
   } catch (error) {
     detail = detailWithinLimit(error)
   }

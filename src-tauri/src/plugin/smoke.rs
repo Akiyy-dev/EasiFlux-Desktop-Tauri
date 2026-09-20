@@ -21,16 +21,24 @@ use crate::storage::managed_plugin_ownership::{
 };
 use crate::storage::plugin_state::{PluginStatePersistence, PluginStateStore};
 
+mod account_host;
+pub(crate) use account_host::SmokeWorkflowHost;
+
 const FIXTURE_MANIFEST_BYTES: &[u8] =
     include_bytes!("../../../examples/plugins/series-sma/manifest.json");
+const ACCOUNT_FIXTURE_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../../../examples/plugins/account-workflow/manifest.json");
 const FIXTURE_PLUGIN_ID: &str = "com.easiflux.examples.series-sma";
+const ACCOUNT_FIXTURE_PLUGIN_ID: &str = "com.easiflux.examples.account-workflow";
 const OUTSIDE_ARTIFACT_ROOT: &str =
     "plugin smoke parent is outside the build checkout target directory";
 
 pub(crate) struct PluginSmokeProfile {
     pub(crate) root: PathBuf,
     pub(crate) source: PathBuf,
+    pub(crate) account_source: PathBuf,
     runtime: Arc<PluginRuntime>,
+    workflow_host: Arc<SmokeWorkflowHost>,
 }
 
 impl PluginSmokeProfile {
@@ -79,6 +87,12 @@ impl PluginSmokeProfile {
         let source = source
             .canonicalize()
             .map_err(|error| format!("failed to canonicalize plugin smoke fixture: {error}"))?;
+        let account_source = source_dir.join("account-workflow.json");
+        std::fs::write(&account_source, ACCOUNT_FIXTURE_MANIFEST_BYTES)
+            .map_err(|error| format!("failed to write account workflow smoke fixture: {error}"))?;
+        let account_source = account_source.canonicalize().map_err(|error| {
+            format!("failed to canonicalize account workflow smoke fixture: {error}")
+        })?;
 
         let plugins_root = root.join("plugins");
         let packages = Arc::new(SystemLocalPluginPackageStorage::with_plugins_root(
@@ -98,7 +112,7 @@ impl PluginSmokeProfile {
             registry,
             Arc::new(FixedRootDiscovery(plugins_root)),
             Arc::new(FixtureOnlyManifestReader {
-                source: source.clone(),
+                sources: [source.clone(), account_source.clone()],
             }),
             packages.clone(),
             packages,
@@ -107,7 +121,9 @@ impl PluginSmokeProfile {
         Ok(Self {
             root,
             source,
+            account_source,
             runtime,
+            workflow_host: Arc::new(SmokeWorkflowHost::new()),
         })
     }
 
@@ -116,7 +132,14 @@ impl PluginSmokeProfile {
     }
 
     pub(crate) fn selector(&self) -> Arc<dyn LocalManifestSelector> {
-        Arc::new(FixedFixtureSelector(self.source.clone()))
+        Arc::new(SequencedFixtureSelector {
+            sources: [self.source.clone(), self.account_source.clone()],
+            selections: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn workflow_host(&self) -> Arc<dyn crate::plugin::workflow::WorkflowHost> {
+        self.workflow_host.clone()
     }
 
     pub(crate) fn inspect_final_state(&self) -> Result<SmokeNativeChecks, String> {
@@ -127,18 +150,27 @@ impl PluginSmokeProfile {
         let ownership = ManagedOwnershipStore::with_plugins_root(plugins_root.clone())
             .load()
             .map_err(|error| format!("failed to inspect plugin smoke ownership: {error}"))?;
-        Ok(SmokeNativeChecks {
-            source_unchanged: std::fs::read(&self.source)
-                .is_ok_and(|bytes| bytes == FIXTURE_MANIFEST_BYTES),
-            disabled_decision_retained: state.state.entries.iter().any(|entry| {
-                entry.id.as_str() == FIXTURE_PLUGIN_ID
+        let disabled = |plugin_id: &str| {
+            state.state.entries.iter().any(|entry| {
+                entry.id.as_str() == plugin_id
                     && entry.source == PluginSource::LocalDeclarative
                     && !entry.enabled
-            }),
+            })
+        };
+        let (place_mutations, cancel_mutations) = self.workflow_host.mutation_counts();
+        Ok(SmokeNativeChecks {
+            source_unchanged: std::fs::read(&self.source)
+                .is_ok_and(|bytes| bytes == FIXTURE_MANIFEST_BYTES)
+                && std::fs::read(&self.account_source)
+                    .is_ok_and(|bytes| bytes == ACCOUNT_FIXTURE_MANIFEST_BYTES),
+            disabled_decision_retained: disabled(FIXTURE_PLUGIN_ID)
+                && disabled(ACCOUNT_FIXTURE_PLUGIN_ID),
             ownership_empty: ownership.index.entries().is_empty(),
             local_empty: directory_is_empty(&plugins_root.join("local"))?,
             staging_empty: directory_is_empty(&plugins_root.join("import-staging"))?
                 && directory_is_empty(&plugins_root.join("removal-staging"))?,
+            place_mutations,
+            cancel_mutations,
         })
     }
 }
@@ -152,13 +184,13 @@ impl LocalPluginDiscovery for FixedRootDiscovery {
 }
 
 struct FixtureOnlyManifestReader {
-    source: PathBuf,
+    sources: [PathBuf; 2],
 }
 
 impl LocalManifestReader for FixtureOnlyManifestReader {
     fn read(&self, path: &Path) -> AppResult<PreparedManifest> {
         let selected = path.canonicalize().map_err(|_| source_rejected())?;
-        if selected != self.source {
+        if !self.sources.contains(&selected) {
             return Err(source_rejected());
         }
         SystemLocalManifestReader.read(&selected)
@@ -179,13 +211,34 @@ fn directory_is_empty(path: &Path) -> Result<bool, String> {
     Ok(entries.next().is_none())
 }
 
+#[cfg(test)]
 struct FixedFixtureSelector(PathBuf);
 
+#[cfg(test)]
 impl LocalManifestSelector for FixedFixtureSelector {
     fn select(
         &self,
     ) -> Pin<Box<dyn Future<Output = AppResult<SelectedManifestSource>> + Send + '_>> {
         let source = self.0.clone();
+        Box::pin(async move { Ok(SelectedManifestSource::Selected(source)) })
+    }
+}
+
+struct SequencedFixtureSelector {
+    sources: [PathBuf; 2],
+    selections: std::sync::atomic::AtomicUsize,
+}
+
+impl LocalManifestSelector for SequencedFixtureSelector {
+    fn select(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = AppResult<SelectedManifestSource>> + Send + '_>> {
+        use std::sync::atomic::Ordering;
+
+        // The legacy flow previews/cancels once, then imports. Every later selection
+        // resolves to the account-workflow fixture. No frontend path is accepted.
+        let index = usize::from(self.selections.fetch_add(1, Ordering::AcqRel) >= 2);
+        let source = self.sources[index].clone();
         Box::pin(async move { Ok(SelectedManifestSource::Selected(source)) })
     }
 }
@@ -198,6 +251,8 @@ pub(crate) struct SmokeNativeChecks {
     pub(crate) ownership_empty: bool,
     pub(crate) local_empty: bool,
     pub(crate) staging_empty: bool,
+    pub(crate) place_mutations: usize,
+    pub(crate) cancel_mutations: usize,
 }
 
 impl SmokeNativeChecks {
@@ -207,6 +262,8 @@ impl SmokeNativeChecks {
             && self.ownership_empty
             && self.local_empty
             && self.staging_empty
+            && self.place_mutations == 1
+            && self.cancel_mutations == 1
     }
 }
 
@@ -227,6 +284,22 @@ mod tests {
     const SERIES_SMA_MANIFEST: &str =
         include_str!("../../../examples/plugins/series-sma/manifest.json");
     const SERIES_SMA_WAT: &str = include_str!("../../../examples/plugins/series-sma/plugin.wat");
+    const ACCOUNT_WORKFLOW_MANIFEST: &str =
+        include_str!("../../../examples/plugins/account-workflow/manifest.json");
+    const ACCOUNT_WORKFLOW_WAT: [(&str, &str); 3] = [
+        (
+            "account.available-balance",
+            include_str!("../../../examples/plugins/account-workflow/balance.wat"),
+        ),
+        (
+            "account.place-order",
+            include_str!("../../../examples/plugins/account-workflow/place.wat"),
+        ),
+        (
+            "account.cancel-first-open-order",
+            include_str!("../../../examples/plugins/account-workflow/cancel.wat"),
+        ),
+    ];
 
     fn fixture_parent() -> TempDir {
         let base = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -300,6 +373,117 @@ mod tests {
         }
     }
 
+    // Catches stale Base64, host-computed demo results, or a guest that ignores the
+    // granted snapshot/user proposal while still producing superficially valid JSON.
+    #[test]
+    fn checked_in_account_workflow_sources_match_and_run_in_production_interpreter() {
+        let manifest: PluginManifestV1 =
+            serde_json::from_str(ACCOUNT_WORKFLOW_MANIFEST).unwrap();
+        assert_eq!(manifest.schema_version, 5);
+        assert_eq!(manifest.contributions.len(), 3);
+
+        let execute = |contribution_id: &str, context: Value, input: Value| -> Value {
+            let contribution = manifest
+                .contributions
+                .iter()
+                .find(|item| item.contribution_id.as_str() == contribution_id)
+                .unwrap();
+            let params = match &contribution.params {
+                PluginCommandParams::AccountWorkflow(params) => params,
+                other => panic!("account workflow contribution is not executable: {other:?}"),
+            };
+            let source = ACCOUNT_WORKFLOW_WAT
+                .iter()
+                .find_map(|(id, source)| (*id == contribution_id).then_some(*source))
+                .unwrap();
+            let compiled = wat::parse_str(source).unwrap();
+            assert_eq!(params.module_base64, STANDARD.encode(&compiled));
+            let output = crate::plugin::compute::sandbox::execute_json(
+                &compiled,
+                &serde_json::to_vec(&context).unwrap(),
+                &serde_json::to_vec(&input).unwrap(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            serde_json::from_slice(&output).unwrap()
+        };
+        let snapshot = |available: &str, order_id: &str| {
+            serde_json::json!({
+                "schemaVersion": 1,
+                "account": {
+                    "accountId": "plugin-smoke-account",
+                    "sessionEpoch": "1",
+                    "environment": "Injected synthetic smoke host"
+                },
+                "capturedAtMs": "1789948800000",
+                "symbol": "BTCUSDT",
+                "grantedCapabilities": [
+                    "account.read", "balances.read", "orders.read",
+                    "trade.place", "trade.cancel"
+                ],
+                "balances": {
+                    "items": [{"asset": "USDT", "available": available, "frozen": "0", "total": available}],
+                    "fetchedAtMs": "1789948799900", "partial": true
+                },
+                "positions": null,
+                "orders": {
+                    "items": [{
+                        "orderId": order_id, "symbol": "BTCUSDT", "side": "Buy",
+                        "orderType": "Limit", "price": "50000", "qty": "0.001",
+                        "status": "New", "orderLinkId": "plugin-smoke-existing-link",
+                        "filledQty": "0", "avgPrice": "0"
+                    }],
+                    "fetchedAtMs": "1789948799950", "partial": true
+                },
+                "market": null
+            })
+        };
+
+        assert_eq!(
+            execute(
+                "account.available-balance",
+                snapshot("12.5", "plugin-smoke-open-order"),
+                serde_json::json!({})
+            ),
+            serde_json::json!({"kind": "display", "text": "Available balance: 12.5"})
+        );
+        assert_eq!(
+            execute(
+                "account.available-balance",
+                snapshot("8", "plugin-smoke-open-order"),
+                serde_json::json!({})
+            ),
+            serde_json::json!({"kind": "display", "text": "Available balance: 8"})
+        );
+        let proposal = serde_json::json!({
+            "kind": "placeOrder",
+            "order": {
+                "symbol": "BTCUSDT", "side": "Buy", "orderType": "Limit",
+                "qty": "0.002", "price": "49000", "timeInForce": "GTC",
+                "positionIdx": 1, "reduceOnly": false
+            }
+        });
+        assert_eq!(
+            execute(
+                "account.place-order",
+                snapshot("12.5", "plugin-smoke-open-order"),
+                proposal.clone()
+            ),
+            proposal
+        );
+        assert_eq!(
+            execute(
+                "account.cancel-first-open-order",
+                snapshot("12.5", "captured-order-77"),
+                serde_json::json!({})
+            ),
+            serde_json::json!({
+                "kind": "cancelOrder",
+                "order": {"symbol": "BTCUSDT", "orderId": "captured-order-77"}
+            })
+        );
+    }
+
     // Catches accepting an ambiguous parent before reserving a fresh owned child.
     #[test]
     fn create_rejects_relative_missing_and_non_directory_parents_without_child_creation() {
@@ -347,6 +531,8 @@ mod tests {
 
         assert_ne!(first.root, second.root);
         assert_ne!(first.source, second.source);
+        assert_ne!(first.account_source, second.account_source);
+        assert_ne!(first.source, first.account_source);
         assert_eq!(smoke_children(parent.path()).len(), 2);
     }
 
@@ -406,7 +592,7 @@ mod tests {
         assert_eq!(serde_json::to_value(removed).unwrap()["status"], "removed");
 
         assert_eq!(fs::read(&profile.source).unwrap(), source_before);
-        assert!(profile.inspect_final_state().unwrap().passed());
+        assert!(!profile.inspect_final_state().unwrap().passed());
         let other_catalog =
             serde_json::to_value(other.runtime().get_catalog().await.unwrap()).unwrap();
         assert!(!other_catalog["plugins"]
@@ -420,10 +606,12 @@ mod tests {
             checks,
             serde_json::json!({
                 "sourceUnchanged": true,
-                "disabledDecisionRetained": true,
+                "disabledDecisionRetained": false,
                 "ownershipEmpty": true,
                 "localEmpty": true,
-                "stagingEmpty": true
+                "stagingEmpty": true,
+                "placeMutations": 0,
+                "cancelMutations": 0
             })
         );
         assert_eq!(ready["schemaVersion"], 2);

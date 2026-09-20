@@ -1,0 +1,54 @@
+{
+  "contributions": [
+    {
+      "actionId": "sandbox.accountWorkflow",
+      "contributionId": "account.available-balance",
+      "kind": "command",
+      "params": {
+        "abi": "account-json-v1",
+        "defaultInput": "{}",
+        "moduleBase64": "AGFzbQEAAAABDgJgAX8Bf2AEf39/fwF+AwQDAAABBQQBAQEQBxgDBm1lbW9yeQIABWFsbG9jAAADcnVuAAIK1wIDEwAgAEH//wNqQRB2QABBgIAEbAt/ACAALQAAQSJGIAAtAAFB4QBGcSAALQACQfYARnEgAC0AA0HhAEZxIAAtAARB6QBGcSAALQAFQewARnEgAC0ABkHhAEZxIAAtAAdB4gBGcSAALQAIQewARnEgAC0ACUHlAEZxIAAtAApBIkZxIAAtAAtBOkZxIAAtAAxBIkZxC8ABAQZ/AkADQCAEQQ1qIAFLBEAACyAAIARqEAEEQCAAIARqQQ1qIQUMAgsgBEEBaiEEDAALCyAFIQYCQANAIAYgACABak8EQAALIAYtAABBIkYNASAGQQFqIQYMAAsLIAYgBWsiB0HAAEsEQAALAkADQCAIIAdPDQFBrYABIAhqIAUgCGotAAA6AAAgCEEBaiEIDAALC0GtgAEgB2pBIjoAAEGugAEgB2pB/QA6AABBLyAHaiEJQoCAAUIghiAJrYQLCzUBAEGAgAELLXsia2luZCI6ImRpc3BsYXkiLCJ0ZXh0IjoiQXZhaWxhYmxlIGJhbGFuY2U6IADlAQRuYW1lARQBARFtYXRjaGVzX2F2YWlsYWJsZQJ+AwABAAVieXRlcwEBAANwdHICCgALY29udGV4dF9wdHIBC2NvbnRleHRfbGVuAglpbnB1dF9wdHIDCWlucHV0X2xlbgQEc2NhbgULdmFsdWVfc3RhcnQGCXZhbHVlX2VuZAcJdmFsdWVfbGVuCARjb3B5CQpvdXRwdXRfbGVuA0gBAgYAC3ZhbHVlX2ZvdW5kAQpzY2FuX3ZhbHVlBAllbmRfZm91bmQFCHNjYW5fZW5kCAljb3B5X2RvbmUJCmNvcHlfdmFsdWU=",
+        "runtime": "wasm-v1"
+      },
+      "title": "Show granted available balance"
+    },
+    {
+      "actionId": "sandbox.accountWorkflow",
+      "contributionId": "account.place-order",
+      "kind": "command",
+      "params": {
+        "abi": "account-json-v1",
+        "defaultInput": "{\"kind\":\"placeOrder\",\"order\":{\"symbol\":\"BTCUSDT\",\"side\":\"Buy\",\"orderType\":\"Limit\",\"qty\":\"0.001\",\"price\":\"50000\",\"timeInForce\":\"GTC\",\"positionIdx\":1,\"reduceOnly\":false}}",
+        "moduleBase64": "AGFzbQEAAAABDgJgAX8Bf2AEf39/fwF+AwMCAAEFBAEBARAHGAMGbWVtb3J5AgAFYWxsb2MAAANydW4AAQoiAhMAIABB//8DakEQdkAAQYCABGwLDAAgAq1CIIYgA62ECwBDBG5hbWUCPAIAAQAFYnl0ZXMBBAALY29udGV4dF9wdHIBC2NvbnRleHRfbGVuAglpbnB1dF9wdHIDCWlucHV0X2xlbg==",
+        "runtime": "wasm-v1"
+      },
+      "title": "Prepare example limit order"
+    },
+    {
+      "actionId": "sandbox.accountWorkflow",
+      "contributionId": "account.cancel-first-open-order",
+      "kind": "command",
+      "params": {
+        "abi": "account-json-v1",
+        "defaultInput": "{}",
+        "moduleBase64": "AGFzbQEAAAABDgJgAX8Bf2AEf39/fwF+AwYFAAAAAQEFBAEBARAHGAMGbWVtb3J5AgAFYWxsb2MAAANydW4ABArvBAUTACAAQf//A2pBEHZAAEGAgARsC2EAIAAtAABBIkYgAC0AAUHzAEZxIAAtAAJB+QBGcSAALQADQe0ARnEgAC0ABEHiAEZxIAAtAAVB7wBGcSAALQAGQewARnEgAC0AB0EiRnEgAC0ACEE6RnEgAC0ACUEiRnELawAgAC0AAEEiRiAALQABQe8ARnEgAC0AAkHyAEZxIAAtAANB5ABGcSAALQAEQeUARnEgAC0ABUHyAEZxIAAtAAZByQBGcSAALQAHQeQARnEgAC0ACEEiRnEgAC0ACUE6RnEgAC0ACkEiRnELfQEEfwJAA0AgBCADaiABSwRAAAsgAkUEfyAAIARqEAEFIAAgBGoQAgshByAHBEAgACAEaiADaiEFDAILIARBAWohBAwACwsgBSEGAkADQCAGIAAgAWpPBEAACyAGLQAAQSJGDQEgBkEBaiEGDAALCyAFrUIghiAGIAVrrYQLjAICAn4EfyAAIAFBAEEKEAMhBCAAIAFBAUELEAMhBSAEpyIHQSBLBEAACyAEQiCIpyEGQamAASEJAkADQCAIIAdPDQEgCSAIaiAGIAhqLQAAOgAAIAhBAWohCAwACwsgCSAHaiEJQQAhCAJAA0AgCEENTw0BIAkgCGpBgMAAIAhqLQAAOgAAIAhBAWohCAwACwsgCUENaiEJIAWnIgdBgAFLBEAACyAFQiCIpyEGQQAhCAJAA0AgCCAHTw0BIAkgCGogBiAIai0AADoAACAIQQFqIQgMAAsLIAkgB2oiCUEiOgAAIAlBAWpB/QA6AAAgCUECakH9ADoAAEKAgAFCIIYgCUEDakGAgAFrrYQLC0UCAEGAwAALDSIsIm9yZGVySWQiOiIAQYCAAQspeyJraW5kIjoiY2FuY2VsT3JkZXIiLCJvcmRlciI6eyJzeW1ib2wiOiIA8wIEbmFtZQEvAwEObWF0Y2hlc19zeW1ib2wCEG1hdGNoZXNfb3JkZXJfaWQDCmZpbmRfdmFsdWUCxQEFAAEABWJ5dGVzAQEAA3B0cgIBAANwdHIDCAALY29udGV4dF9wdHIBC2NvbnRleHRfbGVuAgdwYXR0ZXJuAwtwYXR0ZXJuX2xlbgQEc2NhbgUFc3RhcnQGA2VuZAcHbWF0Y2hlcwQKAAtjb250ZXh0X3B0cgELY29udGV4dF9sZW4CCWlucHV0X3B0cgMJaW5wdXRfbGVuBAZzeW1ib2wFCG9yZGVyX2lkBgZzb3VyY2UHBmxlbmd0aAgEY29weQkEZGVzdANzAgMEAAVmb3VuZAEKc2Nhbl92YWx1ZQUJZW5kX2ZvdW5kBghzY2FuX2VuZAQGAQtzeW1ib2xfZG9uZQILY29weV9zeW1ib2wDC21pZGRsZV9kb25lBAtjb3B5X21pZGRsZQYHaWRfZG9uZQcHY29weV9pZA==",
+        "runtime": "wasm-v1"
+      },
+      "title": "Prepare cancellation of first captured order"
+    }
+  ],
+  "description": "Reads a granted balance and prepares host-confirmed place or cancel proposals without direct account authority.",
+  "id": "com.easiflux.examples.account-workflow",
+  "name": "Account workflow safety example",
+  "publisher": "EasiFlux example (unverified)",
+  "publisherId": "com.easiflux.examples",
+  "requestedCapabilities": [
+    "account.read",
+    "balances.read",
+    "orders.read",
+    "trade.place",
+    "trade.cancel"
+  ],
+  "schemaVersion": 5,
+  "version": "1.0.0"
+}
