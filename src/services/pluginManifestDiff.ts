@@ -50,7 +50,37 @@ function commandEqual(
   if (current.actionId === 'host.openPage' && incoming.actionId === 'host.openPage') {
     return current.params.destination === incoming.params.destination
   }
+  if (
+    current.actionId === 'sandbox.computeSeries'
+    && incoming.actionId === 'sandbox.computeSeries'
+  ) {
+    return current.params.runtime === incoming.params.runtime
+      && current.params.abi === incoming.params.abi
+      && current.params.moduleBase64 === incoming.params.moduleBase64
+      && current.params.parameter.label === incoming.params.parameter.label
+      && current.params.parameter.default === incoming.params.parameter.default
+      && current.params.parameter.min === incoming.params.parameter.min
+      && current.params.parameter.max === incoming.params.parameter.max
+  }
   return false
+}
+
+export function pluginComputeModuleByteLength(command: PluginCommandContribution): number | null {
+  return command.actionId === 'sandbox.computeSeries'
+    ? atob(command.params.moduleBase64).length
+    : null
+}
+
+export function pluginComputeCodeChanged(
+  before: PluginCommandContribution,
+  after: PluginCommandContribution,
+): boolean {
+  if (before.actionId !== 'sandbox.computeSeries' && after.actionId !== 'sandbox.computeSeries') {
+    return false
+  }
+  return before.actionId !== 'sandbox.computeSeries'
+    || after.actionId !== 'sandbox.computeSeries'
+    || before.params.moduleBase64 !== after.params.moduleBase64
 }
 
 export function comparePluginManifests(

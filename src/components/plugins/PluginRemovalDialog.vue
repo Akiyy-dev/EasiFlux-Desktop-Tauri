@@ -144,7 +144,7 @@ onUnmounted(() => {
     <div class="plugin-removal-dialog__surface">
       <header>
         <p class="plugin-removal-dialog__eyebrow">
-          受管本地声明式包
+          受管本地插件包
         </p>
         <h2 id="plugin-removal-title">
           确认移除此本地包

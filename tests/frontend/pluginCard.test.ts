@@ -65,7 +65,7 @@ describe('PluginCard', () => {
   it('discloses local metadata-only preferences without implying verified publishing', () => {
     const wrapper = mountCard(pluginFixture('disabled', { source: 'localDeclarative', management: 'external' }))
 
-    expect(wrapper.text()).toContain('本地声明式包 · 外部放置，应用不会删除')
+    expect(wrapper.text()).toContain('本地插件包 · 外部放置，应用不会删除')
     expect(wrapper.text()).toContain('启用仅记录宿主偏好，不会运行插件代码')
     expect(wrapper.text()).not.toMatch(/已认证|已验证|签名认证|可信发布者|内置 · 随应用提供/)
     const control = wrapper.get<HTMLInputElement>('[role="switch"]')
@@ -96,6 +96,47 @@ describe('PluginCard', () => {
 
     expect(wrapper.text()).toContain('显示信息或请求宿主打开白名单页面')
     expect(wrapper.text()).toContain('不会运行插件代码')
+  })
+
+  it('discloses v4 code execution as explicit sandboxed local computation', () => {
+    const wrapper = mountCard(pluginFixture('enabled', {
+      source: 'localDeclarative',
+      management: 'external',
+      manifest: {
+        ...pluginFixture().manifest,
+        schemaVersion: 4,
+        contributions: [{
+          kind: 'command', contributionId: 'analytics.average', title: 'Average',
+          actionId: 'sandbox.computeSeries',
+          params: {
+            runtime: 'wasm-v1', abi: 'series-f64-v1', moduleBase64: 'AGFzbQEAAAA=',
+            parameter: { label: 'Window', default: 3, min: 1, max: 10 },
+          },
+        }],
+      },
+    }))
+
+    expect(wrapper.text()).toContain('明确点击运行')
+    expect(wrapper.text()).toContain('WebAssembly 沙箱')
+    expect(wrapper.text()).toContain('输入和结果仅保存在内存中')
+  })
+
+  it('does not claim executable code for a v4 manifest with host actions only', () => {
+    const wrapper = mountCard(pluginFixture('enabled', {
+      source: 'localDeclarative',
+      management: 'external',
+      manifest: {
+        ...pluginFixture().manifest,
+        schemaVersion: 4,
+        contributions: [{
+          kind: 'command', contributionId: 'workspace.charts', title: 'Charts',
+          actionId: 'host.openPage', params: { destination: 'charts' },
+        }],
+      },
+    }))
+
+    expect(wrapper.text()).toContain('不会运行插件代码')
+    expect(wrapper.text()).not.toContain('WebAssembly 沙箱')
   })
 
   it.each([
@@ -183,7 +224,7 @@ describe('PluginCard', () => {
 
   it.each([
     ['built-in', { management: 'builtIn', canRemove: false }, '内置 · 随应用提供', false],
-    ['external', { source: 'localDeclarative', management: 'external', canRemove: false }, '本地声明式包 · 外部放置，应用不会删除', false],
+    ['external', { source: 'localDeclarative', management: 'external', canRemove: false }, '本地插件包 · 外部放置，应用不会删除', false],
     ['managed enabled', { source: 'localDeclarative', management: 'managed', status: 'enabled', canRemove: false }, '请先停用', false],
     ['managed disabled', { source: 'localDeclarative', management: 'managed', status: 'disabled', canRemove: true }, '移除本地包', true],
     ['managed blocked', { source: 'localDeclarative', management: 'managed', status: 'blocked', canToggle: false, canRemove: false }, '当前不可移除', false],

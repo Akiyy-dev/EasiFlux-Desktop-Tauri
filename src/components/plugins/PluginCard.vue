@@ -30,6 +30,12 @@ const reasonLabels = {
 } as const
 
 const statusLabel = computed(() => pluginStatusLabel(props.plugin.status))
+const hasComputeCommand = computed(() => (
+  props.plugin.manifest.schemaVersion === 4
+  && props.plugin.manifest.contributions.some(
+    (command) => command.actionId === 'sandbox.computeSeries',
+  )
+))
 const statusId = computed(() => `plugin-card-${props.plugin.manifest.id}-status`)
 const errorId = computed(() => `plugin-card-${props.plugin.manifest.id}-error`)
 const describedBy = computed(() => (
@@ -125,11 +131,13 @@ function requestRemoval(event: RemovalClickEvent): void {
     </dl>
 
     <p v-if="plugin.source === 'localDeclarative'" class="plugin-card__local-note">
-      {{ plugin.manifest.schemaVersion !== 1
-        ? plugin.manifest.schemaVersion === 3
-          ? '启用后可显示信息或请求宿主打开白名单页面，不会运行插件代码'
-          : '启用后提供只读命令，不会运行插件代码'
-        : '启用仅记录宿主偏好，不会运行插件代码' }}
+      {{ hasComputeCommand
+        ? '只有明确点击运行才会在 WebAssembly 沙箱中执行本地计算；输入和结果仅保存在内存中'
+        : plugin.manifest.schemaVersion !== 1
+          ? plugin.manifest.schemaVersion >= 3
+            ? '启用后可显示信息或请求宿主打开白名单页面，不会运行插件代码'
+            : '启用后提供只读命令，不会运行插件代码'
+          : '启用仅记录宿主偏好，不会运行插件代码' }}
     </p>
 
     <slot name="commands" />

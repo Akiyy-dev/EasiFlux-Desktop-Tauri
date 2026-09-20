@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { pluginPageLabel } from '../../services/pluginNavigation'
-import { comparePluginManifests } from '../../services/pluginManifestDiff'
+import {
+  comparePluginManifests,
+  pluginComputeCodeChanged,
+  pluginComputeModuleByteLength,
+} from '../../services/pluginManifestDiff'
 import type {
   PluginCatalogItem,
   PluginCommandContribution,
@@ -48,9 +52,11 @@ function fieldValue(manifest: PluginManifest, field: PluginManifestField): strin
 }
 
 function commandLabel(command: PluginCommandContribution): string {
-  return command.actionId === 'host.showInfo'
-    ? `显示信息：${command.title}`
-    : `打开页面：${pluginPageLabel(command.params.destination)}`
+  if (command.actionId === 'host.showInfo') return `显示信息：${command.title}`
+  if (command.actionId === 'host.openPage') {
+    return `打开页面：${pluginPageLabel(command.params.destination)}`
+  }
+  return `运行本地计算：${command.title}`
 }
 
 function commandDetails(
@@ -66,6 +72,20 @@ function commandDetails(
       ...common,
       { label: '信息标题', value: command.params.title },
       { label: '信息正文', value: command.params.text },
+    ]
+  }
+  if (command.actionId === 'sandbox.computeSeries') {
+    return [
+      ...common,
+      { label: '运行时', value: command.params.runtime },
+      { label: 'ABI', value: command.params.abi },
+      { label: '代码模块', value: `${pluginComputeModuleByteLength(command)} 字节` },
+      { label: '参数名称', value: command.params.parameter.label },
+      { label: '参数默认值', value: String(command.params.parameter.default) },
+      {
+        label: '参数范围',
+        value: `${command.params.parameter.min} 至 ${command.params.parameter.max}`,
+      },
     ]
   }
   return [
@@ -185,6 +205,13 @@ function commandDetails(
       <h3>变更命令</h3>
       <details v-for="change in diff.changed" :key="change.after.contributionId">
         <summary><bdi>{{ change.after.contributionId }} · {{ commandLabel(change.after) }}</bdi></summary>
+        <p
+          v-if="pluginComputeCodeChanged(change.before, change.after)"
+          class="plugin-manifest-comparison__warning"
+          data-testid="plugin-compute-code-change"
+        >
+          可执行代码内容已变化；比较仅显示模块大小，不显示 Base64 内容。
+        </p>
         <div class="plugin-manifest-comparison__command-change">
           <section>
             <h4>当前</h4>

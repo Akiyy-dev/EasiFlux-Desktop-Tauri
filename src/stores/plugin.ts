@@ -23,6 +23,7 @@ import type {
   PluginCommandSummary,
   PluginLocalDiscoverySummary,
   PluginStatus,
+  PluginV3CommandContribution,
   ReadyLocalManifestImport,
   RemoveManagedLocalPluginResult,
 } from '../types/plugin'
@@ -76,12 +77,32 @@ function cloneCatalogItem(plugin: PluginCatalogItem): PluginCatalogItem {
           })),
           requestedCapabilities: [] as [],
         }
-      : {
+      : plugin.manifest.schemaVersion === 3
+        ? {
+            ...plugin.manifest,
+            contributions: plugin.manifest.contributions.map(
+              (command): PluginV3CommandContribution => (
+                command.actionId === 'host.showInfo'
+                  ? { ...command, params: { ...command.params } }
+                  : { ...command, params: { ...command.params } }
+              ),
+            ),
+            requestedCapabilities: [] as [],
+          }
+        : {
           ...plugin.manifest,
           contributions: plugin.manifest.contributions.map((command): PluginCommandContribution => (
             command.actionId === 'host.showInfo'
               ? { ...command, params: { ...command.params } }
-              : { ...command, params: { ...command.params } }
+              : command.actionId === 'host.openPage'
+                ? { ...command, params: { ...command.params } }
+                : {
+                    ...command,
+                    params: {
+                      ...command.params,
+                      parameter: { ...command.params.parameter },
+                    },
+                  }
           )),
           requestedCapabilities: [] as [],
         }
@@ -180,13 +201,19 @@ export const usePluginStore = defineStore('plugin', () => {
         }
         if (selected.command.actionId === 'host.showInfo') {
           summaries.push({ ...base, actionId: 'host.showInfo' })
-        } else {
+        } else if (selected.command.actionId === 'host.openPage') {
           summaries.push({
             ...base,
             actionId: 'host.openPage',
             destination: selected.command.params.destination,
           })
-        }
+        } else {
+          summaries.push({
+            ...base,
+            actionId: 'sandbox.computeSeries',
+            parameter: { ...selected.command.params.parameter },
+          })
+          }
       }
     }
     return summaries
@@ -205,12 +232,26 @@ export const usePluginStore = defineStore('plugin', () => {
         },
       }
     }
+    if (command.actionId === 'host.openPage') {
+      return {
+        actionId: 'host.openPage',
+        pluginId,
+        pluginName: plugin.manifest.name,
+        contributionId,
+        destination: command.params.destination,
+      }
+    }
     return {
-      actionId: 'host.openPage',
+      actionId: 'sandbox.computeSeries',
       pluginId,
       pluginName: plugin.manifest.name,
       contributionId,
-      destination: command.params.destination,
+      title: command.title,
+      runtime: command.params.runtime,
+      abi: command.params.abi,
+      parameter: { ...command.params.parameter },
+      expectedCatalogGeneration: catalogGeneration.value,
+      expectedRevision: revision.value,
     }
   }
 
