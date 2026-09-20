@@ -18,6 +18,10 @@ fn main() {
         "remove_managed_local_plugin",
         "execute_plugin_compute",
         "cancel_plugin_compute",
+        "get_plugin_workflow_access",
+        "set_plugin_workflow_grants",
+        "run_plugin_workflow",
+        "confirm_plugin_workflow",
     ];
     if smoke {
         commands.push("finish_plugin_smoke");

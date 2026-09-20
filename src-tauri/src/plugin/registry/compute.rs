@@ -54,7 +54,7 @@ impl PluginRegistry {
         let PluginCommandParams::ComputeSeries(params) = &contribution.params else {
             return Err(error("plugin_compute_not_supported"));
         };
-        if record.manifest().schema_version != 4
+        if !(4..=5).contains(&record.manifest().schema_version)
             || contribution.action_id != PluginCommandActionId::SandboxComputeSeries
         {
             return Err(error("plugin_compute_not_supported"));

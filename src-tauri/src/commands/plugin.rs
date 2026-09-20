@@ -13,7 +13,7 @@ use crate::plugin::removal::RemoveManagedLocalPluginResult;
 use crate::plugin::PluginRuntime;
 
 pub(crate) struct PluginCommandState {
-    runtime: Arc<PluginRuntime>,
+    pub(crate) runtime: Arc<PluginRuntime>,
     #[cfg(any(test, feature = "plugin-smoke"))]
     selector: Option<Arc<dyn LocalManifestSelector>>,
 }

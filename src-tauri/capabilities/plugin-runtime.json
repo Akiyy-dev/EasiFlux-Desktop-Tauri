@@ -12,6 +12,10 @@
     "allow-commit-local-manifest-import",
     "allow-remove-managed-local-plugin",
     "allow-execute-plugin-compute",
-    "allow-cancel-plugin-compute"
+    "allow-cancel-plugin-compute",
+    "allow-get-plugin-workflow-access",
+    "allow-set-plugin-workflow-grants",
+    "allow-run-plugin-workflow",
+    "allow-confirm-plugin-workflow"
   ]
 }

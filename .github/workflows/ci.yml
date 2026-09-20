@@ -79,7 +79,9 @@ jobs:
             'plugin::ownership::tests',
             'plugin::runtime::removal::tests',
             'plugin::compute',
-            'plugin::runtime::compute'
+            'plugin::runtime::compute',
+            'plugin::workflow',
+            'plugin::runtime::workflow'
           )
           foreach ($suite in $suites) {
             $listed = @(& cargo test --locked --manifest-path src-tauri/Cargo.toml $suite --lib -- --list --format terse)

@@ -1,6 +1,6 @@
 pub mod builtin;
-pub mod contribution;
 pub mod compute;
+pub mod contribution;
 pub(crate) mod discovery;
 pub(crate) mod import;
 pub mod manifest;
@@ -11,6 +11,7 @@ pub(crate) mod removal;
 mod runtime;
 #[cfg(any(test, feature = "plugin-smoke"))]
 pub(crate) mod smoke;
+pub(crate) mod workflow;
 
 pub use registry::PluginRegistry;
 pub(crate) use runtime::PluginRuntime;

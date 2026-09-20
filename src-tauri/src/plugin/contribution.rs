@@ -31,6 +31,8 @@ pub enum PluginCommandActionId {
     HostOpenPage,
     #[serde(rename = "sandbox.computeSeries")]
     SandboxComputeSeries,
+    #[serde(rename = "sandbox.accountWorkflow")]
+    SandboxAccountWorkflow,
 }
 
 impl<'de> Deserialize<'de> for PluginCommandActionId {
@@ -42,6 +44,7 @@ impl<'de> Deserialize<'de> for PluginCommandActionId {
             "host.showInfo" => Ok(Self::HostShowInfo),
             "host.openPage" => Ok(Self::HostOpenPage),
             "sandbox.computeSeries" => Ok(Self::SandboxComputeSeries),
+            "sandbox.accountWorkflow" => Ok(Self::SandboxAccountWorkflow),
             value => Err(serde::de::Error::unknown_variant(
                 value,
                 &["host.showInfo", "host.openPage", "sandbox.computeSeries"],
@@ -163,6 +166,7 @@ pub enum PluginCommandParams {
     ShowInfo(PluginInfoParams),
     OpenPage(PluginOpenPageParams),
     ComputeSeries(super::compute::PluginComputeParams),
+    AccountWorkflow(super::workflow::PluginWorkflowParams),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -215,6 +219,10 @@ impl PluginCommandContribution {
                 PluginCommandActionId::SandboxComputeSeries,
                 PluginCommandParams::ComputeSeries(params),
             ) => params.validate(),
+            (
+                PluginCommandActionId::SandboxAccountWorkflow,
+                PluginCommandParams::AccountWorkflow(params),
+            ) => params.validate(),
             _ => Err("plugin command action does not match params".into()),
         }
     }
@@ -228,6 +236,39 @@ mod tests {
 
     const VALID: &str = r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}"#;
     const VALID_NAVIGATION: &str = r#"{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":{"destination":"charts"}}"#;
+
+    #[test]
+    fn workflow_v5_closed_contract_and_legacy_exclusion() {
+        let action = json!({"kind":"command","contributionId":"account.inspect","title":"Inspect",
+            "actionId":"sandbox.accountWorkflow", "params":{"runtime":"wasm-v1", "abi":"account-json-v1",
+            "moduleBase64":"AGFzbQEAAAA=", "defaultInput":"{}"}});
+        let mut document = manifest(5, vec![action]);
+        document["requestedCapabilities"] = json!(["account.read", "trade.place"]);
+        let parsed: PluginManifestV1 = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), document);
+        for version in 1..=4 {
+            let mut old = document.clone();
+            old["schemaVersion"] = json!(version);
+            assert!(serde_json::from_value::<PluginManifestV1>(old).is_err());
+        }
+        for capabilities in [
+            json!([]),
+            json!(["trade.place"]),
+            json!(["account.read", "network"]),
+            json!(["account.read", "account.read"]),
+        ] {
+            let mut invalid = document.clone();
+            invalid["requestedCapabilities"] = capabilities;
+            assert!(serde_json::from_value::<PluginManifestV1>(invalid).is_err());
+        }
+        for input in ["[]", "null", "{", "{}{}"] {
+            let mut invalid = document.clone();
+            invalid["contributions"][0]["params"]["defaultInput"] = json!(input);
+            assert!(serde_json::from_value::<PluginManifestV1>(invalid).is_err());
+        }
+        document["contributions"] = json!([serde_json::from_str::<Value>(VALID).unwrap()]);
+        assert!(serde_json::from_value::<PluginManifestV1>(document).is_err());
+    }
 
     #[test]
     fn manifest_v4_compute_roundtrips_and_rejects_old_versions() {

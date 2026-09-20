@@ -11,6 +11,7 @@ pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V1: u32 = 1;
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V2: u32 = 2;
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V3: u32 = 3;
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V4: u32 = 4;
+pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V5: u32 = 5;
 
 const CATALOG_TRANSPORT_SCHEMA_VERSION: u8 = 3;
 
@@ -161,13 +162,19 @@ impl PluginManifest {
         match self.schema_version {
             PLUGIN_MANIFEST_SCHEMA_VERSION_V1 if self.contributions.is_empty() => {}
             version @ (PLUGIN_MANIFEST_SCHEMA_VERSION_V2
-                | PLUGIN_MANIFEST_SCHEMA_VERSION_V3
-                | PLUGIN_MANIFEST_SCHEMA_VERSION_V4)
+            | PLUGIN_MANIFEST_SCHEMA_VERSION_V3
+            | PLUGIN_MANIFEST_SCHEMA_VERSION_V4
+            | PLUGIN_MANIFEST_SCHEMA_VERSION_V5)
                 if (1..=16).contains(&self.contributions.len()) =>
             {
                 let mut contribution_ids = std::collections::BTreeSet::new();
                 for contribution in &self.contributions {
                     contribution.validate()?;
+                    if version < 5
+                        && contribution.action_id == PluginCommandActionId::SandboxAccountWorkflow
+                    {
+                        return Err("account workflow requires manifest v5".into());
+                    }
                     if version < PLUGIN_MANIFEST_SCHEMA_VERSION_V4
                         && contribution.action_id == PluginCommandActionId::SandboxComputeSeries
                     {
@@ -191,7 +198,20 @@ impl PluginManifest {
         if self.version.to_string().len() > MAX_VERSION_LENGTH {
             return Err("plugin version exceeds 64 bytes".into());
         }
-        if !self.requested_capabilities.is_empty() {
+        if self.schema_version == 5 {
+            super::workflow::validate_capabilities(&self.requested_capabilities)?;
+            if !self
+                .requested_capabilities
+                .iter()
+                .any(|c| c == "account.read")
+                || !self
+                    .contributions
+                    .iter()
+                    .any(|c| c.action_id == PluginCommandActionId::SandboxAccountWorkflow)
+            {
+                return Err("v5 requires account.read and an account workflow".into());
+            }
+        } else if !self.requested_capabilities.is_empty() {
             return Err("plugin requested capabilities are reserved".into());
         }
         Ok(())
