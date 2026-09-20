@@ -143,6 +143,13 @@ that startup is flake-free.
 
 ## Limits and remaining gates
 
+The first PR CI frontend run passed 1,428 tests and failed one security allowlist
+expectation that still enumerated the previous nine IPCs. The expectation now
+enumerates the intended thirteen commands explicitly, while retaining all
+forbidden filesystem/dialog/shell/remote authority assertions and main-WebView
+restriction. The focused four-test security file passed after this correction;
+the final updated-head CI result remains the merge gate.
+
 - Native UI acceptance passed on the controlled diagnostic run, but the earlier
   startup timeout remains unexplained and must not be hidden.
 - No production profile, account, key, private endpoint, live HTTP, or real

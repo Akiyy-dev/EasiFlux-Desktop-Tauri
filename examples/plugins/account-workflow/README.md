@@ -2,7 +2,8 @@
 
 This v5 example contains three small, import-free WebAssembly guests:
 
-- `balance.wat` reads the granted USDT `available` value from the captured context.
+- `balance.wat` reads the first captured balance entry's granted `available` value.
+  It does not select USDT or aggregate assets; check the asset in the host snapshot.
 - `place.wat` returns the user's strict `placeOrder` JSON proposal.
 - `cancel.wat` derives a `cancelOrder` proposal from the first order captured by the host.
 
