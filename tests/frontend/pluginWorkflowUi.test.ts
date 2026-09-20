@@ -21,7 +21,9 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve }
 }
 
-function catalog(generation = '8') {
+const DEFAULT_CAPABILITIES = ['account.read', 'balances.read', 'market.read', 'trade.place']
+
+function catalog(generation = '8', requestedCapabilities = DEFAULT_CAPABILITIES) {
   return {
     schemaVersion: 3, revision: '13', catalogGeneration: generation,
     availability: 'available', availabilityReasonCode: null,
@@ -35,7 +37,7 @@ function catalog(generation = '8') {
         schemaVersion: 5,
         id: 'com.example.trader', publisherId: 'com.example', publisher: 'Example',
         name: 'Example trader', description: 'Account workflow', version: '1.0.0',
-        requestedCapabilities: ['account.read', 'balances.read', 'market.read', 'trade.place'],
+        requestedCapabilities,
         contributions: [{
           kind: 'command', contributionId: 'trader.prepare', title: 'Prepare order',
           actionId: 'sandbox.accountWorkflow',
@@ -52,12 +54,16 @@ function catalog(generation = '8') {
   }
 }
 
-function access(grantedCapabilities: string[] = [], grantRevision = '0') {
+function access(
+  grantedCapabilities: string[] = [],
+  grantRevision = '0',
+  requestedCapabilities = DEFAULT_CAPABILITIES,
+) {
   return {
     schemaVersion: 1, pluginId: 'com.example.trader', contributionId: 'trader.prepare',
     catalogGeneration: '8', revision: '13',
     account: { accountId: 'paper-main', sessionEpoch: '21', environment: 'Testnet' },
-    requestedCapabilities: ['account.read', 'balances.read', 'market.read', 'trade.place'],
+    requestedCapabilities,
     grantedCapabilities, grantRevision,
   }
 }
@@ -115,10 +121,10 @@ function displayResult(requestId: string) {
   }
 }
 
-async function mountWorkflow() {
+async function mountWorkflow(requestedCapabilities = DEFAULT_CAPABILITIES) {
   const pinia = createPinia()
   setActivePinia(pinia)
-  vi.mocked(tauriInvoke).mockResolvedValueOnce(catalog())
+  vi.mocked(tauriInvoke).mockResolvedValueOnce(catalog('8', requestedCapabilities))
   const store = usePluginStore()
   await store.load()
   const wrapper = mount(PluginCommands, {
@@ -266,6 +272,79 @@ describe('plugin account workflow dialog', () => {
     await flushPromises()
     expect(vi.mocked(tauriInvoke).mock.calls
       .filter(([name]) => name === 'confirm_plugin_workflow')).toHaveLength(1)
+  })
+
+  it('consumes an explicitly expired native confirmation without claiming submission', async () => {
+    const { wrapper } = await mountWorkflow()
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(access(
+      ['account.read', 'balances.read', 'market.read', 'trade.place'], '1',
+    ))
+    await wrapper.get('[data-testid="plugin-command-button"]').trigger('click')
+    await flushPromises()
+    vi.mocked(tauriInvoke).mockImplementationOnce((_name, args) => Promise.resolve(
+      workflowResult((args as { request: { requestId: string } }).request.requestId),
+    ))
+    await wrapper.get('[data-testid="workflow-run"]').trigger('click')
+    await flushPromises()
+
+    vi.mocked(tauriInvoke).mockRejectedValueOnce({
+      code: 'plugin_workflow_token_invalid',
+      message: 'raw native message must not render',
+    })
+    const detachedConfirmButton = wrapper.get('[data-testid="workflow-confirm"]')
+    await detachedConfirmButton.trigger('click')
+    await flushPromises()
+
+    const outcome = wrapper.get('[data-testid="workflow-confirmation-not-submitted"]')
+    expect(outcome.text()).toContain('未提交')
+    expect(outcome.text()).toContain('不能重试')
+    expect(outcome.text()).not.toContain('raw native message')
+    expect(wrapper.find('[data-testid="workflow-confirm"]').exists()).toBe(false)
+
+    await detachedConfirmButton.trigger('click')
+    await flushPromises()
+    expect(vi.mocked(tauriInvoke).mock.calls
+      .filter(([name]) => name === 'confirm_plugin_workflow')).toHaveLength(1)
+  })
+
+  it('renders separate acquisition timestamps for granted position and order sections', async () => {
+    const capabilities = ['account.read', 'positions.read', 'orders.read', 'trade.place']
+    const { wrapper } = await mountWorkflow(capabilities)
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(access(capabilities, '1', capabilities))
+    await wrapper.get('[data-testid="plugin-command-button"]').trigger('click')
+    await flushPromises()
+    vi.mocked(tauriInvoke).mockImplementationOnce((_name, args) => {
+      const requestId = (args as { request: { requestId: string } }).request.requestId
+      const response = workflowResult(requestId)
+      response.snapshot.grantedCapabilities = [
+        'account.read', 'positions.read', 'orders.read', 'trade.place',
+      ]
+      response.snapshot.balances = null
+      response.snapshot.market = null
+      Object.assign(response.snapshot, {
+        positions: {
+          items: [{
+            symbol: 'BTCUSDT', side: 'Buy', size: '1', entryPrice: '50000',
+            leverage: '2', unrealisedPnl: '1', positionIdx: 1,
+          }],
+          fetchedAtMs: '1789920000100', partial: true,
+        },
+        orders: {
+          items: [{
+            orderId: 'order-1', symbol: 'BTCUSDT', side: 'Buy', orderType: 'Limit',
+            price: '50000', qty: '1', status: 'New', orderLinkId: null,
+            filledQty: '0', avgPrice: '0',
+          }],
+          fetchedAtMs: '1789920000110', partial: true,
+        },
+      })
+      return Promise.resolve(response)
+    })
+    await wrapper.get('[data-testid="workflow-run"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="workflow-positions"]').text()).toContain('获取于')
+    expect(wrapper.get('[data-testid="workflow-orders"]').text()).toContain('获取于')
   })
 
   it('clears prepared confirmation on input change and suppresses late runs after account change', async () => {

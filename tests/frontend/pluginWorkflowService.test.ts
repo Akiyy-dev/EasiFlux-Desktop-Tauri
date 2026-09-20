@@ -4,6 +4,7 @@ import { getPluginCatalog } from '../../src/services/pluginService'
 import {
   confirmPluginWorkflow,
   getPluginWorkflowAccess,
+  isPluginWorkflowConfirmationNotSubmitted,
   parseWorkflowAccess,
   runPluginWorkflow,
   setPluginWorkflowGrants,
@@ -168,6 +169,10 @@ describe('plugin workflow strict wire parsing', () => {
     expect(() => parseWorkflowAccess({
       ...accessFixture(), grantedCapabilities: ['trade.place'],
     }, intent())).toThrow(INVALID_RESPONSE_ERROR)
+    expect(parseWorkflowAccess({
+      ...accessFixture(),
+      account: { ...accessFixture().account, environment: 'E'.repeat(256) },
+    }, intent()).account.environment).toHaveLength(256)
   })
 
   it('builds allowlisted authority and grant requests without spreading caller data', async () => {
@@ -311,6 +316,59 @@ describe('plugin workflow strict wire parsing', () => {
       requestId: 'workflow-fixed-request', symbol: 'BTCUSDT', inputJson: '{}',
     })
     expect(parsed.output).toEqual({ kind: 'display', text: '  first line\nsecond line  ' })
+  })
+
+  it('preserves native-valid leading-zero decimals without numeric conversion', async () => {
+    const access = parseWorkflowAccess({
+      ...accessFixture(),
+      grantedCapabilities: ['account.read', 'balances.read', 'market.read', 'trade.place'],
+      grantRevision: '1',
+    }, intent())
+    const leadingZeroResult = resultFixture()
+    leadingZeroResult.snapshot.balances!.items[0].available = '00.10'
+    leadingZeroResult.snapshot.market!.ticker.lastPrice = '050000.00'
+    leadingZeroResult.output.order.qty = '00.001'
+    leadingZeroResult.output.order.price = '050000'
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(leadingZeroResult)
+
+    const parsed = await runPluginWorkflow(intent(), access, {
+      requestId: 'workflow-fixed-request', symbol: 'BTCUSDT', inputJson: '{}',
+    })
+    expect(parsed.snapshot.balances?.items[0].available).toBe('00.10')
+    expect(parsed.snapshot.market?.ticker.lastPrice).toBe('050000.00')
+    expect(parsed.output.kind === 'placeOrder' && parsed.output.order.qty).toBe('00.001')
+
+    for (const qty of ['00', '00.00', '-00.10']) {
+      vi.mocked(tauriInvoke).mockResolvedValueOnce({
+        ...resultFixture(),
+        output: {
+          kind: 'placeOrder',
+          order: { ...resultFixture().output.order, qty },
+        },
+      })
+      await expect(runPluginWorkflow(intent(), access, {
+        requestId: 'workflow-fixed-request', symbol: 'BTCUSDT', inputJson: '{}',
+      })).rejects.toThrow(INVALID_RESPONSE_ERROR)
+    }
+  })
+
+  it('classifies only audited native pre-dispatch errors as not submitted', () => {
+    for (const code of [
+      'plugin_workflow_invalid_request',
+      'plugin_workflow_token_invalid',
+      'plugin_workflow_stale',
+    ]) {
+      expect(isPluginWorkflowConfirmationNotSubmitted({ code, message: 'native safe copy' }))
+        .toBe(true)
+    }
+    for (const error of [
+      { code: 'plugin_workflow_unknown', message: 'native safe copy' },
+      { code: 'plugin_workflow_denied', message: 'native safe copy' },
+      { code: 'plugin_workflow_stale', message: 'native safe copy', extra: true },
+      new Error('plugin_workflow_stale'),
+    ]) {
+      expect(isPluginWorkflowConfirmationNotSubmitted(error)).toBe(false)
+    }
   })
 
   it('confirms with the token only and rejects a mismatched receipt', async () => {

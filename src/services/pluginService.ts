@@ -735,7 +735,7 @@ function manifestsMatch(left: PluginManifest, right: PluginManifest): boolean {
     && left.version === right.version
     // Both sides are strictly parsed with normalized nested command keys.
     && JSON.stringify(left.contributions) === JSON.stringify(right.contributions)
-    && left.requestedCapabilities.length === right.requestedCapabilities.length
+    && JSON.stringify(left.requestedCapabilities) === JSON.stringify(right.requestedCapabilities)
 }
 
 function parsePrepareImport(value: unknown): PrepareLocalManifestImportResult {

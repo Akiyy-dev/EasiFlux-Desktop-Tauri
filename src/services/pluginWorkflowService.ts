@@ -54,6 +54,11 @@ const RECEIPT_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   plugin_workflow_rejected: '交易请求被拒绝。',
   plugin_workflow_unknown: '交易结果尚不确定。',
 }
+const CONFIRMATION_NOT_SUBMITTED_CODES = new Set([
+  'plugin_workflow_invalid_request',
+  'plugin_workflow_token_invalid',
+  'plugin_workflow_stale',
+])
 
 type WireObject = Record<string, unknown>
 
@@ -131,8 +136,8 @@ function symbol(value: unknown): string {
 
 function decimal(value: unknown, positive = false): string {
   if (typeof value !== 'string' || textEncoder.encode(value).byteLength > 64
-    || !/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(value)) invalidResponse()
-  if (positive && (value.startsWith('-') || /^0(?:\.0+)?$/.test(value))) invalidResponse()
+    || !/^-?[0-9]+(?:\.[0-9]+)?$/.test(value)) invalidResponse()
+  if (positive && (value.startsWith('-') || /^0+(?:\.0+)?$/.test(value))) invalidResponse()
   return value
 }
 
@@ -141,7 +146,7 @@ function parseAccount(value: unknown): PluginWorkflowAccount {
   return {
     accountId: boundedString(account.accountId, 128),
     sessionEpoch: canonicalCounter(account.sessionEpoch),
-    environment: boundedString(account.environment, 128),
+    environment: boundedString(account.environment, 256),
   }
 }
 
@@ -597,12 +602,21 @@ export async function confirmPluginWorkflow(
   return parseReceipt(value, confirmation, output, account)
 }
 
+function nativeWorkflowErrorCode(error: unknown): string | null {
+  if (!isObject(error) || Object.keys(error).length !== 2
+    || typeof error.code !== 'string' || typeof error.message !== 'string'
+    || !error.code.startsWith('plugin_workflow_')) return null
+  return error.code
+}
+
+export function isPluginWorkflowConfirmationNotSubmitted(error: unknown): boolean {
+  const code = nativeWorkflowErrorCode(error)
+  return code !== null && CONFIRMATION_NOT_SUBMITTED_CODES.has(code)
+}
+
 export function pluginWorkflowErrorMessage(error: unknown): string {
-  if (isObject(error) && Object.keys(error).length === 2
-    && typeof error.code === 'string' && typeof error.message === 'string'
-    && error.code.startsWith('plugin_workflow_')) {
-    return RECEIPT_ERROR_MESSAGES[error.code] ?? GENERIC_ERROR
-  }
+  const code = nativeWorkflowErrorCode(error)
+  if (code !== null) return RECEIPT_ERROR_MESSAGES[code] ?? GENERIC_ERROR
   return error instanceof Error && error.message === INVALID_RESPONSE_ERROR
     ? INVALID_RESPONSE_ERROR
     : GENERIC_ERROR

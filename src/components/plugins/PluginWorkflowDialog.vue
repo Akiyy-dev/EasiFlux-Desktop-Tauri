@@ -4,6 +4,7 @@ import { cancelPluginCompute } from '../../services/pluginService'
 import {
   confirmPluginWorkflow,
   getPluginWorkflowAccess,
+  isPluginWorkflowConfirmationNotSubmitted,
   parsePluginWorkflowInput,
   parsePluginWorkflowSymbol,
   pluginWorkflowErrorMessage,
@@ -54,6 +55,7 @@ const inputText = ref(props.intent.defaultInput)
 const result = ref<PluginWorkflowResult | null>(null)
 const receipt = ref<PluginWorkflowTradeReceipt | null>(null)
 const confirmationUnknown = ref(false)
+const confirmationNotSubmitted = ref(false)
 const error = ref<string | null>(null)
 
 const busy = computed(() => ['loading', 'granting', 'running', 'confirming'].includes(status.value))
@@ -78,6 +80,7 @@ function clearExecution(cancelRunning = false): void {
   result.value = null
   receipt.value = null
   confirmationUnknown.value = false
+  confirmationNotSubmitted.value = false
   error.value = null
   if (!busy.value && access.value) status.value = 'ready'
 }
@@ -126,6 +129,7 @@ async function saveGrants(capabilities = selectedCapabilities.value): Promise<vo
   result.value = null
   receipt.value = null
   confirmationUnknown.value = false
+  confirmationNotSubmitted.value = false
   error.value = null
   try {
     const updated = await setPluginWorkflowGrants(props.intent, current, capabilities)
@@ -171,6 +175,7 @@ async function run(): Promise<void> {
   result.value = null
   receipt.value = null
   confirmationUnknown.value = false
+  confirmationNotSubmitted.value = false
   error.value = null
   try {
     const completed = await runPluginWorkflow(props.intent, current, {
@@ -191,7 +196,9 @@ async function run(): Promise<void> {
 async function confirmTrade(): Promise<void> {
   const prepared = result.value
   if (!prepared?.confirmation || prepared.output.kind === 'display'
-    || busy.value || receipt.value || confirmationUnknown.value) return
+    || busy.value || receipt.value || confirmationUnknown.value || confirmationNotSubmitted.value) {
+    return
+  }
   const owner = accessOwner()
   status.value = 'confirming'
   error.value = null
@@ -206,10 +213,10 @@ async function confirmTrade(): Promise<void> {
     status.value = 'ready'
   } catch (caught) {
     if (disposed || owner !== ownerSequence) return
-    // Confirmation may already have dispatched the mutation. Consume the
-    // local proposal and require external reconciliation instead of retrying.
-    void caught
-    confirmationUnknown.value = true
+    // Both outcomes consume the local proposal. Only audited native codes are
+    // safe to label pre-dispatch; every other failure requires reconciliation.
+    confirmationNotSubmitted.value = isPluginWorkflowConfirmationNotSubmitted(caught)
+    confirmationUnknown.value = !confirmationNotSubmitted.value
     error.value = null
     status.value = 'ready'
   }
@@ -383,7 +390,7 @@ onBeforeUnmount(() => {
           </ul>
         </template>
       </section>
-      <section>
+      <section data-testid="workflow-positions">
         <h5>持仓</h5>
         <p v-if="result.snapshot.positions === null">
           未授权，未读取持仓。
@@ -392,6 +399,7 @@ onBeforeUnmount(() => {
           <p v-if="result.snapshot.positions.partial" data-testid="workflow-partial-warning">
             此列表可能不完整。
           </p>
+          <p>获取于 {{ timestampLabel(result.snapshot.positions.fetchedAtMs) }}。</p>
           <ul>
             <li v-for="position in result.snapshot.positions.items" :key="`${position.symbol}:${position.positionIdx}`">
               {{ position.symbol }} {{ position.side }}，数量 {{ position.size }}，入场价 {{ position.entryPrice }}，未实现盈亏 {{ position.unrealisedPnl }}
@@ -399,7 +407,7 @@ onBeforeUnmount(() => {
           </ul>
         </template>
       </section>
-      <section>
+      <section data-testid="workflow-orders">
         <h5>未成交委托</h5>
         <p v-if="result.snapshot.orders === null">
           未授权，未读取委托。
@@ -408,6 +416,7 @@ onBeforeUnmount(() => {
           <p v-if="result.snapshot.orders.partial" data-testid="workflow-partial-warning">
             此列表可能不完整。
           </p>
+          <p>获取于 {{ timestampLabel(result.snapshot.orders.fetchedAtMs) }}。</p>
           <ul>
             <li v-for="order in result.snapshot.orders.items" :key="order.orderId">
               {{ order.symbol }} {{ order.side }} {{ order.orderType }}，数量 {{ order.qty }}，价格 {{ order.price }}，状态 {{ order.status }}，订单 ID {{ order.orderId }}
@@ -433,7 +442,7 @@ onBeforeUnmount(() => {
     </section>
 
     <section
-      v-if="result?.confirmation && result.output.kind !== 'display' && !receipt && !confirmationUnknown"
+      v-if="result?.confirmation && result.output.kind !== 'display' && !receipt && !confirmationUnknown && !confirmationNotSubmitted"
       class="plugin-workflow-dialog__confirmation"
       data-testid="workflow-confirmation"
       aria-label="真实交易确认"
@@ -470,8 +479,15 @@ onBeforeUnmount(() => {
       </button>
     </section>
 
-    <section v-if="receipt || confirmationUnknown" class="plugin-workflow-dialog__receipt" aria-live="polite">
-      <p v-if="receipt?.status === 'accepted'" data-testid="workflow-receipt-accepted">
+    <section
+      v-if="receipt || confirmationUnknown || confirmationNotSubmitted"
+      class="plugin-workflow-dialog__receipt"
+      aria-live="polite"
+    >
+      <p v-if="confirmationNotSubmitted" data-testid="workflow-confirmation-not-submitted">
+        交易确认已过期、失效或上下文已变化，本次请求未提交。此提案已作废且不能重试；请重新运行工作流生成新提案。
+      </p>
+      <p v-else-if="receipt?.status === 'accepted'" data-testid="workflow-receipt-accepted">
         {{ receipt.action === 'cancelOrder'
           ? '撤单请求已受理；这不代表已确认终态取消，请在订单中心确认最终状态。'
           : '真实订单请求已被交易系统接受。' }}

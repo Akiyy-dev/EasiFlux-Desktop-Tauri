@@ -302,6 +302,31 @@ function validManifest(
   }
 }
 
+function workflowManifest(requestedCapabilities: string[]): WireObject {
+  return {
+    schemaVersion: 5,
+    id: 'com.example.trader',
+    publisherId: 'com.example',
+    publisher: 'Example',
+    name: 'Trader',
+    description: 'Account workflow',
+    version: '1.0.0',
+    requestedCapabilities,
+    contributions: [{
+      kind: 'command',
+      contributionId: 'trader.prepare',
+      title: 'Prepare order',
+      actionId: 'sandbox.accountWorkflow',
+      params: {
+        runtime: 'wasm-v1',
+        abi: 'account-json-v1',
+        moduleBase64: 'AGFzbQEAAAA=',
+        defaultInput: '{}',
+      },
+    }],
+  }
+}
+
 function validItem(
   id = 'com.easiflux.analytics',
   status: 'enabled' | 'disabled' = 'disabled',
@@ -1212,6 +1237,16 @@ describe('local manifest import transport validation', () => {
     const snapshot = value.snapshot as WireObject
     manifestFromItem(firstItem(snapshot))[field] = changed
     await expectCommitRejected(value)
+  })
+
+  it('rejects an equal-length requested-capability substitution after preview', async () => {
+    const previewManifest = workflowManifest(['account.read', 'balances.read'])
+    const preview = await parseReadyThroughPrepare(readyImport(previewManifest))
+    const result = importedResult(workflowManifest(['account.read', 'positions.read']))
+    result.pluginId = 'com.example.trader'
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(result)
+
+    await expect(commitLocalManifestImport(preview)).rejects.toThrow(INVALID_RESPONSE_ERROR)
   })
 
   it.each([
