@@ -139,6 +139,33 @@ describe('PluginCard', () => {
     expect(wrapper.text()).not.toContain('WebAssembly 沙箱')
   })
 
+  it('discloses v5 account and trading requests without implying enablement grants them', () => {
+    const wrapper = mountCard(pluginFixture('enabled', {
+      source: 'localDeclarative',
+      management: 'external',
+      manifest: {
+        ...pluginFixture().manifest,
+        schemaVersion: 5,
+        requestedCapabilities: ['account.read', 'balances.read', 'trade.place'],
+        contributions: [{
+          kind: 'command', contributionId: 'trader.prepare', title: 'Prepare order',
+          actionId: 'sandbox.accountWorkflow',
+          params: {
+            runtime: 'wasm-v1', abi: 'account-json-v1', moduleBase64: 'AGFzbQEAAAA=',
+            defaultInput: '{"qty":"0.001"}',
+          },
+        }],
+      },
+    }))
+
+    expect(wrapper.get('[data-testid="requested-capabilities"]').text())
+      .toContain('账户会话、余额、真实下单提案')
+    expect(wrapper.get('[data-testid="granted-capabilities"]').text())
+      .toContain('启用不会授权')
+    expect(wrapper.text()).toContain('每次真实交易仍需单独确认')
+    expect(wrapper.text()).not.toContain('不会运行插件代码')
+  })
+
   it.each([
     ['enabled', '已启用', true],
     ['disabled', '已停用', false],

@@ -101,4 +101,36 @@ describe('compute manifest comparison', () => {
     expect(wrapper.text()).not.toContain(currentBase64)
     expect(wrapper.text()).not.toContain(incomingBase64)
   })
+
+  it('discloses v5 workflow permission and confirmation changes without rendering module bytes', () => {
+    const current = item('AGFzbQEAAAA=')
+    const incoming = {
+      ...manifest('AGFzbQEAAAA='),
+      schemaVersion: 5 as const,
+      requestedCapabilities: ['account.read', 'balances.read', 'trade.place'] as const,
+      contributions: [{
+        kind: 'command' as const,
+        contributionId: 'trader.prepare',
+        title: 'Prepare order',
+        actionId: 'sandbox.accountWorkflow' as const,
+        params: {
+          runtime: 'wasm-v1' as const,
+          abi: 'account-json-v1' as const,
+          moduleBase64: 'AGFzbQEAAAA=',
+          defaultInput: '{"qty":"0.001"}',
+        },
+      }],
+    }
+    const wrapper = mount(PluginManifestComparison, {
+      props: { current, incoming, versionRelation: 'incomingHigher' },
+    })
+
+    expect(wrapper.get('[data-testid="plugin-workflow-comparison-notice"]').text())
+      .toContain('启用不会授权')
+    expect(wrapper.get('[data-testid="plugin-workflow-comparison-notice"]').text())
+      .toContain('真实交易仍需单独确认')
+    expect(wrapper.text()).toContain('account.read、balances.read、trade.place')
+    expect(wrapper.text()).toContain('{"qty":"0.001"}')
+    expect(wrapper.text()).not.toContain('AGFzbQEAAAA=')
+  })
 })

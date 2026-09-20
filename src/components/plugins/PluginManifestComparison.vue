@@ -27,8 +27,14 @@ const props = defineProps<{
 const diff = computed(() => comparePluginManifests(props.current.manifest, props.incoming))
 const comparisonHasCompute = computed(() => (
   [props.current.manifest, props.incoming].some((manifest) => (
-    manifest.schemaVersion === 4
+    manifest.schemaVersion >= 4
     && manifest.contributions.some((command) => command.actionId === 'sandbox.computeSeries')
+  ))
+))
+const comparisonHasWorkflow = computed(() => (
+  [props.current.manifest, props.incoming].some((manifest) => (
+    manifest.schemaVersion === 5
+    && manifest.contributions.some((command) => command.actionId === 'sandbox.accountWorkflow')
   ))
 ))
 
@@ -62,7 +68,8 @@ function commandLabel(command: PluginCommandContribution): string {
   if (command.actionId === 'host.openPage') {
     return `打开页面：${pluginPageLabel(command.params.destination)}`
   }
-  return `运行本地计算：${command.title}`
+  if (command.actionId === 'sandbox.computeSeries') return `运行本地计算：${command.title}`
+  return `账户工作流：${command.title}`
 }
 
 function commandDetails(
@@ -92,6 +99,15 @@ function commandDetails(
         label: '参数范围',
         value: `${command.params.parameter.min} 至 ${command.params.parameter.max}`,
       },
+    ]
+  }
+  if (command.actionId === 'sandbox.accountWorkflow') {
+    return [
+      ...common,
+      { label: '运行时', value: command.params.runtime },
+      { label: 'ABI', value: command.params.abi },
+      { label: '代码模块', value: `${pluginComputeModuleByteLength(command)} 字节` },
+      { label: '默认输入', value: command.params.defaultInput },
     ]
   }
   return [
@@ -153,6 +169,14 @@ function commandDetails(
     </section>
     <p data-testid="plugin-import-version-relation">
       {{ versionRelationCopy[props.versionRelation] }}
+    </p>
+
+    <p
+      v-if="comparisonHasWorkflow"
+      class="plugin-manifest-comparison__warning"
+      data-testid="plugin-workflow-comparison-notice"
+    >
+      此比较涉及账户工作流和请求权限。导入或启用不会授权；必须在当前会话单独选择授权，真实交易仍需单独确认。
     </p>
 
     <p

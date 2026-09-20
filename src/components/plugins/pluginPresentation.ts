@@ -1,4 +1,5 @@
 import type { PluginManagement, PluginSource, PluginStatus } from '../../types/plugin'
+import type { PluginWorkflowCapability } from '../../types/pluginWorkflow'
 
 export const pluginSourceLabels: Record<PluginSource, string> = {
   builtIn: '内置 · 随应用提供',
@@ -30,4 +31,14 @@ export const pluginStatusLabels: Record<PluginStatus, string> = {
 
 export function pluginStatusLabel(status: PluginStatus): string {
   return pluginStatusLabels[status]
+}
+
+export const pluginCapabilityLabels: Record<PluginWorkflowCapability, string> = {
+  'account.read': '账户会话',
+  'balances.read': '余额',
+  'positions.read': '持仓',
+  'orders.read': '未成交委托',
+  'market.read': '市场报价',
+  'trade.place': '真实下单提案',
+  'trade.cancel': '真实撤单提案',
 }

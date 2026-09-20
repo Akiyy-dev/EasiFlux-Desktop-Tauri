@@ -62,11 +62,21 @@ function commandEqual(
       && current.params.parameter.min === incoming.params.parameter.min
       && current.params.parameter.max === incoming.params.parameter.max
   }
+  if (
+    current.actionId === 'sandbox.accountWorkflow'
+    && incoming.actionId === 'sandbox.accountWorkflow'
+  ) {
+    return current.params.runtime === incoming.params.runtime
+      && current.params.abi === incoming.params.abi
+      && current.params.moduleBase64 === incoming.params.moduleBase64
+      && current.params.defaultInput === incoming.params.defaultInput
+  }
   return false
 }
 
 export function pluginComputeModuleByteLength(command: PluginCommandContribution): number | null {
   return command.actionId === 'sandbox.computeSeries'
+    || command.actionId === 'sandbox.accountWorkflow'
     ? atob(command.params.moduleBase64).length
     : null
 }
@@ -75,11 +85,15 @@ export function pluginComputeCodeChanged(
   before: PluginCommandContribution,
   after: PluginCommandContribution,
 ): boolean {
-  if (before.actionId !== 'sandbox.computeSeries' && after.actionId !== 'sandbox.computeSeries') {
+  const beforeExecutable = before.actionId === 'sandbox.computeSeries'
+    || before.actionId === 'sandbox.accountWorkflow'
+  const afterExecutable = after.actionId === 'sandbox.computeSeries'
+    || after.actionId === 'sandbox.accountWorkflow'
+  if (!beforeExecutable && !afterExecutable) {
     return false
   }
-  return before.actionId !== 'sandbox.computeSeries'
-    || after.actionId !== 'sandbox.computeSeries'
+  if (!beforeExecutable || !afterExecutable) return true
+  return before.actionId !== after.actionId
     || before.params.moduleBase64 !== after.params.moduleBase64
 }
 

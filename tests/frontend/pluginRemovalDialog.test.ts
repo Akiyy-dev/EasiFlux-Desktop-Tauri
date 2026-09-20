@@ -95,6 +95,8 @@ describe('PluginRemovalDialog', () => {
     expect(wrapper.text()).toContain('最初选择的源文件不会被修改')
     expect(wrapper.text()).toContain('无法撤销')
     expect(wrapper.text()).toContain('停用偏好将保留')
+    expect(wrapper.text()).toContain('会话授权将失效')
+    expect(wrapper.text()).toContain('无法撤回已传送的订单或撤单请求')
     wrapper.unmount()
   })
 
