@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -28,6 +28,8 @@ pub(crate) struct PluginRuntime {
     import_sessions: Arc<ImportSessions>,
     operation_gate: Arc<Mutex<()>>,
     initial_discovery_attempted: AtomicBool,
+    compute_slot: Arc<super::compute::slot::ComputeSlot>,
+    compute_epoch: AtomicU64,
 }
 
 type OperationWaiter = Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>;
@@ -96,6 +98,8 @@ impl PluginRuntime {
             import_sessions: ImportSessions::new(),
             operation_gate: Arc::new(Mutex::new(())),
             initial_discovery_attempted: AtomicBool::new(false),
+            compute_slot: super::compute::slot::ComputeSlot::global(),
+            compute_epoch: AtomicU64::new(0),
         }
     }
 
@@ -166,10 +170,21 @@ impl PluginRuntime {
             Arc::clone(&self.operation_gate).lock_owned(),
         ));
         let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
-        match waiter.as_mut().poll(&mut context) {
+        let reservation = match waiter.as_mut().poll(&mut context) {
             Poll::Ready(guard) => OperationReservation::Ready(guard),
             Poll::Pending => OperationReservation::Waiting(waiter),
-        }
+        };
+        // Reserve/queue the gate BEFORE invalidation: otherwise another thread
+        // can admit compute with the new epoch while lifecycle has no gate yet.
+        // The owned reservation blocks new admission throughout invalidation,
+        // even if publication later fails or returns the same snapshot.
+        let _ = self.compute_epoch.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |epoch| Some(epoch.saturating_add(1)),
+        );
+        self.compute_slot.invalidate();
+        reservation
     }
 
     async fn request_state_retry(self: &Arc<Self>) -> AppResult<PluginCatalogSnapshot> {
@@ -277,6 +292,7 @@ fn runtime_error() -> AppError {
     AppError::Internal("插件目录请求暂不可用".into())
 }
 
+mod compute;
 mod import;
 
 mod removal;

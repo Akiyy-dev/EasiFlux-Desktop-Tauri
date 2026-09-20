@@ -24,8 +24,22 @@ function page(
   }
 }
 
+function compute(
+  contributionId: string,
+  moduleBase64 = 'AGFzbQEAAAA=',
+  parameter = { label: 'Window', default: 3, min: 1, max: 10 },
+): PluginCommandContribution {
+  return {
+    kind: 'command', contributionId, title: 'Compute average',
+    actionId: 'sandbox.computeSeries',
+    params: {
+      runtime: 'wasm-v1', abi: 'series-f64-v1', moduleBase64, parameter,
+    },
+  }
+}
+
 function manifest(
-  schemaVersion: 1 | 2 | 3 = 3,
+  schemaVersion: 1 | 2 | 3 | 4 = 3,
   contributions: PluginCommandContribution[] = [],
   overrides: Partial<PluginManifest> = {},
 ): PluginManifest {
@@ -156,5 +170,27 @@ describe('comparePluginManifests', () => {
     expect(second.changedFields).toEqual(['schemaVersion'])
     expect(second.changed.map(({ before, after }) => [before.actionId, after.actionId]))
       .toEqual([['host.showInfo', 'host.openPage']])
+  })
+
+  it('compares every compute field exactly while preserving identical v4 content', () => {
+    const current = manifest(4, [compute('analytics.average')])
+    expect(comparePluginManifests(current, structuredClone(current))).toMatchObject({
+      sameContent: true,
+      changed: [],
+    })
+
+    const code = comparePluginManifests(
+      current,
+      manifest(4, [compute('analytics.average', 'AGFzbQEAAAAB')]),
+    )
+    expect(code.changed.map(({ after }) => after.contributionId)).toEqual(['analytics.average'])
+    const parameter = comparePluginManifests(
+      current,
+      manifest(4, [compute('analytics.average', 'AGFzbQEAAAA=', {
+        label: 'Window', default: 4, min: 1, max: 10,
+      })]),
+    )
+    expect(parameter.changed.map(({ after }) => after.contributionId))
+      .toEqual(['analytics.average'])
   })
 })

@@ -274,7 +274,7 @@ describe('installed plugin command workbench', () => {
       legacyPlugin(),
     ]))
     await noEnabled.get('[data-testid="plugin-command-view"]').trigger('click')
-    expect(noEnabled.get('[data-testid="plugin-command-empty"]').text()).toContain('没有已启用的宿主命令')
+    expect(noEnabled.get('[data-testid="plugin-command-empty"]').text()).toContain('没有已启用的插件命令')
     noEnabled.unmount()
 
     const unavailable = await mountLoaded(unavailableSnapshot())

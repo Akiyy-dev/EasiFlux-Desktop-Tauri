@@ -13,6 +13,9 @@ import type {
   PluginLocalDiscoverySummary,
   PluginManifest,
   PluginCommandContribution,
+  PluginComputeCancelResult,
+  PluginComputeRequest,
+  PluginComputeResult,
   PluginPageDestination,
   PluginManagement,
   PluginStatus,
@@ -63,6 +66,24 @@ export type PluginErrorCode =
   | 'plugin_remove_staging_capacity_exceeded'
   | 'plugin_remove_write_failed'
   | 'plugin_remove_publication_unconfirmed'
+  | 'plugin_compute_invalid_request'
+  | 'plugin_compute_invalid_input'
+  | 'plugin_compute_invalid_parameter'
+  | 'plugin_compute_unavailable'
+  | 'plugin_compute_stale'
+  | 'plugin_compute_disabled'
+  | 'plugin_compute_not_found'
+  | 'plugin_compute_not_supported'
+  | 'plugin_compute_busy'
+  | 'plugin_compute_cancelled'
+  | 'plugin_compute_invalid_module'
+  | 'plugin_compute_invalid_abi'
+  | 'plugin_compute_memory'
+  | 'plugin_compute_trap'
+  | 'plugin_compute_invalid_output'
+  | 'plugin_compute_budget'
+  | 'plugin_compute_deadline'
+  | 'plugin_compute_internal'
 
 const ERROR_MESSAGES = {
   plugin_invalid_id: '插件标识无效。',
@@ -100,6 +121,24 @@ const ERROR_MESSAGES = {
   plugin_remove_staging_capacity_exceeded: '移除暂存区需要人工检查。',
   plugin_remove_write_failed: '未能完成包隔离，请重新扫描。',
   plugin_remove_publication_unconfirmed: '移除可能已提交，但目录结果未确认，请重新扫描。',
+  plugin_compute_invalid_request: '插件计算请求无效，请重新打开命令。',
+  plugin_compute_invalid_input: '输入序列无效，请检查后重试。',
+  plugin_compute_invalid_parameter: '参数无效或超出此命令允许的范围。',
+  plugin_compute_unavailable: '插件计算当前不可用，请重新扫描后重试。',
+  plugin_compute_stale: '插件目录已变化，本次计算结果已丢弃。',
+  plugin_compute_disabled: '插件已停用，无法运行计算。',
+  plugin_compute_not_found: '未找到此插件计算命令。',
+  plugin_compute_not_supported: '此计算命令不受当前版本支持。',
+  plugin_compute_busy: '已有插件计算正在运行，请稍后重试。',
+  plugin_compute_cancelled: '插件计算已取消。',
+  plugin_compute_invalid_module: '插件计算模块无效，无法运行。',
+  plugin_compute_invalid_abi: '插件计算接口版本不受支持。',
+  plugin_compute_memory: '插件计算超出内存限制。',
+  plugin_compute_trap: '插件计算失败；模块未能完成本次运行。',
+  plugin_compute_invalid_output: '插件计算返回了无效结果。',
+  plugin_compute_budget: '插件计算超出执行预算。',
+  plugin_compute_deadline: '插件计算超过时间限制。',
+  plugin_compute_internal: '插件计算服务发生内部错误，请重试。',
 } satisfies Record<PluginErrorCode, string>
 
 const SNAPSHOT_KEYS = [
@@ -167,6 +206,11 @@ const IMPORTED_NOT_VISIBLE_KEYS = [
   'reasonCode',
   'snapshot',
 ] as const
+const COMPUTE_RESULT_KEYS = [
+  'schemaVersion', 'requestId', 'pluginId', 'contributionId', 'catalogGeneration',
+  'revision', 'value', 'inputCount', 'parameter',
+] as const
+const COMPUTE_CANCEL_KEYS = ['schemaVersion', 'requestId', 'cancelled'] as const
 
 const IMPORT_COMMIT_FAILURES = new Set<LocalManifestImportCommitFailure>([
   'plugin_catalog_stale',
@@ -322,7 +366,34 @@ const PLUGIN_PAGE_DESTINATIONS: readonly PluginPageDestination[] = [
   'settings.about',
 ]
 
-function parseCommand(value: unknown, schemaVersion: 2 | 3): PluginCommandContribution {
+function requireComputeInteger(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < -1_000_000
+    || (value as number) > 1_000_000) invalidResponse()
+  return value as number
+}
+
+function requireWasmModuleBase64(value: unknown): string {
+  const moduleBase64 = requireString(value)
+  if (
+    moduleBase64.length === 0
+    || moduleBase64.length > 10_924
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(moduleBase64)
+  ) invalidResponse()
+  let binary: string
+  try {
+    binary = atob(moduleBase64)
+  } catch {
+    return invalidResponse()
+  }
+  if (btoa(binary) !== moduleBase64) invalidResponse()
+  if (binary.length === 0 || binary.length > 8192) invalidResponse()
+  const wasmHeader = [0, 97, 115, 109, 1, 0, 0, 0]
+  if (binary.length < wasmHeader.length
+    || wasmHeader.some((byte, index) => binary.charCodeAt(index) !== byte)) invalidResponse()
+  return moduleBase64
+}
+
+function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4): PluginCommandContribution {
   const command = requireExactObject(value, ['kind', 'contributionId', 'title', 'actionId', 'params'])
   if (command.kind !== 'command') invalidResponse()
   const contributionId = requireReverseDomainId(command.contributionId)
@@ -337,21 +408,50 @@ function parseCommand(value: unknown, schemaVersion: 2 | 3): PluginCommandContri
       },
     }
   }
-  if (schemaVersion !== 3 || command.actionId !== 'host.openPage') invalidResponse()
-  const params = requireExactObject(command.params, ['destination'])
-  const destination = requireString(params.destination)
-  if (!PLUGIN_PAGE_DESTINATIONS.includes(destination as PluginPageDestination)) invalidResponse()
+  if (command.actionId === 'host.openPage') {
+    if (schemaVersion < 3) invalidResponse()
+    const params = requireExactObject(command.params, ['destination'])
+    const destination = requireString(params.destination)
+    if (!PLUGIN_PAGE_DESTINATIONS.includes(destination as PluginPageDestination)) invalidResponse()
+    return {
+      kind: 'command', contributionId, title, actionId: 'host.openPage',
+      params: { destination: destination as PluginPageDestination },
+    }
+  }
+  if (schemaVersion !== 4 || command.actionId !== 'sandbox.computeSeries') invalidResponse()
+  const params = requireExactObject(
+    command.params,
+    ['runtime', 'abi', 'moduleBase64', 'parameter'],
+  )
+  if (params.runtime !== 'wasm-v1' || params.abi !== 'series-f64-v1') invalidResponse()
+  const parameter = requireExactObject(params.parameter, ['label', 'default', 'min', 'max'])
+  const defaultValue = requireComputeInteger(parameter.default)
+  const min = requireComputeInteger(parameter.min)
+  const max = requireComputeInteger(parameter.max)
+  if (min > defaultValue || defaultValue > max) invalidResponse()
   return {
-    kind: 'command', contributionId, title, actionId: 'host.openPage',
-    params: { destination: destination as PluginPageDestination },
+    kind: 'command', contributionId, title, actionId: 'sandbox.computeSeries',
+    params: {
+      runtime: 'wasm-v1',
+      abi: 'series-f64-v1',
+      moduleBase64: requireWasmModuleBase64(params.moduleBase64),
+      parameter: {
+        label: requireDisplayText(parameter.label, 80),
+        default: defaultValue,
+        min,
+        max,
+      },
+    },
   }
 }
 
 function parseManifest(value: unknown): PluginManifest {
   const manifest = requireExactObject(value, MANIFEST_KEYS)
+  if (textEncoder.encode(JSON.stringify(manifest)).byteLength > 16 * 1024) invalidResponse()
   if (manifest.schemaVersion !== 1
     && manifest.schemaVersion !== 2
-    && manifest.schemaVersion !== 3) invalidResponse()
+    && manifest.schemaVersion !== 3
+    && manifest.schemaVersion !== 4) invalidResponse()
   const id = requireReverseDomainId(manifest.id)
   const publisherId = requireReverseDomainId(manifest.publisherId)
   const publisher = requireDisplayText(manifest.publisher, 80)
@@ -787,6 +887,149 @@ export async function removeManagedLocalPlugin(
     expectedCatalogGeneration,
   })
   return parseRemoveResult(value, id)
+}
+
+export type PluginComputeInputParseResult =
+  | { ok: true; values: number[] }
+  | { ok: false; error: string }
+
+export type PluginComputeParameterParseResult =
+  | { ok: true; value: number }
+  | { ok: false; error: string }
+
+const DECIMAL_NUMBER_PATTERN = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/
+
+export function parsePluginComputeInput(raw: string): PluginComputeInputParseResult {
+  if (textEncoder.encode(raw).byteLength > 128 * 1024) {
+    return { ok: false, error: '输入文本不能超过 128 KiB。' }
+  }
+  const trimmed = raw.trim()
+  if (trimmed.length === 0) return { ok: false, error: '请输入至少一个数值。' }
+  if (/^\s*,|,\s*$|,\s*,/.test(raw)) {
+    return { ok: false, error: '逗号之间必须包含数值。' }
+  }
+  const tokens = trimmed.split(/[\s,]+/u)
+  if (tokens.length < 1 || tokens.length > 4096) {
+    return { ok: false, error: '一次请输入 1 至 4096 个数值。' }
+  }
+  const values: number[] = []
+  for (const token of tokens) {
+    if (!DECIMAL_NUMBER_PATTERN.test(token)) {
+      return { ok: false, error: '仅支持有限的十进制或科学计数法数值。' }
+    }
+    const value = Number(token)
+    if (!Number.isFinite(value)) {
+      return { ok: false, error: '所有输入都必须是有限数值。' }
+    }
+    values.push(value)
+  }
+  return { ok: true, values }
+}
+
+export function parsePluginComputeParameter(
+  raw: string,
+  bounds: { min: number; max: number },
+): PluginComputeParameterParseResult {
+  const trimmed = raw.trim()
+  if (!DECIMAL_NUMBER_PATTERN.test(trimmed)) {
+    return { ok: false, error: '参数必须是有限的十进制数值。' }
+  }
+  const value = Number(trimmed)
+  if (!Number.isFinite(value) || value < bounds.min || value > bounds.max) {
+    return {
+      ok: false,
+      error: `参数必须在 ${bounds.min} 到 ${bounds.max} 之间。`,
+    }
+  }
+  return { ok: true, value }
+}
+
+function requireComputeRequestId(value: unknown): string {
+  const requestId = requireString(value)
+  if (!/^[A-Za-z0-9-]{1,64}$/.test(requestId)) invalidResponse()
+  return requestId
+}
+
+function validateComputeRequest(request: PluginComputeRequest): void {
+  requireComputeRequestId(request.requestId)
+  requireReverseDomainId(request.pluginId)
+  requireReverseDomainId(request.contributionId)
+  requireCanonicalRevision(request.expectedCatalogGeneration)
+  requireCanonicalRevision(request.expectedRevision)
+  if (
+    !Array.isArray(request.values)
+    || request.values.length < 1
+    || request.values.length > 4096
+    || request.values.some((value) => !Number.isFinite(value))
+    || !Number.isFinite(request.parameter)
+  ) invalidResponse()
+}
+
+function parseComputeResult(
+  value: unknown,
+  request: PluginComputeRequest,
+): PluginComputeResult {
+  const result = requireExactObject(value, COMPUTE_RESULT_KEYS)
+  const requestId = requireComputeRequestId(result.requestId)
+  const pluginId = requireReverseDomainId(result.pluginId)
+  const contributionId = requireReverseDomainId(result.contributionId)
+  const catalogGeneration = requireCanonicalRevision(result.catalogGeneration)
+  const revision = requireCanonicalRevision(result.revision)
+  if (
+    result.schemaVersion !== 1
+    || requestId !== request.requestId
+    || pluginId !== request.pluginId
+    || contributionId !== request.contributionId
+    || catalogGeneration !== request.expectedCatalogGeneration
+    || revision !== request.expectedRevision
+    || typeof result.value !== 'number'
+    || !Number.isFinite(result.value)
+    || !Number.isSafeInteger(result.inputCount)
+    || result.inputCount !== request.values.length
+    || typeof result.parameter !== 'number'
+    || !Number.isFinite(result.parameter)
+    || result.parameter !== request.parameter
+  ) invalidResponse()
+  return {
+    schemaVersion: 1,
+    requestId,
+    pluginId,
+    contributionId,
+    catalogGeneration,
+    revision,
+    value: result.value,
+    inputCount: result.inputCount,
+    parameter: result.parameter,
+  }
+}
+
+export async function executePluginCompute(
+  request: PluginComputeRequest,
+): Promise<PluginComputeResult> {
+  validateComputeRequest(request)
+  const value = await tauriInvoke<unknown>('execute_plugin_compute', { request })
+  return parseComputeResult(value, request)
+}
+
+export async function cancelPluginCompute(
+  requestId: string,
+): Promise<PluginComputeCancelResult> {
+  requireComputeRequestId(requestId)
+  const value = requireExactObject(
+    await tauriInvoke<unknown>('cancel_plugin_compute', { requestId }),
+    COMPUTE_CANCEL_KEYS,
+  )
+  const returnedRequestId = requireComputeRequestId(value.requestId)
+  if (
+    value.schemaVersion !== 1
+    || returnedRequestId !== requestId
+    || typeof value.cancelled !== 'boolean'
+  ) invalidResponse()
+  return {
+    schemaVersion: 1,
+    requestId: returnedRequestId,
+    cancelled: value.cancelled,
+  }
 }
 
 function isPluginErrorCode(value: string): value is PluginErrorCode {

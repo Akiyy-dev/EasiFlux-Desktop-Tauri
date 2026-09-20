@@ -1,6 +1,10 @@
 import { ref, watch } from 'vue'
 import { usePluginStore } from '../stores/plugin'
-import type { PluginCatalogItem, PluginCommandInfo } from '../types/plugin'
+import type {
+  PluginCatalogItem,
+  PluginCommandInfo,
+  PluginComputeExecutionIntent,
+} from '../types/plugin'
 
 export interface PluginOpenPageIntent {
   pluginId: string
@@ -13,7 +17,11 @@ export function usePluginCommandResult(
 ) {
   const store = usePluginStore()
   const result = ref<PluginCommandInfo | null>(null)
-  const clear = () => { result.value = null }
+  const computeIntent = ref<PluginComputeExecutionIntent | null>(null)
+  const clear = () => {
+    result.value = null
+    computeIntent.value = null
+  }
 
   watch(
     [() => store.commandContextKey, pluginSource ?? (() => store.catalog)],
@@ -25,13 +33,21 @@ export function usePluginCommandResult(
     const execution = store.runCommand(pluginId, contributionId)
     if (execution?.actionId === 'host.showInfo') {
       result.value = execution.info
+      computeIntent.value = null
       return
     }
     result.value = null
     if (execution?.actionId === 'host.openPage' && navigationAvailable) {
+      computeIntent.value = null
       openPage?.({ pluginId, contributionId })
+      return
     }
+    if (execution?.actionId === 'sandbox.computeSeries') {
+      computeIntent.value = execution
+      return
+    }
+    computeIntent.value = null
   }
 
-  return { result, run, clear }
+  return { result, computeIntent, run, clear }
 }

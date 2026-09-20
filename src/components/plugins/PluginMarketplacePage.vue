@@ -82,7 +82,7 @@ const removalFailureCopy: Record<RemoveManagedLocalPluginFailure, string> = {
 const sectionCopy: Record<PluginSection, { title: string; description: string }> = {
   installed: {
     title: '已安装插件',
-    description: '查看内置插件与本地声明式包，管理启用偏好并使用已启用的宿主命令。',
+    description: '查看内置插件与本地插件包，管理启用偏好并明确使用已启用的命令。',
   },
   market: {
     title: '插件市场',
@@ -613,7 +613,7 @@ onBeforeUnmount(() => {
             class="plugin-marketplace-page__empty"
             data-testid="plugin-catalog-empty"
           >
-            当前没有已安装插件，也没有发现可用的本地声明式包。
+            当前没有已安装插件，也没有发现可用的本地插件包。
           </p>
           <p
             v-else-if="store.visiblePlugins.length === 0"
@@ -647,7 +647,7 @@ onBeforeUnmount(() => {
 
       <section v-else-if="props.section === 'market'" class="plugin-marketplace-page__section">
         <p v-if="builtInPlugins.length === 0" class="plugin-marketplace-page__empty">
-          内置插件目录当前为空。本地声明式包可在已安装插件与插件管理中查看。
+          内置插件目录当前为空。本地插件包可在已安装插件与插件管理中查看。
         </p>
         <div v-else class="plugin-marketplace-page__grid">
           <article

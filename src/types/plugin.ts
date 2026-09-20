@@ -60,7 +60,32 @@ export interface PluginOpenPageCommandContribution {
   params: { destination: PluginPageDestination }
 }
 
+export interface PluginComputeParameterMetadata {
+  label: string
+  default: number
+  min: number
+  max: number
+}
+
+export interface PluginComputeCommandContribution {
+  kind: 'command'
+  contributionId: string
+  title: string
+  actionId: 'sandbox.computeSeries'
+  params: {
+    runtime: 'wasm-v1'
+    abi: 'series-f64-v1'
+    moduleBase64: string
+    parameter: PluginComputeParameterMetadata
+  }
+}
+
 export type PluginCommandContribution =
+  | PluginShowInfoCommandContribution
+  | PluginOpenPageCommandContribution
+  | PluginComputeCommandContribution
+
+export type PluginV3CommandContribution =
   | PluginShowInfoCommandContribution
   | PluginOpenPageCommandContribution
 
@@ -71,10 +96,19 @@ export interface PluginManifestV2 extends Omit<PluginManifestV1, 'schemaVersion'
 
 export interface PluginManifestV3 extends Omit<PluginManifestV1, 'schemaVersion' | 'contributions'> {
   schemaVersion: 3
+  contributions: PluginV3CommandContribution[]
+}
+
+export interface PluginManifestV4 extends Omit<PluginManifestV1, 'schemaVersion' | 'contributions'> {
+  schemaVersion: 4
   contributions: PluginCommandContribution[]
 }
 
-export type PluginManifest = PluginManifestV1 | PluginManifestV2 | PluginManifestV3
+export type PluginManifest =
+  | PluginManifestV1
+  | PluginManifestV2
+  | PluginManifestV3
+  | PluginManifestV4
 
 export type PluginManifestField =
   | 'schemaVersion'
@@ -116,6 +150,10 @@ export type PluginCommandSummary =
       actionId: 'host.openPage'
       destination: PluginPageDestination
     })
+  | (PluginCommandSummaryBase & {
+      actionId: 'sandbox.computeSeries'
+      parameter: PluginComputeParameterMetadata
+    })
 
 export type PluginCommandExecution =
   | { actionId: 'host.showInfo'; info: PluginCommandInfo }
@@ -126,6 +164,51 @@ export type PluginCommandExecution =
       contributionId: string
       destination: PluginPageDestination
     }
+  | {
+      actionId: 'sandbox.computeSeries'
+      pluginId: string
+      pluginName: string
+      contributionId: string
+      title: string
+      runtime: 'wasm-v1'
+      abi: 'series-f64-v1'
+      parameter: PluginComputeParameterMetadata
+      expectedCatalogGeneration: string
+      expectedRevision: string
+    }
+
+export type PluginComputeExecutionIntent = Extract<
+  PluginCommandExecution,
+  { actionId: 'sandbox.computeSeries' }
+>
+
+export interface PluginComputeRequest {
+  requestId: string
+  pluginId: string
+  contributionId: string
+  expectedCatalogGeneration: string
+  expectedRevision: string
+  values: number[]
+  parameter: number
+}
+
+export interface PluginComputeResult {
+  schemaVersion: 1
+  requestId: string
+  pluginId: string
+  contributionId: string
+  catalogGeneration: string
+  revision: string
+  value: number
+  inputCount: number
+  parameter: number
+}
+
+export interface PluginComputeCancelResult {
+  schemaVersion: 1
+  requestId: string
+  cancelled: boolean
+}
 
 export interface PluginCatalogItem {
   manifest: PluginManifest

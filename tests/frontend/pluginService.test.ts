@@ -173,6 +173,118 @@ describe('v3 host navigation manifests', () => {
   })
 })
 
+describe('v4 sandbox compute manifests', () => {
+  function computeCommand(overrides: Record<string, unknown> = {}): WireObject {
+    return {
+      kind: 'command',
+      contributionId: 'analytics.average',
+      title: 'Compute average',
+      actionId: 'sandbox.computeSeries',
+      params: {
+        runtime: 'wasm-v1',
+        abi: 'series-f64-v1',
+        moduleBase64: 'AGFzbQEAAAA=',
+        parameter: { label: 'Period', default: 3, min: 1, max: 4096 },
+      },
+      ...overrides,
+    }
+  }
+
+  function localComputeManifest(
+    schemaVersion: 3 | 4 = 4,
+    contribution: WireObject = computeCommand(),
+  ): WireObject {
+    return {
+      ...validItem(),
+      source: 'localDeclarative',
+      management: 'external',
+      manifest: {
+        ...validManifest(),
+        schemaVersion,
+        contributions: [contribution],
+      },
+    }
+  }
+
+  it('accepts and normalizes an exact v4 compute contribution', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      ...validSnapshot(), plugins: [localComputeManifest()],
+    })
+
+    const parsed = await getPluginCatalog()
+
+    expect(parsed.plugins[0].manifest).toEqual({
+      ...validManifest(),
+      schemaVersion: 4,
+      contributions: [computeCommand()],
+    })
+  })
+
+  it('rejects compute contributions in older schemas', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      ...validSnapshot(), plugins: [localComputeManifest(3)],
+    })
+
+    await expect(getPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+
+  it.each([
+    { runtime: 'wasm-v2' },
+    { abi: 'series-f32-v1' },
+    { moduleBase64: 'AGFzbQEAAAA' },
+    { moduleBase64: 'AGFzbQEAAAB=' },
+    { moduleBase64: 'bm90LXdhc20=' },
+    { moduleBase64: 'AA==' },
+    { parameter: { label: 'Period', default: 3, min: 4, max: 2 } },
+    { parameter: { label: 'Period', default: 3.5, min: 1, max: 10 } },
+    { parameter: { label: 'Period', default: 3, min: 1, max: 1_000_001 } },
+    { parameter: { label: '\uFEFF', default: 3, min: 1, max: 10 } },
+    { parameter: { label: 'Period', default: 3, min: 1, max: 10, extra: true } },
+  ])('rejects invalid v4 compute metadata %#', async (paramsOverride) => {
+    const base = computeCommand()
+    const params = { ...(base.params as WireObject), ...paramsOverride }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      ...validSnapshot(),
+      plugins: [localComputeManifest(4, computeCommand({ params }))],
+    })
+
+    await expect(getPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+
+  it('rejects decoded modules over 8192 bytes without instantiating them', async () => {
+    const bytes = new Uint8Array(8193)
+    bytes.set([0, 97, 115, 109, 1, 0, 0, 0])
+    const moduleBase64 = btoa(String.fromCharCode(...bytes))
+    const base = computeCommand()
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      ...validSnapshot(),
+      plugins: [localComputeManifest(4, computeCommand({
+        params: { ...(base.params as WireObject), moduleBase64 },
+      }))],
+    })
+
+    await expect(getPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+
+  it('keeps the existing 16 KiB whole-manifest budget across valid contributions', async () => {
+    const bytes = new Uint8Array(8192)
+    bytes.set([0, 97, 115, 109, 1, 0, 0, 0])
+    const moduleBase64 = btoa(String.fromCharCode(...bytes))
+    const base = computeCommand()
+    const plugin = localComputeManifest()
+    ;(plugin.manifest as WireObject).contributions = [
+      computeCommand({ params: { ...(base.params as WireObject), moduleBase64 } }),
+      computeCommand({
+        contributionId: 'analytics.second',
+        params: { ...(base.params as WireObject), moduleBase64 },
+      }),
+    ]
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ ...validSnapshot(), plugins: [plugin] })
+
+    await expect(getPluginCatalog()).rejects.toThrow(INVALID_RESPONSE_ERROR)
+  })
+})
+
 function validManifest(
   id = 'com.easiflux.analytics',
   publisherId = 'com.easiflux',

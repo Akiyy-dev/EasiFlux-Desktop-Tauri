@@ -10,6 +10,7 @@ pub const APPROVAL_FINGERPRINT_NONE: &str = "v1:none";
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V1: u32 = 1;
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V2: u32 = 2;
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V3: u32 = 3;
+pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V4: u32 = 4;
 
 const CATALOG_TRANSPORT_SCHEMA_VERSION: u8 = 3;
 
@@ -159,12 +160,19 @@ impl PluginManifest {
     pub fn validate(&self) -> Result<(), String> {
         match self.schema_version {
             PLUGIN_MANIFEST_SCHEMA_VERSION_V1 if self.contributions.is_empty() => {}
-            version @ (PLUGIN_MANIFEST_SCHEMA_VERSION_V2 | PLUGIN_MANIFEST_SCHEMA_VERSION_V3)
+            version @ (PLUGIN_MANIFEST_SCHEMA_VERSION_V2
+                | PLUGIN_MANIFEST_SCHEMA_VERSION_V3
+                | PLUGIN_MANIFEST_SCHEMA_VERSION_V4)
                 if (1..=16).contains(&self.contributions.len()) =>
             {
                 let mut contribution_ids = std::collections::BTreeSet::new();
                 for contribution in &self.contributions {
                     contribution.validate()?;
+                    if version < PLUGIN_MANIFEST_SCHEMA_VERSION_V4
+                        && contribution.action_id == PluginCommandActionId::SandboxComputeSeries
+                    {
+                        return Err("compute requires plugin manifest v4".into());
+                    }
                     if version == PLUGIN_MANIFEST_SCHEMA_VERSION_V2
                         && contribution.action_id != PluginCommandActionId::HostShowInfo
                     {

@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 4,
+  "id": "com.easiflux.examples.series-sma",
+  "publisherId": "com.easiflux.examples",
+  "publisher": "EasiFlux example (unverified)",
+  "name": "Series simple moving average",
+  "description": "Computes the average of the last Period values inside a bounded WebAssembly guest.",
+  "version": "1.0.0",
+  "contributions": [
+    {
+      "kind": "command",
+      "contributionId": "series.sma",
+      "title": "Compute simple moving average",
+      "actionId": "sandbox.computeSeries",
+      "params": {
+        "runtime": "wasm-v1",
+        "abi": "series-f64-v1",
+        "moduleBase64": "AGFzbQEAAAABDQJgAX8Bf2ADf398AXwDAwIAAQUEAQEBEAcYAwZtZW1vcnkCAAVhbGxvYwAAA3J1bgABCnoCBABBAAtzAgJ/AXwgAkQAAAAAAADwP2MEQEQAAAAAAAD4fw8LIAIgAbhkBEBEAAAAAAAA+H8PCyACqiIDtyACYgRARAAAAAAAAPh/DwsgASADayEEA0AgBSAAIARBCGxqKwMAoCEFIARBAWoiBCABSQ0ACyAFIAKjCwBOBG5hbWUCOAIAAQAFYnl0ZXMBBgADcHRyAQVjb3VudAIGcGVyaW9kAwpwZXJpb2RfaTMyBAVpbmRleAUDc3VtAw0BAQEDCHN1bV9uZXh0",
+        "parameter": {
+          "label": "Period",
+          "default": 3,
+          "min": 1,
+          "max": 4096
+        }
+      }
+    }
+  ],
+  "requestedCapabilities": []
+}

@@ -287,6 +287,8 @@ pub fn run_plugin_smoke() -> Result<(), String> {
                 plugin::cancel_local_manifest_import,
                 plugin::commit_local_manifest_import,
                 plugin::remove_managed_local_plugin,
+                plugin::execute_plugin_compute,
+                plugin::cancel_plugin_compute,
                 finish_plugin_smoke,
             ])
             .build(smoke_context())
@@ -302,6 +304,8 @@ pub fn run_plugin_smoke() -> Result<(), String> {
             .title("Isolated Plugin Smoke — fixture data only")
             .inner_size(1100.0, 820.0)
             .visible(!args.self_test)
+            // A hidden WebView cannot reliably accept Wry's default creation-time focus.
+            .focused(!args.self_test)
             .data_directory(webview_data)
             .on_navigation(|url| {
                 url.scheme() == "http"
@@ -533,6 +537,8 @@ mod tests {
             "cancel_local_manifest_import",
             "commit_local_manifest_import",
             "remove_managed_local_plugin",
+            "execute_plugin_compute",
+            "cancel_plugin_compute",
             "finish_plugin_smoke",
         ] {
             assert!(

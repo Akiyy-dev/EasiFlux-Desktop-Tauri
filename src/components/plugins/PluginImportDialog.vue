@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
-import type { ReadyLocalManifestImport } from '../../types/plugin'
+import type { PluginCommandContribution, ReadyLocalManifestImport } from '../../types/plugin'
+import { pluginComputeModuleByteLength } from '../../services/pluginManifestDiff'
 import { pluginPageLabel } from '../../services/pluginNavigation'
 import PluginManifestComparison from './PluginManifestComparison.vue'
 
@@ -32,6 +33,20 @@ const cancelButton = ref<FocusControl | null>(null)
 const actionRequested = ref(false)
 let returnFocusTarget: FocusControl | null = null
 const isComparison = computed(() => props.preview.assessment.kind === 'existingId')
+const hasComputeCommand = computed(() => (
+  props.preview.manifest.schemaVersion === 4
+  && props.preview.manifest.contributions.some(
+    (command) => command.actionId === 'sandbox.computeSeries',
+  )
+))
+
+function commandPreviewLabel(command: PluginCommandContribution): string {
+  if (command.actionId === 'host.showInfo') return `显示信息：${command.title}`
+  if (command.actionId === 'host.openPage') {
+    return `打开页面：${pluginPageLabel(command.params.destination)}`
+  }
+  return `运行计算：${command.title}`
+}
 
 function requestCancel(event?: { preventDefault: () => void }): void {
   event?.preventDefault()
@@ -83,7 +98,7 @@ onUnmounted(() => {
     <div class="plugin-import-dialog__surface">
       <header>
         <p class="plugin-import-dialog__eyebrow">
-          本地声明式清单
+          本地插件清单
         </p>
         <h2 id="plugin-import-title">
           {{ isComparison ? '比较现有插件清单' : '确认导入此清单' }}
@@ -133,23 +148,46 @@ onUnmounted(() => {
       </dl>
 
       <p v-if="!isComparison" id="plugin-import-warning" class="plugin-import-dialog__warning">
-        目录中未发现相同插件 ID；确认后将作为新清单导入。发布者信息由清单作者填写，未经认证。本次只复制清单，不运行代码或授予权限。导入后默认停用，{{ props.preview.manifest.schemaVersion !== 1
-          ? props.preview.manifest.schemaVersion === 3
-            ? '启用后可显示普通文本，或由宿主打开白名单页面。'
-            : '启用后提供只读命令，仅由宿主显示普通文本。'
-          : '启用仅记录宿主偏好。' }}
+        目录中未发现相同插件 ID；确认后将作为新清单导入。发布者信息由清单作者填写，未经认证。
+        <template v-if="hasComputeCommand">
+          本次将复制包含可执行的本地 WebAssembly 代码的清单，但导入和启用不会执行代码或授予权限。导入后默认停用；只有明确点击运行才会在受限沙箱中计算，输入和结果仅保存在内存中。
+        </template>
+        <template v-else>
+          本次只复制清单，不运行代码或授予权限。导入后默认停用，{{ props.preview.manifest.schemaVersion !== 1
+            ? props.preview.manifest.schemaVersion >= 3
+              ? '启用后可显示普通文本，或由宿主打开白名单页面。'
+              : '启用后提供只读命令，仅由宿主显示普通文本。'
+            : '启用仅记录宿主偏好。' }}
+        </template>
       </p>
       <div
         v-if="!isComparison && props.preview.manifest.schemaVersion !== 1"
         class="plugin-import-dialog__hint"
         data-testid="plugin-import-commands"
       >
-        <p>声明式宿主命令：</p>
+        <p>插件命令：</p>
         <ul>
           <li v-for="command in props.preview.manifest.contributions" :key="command.contributionId">
-            <bdi>{{ command.actionId === 'host.showInfo'
-              ? `显示信息：${command.title}`
-              : `打开页面：${pluginPageLabel(command.params.destination)}` }}</bdi>
+            <bdi>{{ commandPreviewLabel(command) }}</bdi>
+            <dl
+              v-if="command.actionId === 'sandbox.computeSeries'"
+              data-testid="plugin-import-compute-details"
+            >
+              <div><dt>运行时</dt><dd><bdi>{{ command.params.runtime }}</bdi></dd></div>
+              <div><dt>ABI</dt><dd><bdi>{{ command.params.abi }}</bdi></dd></div>
+              <div>
+                <dt>代码模块</dt>
+                <dd><bdi>{{ pluginComputeModuleByteLength(command) }} 字节</bdi></dd>
+              </div>
+              <div><dt>参数名称</dt><dd><bdi>{{ command.params.parameter.label }}</bdi></dd></div>
+              <div><dt>参数默认值</dt><dd><bdi>{{ command.params.parameter.default }}</bdi></dd></div>
+              <div>
+                <dt>参数范围</dt>
+                <dd>
+                  <bdi>{{ command.params.parameter.min }} 至 {{ command.params.parameter.max }}</bdi>
+                </dd>
+              </div>
+            </dl>
           </li>
         </ul>
       </div>
