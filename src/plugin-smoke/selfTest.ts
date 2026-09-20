@@ -1,8 +1,9 @@
 import { nextTick } from 'vue'
 import { usePluginStore } from '../stores/plugin'
 import { tauriInvoke } from '../composables/useTauriCommand'
+import { pluginErrorCode } from '../services/pluginService'
 
-const fixtureId = 'com.easiflux.smoke'
+const fixtureId = 'com.easiflux.examples.series-sma'
 const testId = (id: string) => `[data-testid="${id}"]`
 
 async function waitFor(label: string, condition: () => boolean): Promise<void> {
@@ -18,6 +19,12 @@ async function waitFor(label: string, condition: () => boolean): Promise<void> {
 function control(selector: string, scope: ParentNode = document): HTMLButtonElement | HTMLInputElement | null {
   const element = scope.querySelector(selector)
   return (element instanceof HTMLButtonElement || element instanceof HTMLInputElement)
+    && element.isConnected && !element.disabled ? element : null
+}
+
+function textControl(selector: string): HTMLInputElement | HTMLTextAreaElement | null {
+  const element = document.querySelector(selector)
+  return (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)
     && element.isConnected && !element.disabled ? element : null
 }
 
@@ -50,6 +57,56 @@ function detailWithinLimit(error: unknown): string {
     bytes += size
   }
   return result
+}
+
+async function expectPluginRejection(
+  label: string,
+  invocation: Promise<unknown>,
+  expectedCode: string,
+): Promise<void> {
+  let caught: unknown
+  let rejected = false
+  try {
+    await invocation
+  } catch (error) {
+    rejected = true
+    caught = error
+  }
+  if (!rejected) throw new Error(`${label} unexpectedly succeeded`)
+  const code = pluginErrorCode(caught)
+  if (code === expectedCode) return
+  const error = new Error(`${label} returned unexpected safe code: ${code ?? 'none'}`)
+  Object.defineProperty(error, 'cause', { value: caught })
+  throw error
+}
+
+async function confirmForbiddenWebviewIpc(): Promise<void> {
+  try {
+    await tauriInvoke('list_account_profiles')
+  } catch {
+    return
+  }
+  throw new Error('Forbidden account IPC unexpectedly succeeded')
+}
+
+function computeRequest(store: ReturnType<typeof usePluginStore>, requestId: string) {
+  return {
+    requestId,
+    pluginId: fixtureId,
+    contributionId: 'series.sma',
+    expectedCatalogGeneration: store.catalogGeneration,
+    expectedRevision: store.revision,
+    values: [1, 2, 3, 4, 5],
+    parameter: 3,
+  }
+}
+
+export function isExpectedSmaOutput(result: string, provenance: string): boolean {
+  return result.trim() === '结果：4'
+    && provenance.includes(fixtureId)
+    && provenance.includes('series.sma')
+    && provenance.includes('输入 5 个')
+    && provenance.includes('Period 3')
 }
 
 export async function confirmRemovalReload(): Promise<void> {
@@ -91,17 +148,60 @@ export async function runPluginSmokeSelfTest(): Promise<void> {
     await click(testId('plugin-import-dismiss'))
     await waitFor('import result dismissed', () => store.importStatus === 'idle')
 
-    for (const enabled of [true, false]) {
-      await click('input[role="switch"]', requireCard)
-      await waitFor(enabled ? 'fixture enabled' : 'fixture disabled', () => {
-        const card = fixtureCard()
-        const toggle = card?.querySelector<HTMLInputElement>('input[role="switch"]')
-        return fixture()?.status === (enabled ? 'enabled' : 'disabled')
-          && !store.pendingIds.has(fixtureId) && !store.actionErrors[fixtureId]
-          && toggle?.checked === enabled && !toggle.disabled
-          && !!card?.querySelector(testId('plugin-status'))?.textContent?.includes(enabled ? '已启用' : '已停用')
-      })
-    }
+    await expectPluginRejection(
+      'disabled compute before enable',
+      tauriInvoke('execute_plugin_compute', {
+        request: computeRequest(store, 'smoke-disabled-before'),
+      }),
+      'plugin_compute_disabled',
+    )
+
+    await click('input[role="switch"]', requireCard)
+    await waitFor('fixture enabled', () => {
+      const card = fixtureCard()
+      const toggle = card?.querySelector<HTMLInputElement>('input[role="switch"]')
+      return fixture()?.status === 'enabled'
+        && !store.pendingIds.has(fixtureId) && !store.actionErrors[fixtureId]
+        && toggle?.checked === true && !toggle.disabled
+        && !!card?.querySelector(testId('plugin-status'))?.textContent?.includes('已启用')
+    })
+
+    await click(testId('plugin-command-button'), requireCard)
+    await waitFor('compute form opens without execution', () => {
+      return !!document.querySelector(testId('plugin-compute-dialog'))
+        && textControl(testId('plugin-compute-input')) !== null
+    })
+    const input = textControl(testId('plugin-compute-input'))!
+    input.value = '1,2,3,4,5'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    await click(testId('plugin-compute-run'))
+    await waitFor('guest SMA returns exact result and provenance', () => {
+      const result = document.querySelector(testId('plugin-compute-result'))?.textContent
+      const provenance = document.querySelector(testId('plugin-compute-provenance'))?.textContent
+      return result !== undefined && result !== null
+        && provenance !== undefined && provenance !== null
+        && isExpectedSmaOutput(result, provenance)
+    })
+    await click(testId('plugin-compute-close'))
+    await waitFor('completed compute form closes', () => !document.querySelector(testId('plugin-compute-dialog')))
+
+    await click('input[role="switch"]', requireCard)
+    await waitFor('fixture disabled', () => {
+      const card = fixtureCard()
+      const toggle = card?.querySelector<HTMLInputElement>('input[role="switch"]')
+      return fixture()?.status === 'disabled'
+        && !store.pendingIds.has(fixtureId) && !store.actionErrors[fixtureId]
+        && toggle?.checked === false && !toggle.disabled
+        && !!card?.querySelector(testId('plugin-status'))?.textContent?.includes('已停用')
+    })
+    await expectPluginRejection(
+      'disabled compute after disable',
+      tauriInvoke('execute_plugin_compute', {
+        request: computeRequest(store, 'smoke-disabled-after'),
+      }),
+      'plugin_compute_disabled',
+    )
+    await confirmForbiddenWebviewIpc()
 
     await click(testId('plugin-remove-button'), requireCard)
     await waitFor('first removal confirmation', () => store.removalStatus === 'confirming' && store.removalTarget?.plugin.manifest.id === fixtureId)
@@ -117,7 +217,7 @@ export async function runPluginSmokeSelfTest(): Promise<void> {
 
     await confirmRemovalReload()
     success = true
-    detail = 'Real DOM: preview cancel, managed import, enable/disable, removal cancel, removal confirm, explicit reload verified'
+    detail = 'Real DOM: preview cancel, managed v4 import, disabled rejections, enable, guest SMA 4, disable, forbidden IPC, removal and reload verified'
   } catch (error) {
     detail = detailWithinLimit(error)
   }

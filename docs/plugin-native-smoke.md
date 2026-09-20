@@ -1,7 +1,8 @@
 # Isolated native plugin smoke (developer-only)
 
 This opt-in Windows debug binary loads the real Marketplace components, Pinia store,
-service and seven production plugin commands against a fresh fixture-owned profile.
+service and nine production plugin commands against a fresh fixture-owned profile,
+plus the smoke-only completion command.
 It never starts the production `run()`, `AppState`, accounts, keyring, providers,
 scheduler, opener plugin, App.vue or AppShell.
 
@@ -22,17 +23,16 @@ or registry settings. This is conservative rejection, not support for policy-man
 machines: [WebView2 documents environment and registry overrides of creation options](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl?view=webview2-1.0.4129.50).
 
 ```powershell
-Set-Location D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-native-smoke
-cargo build --locked --manifest-path src-tauri/Cargo.toml --features plugin-smoke --bin plugin-smoke --target-dir D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-local-manifest-removal/src-tauri/target
+Set-Location D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-update-preflight
+cargo build --locked --manifest-path src-tauri/Cargo.toml --features plugin-smoke --bin plugin-smoke --target-dir src-tauri/target
 ```
 
 In a separate terminal, start only the dedicated Vite server. This command uses the
-existing Node/dependencies and a runner loader to avoid bundled-config temporary
-writes into the ancestor checkout's node_modules:
+existing Node/dependencies and Vite's standard config loader:
 
 ```powershell
-Set-Location D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-native-smoke
-& 'C:/Program Files/nodejs/node.exe' D:/EasiFlux/EasiFlux-Desktop-Tauri/node_modules/vite/bin/vite.js --config vite.plugin-smoke.config.ts --configLoader runner
+Set-Location D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-update-preflight
+& 'C:/Program Files/nodejs/node.exe' D:/EasiFlux/EasiFlux-Desktop-Tauri/node_modules/vite/bin/vite.js --config vite.plugin-smoke.config.ts
 ```
 
 It must own `127.0.0.1:1430`; strict port mode never falls back. Stop if another
@@ -44,10 +44,10 @@ Only after an isolation review, create one parent under this build checkout's
 `target` and launch the exact dedicated executable once:
 
 ```powershell
-Set-Location D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-native-smoke
+Set-Location D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-update-preflight
 $smokeParent = New-Item -ItemType Directory -Path (Join-Path (Get-Location) ('target/native-run-' + [guid]::NewGuid()))
 $smokeCanonicalParent = (Resolve-Path -LiteralPath $smokeParent.FullName).Path
-& 'D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-local-manifest-removal/src-tauri/target/debug/plugin-smoke.exe' --parent $smokeCanonicalParent --self-test
+& 'D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-update-preflight/src-tauri/target/debug/plugin-smoke.exe' --parent $smokeCanonicalParent --self-test
 $LASTEXITCODE
 ```
 
@@ -64,9 +64,14 @@ build checkout's canonical `target` directory. Relative, missing, system-temp an
 out-of-checkout parents reject before profile creation. The host reserves a new
 `plugin-smoke-<UUID>` child, never reuses a profile, and keeps all artifacts.
 
-The hidden `--self-test` lane uses a fixed native fixture selector. Real DOM controls
-perform preview/cancel, managed import (disabled), enable/disable, removal/cancel,
-confirmed removal, and explicit reload/absence verification. Each condition has a
+The hidden `--self-test` lane uses the checked-in Series SMA v4 manifest through a
+fixed native fixture selector. Real DOM controls perform preview/cancel, managed import
+(disabled), backend disabled rejection, explicit enable, guest computation of
+`1,2,3,4,5` with Period `3` to exact result `4`, disable and a second backend rejection,
+removal/cancel, confirmed removal, and explicit reload/absence verification. It also
+requires the isolated host to reject one account IPC attempt from its main WebView.
+That runtime observation is not proof about a secondary WebView or remote origin;
+the separate Rust authority tests cover those cases. Each condition has a
 15-second bound; mutations are dispatched once, not retried. The native deadline
 starts before WebView creation and is 90 seconds. At that deadline a dedicated
 thread force-terminates only this Windows process with nonzero status, independently
@@ -97,18 +102,19 @@ passing report, and the completion command rejects manual-mode submissions.
 From this checkout, use the same explicit Cargo target directory on every Cargo command:
 
 ```powershell
-cargo test --locked --manifest-path src-tauri/Cargo.toml --features plugin-smoke plugin_smoke::tests --lib --target-dir D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-local-manifest-removal/src-tauri/target
-cargo test --locked --manifest-path src-tauri/Cargo.toml plugin_commands_are_available_only_to_the_local_main_webview --lib --target-dir D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-local-manifest-removal/src-tauri/target
-cargo test --locked --manifest-path src-tauri/Cargo.toml plugin_smoke::tests::default_context_denies_smoke_completion --lib --target-dir D:/EasiFlux/EasiFlux-Desktop-Tauri/target/worktrees/plugin-local-manifest-removal/src-tauri/target
-& 'C:/Program Files/nodejs/node.exe' D:/EasiFlux/EasiFlux-Desktop-Tauri/node_modules/vitest/vitest.mjs run tests/frontend/pluginSmokeSelfTest.test.ts --config vite.plugin-smoke.config.ts --configLoader runner --environment jsdom
+cargo test --locked --manifest-path src-tauri/Cargo.toml --features plugin-smoke plugin_smoke::tests --lib --target-dir src-tauri/target
+cargo test --locked --manifest-path src-tauri/Cargo.toml plugin_commands_are_available_only_to_the_local_main_webview --lib --target-dir src-tauri/target
+cargo test --locked --manifest-path src-tauri/Cargo.toml plugin_smoke::tests::default_context_denies_smoke_completion --lib --target-dir src-tauri/target
+cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::smoke::tests --lib --target-dir src-tauri/target
+& 'C:/Program Files/nodejs/node.exe' D:/EasiFlux/EasiFlux-Desktop-Tauri/node_modules/vitest/vitest.mjs run tests/frontend/pluginSmokeSelfTest.test.ts --config vite.plugin-smoke.config.ts --environment jsdom
 & 'C:/Program Files/nodejs/node.exe' D:/EasiFlux/EasiFlux-Desktop-Tauri/node_modules/vue-tsc/bin/vue-tsc.js --noEmit
-& 'C:/Program Files/nodejs/node.exe' D:/EasiFlux/EasiFlux-Desktop-Tauri/node_modules/vite/bin/vite.js build --config vite.plugin-smoke.config.ts --configLoader runner
+& 'C:/Program Files/nodejs/node.exe' D:/EasiFlux/EasiFlux-Desktop-Tauri/node_modules/vite/bin/vite.js build --config vite.plugin-smoke.config.ts
 ```
 
 The generated completion permission metadata is not a grant. Default context authority
 denies completion, and its invoke handler is unchanged. Smoke authority tests resolve
-the eight exact commands for local main and deny remote/secondary access and default
-window/opener/dialog frontend permissions. Rust still owns the native dialog plugin.
+the ten exact commands for local main and deny remote/secondary access and default
+window/opener/dialog/account frontend permissions. Rust still owns the native dialog plugin.
 
 ## Limits and retained evidence
 

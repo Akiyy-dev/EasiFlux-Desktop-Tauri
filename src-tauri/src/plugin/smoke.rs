@@ -21,7 +21,9 @@ use crate::storage::managed_plugin_ownership::{
 };
 use crate::storage::plugin_state::{PluginStatePersistence, PluginStateStore};
 
-const FIXTURE_MANIFEST_BYTES: &[u8] = br#"{"schemaVersion":1,"id":"com.easiflux.smoke","name":"Plugin Smoke Fixture","version":"1.0.0","description":"Isolated metadata-only fixture","publisherId":"com.easiflux","publisher":"EasiFlux smoke test","contributions":[],"requestedCapabilities":[]}"#;
+const FIXTURE_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../../../examples/plugins/series-sma/manifest.json");
+const FIXTURE_PLUGIN_ID: &str = "com.easiflux.examples.series-sma";
 const OUTSIDE_ARTIFACT_ROOT: &str =
     "plugin smoke parent is outside the build checkout target directory";
 
@@ -129,7 +131,7 @@ impl PluginSmokeProfile {
             source_unchanged: std::fs::read(&self.source)
                 .is_ok_and(|bytes| bytes == FIXTURE_MANIFEST_BYTES),
             disabled_decision_retained: state.state.entries.iter().any(|entry| {
-                entry.id.as_str() == "com.easiflux.smoke"
+                entry.id.as_str() == FIXTURE_PLUGIN_ID
                     && entry.source == PluginSource::LocalDeclarative
                     && !entry.enabled
             }),
@@ -211,11 +213,20 @@ impl SmokeNativeChecks {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::AtomicBool;
 
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::Value;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::plugin::compute::execute_guest;
+    use crate::plugin::contribution::PluginCommandParams;
+    use crate::plugin::manifest::PluginManifestV1;
+
+    const SERIES_SMA_MANIFEST: &str =
+        include_str!("../../../examples/plugins/series-sma/manifest.json");
+    const SERIES_SMA_WAT: &str = include_str!("../../../examples/plugins/series-sma/plugin.wat");
 
     fn fixture_parent() -> TempDir {
         let base = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -248,6 +259,45 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    // Catches a checked-in manifest blob that is unrelated to its author-readable source,
+    // or an example that delegates SMA arithmetic to the host.
+    #[test]
+    fn checked_in_series_sma_source_matches_manifest_and_runs_in_production_interpreter() {
+        let manifest: PluginManifestV1 = serde_json::from_str(SERIES_SMA_MANIFEST).unwrap();
+        assert_eq!(manifest.schema_version, 4);
+        assert_eq!(manifest.contributions.len(), 1);
+        let params = match &manifest.contributions[0].params {
+            PluginCommandParams::ComputeSeries(params) => params,
+            other => panic!("series SMA contribution is not executable: {other:?}"),
+        };
+
+        let compiled = wat::parse_str(SERIES_SMA_WAT).unwrap();
+        assert_eq!(params.module_base64, STANDARD.encode(compiled));
+        assert_eq!(
+            execute_guest(
+                params,
+                &[1.0, 2.0, 3.0, 4.0, 5.0],
+                3.0,
+                &AtomicBool::new(false),
+            )
+            .unwrap(),
+            4.0
+        );
+        for parameter in [2.5, 6.0] {
+            let error = execute_guest(
+                params,
+                &[1.0, 2.0, 3.0, 4.0, 5.0],
+                parameter,
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+            assert_eq!(
+                serde_json::to_value(error).unwrap()["code"],
+                "plugin_compute_invalid_output"
+            );
+        }
     }
 
     // Catches accepting an ambiguous parent before reserving a fresh owned child.
@@ -350,7 +400,7 @@ mod tests {
 
         let catalog = runtime.get_catalog().await.unwrap();
         let removed = runtime
-            .remove_managed_local_plugin("com.easiflux.smoke", &catalog.catalog_generation)
+            .remove_managed_local_plugin(FIXTURE_PLUGIN_ID, &catalog.catalog_generation)
             .await
             .unwrap();
         assert_eq!(serde_json::to_value(removed).unwrap()["status"], "removed");
@@ -363,7 +413,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["manifest"]["id"] == "com.easiflux.smoke"));
+            .any(|item| item["manifest"]["id"] == FIXTURE_PLUGIN_ID));
 
         let checks = serde_json::to_value(profile.inspect_final_state().unwrap()).unwrap();
         assert_eq!(
@@ -381,7 +431,7 @@ mod tests {
             ready["assessment"],
             serde_json::json!({ "kind": "notInCatalog" })
         );
-        assert_eq!(ready["manifest"]["id"], "com.easiflux.smoke");
+        assert_eq!(ready["manifest"]["id"], FIXTURE_PLUGIN_ID);
         assert_eq!(ready.get("sourcePath"), None::<&Value>);
     }
 }
