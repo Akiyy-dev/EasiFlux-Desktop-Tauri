@@ -166,22 +166,25 @@ impl PluginRuntime {
     }
 
     fn reserve_operation(&self) -> OperationReservation {
-        // Admission of any lifecycle operation invalidates in-flight numerical
-        // work, even if publication later fails or returns the same snapshot.
+        let mut waiter: OperationWaiter = Box::pin(tokio::task::unconstrained(
+            Arc::clone(&self.operation_gate).lock_owned(),
+        ));
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+        let reservation = match waiter.as_mut().poll(&mut context) {
+            Poll::Ready(guard) => OperationReservation::Ready(guard),
+            Poll::Pending => OperationReservation::Waiting(waiter),
+        };
+        // Reserve/queue the gate BEFORE invalidation: otherwise another thread
+        // can admit compute with the new epoch while lifecycle has no gate yet.
+        // The owned reservation blocks new admission throughout invalidation,
+        // even if publication later fails or returns the same snapshot.
         let _ = self.compute_epoch.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |epoch| Some(epoch.saturating_add(1)),
         );
         self.compute_slot.invalidate();
-        let mut waiter: OperationWaiter = Box::pin(tokio::task::unconstrained(
-            Arc::clone(&self.operation_gate).lock_owned(),
-        ));
-        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
-        match waiter.as_mut().poll(&mut context) {
-            Poll::Ready(guard) => OperationReservation::Ready(guard),
-            Poll::Pending => OperationReservation::Waiting(waiter),
-        }
+        reservation
     }
 
     async fn request_state_retry(self: &Arc<Self>) -> AppResult<PluginCatalogSnapshot> {

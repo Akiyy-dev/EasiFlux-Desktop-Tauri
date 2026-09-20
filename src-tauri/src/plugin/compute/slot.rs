@@ -62,8 +62,17 @@ impl Drop for ComputeLease {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    // Test utility: hold the real coordinator lock to stop invalidation exactly
+    // after the lifecycle epoch changes, without a production scheduling hook.
+    pub(crate) fn hold_invalidation(
+        slot: &ComputeSlot,
+    ) -> std::sync::MutexGuard<'_, Option<(String, Arc<AtomicBool>)>> {
+        slot.active.lock().unwrap()
+    }
+
     #[test]
     fn busy_and_cancel_are_owned_until_worker_exit_and_old_ids_cannot_cancel_new_run() {
         let slot = Arc::new(ComputeSlot::default());

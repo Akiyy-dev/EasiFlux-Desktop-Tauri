@@ -280,3 +280,35 @@ async fn unavailable_discovery_cannot_execute_cached_enabled_authority() {
         "plugin_compute_unavailable"
     );
 }
+
+#[tokio::test]
+async fn lifecycle_reserves_admission_gate_before_invalidating_compute() {
+    let (runtime, mut request) = fixture().await;
+    enable(&runtime, &mut request).await;
+    let invalidation =
+        crate::plugin::compute::slot::tests::hold_invalidation(&runtime.compute_slot);
+    let previous_epoch = runtime.compute_epoch.load(Ordering::Acquire);
+    let worker_runtime = runtime.clone();
+    let worker = std::thread::spawn(move || worker_runtime.reserve_operation());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while runtime.compute_epoch.load(Ordering::Acquire) == previous_epoch
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    let invalidation_started = runtime.compute_epoch.load(Ordering::Acquire) != previous_epoch;
+    // The operation has advanced its epoch and is now blocked in the real
+    // invalidation mutex. Compute admission must already be impossible here.
+    let admission_blocked = runtime.operation_gate.try_lock().is_err();
+    drop(invalidation);
+    let reservation = worker.join().unwrap();
+    assert!(
+        invalidation_started,
+        "lifecycle worker did not reach invalidation"
+    );
+    assert!(
+        admission_blocked,
+        "compute can enter after epoch change but before lifecycle gate reservation"
+    );
+    drop(reservation);
+}
