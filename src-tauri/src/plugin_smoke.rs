@@ -304,6 +304,8 @@ pub fn run_plugin_smoke() -> Result<(), String> {
             .title("Isolated Plugin Smoke — fixture data only")
             .inner_size(1100.0, 820.0)
             .visible(!args.self_test)
+            // A hidden WebView cannot reliably accept Wry's default creation-time focus.
+            .focused(!args.self_test)
             .data_directory(webview_data)
             .on_navigation(|url| {
                 url.scheme() == "http"
