@@ -93,7 +93,8 @@ selector never receives a frontend-supplied path, and the reader accepts only th
 fresh-profile fixture copies.
 
 `source/manifest.json`, `source/account-workflow.json`, `plugins/`, absolute `webview2/`, and the fixed `report.json`
-are below the fresh profile. The process log prints the profile/source/report paths.
+are below the fresh profile. The process log prints the profile, v4 source and report
+paths; the v5 fixture is identified only by its fixed profile-relative filename.
 Completion is one-shot: UTF-8 detail is capped at 2,000 bytes; oversize detail forces
 failure. The report independently checks both unchanged source byte sets, retained
 disabled decisions for both fixtures, exactly one placement and cancellation, empty
@@ -108,7 +109,8 @@ creation and sync before exit; duplicates cannot replace the first decision.
 
 Without `--self-test`, the visible manual lane keeps the native picker and shows
 fixture-only instructions and Installed/Market/Manage controls. Select only one of the
-two manifests printed in the local host log. Manual close does not produce an automatic
+two manifests identified in the local host log (the v5 path is relative to the printed
+smoke profile). Manual close does not produce an automatic
 passing report, and the completion command rejects manual-mode submissions.
 
 ## Focused checks

@@ -141,6 +141,18 @@ smoke work. The initial timeout's root cause is not proven or fixed; the passing
 warm-server diagnostic shows the integrated synthetic flow can complete, not
 that startup is flake-free.
 
+## Final security scan follow-up
+
+All five jobs in CI run `35541448377` passed at `c6da286`. An additional CodeQL
+check (`106159627173`) reported cleartext sensitive logging at the new smoke
+fixture-path message. The traced value is a `PathBuf` constructed from the
+checkout-only synthetic smoke profile and fixed `source/account-workflow.json`
+filename, not an account credential or API response. The unnecessary dynamic
+path interpolation was removed in favor of fixed profile-relative instructions;
+manual fixture selection remains possible. No alert was dismissed or security
+rule disabled. The existing failing CodeQL check is the regression gate; an
+updated-head scan and CI must pass before merge.
+
 ## Limits and remaining gates
 
 The first PR CI frontend run passed 1,428 tests and failed one security allowlist

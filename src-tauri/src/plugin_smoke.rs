@@ -234,8 +234,7 @@ pub fn run_plugin_smoke() -> Result<(), String> {
         profile.source.display()
     );
     eprintln!(
-        "plugin smoke v5 fixture (select only a printed file in manual mode): {}",
-        profile.account_source.display()
+        "plugin smoke v5 fixture: source/account-workflow.json under the printed smoke profile"
     );
     eprintln!(
         "automatic lane: {}; native picker and whole app unverified",
