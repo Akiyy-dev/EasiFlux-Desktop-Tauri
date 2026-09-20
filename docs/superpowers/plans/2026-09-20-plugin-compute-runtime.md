@@ -30,7 +30,7 @@ Implement the spec's manifest v4 and full Rust runtime as one integrated task. R
 
 ## Task 2: Host computation UI and v4 transport
 
-Implement frontend against Task 1 report and spec. Primary files: `types/plugin.ts`, `services/pluginService.ts`, new focused compute service/parser if useful, `stores/plugin.ts`, `composables/usePluginCommandResult.ts`, `components/plugins/{PluginCommands,PluginCommandWorkbench,PluginImportDialog,PluginManifestComparison}.vue`, new `PluginComputeDialog.vue` (or equivalent host-owned form), `utils/pluginManifestDiff.ts` and related focused tests.
+Implement frontend against Task 1 report and spec. Primary files: `types/plugin.ts`, `services/pluginService.ts`, new focused compute service/parser if useful, `stores/plugin.ts`, `composables/usePluginCommandResult.ts`, `components/plugins/{PluginCommands,PluginCommandWorkbench,PluginImportDialog,PluginManifestComparison}.vue`, new `PluginComputeDialog.vue` (or equivalent host-owned form), `services/pluginManifestDiff.ts` and related `tests/frontend/plugin*.test.ts` tests. Update v4-aware copy in `pluginPresentation.ts`, `PluginCard.vue`, `PluginMarketplacePage.vue` and `PluginRemovalDialog.vue` where existing text wrongly claims all local plugins are declarative or never executed.
 
 1. RED: strict v4 parsing/old schema rejection, explicit compute action selection (never fall through to navigation), input parsing, async stale-result/cancel UI tests.
 2. Mirror exact closed wire union and metadata constraints; module encoding/size checked without execution. Existing v3 TS type must exclude v4 compute despite shared contribution union. Error messages use fixed backend codes, not arbitrary backend text.
