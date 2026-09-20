@@ -620,6 +620,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "assessment",
                 "catalogGeneration",
                 "expiresInSeconds",
                 "manifest",
@@ -627,6 +628,11 @@ mod tests {
                 "status",
                 "token",
             ]
+        );
+        assert_eq!(wire["schemaVersion"], 2);
+        assert_eq!(
+            wire["assessment"],
+            serde_json::json!({ "kind": "notInCatalog" })
         );
         assert_eq!(*paths.lock().unwrap(), [private_path.clone()]);
         let serialized = serde_json::to_string(&wire).unwrap();
