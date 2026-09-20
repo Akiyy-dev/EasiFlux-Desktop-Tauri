@@ -1,7 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { nextTick } from 'vue'
+import { defineComponent, nextTick } from 'vue'
 import PluginCommands from '../../src/components/plugins/PluginCommands.vue'
 import PluginComputeDialog from '../../src/components/plugins/PluginComputeDialog.vue'
 import { tauriInvoke } from '../../src/composables/useTauriCommand'
@@ -103,6 +103,20 @@ async function mountLoaded(catalog = snapshot()) {
     global: { plugins: [pinia] },
   })
   return { wrapper, store }
+}
+
+function computeIntent(
+  contributionId = 'analytics.average',
+  title = 'Average',
+): PluginComputeExecutionIntent {
+  return {
+    actionId: 'sandbox.computeSeries',
+    pluginId: 'com.example.analytics', pluginName: 'Analytics',
+    contributionId, title,
+    runtime: 'wasm-v1', abi: 'series-f64-v1',
+    parameter: { label: 'Window', default: 3, min: 1, max: 10 },
+    expectedCatalogGeneration: '8', expectedRevision: '13',
+  }
 }
 
 beforeEach(() => {
@@ -211,6 +225,26 @@ describe('plugin compute command UI', () => {
     expect(wrapper.get('[data-testid="plugin-compute-error"]').text()).toContain('已取消')
   })
 
+  it('keeps user cancellation authoritative over a late non-cancel error', async () => {
+    const { wrapper } = await mountLoaded()
+    await wrapper.get('[data-testid="plugin-command-button"]').trigger('click')
+    const execute = deferred<PluginComputeResult>()
+    vi.mocked(tauriInvoke).mockReturnValueOnce(execute.promise)
+    await wrapper.get('[data-testid="plugin-compute-input"]').setValue('1 2 3')
+    await wrapper.get('[data-testid="plugin-compute-run"]').trigger('click')
+    const executeCall = vi.mocked(tauriInvoke).mock.calls[1]
+    const requestId = (executeCall?.[1] as { request: { requestId: string } }).request.requestId
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ schemaVersion: 1, requestId, cancelled: false })
+
+    await wrapper.get('[data-testid="plugin-compute-cancel"]').trigger('click')
+    execute.reject({ code: 'plugin_compute_deadline', message: 'late guest detail' })
+    await flushPromises()
+
+    const error = wrapper.get('[data-testid="plugin-compute-error"]').text()
+    expect(error).toContain('已取消')
+    expect(error).not.toContain('时间限制')
+  })
+
   it('keys the form by command identity, resets fields, and cancels A when selecting B', async () => {
     const { wrapper } = await mountLoaded(snapshot('13', '8', true))
     const buttons = wrapper.findAll('[data-testid="plugin-command-button"]')
@@ -240,14 +274,7 @@ describe('plugin compute command UI', () => {
   })
 
   it('uses collision-resistant request IDs across separate form instances', async () => {
-    const base: PluginComputeExecutionIntent = {
-      actionId: 'sandbox.computeSeries',
-      pluginId: 'com.example.analytics', pluginName: 'Analytics',
-      contributionId: 'analytics.average', title: 'Average',
-      runtime: 'wasm-v1', abi: 'series-f64-v1',
-      parameter: { label: 'Window', default: 3, min: 1, max: 10 },
-      expectedCatalogGeneration: '8', expectedRevision: '13',
-    }
+    const base = computeIntent()
     const first = mount(PluginComputeDialog, { props: { intent: base } })
     const second = mount(PluginComputeDialog, { props: { intent: base } })
     const randomUUID = vi.spyOn(globalThis.crypto, 'randomUUID')
@@ -265,6 +292,39 @@ describe('plugin compute command UI', () => {
     first.unmount()
     second.unmount()
     randomUUID.mockRestore()
+  })
+
+  it('uses unique per-instance IDs and keeps each label and description local', () => {
+    const host = defineComponent({
+      components: { PluginComputeDialog },
+      setup: () => ({
+        first: computeIntent(),
+        second: computeIntent('analytics.second', 'Second'),
+      }),
+      template: `
+        <PluginComputeDialog :intent="first" />
+        <PluginComputeDialog :intent="second" />
+      `,
+    })
+    const wrapper = mount(host)
+    const panels = wrapper.findAll('[data-testid="plugin-compute-dialog"]')
+    const ids = panels.map((panel) => {
+      const title = panel.get('h3')
+      const input = panel.get('[data-testid="plugin-compute-input"]')
+      const parameter = panel.get('[data-testid="plugin-compute-parameter"]')
+      const rangeId = parameter.attributes('aria-describedby')
+      const labels = panel.findAll('label')
+
+      expect(panel.attributes('aria-labelledby')).toBe(title.attributes('id'))
+      expect(labels.some((label) => label.attributes('for') === input.attributes('id'))).toBe(true)
+      expect(labels.some((label) => label.attributes('for') === parameter.attributes('id')))
+        .toBe(true)
+      expect(panel.get(`[id="${rangeId}"]`).text()).toContain('允许范围')
+      return [title.attributes('id'), input.attributes('id'), parameter.attributes('id'), rangeId]
+    })
+
+    expect(new Set(ids.flat()).size).toBe(8)
+    wrapper.unmount()
   })
 
   it('cancels on command-context invalidation and discards a late success', async () => {

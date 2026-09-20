@@ -25,6 +25,12 @@ const props = defineProps<{
 }>()
 
 const diff = computed(() => comparePluginManifests(props.current.manifest, props.incoming))
+const comparisonHasCompute = computed(() => (
+  [props.current.manifest, props.incoming].some((manifest) => (
+    manifest.schemaVersion === 4
+    && manifest.contributions.some((command) => command.actionId === 'sandbox.computeSeries')
+  ))
+))
 
 const fieldLabels: Record<PluginManifestField, string> = {
   schemaVersion: '清单架构',
@@ -147,6 +153,15 @@ function commandDetails(
     </section>
     <p data-testid="plugin-import-version-relation">
       {{ versionRelationCopy[props.versionRelation] }}
+    </p>
+
+    <p
+      v-if="comparisonHasCompute"
+      class="plugin-manifest-comparison__warning"
+      data-testid="plugin-compute-comparison-notice"
+    >
+      此比较涉及可执行的本地 WebAssembly 代码；比较本身不会执行代码。
+      只有在已安装且启用的对应命令中明确点击运行才会执行；输入和结果仅保存在内存中。
     </p>
 
     <p

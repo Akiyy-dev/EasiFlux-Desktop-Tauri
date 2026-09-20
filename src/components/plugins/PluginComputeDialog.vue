@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, useId } from 'vue'
 import {
   cancelPluginCompute,
   executePluginCompute,
@@ -19,6 +19,12 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: []
 }>()
+
+const instanceId = useId()
+const titleId = `${instanceId}-plugin-compute-title`
+const inputId = `${instanceId}-plugin-compute-input`
+const parameterId = `${instanceId}-plugin-compute-parameter`
+const parameterRangeId = `${instanceId}-plugin-compute-parameter-range`
 
 type ComputeStatus = 'idle' | 'running' | 'cancelling' | 'completed' | 'error'
 
@@ -115,7 +121,9 @@ async function run(): Promise<void> {
     status.value = 'completed'
   } catch (caught) {
     if (disposed || activeRequest?.owner !== owner) return
-    error.value = pluginErrorMessage(caught)
+    error.value = activeRequest.cancelRequested
+      ? pluginErrorMessage({ code: 'plugin_compute_cancelled', message: 'cancelled' })
+      : pluginErrorMessage(caught)
     status.value = 'error'
   } finally {
     if (!disposed && activeRequest?.owner === owner) {
@@ -147,12 +155,12 @@ onBeforeUnmount(() => {
     class="plugin-compute-dialog ef-card"
     data-testid="plugin-compute-dialog"
     role="region"
-    aria-labelledby="plugin-compute-title"
+    :aria-labelledby="titleId"
     :aria-busy="busy || undefined"
   >
     <header>
       <p>本地 WebAssembly 计算</p>
-      <h3 id="plugin-compute-title">
+      <h3 :id="titleId">
         {{ props.intent.title }}
       </h3>
     </header>
@@ -160,10 +168,10 @@ onBeforeUnmount(() => {
       只有点击“运行”才会执行此插件代码。输入和结果仅保存在当前内存中，不会写入插件或应用数据。
     </p>
     <form @submit.prevent>
-      <label for="plugin-compute-input">
+      <label :for="inputId">
         <span>数值序列</span>
         <textarea
-          id="plugin-compute-input"
+          :id="inputId"
           v-model="inputText"
           data-testid="plugin-compute-input"
           rows="5"
@@ -171,19 +179,19 @@ onBeforeUnmount(() => {
           placeholder="例如：1, 2, 3, 4, 5"
         />
       </label>
-      <label for="plugin-compute-parameter">
+      <label :for="parameterId">
         <span>{{ props.intent.parameter.label }}</span>
         <input
-          id="plugin-compute-parameter"
+          :id="parameterId"
           v-model="parameterText"
           data-testid="plugin-compute-parameter"
           type="text"
           inputmode="decimal"
           :disabled="busy"
-          :aria-describedby="'plugin-compute-parameter-range'"
+          :aria-describedby="parameterRangeId"
         >
       </label>
-      <p id="plugin-compute-parameter-range">
+      <p :id="parameterRangeId">
         允许范围：{{ props.intent.parameter.min }} 至 {{ props.intent.parameter.max }}
       </p>
 
