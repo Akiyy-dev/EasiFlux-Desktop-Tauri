@@ -51,6 +51,7 @@ struct Fake {
     reads: std::sync::Mutex<Vec<&'static str>>,
     placed: std::sync::Mutex<Vec<(SubmissionContext, PlaceOrderRequest)>>,
     cancelled: std::sync::Mutex<Vec<(SessionContext, CancelOrderRequest)>>,
+    cancel_payload: std::sync::Mutex<Option<serde_json::Value>>,
     unknown: AtomicBool,
     rejected: AtomicBool,
     hold: AtomicBool,
@@ -66,6 +67,7 @@ impl Fake {
             reads: Default::default(),
             placed: Default::default(),
             cancelled: Default::default(),
+            cancel_payload: Default::default(),
             unknown: AtomicBool::new(false),
             rejected: AtomicBool::new(false),
             hold: AtomicBool::new(false),
@@ -156,7 +158,10 @@ impl WorkflowHost for Fake {
     }
     fn cancel_locked(&self, c: SessionContext, r: CancelOrderRequest) -> HostFuture<'_, Order> {
         Box::pin(async move {
-            self.cancelled.lock().unwrap().push((c, r));
+            self.cancelled.lock().unwrap().push((c, r.clone()));
+            if let Some(payload) = self.cancel_payload.lock().unwrap().as_ref() {
+                return crate::api::PrivateApi::parse_cancel_acknowledgement(payload, &r);
+            }
             let mut o = order();
             o.status = OrderStatus::Cancelled;
             o.side.clear();
@@ -549,4 +554,46 @@ async fn known_but_unrequested_capability_is_not_grantable() {
         .await
         .is_err());
     assert!(h.reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancel_acknowledgement_requires_actual_matching_exchange_identity_and_never_retries() {
+    for (payload, status) in [
+        (json!({"code":0,"data":{}}), TradeStatus::Unknown),
+        (
+            json!({"code":0,"data":{"order_id":"other-exchange-order"}}),
+            TradeStatus::Unknown,
+        ),
+        (
+            json!({"code":0,"data":{"order_id":"exchange-1","order_link_id":"optional","futureHarmlessField":true}}),
+            TradeStatus::Accepted,
+        ),
+    ] {
+        let (r, h, a) = fixture(
+            r#"{"kind":"cancelOrder","order":{"symbol":"BTCUSDT","orderId":"exchange-1"}}"#,
+        )
+        .await;
+        let access = authorize(&r, &h, a, &["account.read", "orders.read", "trade.cancel"]).await;
+        let token = r
+            .run_workflow(h.clone(), run(&access))
+            .await
+            .unwrap()
+            .confirmation
+            .unwrap()
+            .token;
+        *h.cancel_payload.lock().unwrap() = Some(payload);
+        let receipt = r.confirm_workflow(h.clone(), token.clone()).await.unwrap();
+        assert_eq!(receipt.status, status);
+        if status == TradeStatus::Accepted {
+            assert_eq!(receipt.order.unwrap().status, OrderStatus::Unknown);
+        } else {
+            assert!(receipt.order.is_none());
+            assert_eq!(
+                receipt.error_code.as_deref(),
+                Some("plugin_workflow_unknown")
+            );
+        }
+        assert!(r.confirm_workflow(h.clone(), token).await.is_err());
+        assert_eq!(h.cancelled.lock().unwrap().len(), 1);
+    }
 }

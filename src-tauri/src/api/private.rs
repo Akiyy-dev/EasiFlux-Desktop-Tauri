@@ -151,6 +151,52 @@ impl PrivateApi {
         })))
     }
 
+    /// Workflow-only cancellation: an HTTP success without a matching exchange
+    /// acknowledgment is ambiguous, never a fabricated accepted cancellation.
+    pub(crate) async fn cancel_order_acknowledged(
+        client: &ApiClient,
+        request: &CancelOrderRequest,
+    ) -> AppResult<Order> {
+        let payload = client
+            .private_post(endpoints::CANCEL_ORDER, build_cancel_order_body(request))
+            .await?;
+        Self::parse_cancel_acknowledgement(&payload, request)
+    }
+
+    pub(crate) fn parse_cancel_acknowledgement(
+        payload: &Value,
+        request: &CancelOrderRequest,
+    ) -> AppResult<Order> {
+        let unknown = || AppError::Internal("撤单受理结果不明确，请查询原订单".into());
+        let expected = request.order_id.as_deref().ok_or_else(unknown)?;
+        let data = payload
+            .get("data")
+            .filter(|v| v.is_object())
+            .ok_or_else(unknown)?;
+        let id = data
+            .get("order_id")
+            .or_else(|| data.get("orderId"))
+            .and_then(Value::as_str)
+            .ok_or_else(unknown)?;
+        if id.trim().is_empty()
+            || id.len() > 128
+            || id.chars().any(char::is_control)
+            || id != expected
+            || data
+                .get("orderId")
+                .is_some_and(|value| value.as_str() != Some(id))
+            || !super::response::is_success_response(payload)
+        {
+            return Err(unknown());
+        }
+        let mut order = parse_order(data);
+        order.order_id = id.into();
+        order.symbol = request.symbol.clone();
+        // The endpoint acknowledges a request, not the final exchange state.
+        order.status = crate::models::trading::OrderStatus::Unknown;
+        Ok(order)
+    }
+
     pub async fn cancel_all_orders(
         client: &ApiClient,
         request: &ApiCancelAllOrdersRequest,
@@ -284,6 +330,38 @@ mod tests {
 
     use super::*;
     use crate::models::config::ApiCredential;
+
+    #[test]
+    fn cancel_acknowledgement_rejects_empty_malformed_mismatched_or_uncorrelated_success() {
+        let request = CancelOrderRequest {
+            symbol: "BTCUSDT".into(),
+            order_id: Some("fixture-order".into()),
+            order_link_id: None,
+        };
+        for payload in [
+            serde_json::json!({"code":0,"data":{}}),
+            serde_json::json!({"code":0,"data":null}),
+            serde_json::json!({"code":0,"data":{"order_id":42}}),
+            serde_json::json!({"code":0,"data":{"order_id":" "}}),
+            serde_json::json!({"code":0,"data":{"order_id":"other"}}),
+            serde_json::json!({"code":0,"data":{"order_id":"fixture-order","orderId":"other"}}),
+            serde_json::json!({"code":0,"data":{"list":[{"order_id":"fixture-order"}]}}),
+            serde_json::json!({"code":1,"data":{"order_id":"fixture-order"}}),
+        ] {
+            assert!(
+                matches!(
+                    PrivateApi::parse_cancel_acknowledgement(&payload, &request),
+                    Err(AppError::Internal(_))
+                ),
+                "{payload}"
+            );
+        }
+        let payload = serde_json::json!({"code":0,"data":{"order_id":"fixture-order","order_link_id":"optional","status":"Cancelled","futureHarmlessField":true}});
+        let order = PrivateApi::parse_cancel_acknowledgement(&payload, &request).unwrap();
+        assert_eq!(order.order_id, "fixture-order");
+        assert_eq!(order.symbol, "BTCUSDT");
+        assert_eq!(order.status, crate::models::trading::OrderStatus::Unknown);
+    }
 
     fn place_order_request(order_link_id: Option<&str>) -> PlaceOrderRequest {
         PlaceOrderRequest {

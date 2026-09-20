@@ -32,9 +32,12 @@ Task 1's latest focused backend evidence, all against injected/in-memory fixture
 
 The post-review cancellation acknowledgment provenance fix then passed its two
 focused adapter tests plus one workflow receipt test. Production now requires an
-actual matching exchange acknowledgment; an accepted cancel still publishes an
-`Unknown` order status rather than claiming terminal cancellation. This did not
-change the public host or IPC wire contract.
+actual matching exchange acknowledgment; an accepted cancel receipt carries an
+`Unknown` order status rather than claiming terminal cancellation. The strict
+service logs request acceptance but does not publish the incomplete acknowledgment
+as an order event or append it to history/analytics. This preserves existing
+order-center data until authoritative WebSocket/refresh observations arrive.
+The legacy cancellation path and public host/IPC wire contract are unchanged.
 
 An earlier plugin run reported 365 passed, 1 failed, 2 ignored because the
 pre-existing Windows removal crash-checkpoint fixture hit OS error 5 during a

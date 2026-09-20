@@ -146,7 +146,11 @@ impl WorkflowHost for ProductionWorkflowHost {
         context: SessionContext,
         request: CancelOrderRequest,
     ) -> HostFuture<'_, Order> {
-        Box::pin(async move { self.trading.cancel_order(context, request).await })
+        Box::pin(async move {
+            self.trading
+                .cancel_order_acknowledged(context, request)
+                .await
+        })
     }
 }
 

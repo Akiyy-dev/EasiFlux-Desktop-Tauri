@@ -389,6 +389,23 @@ impl TradingService {
         Ok(order)
     }
 
+    pub(crate) async fn cancel_order_acknowledged(
+        &self,
+        _context: OrderStreamContext,
+        request: CancelOrderRequest,
+    ) -> AppResult<Order> {
+        let acknowledgement = PrivateApi::cancel_order_acknowledged(&self.api, &request).await?;
+        // This endpoint returns only request acknowledgment identity. Publishing it
+        // as an order would overwrite a complete open-order row with empty/zero
+        // fields. The broker hydrates its receipt from its captured target; normal
+        // WebSocket/refresh observations remain authoritative for final order state.
+        self.emitter.emit_log(
+            "info",
+            &format!("撤单请求已受理: {}", acknowledgement.order_id),
+        );
+        Ok(acknowledgement)
+    }
+
     pub async fn refresh_orders(
         &self,
         context: &OrderStreamContext,
