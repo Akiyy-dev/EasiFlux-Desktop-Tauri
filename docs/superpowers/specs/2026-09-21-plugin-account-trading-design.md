@@ -60,11 +60,20 @@ All counters/timestamps below are canonical nonnegative decimal strings; IDs are
 
 ```json
 {"kind":"display","text":"text, at most 2000 UTF-8 bytes"}
-{"kind":"placeOrder","order":{"symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"50000","timeInForce":"GTC","positionIdx":0,"reduceOnly":false}}
+{"kind":"placeOrder","order":{"symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"50000","timeInForce":"GTC","positionIdx":1,"reduceOnly":false}}
 {"kind":"cancelOrder","order":{"symbol":"BTCUSDT","orderId":"exchange-order-id"}}
 ```
 
-Place: positive non-exponent Decimal strings (max 64 bytes), canonicalized before preview; side Buy/Sell; type Market/Limit; Limit requires positive price and GTC/IOC/FOK; Market requires null price and IOC; positionIdx is 0/1/2; reduceOnly boolean. Symbol must equal the snapshot symbol. Unknown order fields (including orderLinkId) reject. Cancel: requires both `trade.cancel` and `orders.read`, a nonblank bounded orderId (<=128 bytes) actually present in the captured open-order section for that symbol, with New/PartiallyFilled status. Place requires `trade.place`. Neither mutation happens during run.
+Place: positive non-exponent Decimal strings (max 64 bytes), canonicalized before preview; side Buy/Sell; type Market/Limit; Limit requires positive price and GTC/IOC/FOK; Market requires null price and IOC; positionIdx is 1/2; reduceOnly boolean. Opening Buy/Sell uses index 1/2 respectively; reduce-only Sell/Buy uses index 1/2 respectively. Reject inconsistent side/index/reduction combinations. Symbol must equal the snapshot symbol. Unknown order fields (including orderLinkId) reject. Cancel: requires both `trade.cancel` and `orders.read`, a nonblank bounded orderId (<=128 bytes) actually present in the captured open-order section for that symbol, with New/PartiallyFilled status. Place requires `trade.place`. Neither mutation happens during run.
+
+### Official production API mapping
+
+Checked against the public [wallet balance](https://www.easicoin.io/api-doc/contract/accountHttp/get-wallet-list), [active orders](https://www.easicoin.io/api-doc/contract/orderHttp/open-order-list), [ticker](https://www.easicoin.io/api-doc/contract/marketHttp/symbol-ticker), [positions](https://www.easicoin.io/api-doc/contract/positionHttp/list), and [create order](https://www.easicoin.io/api-doc/contract/orderHttp/order-create) documentation; no authenticated API call was made. Do not assume legacy forgiving DTO parsers match actual response fields.
+
+- Balance: map `coin`, `available_balance` and `equity`. If an explicit frozen field is absent, derive `frozen` as checked Decimal `position_margin + order_margin` (occupied/reserved margin); require both source values. This is not an invented zero or a cross-asset sum.
+- Open orders: request `order_filter=Normal` (ordinary active orders, not conditional/TPSL). Accept explicit validated average price when provided. Otherwise use checked Decimal `cum_exec_value / cum_exec_qty` when filled quantity is positive; normalize to the host Decimal precision. An authoritative zero fill quantity has average-price sentinel `"0"`; missing/malformed fill information is not zero. Document this derived field. The documented PendingCancel state maps honestly to Unknown and is not cancellable; a transitional row must not make unrelated valid orders unreadable.
+- Preserve public proposal TIF GTC/IOC/FOK; the production adapter maps to the documented exchange spellings GoodTillCancel/ImmediateOrCancel/FillOrKill before the existing submission pipeline. Position indexes are explicitly 1-long/2-short; do not send the legacy UI's undocumented default 0 from plugins.
+- Tests use synthetic values in the documented envelopes and reject missing required inputs instead of using personal account data or raw captured exchange responses.
 
 `Confirmation` is exactly `{token, expiresAtMs, submissionId:string|null}`. Native stores immutable canonical output, captured content/counters/runtime epoch, account and private authority, grant revision, monotonic deadline and a generated UUID submissionId for placement. Limit pending confirmations to 32 with expired entries removed; no silent unbounded growth. ExpiresAtMs is for display only. Consume exactly once before external mutation; repeated/expired/stale tokens cannot send.
 
