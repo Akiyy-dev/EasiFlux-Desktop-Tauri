@@ -10,6 +10,8 @@
     "allow-prepare-local-manifest-import",
     "allow-cancel-local-manifest-import",
     "allow-commit-local-manifest-import",
-    "allow-remove-managed-local-plugin"
+    "allow-remove-managed-local-plugin",
+    "allow-execute-plugin-compute",
+    "allow-cancel-plugin-compute"
   ]
 }

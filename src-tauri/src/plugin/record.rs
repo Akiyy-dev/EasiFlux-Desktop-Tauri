@@ -240,4 +240,52 @@ mod tests {
         let changed = PluginRecord::local_declarative(changed).unwrap();
         assert_ne!(first.approval_fingerprint(), changed.approval_fingerprint());
     }
+
+    #[test]
+    fn v2_and_v3_pre_compute_fingerprints_remain_golden() {
+        for (document, digest) in [
+            (
+                r#"{"schemaVersion":2,"id":"com.example.guide","publisherId":"com.example","publisher":"Example","name":"Guide","description":"Read-only guide","version":"1.0.0","contributions":[{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}],"requestedCapabilities":[]}"#,
+                "v1:sha256:3305a75b0633ffb2f0b9c919848d9509c770c806c105266599c84c3a9bbb6368",
+            ),
+            (
+                r#"{"schemaVersion":3,"id":"com.example.guide","publisherId":"com.example","publisher":"Example","name":"Guide","description":"Read-only guide","version":"1.0.0","contributions":[{"kind":"command","contributionId":"guide.overview","title":"Charts","actionId":"host.openPage","params":{"destination":"charts"}}],"requestedCapabilities":[]}"#,
+                "v1:sha256:3afd36fa1fa0c177d82df718dcb24f126b34e7b759aa1620d404b8f97bc1f8f3",
+            ),
+        ] {
+            let record =
+                PluginRecord::local_declarative(serde_json::from_str(document).unwrap()).unwrap();
+            assert_eq!(
+                record.canonical_manifest_bytes().unwrap(),
+                document.as_bytes()
+            );
+            assert_eq!(record.approval_fingerprint(), digest);
+        }
+    }
+
+    #[test]
+    fn v4_fingerprint_binds_guest_code_and_parameter_metadata() {
+        let document = serde_json::json!({"schemaVersion":4,"id":"com.example.compute","publisherId":"com.example",
+            "publisher":"Example","name":"Compute","description":"Compute","version":"1.0.0","requestedCapabilities":[],
+            "contributions":[{"kind":"command","contributionId":"series.sma","title":"SMA","actionId":"sandbox.computeSeries",
+                "params":crate::plugin::compute::tests::params(crate::plugin::compute::tests::SMA)}]});
+        let original =
+            PluginRecord::local_declarative(serde_json::from_value(document.clone()).unwrap())
+                .unwrap();
+        for (key, value) in [
+            ("default", serde_json::json!(2)),
+            ("label", serde_json::json!("Window")),
+        ] {
+            let mut changed = document.clone();
+            changed["contributions"][0]["params"]["parameter"][key] = value;
+            let record =
+                PluginRecord::local_declarative(serde_json::from_value(changed).unwrap()).unwrap();
+            assert_ne!(record.identity(), original.identity());
+        }
+        let mut changed = document;
+        changed["contributions"][0]["params"]["moduleBase64"] = serde_json::json!("AGFzbQEAAAA=");
+        let record =
+            PluginRecord::local_declarative(serde_json::from_value(changed).unwrap()).unwrap();
+        assert_ne!(record.identity(), original.identity());
+    }
 }

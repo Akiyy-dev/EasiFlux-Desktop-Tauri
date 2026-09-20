@@ -21,6 +21,8 @@ it('runs nonzero lifecycle security suites on all three OS runners', () => {
     'storage::local_plugin_package::tests',
     'plugin::ownership::tests',
     'plugin::runtime::removal::tests',
+    'plugin::compute',
+    'plugin::runtime::compute',
   ]) {
     expect(job).toContain(`'${suite}'`)
   }

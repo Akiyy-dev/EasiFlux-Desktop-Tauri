@@ -29,6 +29,8 @@ pub enum PluginCommandActionId {
     HostShowInfo,
     #[serde(rename = "host.openPage")]
     HostOpenPage,
+    #[serde(rename = "sandbox.computeSeries")]
+    SandboxComputeSeries,
 }
 
 impl<'de> Deserialize<'de> for PluginCommandActionId {
@@ -39,9 +41,10 @@ impl<'de> Deserialize<'de> for PluginCommandActionId {
         match String::deserialize(deserializer)?.as_str() {
             "host.showInfo" => Ok(Self::HostShowInfo),
             "host.openPage" => Ok(Self::HostOpenPage),
+            "sandbox.computeSeries" => Ok(Self::SandboxComputeSeries),
             value => Err(serde::de::Error::unknown_variant(
                 value,
-                &["host.showInfo", "host.openPage"],
+                &["host.showInfo", "host.openPage", "sandbox.computeSeries"],
             )),
         }
     }
@@ -159,6 +162,7 @@ impl<'de> Deserialize<'de> for PluginOpenPageParams {
 pub enum PluginCommandParams {
     ShowInfo(PluginInfoParams),
     OpenPage(PluginOpenPageParams),
+    ComputeSeries(super::compute::PluginComputeParams),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -207,6 +211,10 @@ impl PluginCommandContribution {
                 params.validate()
             }
             (PluginCommandActionId::HostOpenPage, PluginCommandParams::OpenPage(_)) => Ok(()),
+            (
+                PluginCommandActionId::SandboxComputeSeries,
+                PluginCommandParams::ComputeSeries(params),
+            ) => params.validate(),
             _ => Err("plugin command action does not match params".into()),
         }
     }
@@ -220,6 +228,23 @@ mod tests {
 
     const VALID: &str = r#"{"kind":"command","contributionId":"guide.overview","title":"Guide","actionId":"host.showInfo","params":{"title":"Guide","text":"Read-only guide"}}"#;
     const VALID_NAVIGATION: &str = r#"{"kind":"command","contributionId":"workspace.charts","title":"Open charts","actionId":"host.openPage","params":{"destination":"charts"}}"#;
+
+    #[test]
+    fn manifest_v4_compute_roundtrips_and_rejects_old_versions() {
+        let compute = json!({"kind":"command","contributionId":"series.sma","title":"SMA",
+            "actionId":"sandbox.computeSeries", "params":{"runtime":"wasm-v1", "abi":"series-f64-v1",
+            "moduleBase64":"AGFzbQEAAAA=", "parameter":{"label":"Period","default":3,"min":1,"max":4096}}});
+        let document = manifest(4, vec![compute.clone()]);
+        let parsed: PluginManifestV1 = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), document);
+        for version in 1..=3 {
+            assert!(serde_json::from_value::<PluginManifestV1>(manifest(
+                version,
+                vec![compute.clone()]
+            ))
+            .is_err());
+        }
+    }
 
     fn manifest(schema_version: u32, contributions: Vec<Value>) -> Value {
         json!({

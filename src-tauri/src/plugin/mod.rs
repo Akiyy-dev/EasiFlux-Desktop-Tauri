@@ -1,5 +1,6 @@
 pub mod builtin;
 pub mod contribution;
+pub mod compute;
 pub(crate) mod discovery;
 pub(crate) mod import;
 pub mod manifest;

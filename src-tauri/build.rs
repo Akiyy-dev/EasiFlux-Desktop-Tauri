@@ -16,6 +16,8 @@ fn main() {
         "cancel_local_manifest_import",
         "commit_local_manifest_import",
         "remove_managed_local_plugin",
+        "execute_plugin_compute",
+        "cancel_plugin_compute",
     ];
     if smoke {
         commands.push("finish_plugin_smoke");

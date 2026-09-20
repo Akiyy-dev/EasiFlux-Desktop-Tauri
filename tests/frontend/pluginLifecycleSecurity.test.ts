@@ -105,6 +105,7 @@ it('capability union adds no filesystem, dialog, shell, remote, or new opener au
         'allow-get-plugin-catalog', 'allow-reload-plugin-catalog', 'allow-set-plugin-enabled',
         'allow-prepare-local-manifest-import', 'allow-cancel-local-manifest-import',
         'allow-commit-local-manifest-import', 'allow-remove-managed-local-plugin',
+        'allow-execute-plugin-compute', 'allow-cancel-plugin-compute',
       ])
       expect(capability.webviews).toEqual(['main'])
     }

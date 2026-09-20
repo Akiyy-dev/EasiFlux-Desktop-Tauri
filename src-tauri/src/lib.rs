@@ -88,6 +88,8 @@ pub fn run() {
             cancel_local_manifest_import,
             commit_local_manifest_import,
             remove_managed_local_plugin,
+            execute_plugin_compute,
+            cancel_plugin_compute,
             get_risk_status,
             update_risk_config,
             save_credentials,
@@ -273,6 +275,8 @@ mod capability_tests {
             "cancel_local_manifest_import",
             "commit_local_manifest_import",
             "remove_managed_local_plugin",
+            "execute_plugin_compute",
+            "cancel_plugin_compute",
         ] {
             assert!(
                 authority
@@ -309,7 +313,7 @@ mod capability_tests {
 
     // Catches wildcard or path-scoped grants expanding this fixed IPC surface.
     #[test]
-    fn plugin_capability_grants_exactly_the_seven_fixed_commands_without_scope() {
+    fn plugin_capability_grants_exactly_the_nine_fixed_commands_without_scope() {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/plugin-runtime.json")).unwrap();
         assert_eq!(capability["webviews"], serde_json::json!(["main"]));
@@ -325,7 +329,9 @@ mod capability_tests {
                 "allow-prepare-local-manifest-import",
                 "allow-cancel-local-manifest-import",
                 "allow-commit-local-manifest-import",
-                "allow-remove-managed-local-plugin"
+                "allow-remove-managed-local-plugin",
+                "allow-execute-plugin-compute",
+                "allow-cancel-plugin-compute"
             ])
         );
     }

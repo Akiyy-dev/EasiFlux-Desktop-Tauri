@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tauri::{State, WebviewWindow};
 
 use crate::error::AppResult;
+use crate::plugin::compute::{CancelComputeResult, ComputeRequest, ComputeResult};
 use crate::plugin::import::dialog::NativeLocalManifestSelector;
 use crate::plugin::import::{
     CancelImportResult, CommitImportResult, LocalManifestSelector, PrepareImportResult,
@@ -108,6 +109,22 @@ pub async fn get_plugin_catalog(
     state: State<'_, PluginCommandState>,
 ) -> AppResult<PluginCatalogSnapshot> {
     get_plugin_catalog_from(&state.runtime).await
+}
+
+#[tauri::command]
+pub async fn execute_plugin_compute(
+    state: State<'_, PluginCommandState>,
+    request: ComputeRequest,
+) -> AppResult<ComputeResult> {
+    state.runtime.execute_compute(request).await
+}
+
+#[tauri::command]
+pub async fn cancel_plugin_compute(
+    state: State<'_, PluginCommandState>,
+    request_id: String,
+) -> AppResult<CancelComputeResult> {
+    state.runtime.cancel_compute(&request_id)
 }
 
 #[tauri::command]
