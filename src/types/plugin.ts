@@ -76,6 +76,25 @@ export interface PluginManifestV3 extends Omit<PluginManifestV1, 'schemaVersion'
 
 export type PluginManifest = PluginManifestV1 | PluginManifestV2 | PluginManifestV3
 
+export type PluginManifestField =
+  | 'schemaVersion'
+  | 'publisherId'
+  | 'publisher'
+  | 'name'
+  | 'description'
+  | 'version'
+  | 'requestedCapabilities'
+
+export interface PluginManifestDiff {
+  changedFields: PluginManifestField[]
+  added: PluginCommandContribution[]
+  removed: PluginCommandContribution[]
+  changed: { before: PluginCommandContribution; after: PluginCommandContribution }[]
+  orderChanged: boolean
+  sameContent: boolean
+  publisherIdChanged: boolean
+}
+
 export interface PluginCommandInfo {
   pluginId: string
   pluginName: string
@@ -155,18 +174,27 @@ export type LocalManifestImportCommitFailure =
   | 'plugin_ownership_capacity_exceeded'
   | 'plugin_ownership_revision_exhausted'
 
+export type ImportAssessment =
+  | { kind: 'notInCatalog' }
+  | {
+      kind: 'existingId'
+      current: PluginCatalogItem
+      versionRelation: 'incomingLower' | 'samePrecedence' | 'incomingHigher'
+    }
+
 export type PrepareLocalManifestImportResult =
   | {
       schemaVersion: 1
       status: 'cancelled'
     }
   | {
-      schemaVersion: 1
+      schemaVersion: 2
       status: 'ready'
       token: string
       expiresInSeconds: 300
       catalogGeneration: string
       manifest: PluginManifest
+      assessment: ImportAssessment
     }
 
 export type ReadyLocalManifestImport = Extract<

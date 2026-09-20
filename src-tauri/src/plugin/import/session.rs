@@ -5,8 +5,9 @@ use std::{
 
 use uuid::Uuid;
 
-use super::{ImportPreview, PreparedManifest};
+use super::{ImportAssessment, ImportPreview, PreparedManifest};
 use crate::error::{AppError, AppResult};
+use crate::plugin::manifest::PluginCatalogItem;
 
 enum SessionState {
     Idle,
@@ -119,6 +120,7 @@ impl PrepareLease {
         self,
         content: PreparedManifest,
         generation: u64,
+        catalog: &[PluginCatalogItem],
         now: Instant,
     ) -> AppResult<ImportPreview> {
         let mut state = self.sessions.state.lock().map_err(|_| busy())?;
@@ -130,10 +132,12 @@ impl PrepareLease {
             public_id = Uuid::new_v4();
         }
         let token = public_id.simple().to_string();
+        let assessment = ImportAssessment::from_catalog(content.record().manifest(), catalog);
         let preview = ImportPreview::new(
             token.clone(),
             generation,
             content.record().manifest().clone(),
+            assessment,
         );
         *state = SessionState::Ready {
             owner: self.owner,

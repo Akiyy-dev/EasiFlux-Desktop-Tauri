@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::error::{AppError, AppResult};
 use crate::plugin::manifest::{
-    LocalDiscoverySummary, PluginAvailability, PluginCatalogSnapshot, PluginManifestV1,
+    LocalDiscoverySummary, PluginAvailability, PluginCatalogItem, PluginCatalogSnapshot,
+    PluginManifestV1, PluginSource,
 };
 
 fn assert_code<T>(result: AppResult<T>, expected: &str) {
@@ -30,6 +31,7 @@ fn ready(sessions: &std::sync::Arc<ImportSessions>, now: Instant) -> ImportPrevi
         .publish(
             PreparedManifest::parse(test_support::VALID).unwrap(),
             4,
+            &[],
             now,
         )
         .unwrap()
@@ -54,6 +56,25 @@ fn v2_manifest_and_prepared_import_preserve_declared_command_text() {
             ["text"],
         "Read-only guide"
     );
+}
+
+#[test]
+fn workspace_shortcuts_update_candidate_is_a_real_prepared_manifest_fixture() {
+    let prepared = PreparedManifest::parse(include_bytes!(
+        "../../../../examples/plugins/workspace-shortcuts/update-candidate.json"
+    ))
+    .unwrap();
+    let manifest = prepared.record().manifest();
+    assert_eq!(
+        manifest.id.as_str(),
+        "com.easiflux.examples.workspace-shortcuts"
+    );
+    assert_eq!(manifest.version.to_string(), "1.1.0");
+    assert_eq!(manifest.contributions.len(), 4);
+    assert!(manifest
+        .contributions
+        .iter()
+        .any(|command| command.contribution_id.as_str() == "workspace.general"));
 }
 
 // Catches the per-manifest command limit bypassing the existing 16 KiB import budget.
@@ -292,6 +313,7 @@ fn dropping_old_owner_cannot_release_new_session() {
         stale_publisher.publish(
             PreparedManifest::parse(test_support::VALID).unwrap(),
             99,
+            &[],
             start,
         ),
         "plugin_import_busy",
@@ -301,6 +323,7 @@ fn dropping_old_owner_cannot_release_new_session() {
         .publish(
             PreparedManifest::parse(test_support::VALID).unwrap(),
             4,
+            &[],
             start,
         )
         .unwrap();
@@ -327,6 +350,7 @@ fn prepare_and_cancel_expire_ready_at_the_publication_deadline() {
             .publish(
                 PreparedManifest::parse(test_support::VALID).unwrap(),
                 4,
+                &[],
                 published,
             )
             .unwrap();
@@ -396,10 +420,11 @@ fn import_result_wire_keys_match_spec() {
         .publish(
             PreparedManifest::parse(test_support::VALID).unwrap(),
             u64::MAX,
+            &[],
             now,
         )
         .unwrap();
-    let expected = json!({"schemaVersion":1,"status":"ready","token":preview.token,"expiresInSeconds":300,"catalogGeneration":"18446744073709551615","manifest":serde_json::from_slice::<serde_json::Value>(test_support::VALID).unwrap()});
+    let expected = json!({"schemaVersion":2,"status":"ready","token":preview.token,"expiresInSeconds":300,"catalogGeneration":"18446744073709551615","manifest":serde_json::from_slice::<serde_json::Value>(test_support::VALID).unwrap(),"assessment":{"kind":"notInCatalog"}});
     assert_eq!(serde_json::to_value(&preview).unwrap(), expected);
     assert_eq!(
         serde_json::to_value(PrepareImportResult::Ready(preview)).unwrap(),
@@ -520,6 +545,41 @@ fn import_result_wire_keys_match_spec() {
             );
         }
     }
+}
+
+#[test]
+fn ready_preview_serializes_same_precedence_existing_catalog_item() {
+    let incoming = PreparedManifest::parse(
+        std::str::from_utf8(test_support::VALID)
+            .unwrap()
+            .replace("1.0.0", "1.0.0+new")
+            .as_bytes(),
+    )
+    .unwrap();
+    let current_manifest: PluginManifestV1 = serde_json::from_slice(
+        std::str::from_utf8(test_support::VALID)
+            .unwrap()
+            .replace("1.0.0", "1.0.0+old")
+            .as_bytes(),
+    )
+    .unwrap();
+    let current = PluginCatalogItem::disabled(current_manifest, PluginSource::LocalDeclarative);
+    let now = Instant::now();
+    let preview = ImportSessions::new()
+        .reserve_prepare(now)
+        .unwrap()
+        .publish(incoming, 7, std::slice::from_ref(&current), now)
+        .unwrap();
+    let wire = serde_json::to_value(preview).unwrap();
+
+    assert_eq!(wire["schemaVersion"], 2);
+    assert_eq!(wire["assessment"]["kind"], "existingId");
+    assert_eq!(wire["assessment"]["versionRelation"], "samePrecedence");
+    assert_eq!(
+        wire["assessment"]["current"]["manifest"]["version"],
+        "1.0.0+old"
+    );
+    assert_eq!(wire["manifest"]["version"], "1.0.0+new");
 }
 
 // Catches a selector contract that cannot be shared or awaited in an owned worker.

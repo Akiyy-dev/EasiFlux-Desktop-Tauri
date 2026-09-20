@@ -502,6 +502,10 @@ impl<'de> Deserialize<'de> for PluginCatalogItem {
     }
 }
 impl PluginCatalogItem {
+    pub(crate) fn manifest(&self) -> &PluginManifestV1 {
+        &self.manifest
+    }
+
     pub fn enabled(manifest: PluginManifestV1, source: PluginSource) -> Self {
         Self::project(
             manifest,

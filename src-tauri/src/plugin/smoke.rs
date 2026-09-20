@@ -376,7 +376,11 @@ mod tests {
                 "stagingEmpty": true
             })
         );
-        assert_eq!(ready["schemaVersion"], 1);
+        assert_eq!(ready["schemaVersion"], 2);
+        assert_eq!(
+            ready["assessment"],
+            serde_json::json!({ "kind": "notInCatalog" })
+        );
         assert_eq!(ready["manifest"]["id"], "com.easiflux.smoke");
         assert_eq!(ready.get("sourcePath"), None::<&Value>);
     }
