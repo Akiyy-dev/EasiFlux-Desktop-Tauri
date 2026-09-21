@@ -40,6 +40,9 @@ pub fn run() {
             // returned driver performs network initialization asynchronously.
             let scheduler_start = scheduler.start();
             app.manage(PluginCommandState::new(Arc::clone(&state.plugins)));
+            app.manage(plugin::workflow::WorkflowHostState(Arc::new(
+                plugin::workflow::ProductionWorkflowHost::from_state(&state),
+            )));
             app.manage(state);
 
             let emitter = {
@@ -90,6 +93,10 @@ pub fn run() {
             remove_managed_local_plugin,
             execute_plugin_compute,
             cancel_plugin_compute,
+            get_plugin_workflow_access,
+            set_plugin_workflow_grants,
+            run_plugin_workflow,
+            confirm_plugin_workflow,
             get_risk_status,
             update_risk_config,
             save_credentials,
@@ -277,6 +284,10 @@ mod capability_tests {
             "remove_managed_local_plugin",
             "execute_plugin_compute",
             "cancel_plugin_compute",
+            "get_plugin_workflow_access",
+            "set_plugin_workflow_grants",
+            "run_plugin_workflow",
+            "confirm_plugin_workflow",
         ] {
             assert!(
                 authority
@@ -313,7 +324,7 @@ mod capability_tests {
 
     // Catches wildcard or path-scoped grants expanding this fixed IPC surface.
     #[test]
-    fn plugin_capability_grants_exactly_the_nine_fixed_commands_without_scope() {
+    fn plugin_capability_grants_exactly_the_thirteen_fixed_commands_without_scope() {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/plugin-runtime.json")).unwrap();
         assert_eq!(capability["webviews"], serde_json::json!(["main"]));
@@ -331,7 +342,11 @@ mod capability_tests {
                 "allow-commit-local-manifest-import",
                 "allow-remove-managed-local-plugin",
                 "allow-execute-plugin-compute",
-                "allow-cancel-plugin-compute"
+                "allow-cancel-plugin-compute",
+                "allow-get-plugin-workflow-access",
+                "allow-set-plugin-workflow-grants",
+                "allow-run-plugin-workflow",
+                "allow-confirm-plugin-workflow"
             ])
         );
     }

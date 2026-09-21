@@ -1,10 +1,12 @@
 # Isolated native plugin smoke (developer-only)
 
 This opt-in Windows debug binary loads the real Marketplace components, Pinia store,
-service and nine production plugin commands against a fresh fixture-owned profile,
-plus the smoke-only completion command.
-It never starts the production `run()`, `AppState`, accounts, keyring, providers,
-scheduler, opener plugin, App.vue or AppShell.
+services, thirteen production plugin commands and the smoke-only completion command
+against a fresh fixture-owned profile. It injects a minimal synthetic `WorkflowHost`
+for the four account-workflow commands.
+It never starts the production `run()`, `AppState`, account/profile services, keyring,
+API clients, providers, scheduler, opener plugin, App.vue or AppShell. The synthetic
+host has fixed in-memory DTOs and counters only; it cannot contact an exchange.
 
 ## Build and launch
 
@@ -64,26 +66,39 @@ build checkout's canonical `target` directory. Relative, missing, system-temp an
 out-of-checkout parents reject before profile creation. The host reserves a new
 `plugin-smoke-<UUID>` child, never reuses a profile, and keeps all artifacts.
 
-The hidden `--self-test` lane uses the checked-in Series SMA v4 manifest through a
-fixed native fixture selector. Real DOM controls perform preview/cancel, managed import
-(disabled), backend disabled rejection, explicit enable, guest computation of
-`1,2,3,4,5` with Period `3` to exact result `4`, disable and a second backend rejection,
-removal/cancel, confirmed removal, and explicit reload/absence verification. It also
-requires the isolated host to reject one account IPC attempt from its main WebView.
+The hidden `--self-test` lane uses the checked-in Series SMA v4 and account-workflow v5
+manifests through a sequenced native fixture selector. The existing v4 path remains:
+real DOM controls perform preview/cancel, managed disabled import, backend disabled
+rejection, explicit enable, guest computation of `1,2,3,4,5` with Period `3` to exact
+result `4`, disable, a second backend rejection, removal/cancel, confirmed removal and
+explicit reload/absence verification.
+
+It then imports the v5 fixture disabled, enables it, opens the production workflow UI,
+proves all grants initially unchecked, explicitly grants the five requested capabilities,
+runs a user-edited placement proposal, and requires no receipt before the separate real-
+order confirmation. The injected host accepts exactly one placement. A second workflow
+derives `plugin-smoke-open-order` from the captured open-order snapshot and accepts
+exactly one separately confirmed cancellation. The UI revokes all grants and proves Run
+is blocked before disable, removal and reload. Final native inspection requires both
+mutation counters to equal one; implicit or duplicate dispatch cannot pass. The isolated
+host also rejects forbidden `list_account_profiles` IPC from its main WebView.
 That runtime observation is not proof about a secondary WebView or remote origin;
 the separate Rust authority tests cover those cases. Each condition has a
 15-second bound; mutations are dispatched once, not retried. The native deadline
 starts before WebView creation and is 90 seconds. At that deadline a dedicated
 thread force-terminates only this Windows process with nonzero status, independently
 of completion ownership, inspection, fsync, logging, or event-loop shutdown. A separate
-same-deadline worker attempts timeout evidence without delaying the hard stop. The selector never receives a
-frontend-supplied path, and the reader accepts only the fixture source.
+same-deadline worker attempts timeout evidence without delaying the hard stop. The
+selector never receives a frontend-supplied path, and the reader accepts only the two
+fresh-profile fixture copies.
 
-`source/manifest.json`, `plugins/`, absolute `webview2/`, and the fixed `report.json`
-are below the fresh profile. The process log prints the profile/source/report paths.
+`source/manifest.json`, `source/account-workflow.json`, `plugins/`, absolute `webview2/`, and the fixed `report.json`
+are below the fresh profile. The process log prints the profile, v4 source and report
+paths; the v5 fixture is identified only by its fixed profile-relative filename.
 Completion is one-shot: UTF-8 detail is capped at 2,000 bytes; oversize detail forces
-failure. The report independently checks unchanged source bytes, a retained disabled
-decision, empty ownership, and empty local/import/removal staging directories.
+failure. The report independently checks both unchanged source byte sets, retained
+disabled decisions for both fixtures, exactly one placement and cancellation, empty
+ownership, and empty local/import/removal staging directories.
 Exit 0 requires both UI success and every native check. Timeouts, native-check failures,
 premature UI success and report-write errors cannot pass. A hard timeout can leave a
 partial or missing report/log if persistence stalls or termination wins the race; all
@@ -93,8 +108,9 @@ passing report and successful process exit. Report writes use exclusive
 creation and sync before exit; duplicates cannot replace the first decision.
 
 Without `--self-test`, the visible manual lane keeps the native picker and shows
-fixture-only instructions and Installed/Market/Manage controls. Select only the
-manifest printed in the local host log. Manual close does not produce an automatic
+fixture-only instructions and Installed/Market/Manage controls. Select only one of the
+two manifests identified in the local host log (the v5 path is relative to the printed
+smoke profile). Manual close does not produce an automatic
 passing report, and the completion command rejects manual-mode submissions.
 
 ## Focused checks
@@ -113,7 +129,7 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::smoke::tests --
 
 The generated completion permission metadata is not a grant. Default context authority
 denies completion, and its invoke handler is unchanged. Smoke authority tests resolve
-the ten exact commands for local main and deny remote/secondary access and default
+the fourteen exact commands for local main and deny remote/secondary access and default
 window/opener/dialog/account frontend permissions. Rust still owns the native dialog plugin.
 
 ## Limits and retained evidence
@@ -125,7 +141,9 @@ Smoke build output is under `target/plugin-smoke-dist`; old build assets are ret
 Inspect the stylesheet referenced by the current HTML, not an obsolete retained asset.
 
 The automatic lane does **not** test the OS file picker, whole `AppState` startup,
-scheduler coexistence/shutdown, accounts/keyring/providers, main-shell navigation/close
-guard, installers, or restart recovery. It does not control WebView2/OS vendor telemetry.
+scheduler coexistence/shutdown, real accounts/keyring/providers, exchange/network I/O,
+production risk configuration, main-shell navigation/close guard, installers, or restart
+recovery. It proves the Vue -> Tauri ACL -> broker -> injected-host path only and must not
+be described as a real trade test. It does not control WebView2/OS vendor telemetry.
 The historical system-temp Windows NtCreateFile OS 5 failure is separate evidence:
 workspace-owned fixtures do not explain or fix that failure or lift its reliability hold.

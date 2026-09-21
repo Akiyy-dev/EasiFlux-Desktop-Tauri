@@ -160,7 +160,7 @@ onUnmounted(() => {
       </dl>
 
       <p id="plugin-removal-warning" class="plugin-removal-dialog__warning">
-        EasiFlux 管理的本地副本将被移除；最初选择的源文件不会被修改。此操作无法撤销，当前的停用偏好将保留。
+        EasiFlux 管理的本地副本将被移除；最初选择的源文件不会被修改。此操作无法撤销，当前的停用偏好将保留。会话授权将失效，但无法撤回已传送的订单或撤单请求。
       </p>
       <p
         v-if="props.stale"

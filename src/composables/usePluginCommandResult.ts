@@ -4,6 +4,7 @@ import type {
   PluginCatalogItem,
   PluginCommandInfo,
   PluginComputeExecutionIntent,
+  PluginWorkflowExecutionIntent,
 } from '../types/plugin'
 
 export interface PluginOpenPageIntent {
@@ -18,9 +19,11 @@ export function usePluginCommandResult(
   const store = usePluginStore()
   const result = ref<PluginCommandInfo | null>(null)
   const computeIntent = ref<PluginComputeExecutionIntent | null>(null)
+  const workflowIntent = ref<PluginWorkflowExecutionIntent | null>(null)
   const clear = () => {
     result.value = null
     computeIntent.value = null
+    workflowIntent.value = null
   }
 
   watch(
@@ -34,20 +37,28 @@ export function usePluginCommandResult(
     if (execution?.actionId === 'host.showInfo') {
       result.value = execution.info
       computeIntent.value = null
+      workflowIntent.value = null
       return
     }
     result.value = null
     if (execution?.actionId === 'host.openPage' && navigationAvailable) {
       computeIntent.value = null
+      workflowIntent.value = null
       openPage?.({ pluginId, contributionId })
       return
     }
     if (execution?.actionId === 'sandbox.computeSeries') {
       computeIntent.value = execution
+      workflowIntent.value = null
       return
     }
     computeIntent.value = null
+    if (execution?.actionId === 'sandbox.accountWorkflow') {
+      workflowIntent.value = execution
+      return
+    }
+    workflowIntent.value = null
   }
 
-  return { result, computeIntent, run, clear }
+  return { result, computeIntent, workflowIntent, run, clear }
 }

@@ -30,6 +30,7 @@ pub(crate) struct PluginRuntime {
     initial_discovery_attempted: AtomicBool,
     compute_slot: Arc<super::compute::slot::ComputeSlot>,
     compute_epoch: AtomicU64,
+    workflow: std::sync::Mutex<workflow::WorkflowState>,
 }
 
 type OperationWaiter = Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>;
@@ -100,6 +101,7 @@ impl PluginRuntime {
             initial_discovery_attempted: AtomicBool::new(false),
             compute_slot: super::compute::slot::ComputeSlot::global(),
             compute_epoch: AtomicU64::new(0),
+            workflow: std::sync::Mutex::new(workflow::WorkflowState::default()),
         }
     }
 
@@ -165,24 +167,28 @@ impl PluginRuntime {
         })?
     }
 
-    fn reserve_operation(&self) -> OperationReservation {
+    fn reserve_operation_gate(&self) -> OperationReservation {
         let mut waiter: OperationWaiter = Box::pin(tokio::task::unconstrained(
             Arc::clone(&self.operation_gate).lock_owned(),
         ));
         let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
-        let reservation = match waiter.as_mut().poll(&mut context) {
+        match waiter.as_mut().poll(&mut context) {
             Poll::Ready(guard) => OperationReservation::Ready(guard),
             Poll::Pending => OperationReservation::Waiting(waiter),
-        };
+        }
+    }
+
+    fn reserve_operation(&self) -> OperationReservation {
+        let reservation = self.reserve_operation_gate();
         // Reserve/queue the gate BEFORE invalidation: otherwise another thread
         // can admit compute with the new epoch while lifecycle has no gate yet.
         // The owned reservation blocks new admission throughout invalidation,
         // even if publication later fails or returns the same snapshot.
-        let _ = self.compute_epoch.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |epoch| Some(epoch.saturating_add(1)),
-        );
+        let _ = self
+            .compute_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                Some(epoch.saturating_add(1))
+            });
         self.compute_slot.invalidate();
         reservation
     }
@@ -294,6 +300,7 @@ fn runtime_error() -> AppError {
 
 mod compute;
 mod import;
+mod workflow;
 
 mod removal;
 

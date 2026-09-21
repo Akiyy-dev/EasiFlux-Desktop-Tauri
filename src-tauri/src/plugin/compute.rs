@@ -16,7 +16,7 @@ pub const MAX_MODULE_BYTES: usize = 8192;
 #[cfg(test)]
 pub(crate) mod tests;
 
-mod sandbox;
+pub(crate) mod sandbox;
 pub(crate) mod slot;
 pub(crate) use sandbox::execute_guest;
 

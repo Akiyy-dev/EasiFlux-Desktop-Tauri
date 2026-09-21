@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod compute;
+pub(crate) mod workflow;
 
 use crate::error::{AppError, AppResult};
 use crate::storage::plugin_state::{

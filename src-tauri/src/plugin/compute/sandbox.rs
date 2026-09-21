@@ -196,7 +196,37 @@ pub(crate) fn execute_guest(
     let bytes = params
         .module_bytes()
         .map_err(|_| error("plugin_compute_invalid_module"))?;
-    preflight(&bytes)?;
+    let (mut store, instance) = instantiate(&bytes, &budget)?;
+    let memory = instance
+        .get_memory(&store, "memory")
+        .ok_or_else(|| error("plugin_compute_invalid_abi"))?;
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&store, "alloc")
+        .map_err(|_| error("plugin_compute_invalid_abi"))?;
+    let run = instance
+        .get_typed_func::<(i32, i32, f64), f64>(&store, "run")
+        .map_err(|_| error("plugin_compute_invalid_abi"))?;
+    let length = values.len() * 8;
+    let ptr = budget.call(&mut store, alloc, length as i32)?;
+    let offset = usize::try_from(ptr).map_err(|_| error("plugin_compute_memory"))?;
+    checked_range(offset, length, memory.data_size(&store))?;
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    memory
+        .write(&mut store, offset, &bytes)
+        .map_err(|_| error("plugin_compute_memory"))?;
+    let value = budget.call(&mut store, run, (ptr, values.len() as i32, parameter))?;
+    if !value.is_finite() {
+        return Err(error("plugin_compute_invalid_output"));
+    }
+    Ok(value)
+}
+
+/// Single allowlist/configuration/budget setup for both guest ABIs.
+fn instantiate(
+    bytes: &[u8],
+    budget: &Budget<'_>,
+) -> AppResult<(Store<StoreLimits>, wasmi::Instance)> {
+    preflight(bytes)?;
     let engine = engine();
     let module = Module::new(&engine, bytes).map_err(|_| error("plugin_compute_invalid_module"))?;
     if module.imports().next().is_some() {
@@ -220,6 +250,32 @@ pub(crate) fn execute_guest(
     let instance = Linker::<StoreLimits>::new(&engine)
         .instantiate_and_start(&mut store, &module)
         .map_err(|_| error("plugin_compute_invalid_module"))?;
+    Ok((store, instance))
+}
+
+fn checked_range(offset: usize, len: usize, size: usize) -> AppResult<()> {
+    if offset.checked_add(len).is_none_or(|end| end > size) {
+        return Err(error("plugin_compute_memory"));
+    }
+    Ok(())
+}
+
+pub(crate) fn execute_json(
+    bytes: &[u8],
+    context: &[u8],
+    input: &[u8],
+    cancel: &AtomicBool,
+) -> AppResult<Vec<u8>> {
+    if context.len() > 65_536 || input.len() > 4096 {
+        return Err(error("plugin_compute_invalid_input"));
+    }
+    let mut budget = Budget {
+        cancel,
+        started: Instant::now(),
+        unissued_fuel: TOTAL_FUEL - FUEL_SLICE,
+    };
+    budget.check()?;
+    let (mut store, instance) = instantiate(bytes, &budget)?;
     let memory = instance
         .get_memory(&store, "memory")
         .ok_or_else(|| error("plugin_compute_invalid_abi"))?;
@@ -227,26 +283,37 @@ pub(crate) fn execute_guest(
         .get_typed_func::<i32, i32>(&store, "alloc")
         .map_err(|_| error("plugin_compute_invalid_abi"))?;
     let run = instance
-        .get_typed_func::<(i32, i32, f64), f64>(&store, "run")
+        .get_typed_func::<(i32, i32, i32, i32), i64>(&store, "run")
         .map_err(|_| error("plugin_compute_invalid_abi"))?;
-    let length = values.len() * 8;
-    let ptr = budget.call(&mut store, alloc, length as i32)?;
-    let offset = usize::try_from(ptr).map_err(|_| error("plugin_compute_memory"))?;
-    let end = offset
-        .checked_add(length)
-        .ok_or_else(|| error("plugin_compute_memory"))?;
-    if end > memory.data_size(&store) {
+    let cp = budget.call(&mut store, alloc, context.len() as i32)?;
+    let ip = budget.call(&mut store, alloc, input.len() as i32)?;
+    let co = usize::try_from(cp).map_err(|_| error("plugin_compute_memory"))?;
+    let io = usize::try_from(ip).map_err(|_| error("plugin_compute_memory"))?;
+    checked_range(co, context.len(), memory.data_size(&store))?;
+    checked_range(io, input.len(), memory.data_size(&store))?;
+    if co < io + input.len() && io < co + context.len() {
         return Err(error("plugin_compute_memory"));
     }
-    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     memory
-        .write(&mut store, offset, &bytes)
+        .write(&mut store, co, context)
         .map_err(|_| error("plugin_compute_memory"))?;
-    let value = budget.call(&mut store, run, (ptr, values.len() as i32, parameter))?;
-    if !value.is_finite() {
+    memory
+        .write(&mut store, io, input)
+        .map_err(|_| error("plugin_compute_memory"))?;
+    let packed = budget.call(
+        &mut store,
+        run,
+        (cp, context.len() as i32, ip, input.len() as i32),
+    )? as u64;
+    let offset = (packed >> 32) as usize;
+    let len = (packed & 0xffff_ffff) as usize;
+    if len > 16_384 {
         return Err(error("plugin_compute_invalid_output"));
     }
-    Ok(value)
+    checked_range(offset, len, memory.data_size(&store))?;
+    let output = memory.data(&store)[offset..offset + len].to_vec();
+    std::str::from_utf8(&output).map_err(|_| error("plugin_compute_invalid_output"))?;
+    Ok(output)
 }
 
 #[cfg(test)]

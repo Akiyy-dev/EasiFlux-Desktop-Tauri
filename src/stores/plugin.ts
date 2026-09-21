@@ -24,6 +24,7 @@ import type {
   PluginLocalDiscoverySummary,
   PluginStatus,
   PluginV3CommandContribution,
+  PluginV4CommandContribution,
   ReadyLocalManifestImport,
   RemoveManagedLocalPluginResult,
 } from '../types/plugin'
@@ -89,9 +90,10 @@ function cloneCatalogItem(plugin: PluginCatalogItem): PluginCatalogItem {
             ),
             requestedCapabilities: [] as [],
           }
-        : {
+        : plugin.manifest.schemaVersion === 4
+          ? {
           ...plugin.manifest,
-          contributions: plugin.manifest.contributions.map((command): PluginCommandContribution => (
+          contributions: plugin.manifest.contributions.map((command): PluginV4CommandContribution => (
             command.actionId === 'host.showInfo'
               ? { ...command, params: { ...command.params } }
               : command.actionId === 'host.openPage'
@@ -106,6 +108,27 @@ function cloneCatalogItem(plugin: PluginCatalogItem): PluginCatalogItem {
           )),
           requestedCapabilities: [] as [],
         }
+          : {
+              ...plugin.manifest,
+              contributions: plugin.manifest.contributions.map(
+                (command): PluginCommandContribution => {
+                  if (command.actionId === 'host.showInfo') {
+                    return { ...command, params: { ...command.params } }
+                  }
+                  if (command.actionId === 'host.openPage') {
+                    return { ...command, params: { ...command.params } }
+                  }
+                  if (command.actionId === 'sandbox.computeSeries') {
+                    return {
+                      ...command,
+                      params: { ...command.params, parameter: { ...command.params.parameter } },
+                    }
+                  }
+                  return { ...command, params: { ...command.params } }
+                },
+              ),
+              requestedCapabilities: [...plugin.manifest.requestedCapabilities],
+            }
   return {
     ...plugin,
     manifest,
@@ -207,11 +230,17 @@ export const usePluginStore = defineStore('plugin', () => {
             actionId: 'host.openPage',
             destination: selected.command.params.destination,
           })
-        } else {
+        } else if (selected.command.actionId === 'sandbox.computeSeries') {
           summaries.push({
             ...base,
             actionId: 'sandbox.computeSeries',
             parameter: { ...selected.command.params.parameter },
+          })
+        } else {
+          summaries.push({
+            ...base,
+            actionId: 'sandbox.accountWorkflow',
+            requestedCapabilities: [...selected.plugin.manifest.requestedCapabilities],
           })
           }
       }
@@ -241,15 +270,31 @@ export const usePluginStore = defineStore('plugin', () => {
         destination: command.params.destination,
       }
     }
+    if (command.actionId === 'sandbox.computeSeries') {
+      return {
+        actionId: 'sandbox.computeSeries',
+        pluginId,
+        pluginName: plugin.manifest.name,
+        contributionId,
+        title: command.title,
+        runtime: command.params.runtime,
+        abi: command.params.abi,
+        parameter: { ...command.params.parameter },
+        expectedCatalogGeneration: catalogGeneration.value,
+        expectedRevision: revision.value,
+      }
+    }
+    if (plugin.manifest.schemaVersion !== 5) return null
     return {
-      actionId: 'sandbox.computeSeries',
+      actionId: 'sandbox.accountWorkflow',
       pluginId,
       pluginName: plugin.manifest.name,
       contributionId,
       title: command.title,
       runtime: command.params.runtime,
       abi: command.params.abi,
-      parameter: { ...command.params.parameter },
+      defaultInput: command.params.defaultInput,
+      requestedCapabilities: [...plugin.manifest.requestedCapabilities],
       expectedCatalogGeneration: catalogGeneration.value,
       expectedRevision: revision.value,
     }

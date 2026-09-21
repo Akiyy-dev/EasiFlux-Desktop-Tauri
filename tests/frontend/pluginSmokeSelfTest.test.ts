@@ -37,6 +37,7 @@ afterEach(() => {
 })
 
 const fixtureId = 'com.easiflux.examples.series-sma'
+const accountFixtureId = 'com.easiflux.examples.account-workflow'
 const fixtureManifest = {
   schemaVersion: 4,
   id: fixtureId,
@@ -58,9 +59,45 @@ const fixtureManifest = {
   requestedCapabilities: [],
 }
 
-function smokeItem(status: 'enabled' | 'disabled') {
+const accountFixtureManifest = {
+  schemaVersion: 5,
+  id: accountFixtureId,
+  publisherId: 'com.easiflux.examples',
+  publisher: 'EasiFlux example (unverified)',
+  name: 'Account workflow safety example',
+  description: 'Synthetic account workflow fixture.',
+  version: '1.0.0',
+  contributions: [
+    {
+      kind: 'command', contributionId: 'account.available-balance',
+      title: 'Show granted available balance', actionId: 'sandbox.accountWorkflow',
+      params: { runtime: 'wasm-v1', abi: 'account-json-v1', moduleBase64: 'AGFzbQEAAAA=', defaultInput: '{}' },
+    },
+    {
+      kind: 'command', contributionId: 'account.place-order',
+      title: 'Prepare example limit order', actionId: 'sandbox.accountWorkflow',
+      params: {
+        runtime: 'wasm-v1', abi: 'account-json-v1', moduleBase64: 'AGFzbQEAAAA=',
+        defaultInput: '{"kind":"placeOrder","order":{"symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"50000","timeInForce":"GTC","positionIdx":1,"reduceOnly":false}}',
+      },
+    },
+    {
+      kind: 'command', contributionId: 'account.cancel-first-open-order',
+      title: 'Prepare cancellation of first captured order', actionId: 'sandbox.accountWorkflow',
+      params: { runtime: 'wasm-v1', abi: 'account-json-v1', moduleBase64: 'AGFzbQEAAAA=', defaultInput: '{}' },
+    },
+  ],
+  requestedCapabilities: [
+    'account.read', 'balances.read', 'orders.read', 'trade.place', 'trade.cancel',
+  ],
+}
+
+function smokeItem(
+  status: 'enabled' | 'disabled',
+  manifest: typeof fixtureManifest | typeof accountFixtureManifest = fixtureManifest,
+) {
   return {
-    manifest: fixtureManifest,
+    manifest,
     source: 'localDeclarative',
     management: 'managed',
     canRemove: status === 'disabled',
@@ -75,7 +112,7 @@ function smokeItem(status: 'enabled' | 'disabled') {
 function smokeSnapshot(
   revision: string,
   catalogGeneration: string,
-  status?: 'enabled' | 'disabled',
+  plugins: ReturnType<typeof smokeItem>[] = [],
 ) {
   return {
     schemaVersion: 3,
@@ -88,7 +125,7 @@ function smokeSnapshot(
       status: 'available', conflictingEntryCount: 0,
       rollbackPendingCount: 0, cleanupPendingCount: 0,
     },
-    plugins: status ? [smokeItem(status)] : [],
+    plugins,
   }
 }
 
@@ -101,47 +138,187 @@ it('accepts only the exact rendered SMA scalar and provenance', () => {
   expect(isExpectedSmaOutput('结果：4', provenance.replace('Period 3', 'Period 2'))).toBe(false)
 })
 
-it('drives disabled-enable-compute-disable authority and a forbidden IPC through real UI', async () => {
+it('drives v4 and v5 authority, confirmations, revocation and forbidden IPC through real UI', async () => {
   const pinia = createPinia()
   setActivePinia(pinia)
   let prepareCount = 0
+  let revision = 0
+  let generation = 0
+  let installed: ReturnType<typeof smokeItem>[] = []
+  let grantedCapabilities: string[] = []
+  let grantRevision = 0
+  const preparedActions = new Map<string, 'placeOrder' | 'cancelOrder'>()
+  const snapshot = () => smokeSnapshot(String(revision), String(generation), installed)
   vi.mocked(tauriInvoke).mockImplementation(async (command, args) => {
-    if (command === 'get_plugin_catalog') return smokeSnapshot('0', '0')
+    if (command === 'get_plugin_catalog') return snapshot()
     if (command === 'prepare_local_manifest_import') {
       prepareCount++
+      const manifest = prepareCount <= 2 ? fixtureManifest : accountFixtureManifest
       return {
         schemaVersion: 2, status: 'ready', token: String(prepareCount).repeat(32),
-        expiresInSeconds: 300, catalogGeneration: '0', manifest: fixtureManifest,
+        expiresInSeconds: 300, catalogGeneration: String(generation), manifest,
         assessment: { kind: 'notInCatalog' },
       }
     }
     if (command === 'cancel_local_manifest_import') return { schemaVersion: 1, status: 'cancelled' }
     if (command === 'commit_local_manifest_import') {
-      return { schemaVersion: 2, status: 'imported', pluginId: fixtureId, snapshot: smokeSnapshot('1', '1', 'disabled') }
+      const manifest = prepareCount <= 2 ? fixtureManifest : accountFixtureManifest
+      revision++
+      generation++
+      installed = [...installed, smokeItem('disabled', manifest)]
+      return { schemaVersion: 2, status: 'imported', pluginId: manifest.id, snapshot: snapshot() }
     }
     if (command === 'set_plugin_enabled') {
-      const enabled = (args as { enabled: boolean }).enabled
+      const request = args as { id: string; enabled: boolean }
+      revision++
+      installed = installed.map(item => item.manifest.id === request.id
+        ? smokeItem(request.enabled ? 'enabled' : 'disabled', item.manifest)
+        : item)
+      const plugin = installed.find(item => item.manifest.id === request.id)
+      if (!plugin) throw new Error('fixture missing')
       return {
-        schemaVersion: 3, revision: enabled ? '2' : '3', catalogGeneration: '1',
-        plugin: smokeItem(enabled ? 'enabled' : 'disabled'),
+        schemaVersion: 3, revision: String(revision), catalogGeneration: String(generation),
+        plugin,
       }
     }
     if (command === 'execute_plugin_compute') {
       const request = (args as { request: { requestId: string; expectedRevision: string } }).request
-      if (request.expectedRevision !== '2') {
+      if (!installed.some(item => item.manifest.id === fixtureId && item.status === 'enabled')) {
         throw { code: 'plugin_compute_disabled', message: 'details must not be rendered' }
       }
       return {
         schemaVersion: 1, requestId: request.requestId, pluginId: fixtureId,
-        contributionId: 'series.sma', catalogGeneration: '1', revision: '2',
+        contributionId: 'series.sma', catalogGeneration: String(generation),
+        revision: request.expectedRevision,
         value: 4, inputCount: 5, parameter: 3,
       }
     }
+    if (command === 'get_plugin_workflow_access') {
+      const request = (args as { request: {
+        pluginId: string; contributionId: string; expectedCatalogGeneration: string;
+        expectedRevision: string;
+      } }).request
+      return {
+        schemaVersion: 1, pluginId: request.pluginId, contributionId: request.contributionId,
+        catalogGeneration: request.expectedCatalogGeneration,
+        revision: request.expectedRevision,
+        account: {
+          accountId: 'plugin-smoke-account', sessionEpoch: '1',
+          environment: 'Injected synthetic smoke host',
+        },
+        requestedCapabilities: accountFixtureManifest.requestedCapabilities,
+        grantedCapabilities, grantRevision: String(grantRevision),
+      }
+    }
+    if (command === 'set_plugin_workflow_grants') {
+      const request = (args as { request: {
+        pluginId: string; contributionId: string; expectedCatalogGeneration: string;
+        expectedRevision: string; capabilities: string[];
+      } }).request
+      grantedCapabilities = [...request.capabilities]
+      grantRevision++
+      return {
+        schemaVersion: 1, pluginId: request.pluginId, contributionId: request.contributionId,
+        catalogGeneration: request.expectedCatalogGeneration, revision: request.expectedRevision,
+        account: {
+          accountId: 'plugin-smoke-account', sessionEpoch: '1',
+          environment: 'Injected synthetic smoke host',
+        },
+        requestedCapabilities: accountFixtureManifest.requestedCapabilities,
+        grantedCapabilities, grantRevision: String(grantRevision),
+      }
+    }
+    if (command === 'run_plugin_workflow') {
+      const request = (args as { request: {
+        pluginId: string; contributionId: string; expectedCatalogGeneration: string;
+        expectedRevision: string; requestId: string; symbol: string; inputJson: string;
+      } }).request
+      const place = request.contributionId === 'account.place-order'
+      const output = place ? JSON.parse(request.inputJson) : {
+        kind: 'cancelOrder', order: { symbol: 'BTCUSDT', orderId: 'plugin-smoke-open-order' },
+      }
+      const token = place
+        ? '00000000-0000-4000-8000-000000000101'
+        : '00000000-0000-4000-8000-000000000102'
+      preparedActions.set(token, place ? 'placeOrder' : 'cancelOrder')
+      return {
+        schemaVersion: 1, requestId: request.requestId,
+        pluginId: request.pluginId, contributionId: request.contributionId,
+        catalogGeneration: request.expectedCatalogGeneration, revision: request.expectedRevision,
+        account: {
+          accountId: 'plugin-smoke-account', sessionEpoch: '1',
+          environment: 'Injected synthetic smoke host',
+        },
+        grantRevision: String(grantRevision),
+        snapshot: {
+          schemaVersion: 1,
+          account: {
+            accountId: 'plugin-smoke-account', sessionEpoch: '1',
+            environment: 'Injected synthetic smoke host',
+          },
+          capturedAtMs: '1789948800000', symbol: request.symbol,
+          grantedCapabilities,
+          balances: {
+            items: [{ asset: 'USDT', available: '12.5', frozen: '0', total: '12.5' }],
+            fetchedAtMs: '1789948799900', partial: true,
+          },
+          positions: null,
+          orders: {
+            items: [{
+              orderId: 'plugin-smoke-open-order', symbol: 'BTCUSDT', side: 'Buy',
+              orderType: 'Limit', price: '50000', qty: '0.001', status: 'New',
+              orderLinkId: 'plugin-smoke-existing-link', filledQty: '0', avgPrice: '0',
+            }],
+            fetchedAtMs: '1789948799950', partial: true,
+          },
+          market: null,
+        },
+        output,
+        confirmation: {
+          token, expiresAtMs: '1789948860000',
+          submissionId: place ? '00000000-0000-4000-8000-000000000201' : null,
+        },
+      }
+    }
+    if (command === 'confirm_plugin_workflow') {
+      const token = (args as { token: string }).token
+      const action = preparedActions.get(token)
+      if (!action) throw new Error('unknown confirmation token')
+      preparedActions.delete(token)
+      return {
+        schemaVersion: 1, token,
+        account: {
+          accountId: 'plugin-smoke-account', sessionEpoch: '1',
+          environment: 'Injected synthetic smoke host',
+        },
+        action, status: 'accepted',
+        submissionId: action === 'placeOrder'
+          ? '00000000-0000-4000-8000-000000000201' : null,
+        order: {
+          orderId: action === 'placeOrder' ? 'plugin-smoke-placed-1' : 'plugin-smoke-open-order',
+          symbol: 'BTCUSDT', side: 'Buy', orderType: 'Limit',
+          price: action === 'placeOrder' ? '49000' : '50000',
+          qty: action === 'placeOrder' ? '0.002' : '0.001',
+          status: action === 'placeOrder' ? 'New' : 'Unknown',
+          orderLinkId: action === 'placeOrder'
+            ? '00000000-0000-4000-8000-000000000201' : 'plugin-smoke-existing-link',
+          filledQty: '0', avgPrice: '0',
+        },
+        errorCode: null,
+      }
+    }
+    if (command === 'cancel_plugin_compute') {
+      return { schemaVersion: 1, requestId: 'unused', cancelled: false }
+    }
     if (command === 'list_account_profiles') throw new Error('not allowed')
     if (command === 'remove_managed_local_plugin') {
-      return { schemaVersion: 1, status: 'removed', pluginId: fixtureId, snapshot: smokeSnapshot('4', '2') }
+      const pluginId = (args as { id: string }).id
+      revision++
+      generation++
+      installed = installed.filter(item => item.manifest.id !== pluginId)
+      return { schemaVersion: 1, status: 'removed', pluginId, snapshot: snapshot() }
     }
-    if (command === 'reload_plugin_catalog') return smokeSnapshot('4', '2')
+    if (command === 'reload_plugin_catalog') return snapshot()
     if (command === 'finish_plugin_smoke') return undefined
     throw new Error(`unexpected command: ${command}`)
   })
@@ -158,15 +335,18 @@ it('drives disabled-enable-compute-disable authority and a forbidden IPC through
     await flushPromises()
     const commands = vi.mocked(tauriInvoke).mock.calls.map(([command]) => command)
     expect(commands.filter(command => command === 'execute_plugin_compute')).toHaveLength(3)
+    expect(commands.filter(command => command === 'run_plugin_workflow')).toHaveLength(2)
+    expect(commands.filter(command => command === 'confirm_plugin_workflow')).toHaveLength(2)
+    expect(commands.filter(command => command === 'set_plugin_workflow_grants')).toHaveLength(2)
     expect(commands).toContain('list_account_profiles')
     expect(tauriInvoke).toHaveBeenLastCalledWith('finish_plugin_smoke', {
       success: true,
-      detail: expect.stringContaining('guest SMA 4'),
+      detail: expect.stringContaining('v4 SMA preserved'),
     })
   } finally {
     page.unmount()
   }
-})
+}, 30_000)
 
 it('reports initial catalog timeout once without dispatching a lifecycle mutation', async () => {
   vi.useFakeTimers()

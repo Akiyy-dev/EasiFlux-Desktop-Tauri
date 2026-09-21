@@ -214,6 +214,32 @@ impl ApiClient {
         self.credential.read().await.is_some()
     }
 
+    /// Native workflow authority: a fresh installation UUID, never a credential digest.
+    /// Caller holds AccountLifecycleCoordinator; this lock makes material/endpoint reads coherent.
+    pub(crate) async fn workflow_session_identity(
+        &self,
+    ) -> AppResult<(SessionContext, String, String)> {
+        let _install = self.session_install_lock.lock().await;
+        let installed = self.session_context.read().await;
+        let installed = installed.as_ref().ok_or(AppError::NotConnected)?;
+        let credential = self.credential.read().await;
+        let credential = credential.as_ref().ok_or(AppError::NotConnected)?;
+        let base = self.base_url.read().await;
+        if *base != normalize_base_url(&credential.base_url) {
+            return Err(AppError::NotConnected);
+        }
+        let url = reqwest::Url::parse(&base).map_err(|_| AppError::NotConnected)?;
+        let origin = url.origin().ascii_serialization();
+        if origin == "null" {
+            return Err(AppError::NotConnected);
+        }
+        Ok((
+            installed.context.session.clone(),
+            installed.request_owner.to_string(),
+            origin,
+        ))
+    }
+
     /// Stable across reconnects, but never shared by different credentials or endpoints.
     pub(crate) async fn order_submission_scope(&self, account_id: &str) -> AppResult<String> {
         let _install = self.session_install_lock.lock().await;
@@ -550,6 +576,40 @@ mod tests {
             original,
             client.order_submission_scope("alpha").await.unwrap()
         );
+    }
+    #[tokio::test]
+    async fn workflow_identity_rotates_on_same_key_secret_replacement_and_reconnect_without_http() {
+        let client = ApiClient::new();
+        assert!(client.workflow_session_identity().await.is_err());
+        let mut credential = ApiCredential {
+            label: "fixture".into(),
+            api_key: "fake-key".into(),
+            api_secret: "fake-secret".into(),
+            base_url: "https://sandbox.example.test".into(),
+        };
+        let context = SessionContext {
+            account_id: "alpha".into(),
+            session_epoch: 7,
+        };
+        client
+            .set_credential_for_session(credential.clone(), context.clone())
+            .await;
+        let (session, first, origin) = client.workflow_session_identity().await.unwrap();
+        assert_eq!(session, context);
+        assert_eq!(origin, "https://sandbox.example.test");
+        assert_eq!(first, client.workflow_session_identity().await.unwrap().1);
+        credential.api_secret = "replacement-secret".into();
+        client
+            .set_credential_for_session(credential.clone(), context.clone())
+            .await;
+        let second = client.workflow_session_identity().await.unwrap().1;
+        assert_ne!(first, second);
+        client.set_credential_for_session(credential, context).await;
+        assert_ne!(second, client.workflow_session_identity().await.unwrap().1);
+        client.set_base_url("https://other.example.test").await;
+        assert!(client.workflow_session_identity().await.is_err());
+        client.clear_credential().await;
+        assert!(client.workflow_session_identity().await.is_err());
     }
     use crate::auth::Signer;
     use crate::models::config::RECV_WINDOW_MS;

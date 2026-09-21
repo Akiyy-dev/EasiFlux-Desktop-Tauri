@@ -342,6 +342,43 @@ describe('PluginImportDialog', () => {
     wrapper.unmount()
   })
 
+  it('discloses v5 requested account/trading access and separate session grant and confirmation', () => {
+    const wrapper = mount(PluginImportDialog, {
+      props: {
+        preview: {
+          ...readyPreview,
+          manifest: {
+            ...readyPreview.manifest,
+            schemaVersion: 5,
+            requestedCapabilities: ['account.read', 'balances.read', 'trade.place'],
+            contributions: [{
+              kind: 'command', contributionId: 'trader.prepare', title: 'Prepare order',
+              actionId: 'sandbox.accountWorkflow',
+              params: {
+                runtime: 'wasm-v1', abi: 'account-json-v1', moduleBase64: 'AGFzbQEAAAA=',
+                defaultInput: '{"qty":"0.001"}',
+              },
+            }],
+          },
+        },
+        committing: false,
+        stale: false,
+      },
+    })
+
+    expect(wrapper.text()).toContain('请求账户数据或交易提案能力')
+    expect(wrapper.text()).toContain('导入和启用都不会授权')
+    expect(wrapper.text()).toContain('会话内单独选择')
+    expect(wrapper.text()).toContain('真实下单仍需单独确认')
+    expect(wrapper.get('[data-testid="plugin-import-commands"]').text())
+      .toContain('账户工作流：Prepare order')
+    const details = wrapper.get('[data-testid="plugin-import-workflow-details"]')
+    expect(details.text()).toContain('account-json-v1')
+    expect(details.text()).toContain('{"qty":"0.001"}')
+    expect(details.text()).not.toContain('AGFzbQEAAAA=')
+    expect(tauriInvoke).not.toHaveBeenCalled()
+  })
+
   it('renders an advisory existing-ID comparison and independently blocks confirmation', async () => {
     const wrapper = mount(PluginImportDialog, {
       attachTo: document.body,

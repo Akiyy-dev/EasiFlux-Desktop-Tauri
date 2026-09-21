@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { PluginCatalogItem } from '../../types/plugin'
-import { pluginManagementLabel, pluginStatusLabel } from './pluginPresentation'
+import {
+  pluginCapabilityLabels,
+  pluginManagementLabel,
+  pluginStatusLabel,
+} from './pluginPresentation'
 
 interface RemovalOpener {
   readonly isConnected: boolean
@@ -31,10 +35,23 @@ const reasonLabels = {
 
 const statusLabel = computed(() => pluginStatusLabel(props.plugin.status))
 const hasComputeCommand = computed(() => (
-  props.plugin.manifest.schemaVersion === 4
+  props.plugin.manifest.schemaVersion >= 4
   && props.plugin.manifest.contributions.some(
     (command) => command.actionId === 'sandbox.computeSeries',
   )
+))
+const hasWorkflowCommand = computed(() => (
+  props.plugin.manifest.schemaVersion === 5
+  && props.plugin.manifest.contributions.some(
+    (command) => command.actionId === 'sandbox.accountWorkflow',
+  )
+))
+const requestedCapabilityLabel = computed(() => (
+  props.plugin.manifest.schemaVersion === 5
+    ? props.plugin.manifest.requestedCapabilities.map(
+      (capability) => pluginCapabilityLabels[capability],
+    ).join('、')
+    : '无需额外权限'
 ))
 const statusId = computed(() => `plugin-card-${props.plugin.manifest.id}-status`)
 const errorId = computed(() => `plugin-card-${props.plugin.manifest.id}-error`)
@@ -131,23 +148,27 @@ function requestRemoval(event: RemovalClickEvent): void {
     </dl>
 
     <p v-if="plugin.source === 'localDeclarative'" class="plugin-card__local-note">
-      {{ hasComputeCommand
-        ? '只有明确点击运行才会在 WebAssembly 沙箱中执行本地计算；输入和结果仅保存在内存中'
-        : plugin.manifest.schemaVersion !== 1
-          ? plugin.manifest.schemaVersion >= 3
-            ? '启用后可显示信息或请求宿主打开白名单页面，不会运行插件代码'
-            : '启用后提供只读命令，不会运行插件代码'
-          : '启用仅记录宿主偏好，不会运行插件代码' }}
+      {{ hasWorkflowCommand
+        ? '只有明确打开账户工作流并在会话内选择授权后，插件才能读取对应数据或准备提案；每次真实交易仍需单独确认'
+        : hasComputeCommand
+          ? '只有明确点击运行才会在 WebAssembly 沙箱中执行本地计算；输入和结果仅保存在内存中'
+          : plugin.manifest.schemaVersion !== 1
+            ? plugin.manifest.schemaVersion >= 3
+              ? '启用后可显示信息或请求宿主打开白名单页面，不会运行插件代码'
+              : '启用后提供只读命令，不会运行插件代码'
+            : '启用仅记录宿主偏好，不会运行插件代码' }}
     </p>
 
     <slot name="commands" />
 
     <div class="plugin-card__permissions">
       <p data-testid="requested-capabilities">
-        <strong>请求权限：</strong>无需额外权限
+        <strong>请求权限：</strong>{{ requestedCapabilityLabel }}
       </p>
       <p data-testid="granted-capabilities">
-        <strong>已授予权限：</strong>无需额外权限
+        <strong>已授予权限：</strong>{{ hasWorkflowCommand
+          ? '目录不显示会话授权；启用不会授权，请在账户工作流中查看和选择'
+          : '无需额外权限' }}
       </p>
     </div>
 

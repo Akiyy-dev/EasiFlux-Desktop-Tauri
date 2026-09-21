@@ -8,6 +8,7 @@ pub mod diagnostic;
 pub mod market;
 pub mod notification;
 pub mod plugin;
+pub(crate) mod plugin_workflow;
 pub mod risk;
 pub mod trading;
 
@@ -21,5 +22,6 @@ pub use diagnostic::*;
 pub use market::*;
 pub use notification::*;
 pub use plugin::*;
+pub(crate) use plugin_workflow::*;
 pub use risk::*;
 pub use trading::*;

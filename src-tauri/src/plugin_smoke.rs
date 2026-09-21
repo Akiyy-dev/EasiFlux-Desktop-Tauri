@@ -230,8 +230,11 @@ pub fn run_plugin_smoke() -> Result<(), String> {
     let gate = Arc::new(CompletionGate::default());
     eprintln!("plugin smoke profile: {}", profile.root.display());
     eprintln!(
-        "plugin smoke fixture (select only this file in manual mode): {}",
+        "plugin smoke v4 fixture (select only a printed file in manual mode): {}",
         profile.source.display()
+    );
+    eprintln!(
+        "plugin smoke v5 fixture: source/account-workflow.json under the printed smoke profile"
     );
     eprintln!(
         "automatic lane: {}; native picker and whole app unverified",
@@ -268,12 +271,15 @@ pub fn run_plugin_smoke() -> Result<(), String> {
         } else {
             PluginCommandState::new(profile.runtime())
         };
+        let workflow_host = profile.workflow_host();
         let webview_data = profile.root.join("webview2");
         std::fs::create_dir(&webview_data)
             .map_err(|e| format!("cannot reserve WebView2 directory: {e}"))?;
+        eprintln!("plugin smoke stage: building isolated host");
         let app = tauri::Builder::default()
             .plugin(tauri_plugin_dialog::init())
             .manage(command_state)
+            .manage(crate::plugin::workflow::WorkflowHostState(workflow_host))
             .manage(HostState {
                 profile: Arc::clone(&profile),
                 gate: Arc::clone(&gate),
@@ -289,10 +295,15 @@ pub fn run_plugin_smoke() -> Result<(), String> {
                 plugin::remove_managed_local_plugin,
                 plugin::execute_plugin_compute,
                 plugin::cancel_plugin_compute,
+                crate::commands::plugin_workflow::get_plugin_workflow_access,
+                crate::commands::plugin_workflow::set_plugin_workflow_grants,
+                crate::commands::plugin_workflow::run_plugin_workflow,
+                crate::commands::plugin_workflow::confirm_plugin_workflow,
                 finish_plugin_smoke,
             ])
             .build(smoke_context())
             .map_err(|e| format!("cannot build isolated host: {e}"))?;
+        eprintln!("plugin smoke stage: building isolated WebView");
         // Build directly before run: a window creation error returns through the
         // report path instead of panicking inside Tauri's deferred setup callback.
         let path = if args.self_test {
@@ -307,6 +318,9 @@ pub fn run_plugin_smoke() -> Result<(), String> {
             // A hidden WebView cannot reliably accept Wry's default creation-time focus.
             .focused(!args.self_test)
             .data_directory(webview_data)
+            .on_page_load(|_, payload| {
+                eprintln!("plugin smoke page event: {:?}", payload.event());
+            })
             .on_navigation(|url| {
                 url.scheme() == "http"
                     && url.host_str() == Some("127.0.0.1")
@@ -315,6 +329,7 @@ pub fn run_plugin_smoke() -> Result<(), String> {
             .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
             .build()
             .map_err(|e| format!("cannot create isolated WebView: {e}"))?;
+        eprintln!("plugin smoke stage: running isolated event loop");
         app.run(|app, event| {
             if matches!(
                 event,
@@ -417,6 +432,8 @@ mod tests {
             ownership_empty: true,
             local_empty: true,
             staging_empty: true,
+            place_mutations: 1,
+            cancel_mutations: 1,
         }
     }
     fn profile() -> PluginSmokeProfile {
@@ -457,14 +474,16 @@ mod tests {
     fn verdict_requires_ui_success_and_every_native_check() {
         assert_eq!(verdict(false, &all_checks()), (false, 1));
         assert_eq!(verdict(true, &all_checks()), (true, 0));
-        for index in 0..5 {
+        for index in 0..7 {
             let mut checks = all_checks();
             match index {
                 0 => checks.source_unchanged = false,
                 1 => checks.disabled_decision_retained = false,
                 2 => checks.ownership_empty = false,
                 3 => checks.local_empty = false,
-                _ => checks.staging_empty = false,
+                4 => checks.staging_empty = false,
+                5 => checks.place_mutations = 0,
+                _ => checks.cancel_mutations = 2,
             }
             assert_eq!(verdict(true, &checks), (false, 1), "check {index}");
         }
@@ -539,6 +558,10 @@ mod tests {
             "remove_managed_local_plugin",
             "execute_plugin_compute",
             "cancel_plugin_compute",
+            "get_plugin_workflow_access",
+            "set_plugin_workflow_grants",
+            "run_plugin_workflow",
+            "confirm_plugin_workflow",
             "finish_plugin_smoke",
         ] {
             assert!(

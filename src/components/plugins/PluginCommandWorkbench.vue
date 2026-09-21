@@ -5,6 +5,7 @@ import { usePluginStore } from '../../stores/plugin'
 import { pluginPageLabel } from '../../services/pluginNavigation'
 import type { PluginCommandSummary } from '../../types/plugin'
 import PluginComputeDialog from './PluginComputeDialog.vue'
+import PluginWorkflowDialog from './PluginWorkflowDialog.vue'
 import PluginCommandResult from './PluginCommandResult.vue'
 
 const props = withDefaults(defineProps<{ navigationAvailable?: boolean }>(), {
@@ -15,7 +16,7 @@ const emit = defineEmits<{
 }>()
 const store = usePluginStore()
 const query = ref('')
-const { result, computeIntent, run, clear } = usePluginCommandResult(
+const { result, computeIntent, workflowIntent, run, clear } = usePluginCommandResult(
   undefined,
   (intent) => emit('open-page', intent),
 )
@@ -35,7 +36,8 @@ function commandActionLabel(command: PluginCommandSummary): string {
   if (command.actionId === 'host.openPage') {
     return `打开页面：${pluginPageLabel(command.destination)}`
   }
-  return '运行计算'
+  if (command.actionId === 'sandbox.computeSeries') return '运行计算'
+  return '打开账户工作流'
 }
 </script>
 
@@ -50,7 +52,7 @@ function commandActionLabel(command: PluginCommandSummary): string {
         <h2 id="plugin-command-workbench-title">
           命令工作台
         </h2>
-        <p>集中查找当前已启用插件提供的信息、导航与本地计算命令；只有明确点击后才会执行。</p>
+        <p>集中查找当前已启用插件提供的信息、导航、本地计算与账户工作流；只有明确点击后才会执行。</p>
       </div>
       <p
         class="plugin-command-workbench__count"
@@ -131,7 +133,7 @@ function commandActionLabel(command: PluginCommandSummary): string {
       v-if="!props.navigationAvailable && store.availableCommands.some((command) => command.actionId === 'host.openPage')"
       class="plugin-marketplace-page__empty"
     >
-      当前宿主不提供页面导航；信息显示与本地计算命令仍可使用。
+      当前宿主不提供页面导航；信息显示、本地计算与账户工作流命令仍可使用。
     </p>
 
     <PluginCommandResult
@@ -143,6 +145,12 @@ function commandActionLabel(command: PluginCommandSummary): string {
       v-if="computeIntent"
       :key="`${computeIntent.expectedCatalogGeneration}:${computeIntent.expectedRevision}:${computeIntent.pluginId}:${computeIntent.contributionId}`"
       :intent="computeIntent"
+      @close="clear"
+    />
+    <PluginWorkflowDialog
+      v-if="workflowIntent"
+      :key="`${workflowIntent.expectedCatalogGeneration}:${workflowIntent.expectedRevision}:${workflowIntent.pluginId}:${workflowIntent.contributionId}`"
+      :intent="workflowIntent"
       @close="clear"
     />
   </section>

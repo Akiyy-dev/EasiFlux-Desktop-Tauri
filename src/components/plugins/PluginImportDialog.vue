@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch
 import type { PluginCommandContribution, ReadyLocalManifestImport } from '../../types/plugin'
 import { pluginComputeModuleByteLength } from '../../services/pluginManifestDiff'
 import { pluginPageLabel } from '../../services/pluginNavigation'
+import { pluginCapabilityLabels } from './pluginPresentation'
 import PluginManifestComparison from './PluginManifestComparison.vue'
 
 interface DialogControl {
@@ -34,9 +35,15 @@ const actionRequested = ref(false)
 let returnFocusTarget: FocusControl | null = null
 const isComparison = computed(() => props.preview.assessment.kind === 'existingId')
 const hasComputeCommand = computed(() => (
-  props.preview.manifest.schemaVersion === 4
+  props.preview.manifest.schemaVersion >= 4
   && props.preview.manifest.contributions.some(
     (command) => command.actionId === 'sandbox.computeSeries',
+  )
+))
+const hasWorkflowCommand = computed(() => (
+  props.preview.manifest.schemaVersion === 5
+  && props.preview.manifest.contributions.some(
+    (command) => command.actionId === 'sandbox.accountWorkflow',
   )
 ))
 
@@ -45,7 +52,8 @@ function commandPreviewLabel(command: PluginCommandContribution): string {
   if (command.actionId === 'host.openPage') {
     return `打开页面：${pluginPageLabel(command.params.destination)}`
   }
-  return `运行计算：${command.title}`
+  if (command.actionId === 'sandbox.computeSeries') return `运行计算：${command.title}`
+  return `账户工作流：${command.title}`
 }
 
 function requestCancel(event?: { preventDefault: () => void }): void {
@@ -149,7 +157,10 @@ onUnmounted(() => {
 
       <p v-if="!isComparison" id="plugin-import-warning" class="plugin-import-dialog__warning">
         目录中未发现相同插件 ID；确认后将作为新清单导入。发布者信息由清单作者填写，未经认证。
-        <template v-if="hasComputeCommand">
+        <template v-if="hasWorkflowCommand">
+          此 v5 清单包含可执行的本地 WebAssembly，并请求账户数据或交易提案能力。导入和启用都不会授权；用户必须在账户工作流中于会话内单独选择每项授权，真实下单仍需单独确认。
+        </template>
+        <template v-else-if="hasComputeCommand">
           本次将复制包含可执行的本地 WebAssembly 代码的清单，但导入和启用不会执行代码或授予权限。导入后默认停用；只有明确点击运行才会在受限沙箱中计算，输入和结果仅保存在内存中。
         </template>
         <template v-else>
@@ -185,6 +196,26 @@ onUnmounted(() => {
                 <dt>参数范围</dt>
                 <dd>
                   <bdi>{{ command.params.parameter.min }} 至 {{ command.params.parameter.max }}</bdi>
+                </dd>
+              </div>
+            </dl>
+            <dl
+              v-else-if="command.actionId === 'sandbox.accountWorkflow'"
+              data-testid="plugin-import-workflow-details"
+            >
+              <div><dt>运行时</dt><dd><bdi>{{ command.params.runtime }}</bdi></dd></div>
+              <div><dt>ABI</dt><dd><bdi>{{ command.params.abi }}</bdi></dd></div>
+              <div>
+                <dt>代码模块</dt>
+                <dd><bdi>{{ pluginComputeModuleByteLength(command) }} 字节</bdi></dd>
+              </div>
+              <div><dt>默认输入</dt><dd><bdi>{{ command.params.defaultInput }}</bdi></dd></div>
+              <div>
+                <dt>请求权限</dt>
+                <dd>
+                  <bdi>{{ props.preview.manifest.schemaVersion === 5
+                    ? props.preview.manifest.requestedCapabilities.map((capability) => pluginCapabilityLabels[capability]).join('、')
+                    : '' }}</bdi>
                 </dd>
               </div>
             </dl>

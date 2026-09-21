@@ -3,6 +3,7 @@ export type LocalDiscoveryStatus = 'available' | 'degraded' | 'unavailable'
 export type PluginStatus = 'enabled' | 'disabled' | 'blocked'
 export type PluginAvailability = 'available' | 'unavailable'
 export type PluginAvailabilityReason = 'stateUnavailable' | 'catalogInvalid'
+import type { PluginWorkflowCapability } from './pluginWorkflow'
 export type PluginManagement =
   | 'builtIn'
   | 'managed'
@@ -80,10 +81,29 @@ export interface PluginComputeCommandContribution {
   }
 }
 
+export interface PluginWorkflowCommandContribution {
+  kind: 'command'
+  contributionId: string
+  title: string
+  actionId: 'sandbox.accountWorkflow'
+  params: {
+    runtime: 'wasm-v1'
+    abi: 'account-json-v1'
+    moduleBase64: string
+    defaultInput: string
+  }
+}
+
 export type PluginCommandContribution =
   | PluginShowInfoCommandContribution
   | PluginOpenPageCommandContribution
   | PluginComputeCommandContribution
+  | PluginWorkflowCommandContribution
+
+export type PluginV4CommandContribution = Exclude<
+  PluginCommandContribution,
+  PluginWorkflowCommandContribution
+>
 
 export type PluginV3CommandContribution =
   | PluginShowInfoCommandContribution
@@ -101,7 +121,16 @@ export interface PluginManifestV3 extends Omit<PluginManifestV1, 'schemaVersion'
 
 export interface PluginManifestV4 extends Omit<PluginManifestV1, 'schemaVersion' | 'contributions'> {
   schemaVersion: 4
+  contributions: PluginV4CommandContribution[]
+}
+
+export interface PluginManifestV5 extends Omit<
+  PluginManifestV1,
+  'schemaVersion' | 'contributions' | 'requestedCapabilities'
+> {
+  schemaVersion: 5
   contributions: PluginCommandContribution[]
+  requestedCapabilities: PluginWorkflowCapability[]
 }
 
 export type PluginManifest =
@@ -109,6 +138,7 @@ export type PluginManifest =
   | PluginManifestV2
   | PluginManifestV3
   | PluginManifestV4
+  | PluginManifestV5
 
 export type PluginManifestField =
   | 'schemaVersion'
@@ -154,6 +184,10 @@ export type PluginCommandSummary =
       actionId: 'sandbox.computeSeries'
       parameter: PluginComputeParameterMetadata
     })
+  | (PluginCommandSummaryBase & {
+      actionId: 'sandbox.accountWorkflow'
+      requestedCapabilities: PluginWorkflowCapability[]
+    })
 
 export type PluginCommandExecution =
   | { actionId: 'host.showInfo'; info: PluginCommandInfo }
@@ -176,10 +210,28 @@ export type PluginCommandExecution =
       expectedCatalogGeneration: string
       expectedRevision: string
     }
+  | {
+      actionId: 'sandbox.accountWorkflow'
+      pluginId: string
+      pluginName: string
+      contributionId: string
+      title: string
+      runtime: 'wasm-v1'
+      abi: 'account-json-v1'
+      defaultInput: string
+      requestedCapabilities: PluginWorkflowCapability[]
+      expectedCatalogGeneration: string
+      expectedRevision: string
+    }
 
 export type PluginComputeExecutionIntent = Extract<
   PluginCommandExecution,
   { actionId: 'sandbox.computeSeries' }
+>
+
+export type PluginWorkflowExecutionIntent = Extract<
+  PluginCommandExecution,
+  { actionId: 'sandbox.accountWorkflow' }
 >
 
 export interface PluginComputeRequest {

@@ -24,6 +24,10 @@ import type {
   RemoveManagedLocalPluginFailure,
   RemoveManagedLocalPluginResult,
 } from '../types/plugin'
+import {
+  PLUGIN_WORKFLOW_CAPABILITIES,
+  type PluginWorkflowCapability,
+} from '../types/pluginWorkflow'
 
 const INVALID_RESPONSE_ERROR = '插件服务返回的数据无效，请重试。'
 const GENERIC_ERROR = '插件操作失败，请重试。'
@@ -393,7 +397,7 @@ function requireWasmModuleBase64(value: unknown): string {
   return moduleBase64
 }
 
-function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4): PluginCommandContribution {
+function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5): PluginCommandContribution {
   const command = requireExactObject(value, ['kind', 'contributionId', 'title', 'actionId', 'params'])
   if (command.kind !== 'command') invalidResponse()
   const contributionId = requireReverseDomainId(command.contributionId)
@@ -418,7 +422,34 @@ function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4): PluginCommandCo
       params: { destination: destination as PluginPageDestination },
     }
   }
-  if (schemaVersion !== 4 || command.actionId !== 'sandbox.computeSeries') invalidResponse()
+  if (command.actionId === 'sandbox.accountWorkflow') {
+    if (schemaVersion !== 5) invalidResponse()
+    const params = requireExactObject(
+      command.params,
+      ['runtime', 'abi', 'moduleBase64', 'defaultInput'],
+    )
+    if (params.runtime !== 'wasm-v1' || params.abi !== 'account-json-v1') invalidResponse()
+    const defaultInput = requireString(params.defaultInput)
+    if (textEncoder.encode(defaultInput).byteLength > 4096) invalidResponse()
+    let parsedDefault: unknown
+    try {
+      parsedDefault = JSON.parse(defaultInput)
+    } catch {
+      return invalidResponse()
+    }
+    if (!isObject(parsedDefault)) invalidResponse()
+    return {
+      kind: 'command', contributionId, title, actionId: 'sandbox.accountWorkflow',
+      params: {
+        runtime: 'wasm-v1',
+        abi: 'account-json-v1',
+        moduleBase64: requireWasmModuleBase64(params.moduleBase64),
+        defaultInput,
+      },
+    }
+  }
+  if ((schemaVersion !== 4 && schemaVersion !== 5)
+    || command.actionId !== 'sandbox.computeSeries') invalidResponse()
   const params = requireExactObject(
     command.params,
     ['runtime', 'abi', 'moduleBase64', 'parameter'],
@@ -445,13 +476,29 @@ function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4): PluginCommandCo
   }
 }
 
+function parseRequestedCapabilities(value: unknown): PluginWorkflowCapability[] {
+  if (!Array.isArray(value) || value.length < 1
+    || value.length > PLUGIN_WORKFLOW_CAPABILITIES.length) invalidResponse()
+  const capabilities = value.map((candidate) => {
+    if (typeof candidate !== 'string'
+      || !PLUGIN_WORKFLOW_CAPABILITIES.includes(candidate as PluginWorkflowCapability)) {
+      return invalidResponse()
+    }
+    return candidate as PluginWorkflowCapability
+  })
+  if (new Set(capabilities).size !== capabilities.length
+    || !capabilities.includes('account.read')) invalidResponse()
+  return [...capabilities]
+}
+
 function parseManifest(value: unknown): PluginManifest {
   const manifest = requireExactObject(value, MANIFEST_KEYS)
   if (textEncoder.encode(JSON.stringify(manifest)).byteLength > 16 * 1024) invalidResponse()
   if (manifest.schemaVersion !== 1
     && manifest.schemaVersion !== 2
     && manifest.schemaVersion !== 3
-    && manifest.schemaVersion !== 4) invalidResponse()
+    && manifest.schemaVersion !== 4
+    && manifest.schemaVersion !== 5) invalidResponse()
   const id = requireReverseDomainId(manifest.id)
   const publisherId = requireReverseDomainId(manifest.publisherId)
   const publisher = requireDisplayText(manifest.publisher, 80)
@@ -459,7 +506,6 @@ function parseManifest(value: unknown): PluginManifest {
   const description = requireDisplayText(manifest.description, 500)
   const version = requireDisplayText(manifest.version, 64)
   if (!isSemVer(version)) invalidResponse()
-  requireEmptyArray(manifest.requestedCapabilities)
   const metadata = {
     id,
     publisherId,
@@ -469,6 +515,7 @@ function parseManifest(value: unknown): PluginManifest {
     version,
   }
   if (manifest.schemaVersion === 1) {
+    requireEmptyArray(manifest.requestedCapabilities)
     requireEmptyArray(manifest.contributions)
     return { schemaVersion: 1, ...metadata, contributions: [], requestedCapabilities: [] }
   }
@@ -479,6 +526,14 @@ function parseManifest(value: unknown): PluginManifest {
   if (new Set(contributions.map((command) => command.contributionId)).size !== contributions.length) {
     invalidResponse()
   }
+  if (schemaVersion === 5) {
+    const requestedCapabilities = parseRequestedCapabilities(manifest.requestedCapabilities)
+    if (!contributions.some((command) => command.actionId === 'sandbox.accountWorkflow')) {
+      invalidResponse()
+    }
+    return { schemaVersion, ...metadata, contributions, requestedCapabilities }
+  }
+  requireEmptyArray(manifest.requestedCapabilities)
   return { schemaVersion, ...metadata, contributions, requestedCapabilities: [] } as PluginManifest
 }
 
@@ -680,7 +735,7 @@ function manifestsMatch(left: PluginManifest, right: PluginManifest): boolean {
     && left.version === right.version
     // Both sides are strictly parsed with normalized nested command keys.
     && JSON.stringify(left.contributions) === JSON.stringify(right.contributions)
-    && left.requestedCapabilities.length === right.requestedCapabilities.length
+    && JSON.stringify(left.requestedCapabilities) === JSON.stringify(right.requestedCapabilities)
 }
 
 function parsePrepareImport(value: unknown): PrepareLocalManifestImportResult {

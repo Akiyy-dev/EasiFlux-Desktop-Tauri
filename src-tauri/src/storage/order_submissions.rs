@@ -16,6 +16,7 @@ const SCHEMA_VERSION: u32 = 1;
 
 /// The caller serializes account mutations while an intent is written or completed.
 /// A damaged intent remains on disk and blocks a retry of the same identity.
+#[derive(Clone)]
 pub struct OrderSubmissionStore {
     dir: PathBuf,
 }
