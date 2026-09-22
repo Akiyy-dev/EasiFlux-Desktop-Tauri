@@ -109,11 +109,17 @@ const orderTemplate = {
 }
 const parameters = { threshold: '100', order: orderTemplate }
 
-function contextAt(lastPrice, state = {}, lastReceipt = null, orders = []) {
+function contextAt(lastPrice, state = {}, lastReceipt = null, orders = [], sequence = '1') {
+  if (lastReceipt !== null) {
+    assert.ok(
+      BigInt(sequence) >= BigInt(lastReceipt.sequence),
+      `fixture context sequence ${sequence} precedes receipt sequence ${lastReceipt.sequence}`,
+    )
+  }
   return {
     schemaVersion: 1,
     runId: '00000000-0000-4000-8000-000000000003',
-    sequence: '1',
+    sequence,
     event: 'timer',
     snapshot: {
       schemaVersion: 1,
@@ -168,7 +174,7 @@ function rejectedPlacement() {
     status: 'rejected',
     submissionId: '00000000-0000-4000-8000-000000000004',
     orderId: null,
-    errorCode: 'strategy_order_rejected',
+    errorCode: 'plugin_strategy_rejected',
   }
 }
 
@@ -203,7 +209,7 @@ assert.deepEqual(execute(contextAt('99'), parameters), {
   message: 'Waiting for the configured threshold.',
 })
 
-assert.deepEqual(execute(contextAt('101'), parameters), {
+assert.deepEqual(execute(contextAt('101', {}, null, [], '2'), parameters), {
   state: { phase: 'placed' },
   action: { kind: 'placeOrder', order: orderTemplate },
   message: 'Threshold reached; requesting one limit order.',
@@ -212,17 +218,17 @@ assert.deepEqual(execute(contextAt('101'), parameters), {
 assert.equal(execute(contextAt('100'), { ...parameters, threshold: '101' }).action.kind, 'none')
 
 const placed = { phase: 'placed' }
-assert.deepEqual(execute(contextAt('102', placed), parameters), {
+assert.deepEqual(execute(contextAt('102', placed, null, [], '3'), parameters), {
   state: { phase: 'placed' },
   action: { kind: 'none' },
   message: 'Waiting for the placement receipt.',
 })
-assert.deepEqual(execute(contextAt('102', placed, rejectedPlacement()), parameters), {
+assert.deepEqual(execute(contextAt('102', placed, rejectedPlacement(), [], '3'), parameters), {
   state: { phase: 'done' },
   action: { kind: 'stop' },
   message: 'Placement was not accepted; stopping the example.',
 })
-const acceptedResult = execute(contextAt('102', placed, acceptedPlacement('owned-123')), parameters)
+const acceptedResult = execute(contextAt('102', placed, acceptedPlacement('owned-123'), [], '3'), parameters)
 assert.deepEqual(acceptedResult, {
   state: { phase: 'awaitingOrder', orderId: 'owned-123' },
   action: { kind: 'none' },
@@ -230,13 +236,13 @@ assert.deepEqual(acceptedResult, {
 })
 
 const awaiting = { phase: 'awaitingOrder', orderId: 'owned-123' }
-assert.equal(execute(contextAt('102', awaiting, acceptedPlacement('owned-123')), parameters).action.kind, 'none')
+assert.equal(execute(contextAt('102', awaiting, acceptedPlacement('owned-123'), [], '4'), parameters).action.kind, 'none')
 assert.equal(
-  execute(contextAt('102', awaiting, acceptedPlacement('owned-123'), [activeOrder('other-456')]), parameters).action.kind,
+  execute(contextAt('102', awaiting, acceptedPlacement('owned-123'), [activeOrder('other-456')], '4'), parameters).action.kind,
   'none',
 )
 assert.deepEqual(
-  execute(contextAt('102', awaiting, acceptedPlacement('owned-123'), [activeOrder('owned-123')]), parameters),
+  execute(contextAt('102', awaiting, acceptedPlacement('owned-123'), [activeOrder('owned-123')], '4'), parameters),
   {
     state: { phase: 'cancelRequested', orderId: 'owned-123' },
     action: { kind: 'cancelOrder', order: { symbol: 'BTCUSDT', orderId: 'owned-123' } },
@@ -245,7 +251,7 @@ assert.deepEqual(
 )
 
 assert.deepEqual(
-  execute(contextAt('102', { phase: 'cancelRequested', orderId: 'owned-123' }), parameters),
+  execute(contextAt('102', { phase: 'cancelRequested', orderId: 'owned-123' }, null, [], '5'), parameters),
   {
     state: { phase: 'done' },
     action: { kind: 'stop' },
@@ -255,11 +261,11 @@ assert.deepEqual(
 
 const normalizedAwaiting = normalizePersistedState(acceptedResult.state)
 assert.equal(
-  execute(contextAt('102', normalizedAwaiting, acceptedPlacement('owned-123')), parameters).action.kind,
+  execute(contextAt('102', normalizedAwaiting, acceptedPlacement('owned-123'), [], '4'), parameters).action.kind,
   'none',
 )
 const normalizedCancelResult = execute(
-  contextAt('102', normalizedAwaiting, acceptedPlacement('owned-123'), [activeOrder('owned-123')]),
+  contextAt('102', normalizedAwaiting, acceptedPlacement('owned-123'), [activeOrder('owned-123')], '4'),
   parameters,
 )
 assert.deepEqual(normalizedCancelResult, {
@@ -268,7 +274,7 @@ assert.deepEqual(normalizedCancelResult, {
   message: 'Owned active order is visible; requesting one cancellation.',
 })
 assert.deepEqual(
-  execute(contextAt('102', normalizePersistedState(normalizedCancelResult.state)), parameters),
+  execute(contextAt('102', normalizePersistedState(normalizedCancelResult.state), null, [], '5'), parameters),
   {
     state: { phase: 'done' },
     action: { kind: 'stop' },
