@@ -18,6 +18,8 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use std::sync::Arc;
 
+mod strategy;
+
 pub(crate) struct ProductionWorkflowHost {
     api: Arc<ApiClient>,
     config: Arc<tokio::sync::RwLock<AppConfig>>,
@@ -65,6 +67,57 @@ impl WorkflowHost for ProductionWorkflowHost {
     }
     fn now_ms(&self) -> u64 {
         self.time.local_now_ms()
+    }
+    fn strategy_scope_locked(&self) -> HostFuture<'_, String> {
+        Box::pin(async {
+            let authority = self.authority_locked().await.map_err(|_| unavailable())?;
+            self.api
+                .order_submission_scope(&authority.account.account_id)
+                .await
+                .map_err(|_| unavailable())
+        })
+    }
+    fn strategy_acknowledge_locked<'a>(
+        &'a self,
+        scope: &'a str,
+        id: &'a str,
+        expected: &'a Order,
+        request: &'a PlaceProposal,
+    ) -> HostFuture<'a, ()> {
+        Box::pin(async move {
+            let current = self.strategy_scope_locked().await?;
+            strategy::acknowledge(
+                &self.submissions,
+                &current,
+                scope,
+                id,
+                expected,
+                request,
+                |endpoint, params| self.api.private_get(endpoint, params),
+            )
+            .await
+        })
+    }
+    fn strategy_reconcile_locked<'a>(
+        &'a self,
+        scope: &'a str,
+        symbol: &'a str,
+        submission: Option<&'a str>,
+        exchange: Option<&'a str>,
+    ) -> HostFuture<'a, Option<Order>> {
+        Box::pin(async move {
+            let current = self.strategy_scope_locked().await?;
+            strategy::reconcile(
+                &self.submissions,
+                &current,
+                scope,
+                symbol,
+                submission,
+                exchange,
+                |endpoint, params| self.api.private_get(endpoint, params),
+            )
+            .await
+        })
     }
     fn authority_locked(&self) -> HostFuture<'_, AccountAuthority> {
         Box::pin(async {
