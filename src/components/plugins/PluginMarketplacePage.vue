@@ -5,10 +5,12 @@ import PluginCommandWorkbench from './PluginCommandWorkbench.vue'
 import PluginCommands from './PluginCommands.vue'
 import PluginImportDialog from './PluginImportDialog.vue'
 import PluginRemovalDialog from './PluginRemovalDialog.vue'
+import PluginStrategyMonitor from './PluginStrategyMonitor.vue'
 import { pluginSourceLabel } from './pluginPresentation'
 import { usePluginStore, type PluginStatusFilter } from '../../stores/plugin'
 import type {
   LocalManifestImportCommitFailure,
+  PluginStrategyExecutionIntent,
   RemoveManagedLocalPluginFailure,
 } from '../../types/plugin'
 import type { PluginSection } from '../../types/navigation'
@@ -32,6 +34,24 @@ const importTrigger = ref<FocusControl | null>(null)
 const importDialogOpener = ref<FocusControl | null>(null)
 const removalDialogOpener = ref<FocusControl | null>(null)
 const installedView = ref<'plugins' | 'commands'>('plugins')
+const strategyIntents = computed<PluginStrategyExecutionIntent[]>(() => store.catalog.flatMap((plugin) => {
+  if (plugin.manifest.schemaVersion !== 6) return []
+  return plugin.manifest.contributions.flatMap((command) => command.actionId === 'sandbox.strategy'
+    ? [{
+        actionId: 'sandbox.strategy' as const,
+        pluginId: plugin.manifest.id,
+        pluginName: plugin.manifest.name,
+        contributionId: command.contributionId,
+        title: command.title,
+        runtime: command.params.runtime,
+        abi: command.params.abi,
+        defaultInput: command.params.defaultInput,
+        requestedCapabilities: [...plugin.manifest.requestedCapabilities],
+        expectedCatalogGeneration: store.catalogGeneration,
+        expectedRevision: store.revision,
+      }]
+    : [])
+}))
 
 watch(
   () => props.section,
@@ -327,6 +347,8 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </header>
+
+    <PluginStrategyMonitor :strategy-intents="strategyIntents" defer-initial-load />
 
     <PluginImportDialog
       v-if="store.importPreview && (

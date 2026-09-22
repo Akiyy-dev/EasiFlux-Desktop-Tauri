@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 mod compute;
 pub(crate) mod workflow;
+pub(crate) mod strategy;
 
 use crate::error::{AppError, AppResult};
 use crate::storage::plugin_state::{

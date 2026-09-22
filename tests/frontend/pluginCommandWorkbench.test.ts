@@ -83,6 +83,28 @@ function legacyPlugin(): PluginCatalogItem {
   }
 }
 
+function strategyPlugin(): PluginCatalogItem {
+  return {
+    manifest: {
+      schemaVersion: 6,
+      id: 'com.example.strategy', publisherId: 'com.example', publisher: 'Example publisher',
+      name: 'Strategy tools', description: 'Native supervised strategy', version: '1.0.0',
+      requestedCapabilities: ['account.read', 'market.read', 'trade.place', 'strategy.run'],
+      contributions: [{
+        kind: 'command', contributionId: 'strategy.threshold', title: 'Threshold once',
+        actionId: 'sandbox.strategy',
+        params: {
+          runtime: 'wasm-v1', abi: 'strategy-json-v1', moduleBase64: 'AGFzbQEAAAA=',
+          defaultInput: '{"threshold":"50000"}',
+        },
+      }],
+    },
+    source: 'localDeclarative', management: 'external', canRemove: false,
+    toggleBlockReasonCode: null, status: 'enabled', statusReasonCode: null,
+    canToggle: true, grantedCapabilities: [],
+  }
+}
+
 const alphaCommands = [
   command('alpha.overview', 'First command', 'First result', 'First content'),
   command('shared.info', 'Shared alpha', 'Alpha shared result', 'Alpha shared content'),
@@ -168,6 +190,27 @@ beforeEach(() => {
 })
 
 describe('installed plugin command workbench', () => {
+  it('lists v6 strategies as configuration actions and opening one does not start it', async () => {
+    const wrapper = await mountLoaded(snapshot([strategyPlugin()], '13', '8'))
+    await wrapper.get('[data-testid="plugin-command-view"]').trigger('click')
+    const action = wrapper.get('[data-testid="plugin-workbench-command"]')
+    expect(action.text()).toBe('配置自动策略')
+    expect(action.attributes('aria-label')).toContain('Threshold once')
+
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      schemaVersion: 1, pluginId: 'com.example.strategy', contributionId: 'strategy.threshold',
+      catalogGeneration: '8', revision: '13',
+      account: { accountId: 'paper-main', sessionEpoch: '21', environment: 'Testnet' },
+      requestedCapabilities: ['account.read', 'market.read', 'trade.place', 'strategy.run'],
+      authorizationToken: 'strategy-ticket-1', expiresAtMs: '1789920060123',
+    })
+    await action.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="strategy-dialog"]').exists()).toBe(true)
+    expect(vi.mocked(tauriInvoke).mock.calls.some(([command]) => command === 'start_plugin_strategy'))
+      .toBe(false)
+  })
+
   it('defaults to cards, keeps plugin filters local, and resets the view after leaving installed', async () => {
     const wrapper = await mountLoaded()
     const pluginView = wrapper.get('[data-testid="plugin-list-view"]')

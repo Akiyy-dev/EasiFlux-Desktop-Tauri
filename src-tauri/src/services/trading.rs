@@ -26,6 +26,8 @@ use crate::services::AnalyticsService;
 use crate::storage::{CacheStore, TradeLogStore};
 
 mod quote;
+mod strategy;
+pub(crate) use strategy::StrategyAdmission;
 
 #[derive(Clone)]
 pub(crate) struct OrderNotificationObserver {
@@ -389,6 +391,57 @@ impl TradingService {
         Ok(order)
     }
 
+    pub(crate) async fn place_strategy_order(
+        &self,
+        context: SubmissionContext,
+        request: PlaceOrderRequest,
+        admission: &StrategyAdmission<'_>,
+    ) -> AppResult<Order> {
+        let session_context = OrderStreamContext::from(&context);
+        let requires_reference_price = self.risk.read().await.requires_reference_price(&request);
+        let reference_price = if requires_reference_price {
+            quote::fresh_reference_price(self.api.as_ref(), &request.symbol).await
+        } else {
+            None
+        };
+        let result = execute_place_order_with_submit(
+            &self.risk,
+            &self.notification_observer,
+            &context,
+            request,
+            reference_price.as_deref(),
+            self.time.now_ms(),
+            Some(admission),
+            |request| async move { PrivateApi::create_order(self.api.as_ref(), &request).await },
+            |order| async move {
+                let _ = self.trade_log.append_order(&order);
+                self.emitter.emit_order(&session_context, order.clone());
+                self.emitter
+                    .emit_log("info", &format!("下单成功: {}", order.order_id));
+                self.analytics.record_order(order).await;
+            },
+        )
+        .await;
+        deliver_notified_placement(&self.emitter, result)
+    }
+
+    pub(crate) async fn cancel_strategy_order(
+        &self,
+        _context: OrderStreamContext,
+        request: CancelOrderRequest,
+        admission: &StrategyAdmission<'_>,
+    ) -> AppResult<Order> {
+        let acknowledgement = strategy::dispatch(Some(admission), || {
+            PrivateApi::cancel_order_acknowledged(&self.api, &request)
+        })
+        .await?;
+        self.emitter.emit_log(
+            "info",
+            &format!("撤单请求已受理: {}", acknowledgement.order_id),
+        );
+        Ok(acknowledgement)
+    }
+
     pub(crate) async fn cancel_order_acknowledged(
         &self,
         _context: OrderStreamContext,
@@ -487,12 +540,43 @@ async fn execute_place_order<S, SFut>(
     risk: &Arc<tokio::sync::RwLock<RiskService>>,
     observer: &OrderNotificationObserver,
     context: &SubmissionContext,
-    mut request: PlaceOrderRequest,
+    request: PlaceOrderRequest,
     reference_price: Option<&str>,
     now_ms: u64,
     success_side_effects: S,
 ) -> AppResult<Order>
 where
+    S: FnOnce(Order) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    execute_place_order_with_submit(
+        risk,
+        observer,
+        context,
+        request,
+        reference_price,
+        now_ms,
+        None,
+        |request| async move { PrivateApi::create_order(api, &request).await },
+        success_side_effects,
+    )
+    .await
+}
+
+async fn execute_place_order_with_submit<F, Fut, S, SFut>(
+    risk: &Arc<tokio::sync::RwLock<RiskService>>,
+    observer: &OrderNotificationObserver,
+    context: &SubmissionContext,
+    mut request: PlaceOrderRequest,
+    reference_price: Option<&str>,
+    now_ms: u64,
+    admission: Option<&StrategyAdmission<'_>>,
+    submit: F,
+    success_side_effects: S,
+) -> AppResult<Order>
+where
+    F: FnOnce(PlaceOrderRequest) -> Fut,
+    Fut: std::future::Future<Output = AppResult<Order>>,
     S: FnOnce(Order) -> SFut,
     SFut: std::future::Future<Output = ()>,
 {
@@ -534,7 +618,11 @@ where
         }
     };
 
-    let order = match PrivateApi::create_order(api, &request).await {
+    let order = match strategy::dispatch_reserved(risk, &reservation, now_ms, admission, || {
+        submit(request)
+    })
+    .await
+    {
         Ok(order) => order,
         Err(submit_error) => {
             return Err(handle_failed_submission(

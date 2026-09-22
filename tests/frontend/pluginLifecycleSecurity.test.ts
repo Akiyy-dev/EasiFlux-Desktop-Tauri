@@ -108,6 +108,9 @@ it('capability union adds no filesystem, dialog, shell, remote, or new opener au
         'allow-execute-plugin-compute', 'allow-cancel-plugin-compute',
         'allow-get-plugin-workflow-access', 'allow-set-plugin-workflow-grants',
         'allow-run-plugin-workflow', 'allow-confirm-plugin-workflow',
+        'allow-get-plugin-strategy-access', 'allow-start-plugin-strategy',
+        'allow-list-plugin-strategies', 'allow-control-plugin-strategy',
+        'allow-stop-all-plugin-strategies', 'allow-reconcile-plugin-strategy',
       ])
       expect(capability.webviews).toEqual(['main'])
     }

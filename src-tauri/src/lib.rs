@@ -40,9 +40,16 @@ pub fn run() {
             // returned driver performs network initialization asynchronously.
             let scheduler_start = scheduler.start();
             app.manage(PluginCommandState::new(Arc::clone(&state.plugins)));
-            app.manage(plugin::workflow::WorkflowHostState(Arc::new(
+            let workflow_host: Arc<dyn plugin::workflow::WorkflowHost> = Arc::new(
                 plugin::workflow::ProductionWorkflowHost::from_state(&state),
-            )));
+            );
+            app.manage(plugin::strategy::StrategySupervisor::new(
+                Arc::clone(&state.plugins),
+                Arc::clone(&workflow_host),
+                plugin::strategy::production_strategy_store(),
+                state.emitter.strategy_wake(),
+            ));
+            app.manage(plugin::workflow::WorkflowHostState(workflow_host));
             app.manage(state);
 
             let emitter = {
@@ -97,6 +104,12 @@ pub fn run() {
             set_plugin_workflow_grants,
             run_plugin_workflow,
             confirm_plugin_workflow,
+            get_plugin_strategy_access,
+            start_plugin_strategy,
+            list_plugin_strategies,
+            control_plugin_strategy,
+            stop_all_plugin_strategies,
+            reconcile_plugin_strategy,
             get_risk_status,
             update_risk_config,
             save_credentials,
@@ -162,9 +175,20 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+                let strategies: tauri::State<Arc<plugin::strategy::StrategySupervisor>> = app.state();
+                // Revoke admission synchronously, before waiting for HTTP or scheduler work.
+                strategies.revoke_for_exit();
+            }
             if let RunEvent::Exit = event {
                 let state: tauri::State<AppState> = app.state();
+                let strategies: tauri::State<Arc<plugin::strategy::StrategySupervisor>> = app.state();
                 tauri::async_runtime::block_on(async {
+                    // A timeout drops only this waiter, never an owned in-flight trade.
+                    // Hard process exit leaves its durable pending intent for reconciliation.
+                    if tokio::time::timeout(std::time::Duration::from_secs(5), strategies.drain()).await.is_err() {
+                        tracing::warn!("strategy shutdown drain timed out; pending actions require reconciliation");
+                    }
                     state.scheduler.shutdown().await;
                     if let Err(error) = state.scheduler.flush_klines_for_shutdown().await {
                         tracing::error!(%error, "final kline flush failed");
@@ -288,6 +312,12 @@ mod capability_tests {
             "set_plugin_workflow_grants",
             "run_plugin_workflow",
             "confirm_plugin_workflow",
+            "get_plugin_strategy_access",
+            "start_plugin_strategy",
+            "list_plugin_strategies",
+            "control_plugin_strategy",
+            "stop_all_plugin_strategies",
+            "reconcile_plugin_strategy",
         ] {
             assert!(
                 authority
@@ -324,7 +354,7 @@ mod capability_tests {
 
     // Catches wildcard or path-scoped grants expanding this fixed IPC surface.
     #[test]
-    fn plugin_capability_grants_exactly_the_thirteen_fixed_commands_without_scope() {
+    fn plugin_capability_grants_exactly_the_nineteen_fixed_commands_without_scope() {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/plugin-runtime.json")).unwrap();
         assert_eq!(capability["webviews"], serde_json::json!(["main"]));
@@ -346,7 +376,13 @@ mod capability_tests {
                 "allow-get-plugin-workflow-access",
                 "allow-set-plugin-workflow-grants",
                 "allow-run-plugin-workflow",
-                "allow-confirm-plugin-workflow"
+                "allow-confirm-plugin-workflow",
+                "allow-get-plugin-strategy-access",
+                "allow-start-plugin-strategy",
+                "allow-list-plugin-strategies",
+                "allow-control-plugin-strategy",
+                "allow-stop-all-plugin-strategies",
+                "allow-reconcile-plugin-strategy"
             ])
         );
     }

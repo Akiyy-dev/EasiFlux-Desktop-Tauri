@@ -166,6 +166,33 @@ describe('PluginCard', () => {
     expect(wrapper.text()).not.toContain('不会运行插件代码')
   })
 
+  it('distinguishes v6 autonomous trading authority from v5 per-trade confirmation', () => {
+    const wrapper = mountCard(pluginFixture('enabled', {
+      source: 'localDeclarative', management: 'external',
+      manifest: {
+        ...pluginFixture().manifest,
+        schemaVersion: 6,
+        requestedCapabilities: ['account.read', 'market.read', 'trade.place', 'strategy.run'],
+        contributions: [{
+          kind: 'command', contributionId: 'strategy.threshold', title: 'Threshold once',
+          actionId: 'sandbox.strategy',
+          params: {
+            runtime: 'wasm-v1', abi: 'strategy-json-v1', moduleBase64: 'AGFzbQEAAAA=',
+            defaultInput: '{"threshold":"50000"}',
+          },
+        }],
+      },
+    }))
+
+    expect(wrapper.get('[data-testid="requested-capabilities"]').text())
+      .toContain('账户会话、市场报价、真实下单提案、自动策略运行')
+    expect(wrapper.get('[data-testid="granted-capabilities"]').text())
+      .toContain('每次启动或恢复')
+    expect(wrapper.text()).toContain('启用或打开不会启动策略')
+    expect(wrapper.text()).toContain('不逐单确认')
+    expect(wrapper.text()).not.toContain('每次真实交易仍需单独确认')
+  })
+
   it.each([
     ['enabled', '已启用', true],
     ['disabled', '已停用', false],

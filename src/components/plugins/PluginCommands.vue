@@ -6,6 +6,7 @@ import type { PluginCatalogItem, PluginCommandSummary } from '../../types/plugin
 import { pluginPageLabel } from '../../services/pluginNavigation'
 import PluginComputeDialog from './PluginComputeDialog.vue'
 import PluginWorkflowDialog from './PluginWorkflowDialog.vue'
+import PluginStrategyDialog from './PluginStrategyDialog.vue'
 import PluginCommandResult from './PluginCommandResult.vue'
 
 const props = withDefaults(defineProps<{
@@ -16,7 +17,7 @@ const emit = defineEmits<{
   'open-page': [intent: { pluginId: string; contributionId: string }]
 }>()
 const store = usePluginStore()
-const { result, computeIntent, workflowIntent, run, clear } = usePluginCommandResult(
+const { result, computeIntent, workflowIntent, strategyIntent, run, clear } = usePluginCommandResult(
   () => props.plugin,
   (intent) => emit('open-page', intent),
 )
@@ -30,7 +31,8 @@ function commandLabel(command: PluginCommandSummary): string {
     return `打开页面：${pluginPageLabel(command.destination)}`
   }
   if (command.actionId === 'sandbox.computeSeries') return `运行计算：${command.title}`
-  return `打开账户工作流：${command.title}`
+  if (command.actionId === 'sandbox.accountWorkflow') return `打开账户工作流：${command.title}`
+  return `配置并启动自动策略：${command.title}`
 }
 </script>
 
@@ -53,7 +55,7 @@ function commandLabel(command: PluginCommandSummary): string {
       v-if="!props.navigationAvailable && commands.some((command) => command.actionId === 'host.openPage')"
       class="plugin-commands__navigation-unavailable"
     >
-      当前宿主不提供页面导航；信息显示、本地计算与账户工作流命令仍可使用。
+      当前宿主不提供页面导航；信息显示、本地计算、账户工作流与自动策略配置仍可使用。
     </p>
     <PluginCommandResult
       v-if="result"
@@ -70,6 +72,12 @@ function commandLabel(command: PluginCommandSummary): string {
       v-if="workflowIntent"
       :key="`${workflowIntent.expectedCatalogGeneration}:${workflowIntent.expectedRevision}:${workflowIntent.pluginId}:${workflowIntent.contributionId}`"
       :intent="workflowIntent"
+      @close="clear"
+    />
+    <PluginStrategyDialog
+      v-if="strategyIntent"
+      :key="`${strategyIntent.expectedCatalogGeneration}:${strategyIntent.expectedRevision}:${strategyIntent.pluginId}:${strategyIntent.contributionId}`"
+      :intent="strategyIntent"
       @close="clear"
     />
   </section>

@@ -37,6 +37,12 @@ const comparisonHasWorkflow = computed(() => (
     && manifest.contributions.some((command) => command.actionId === 'sandbox.accountWorkflow')
   ))
 ))
+const comparisonHasStrategy = computed(() => (
+  [props.current.manifest, props.incoming].some((manifest) => (
+    manifest.schemaVersion === 6
+    && manifest.contributions.some((command) => command.actionId === 'sandbox.strategy')
+  ))
+))
 
 const fieldLabels: Record<PluginManifestField, string> = {
   schemaVersion: '清单架构',
@@ -69,7 +75,8 @@ function commandLabel(command: PluginCommandContribution): string {
     return `打开页面：${pluginPageLabel(command.params.destination)}`
   }
   if (command.actionId === 'sandbox.computeSeries') return `运行本地计算：${command.title}`
-  return `账户工作流：${command.title}`
+  if (command.actionId === 'sandbox.accountWorkflow') return `账户工作流：${command.title}`
+  return `自动交易策略：${command.title}`
 }
 
 function commandDetails(
@@ -108,6 +115,16 @@ function commandDetails(
       { label: 'ABI', value: command.params.abi },
       { label: '代码模块', value: `${pluginComputeModuleByteLength(command)} 字节` },
       { label: '默认输入', value: command.params.defaultInput },
+    ]
+  }
+  if (command.actionId === 'sandbox.strategy') {
+    return [
+      ...common,
+      { label: '运行时', value: command.params.runtime },
+      { label: 'ABI', value: command.params.abi },
+      { label: '代码模块', value: `${pluginComputeModuleByteLength(command)} 字节` },
+      { label: '默认输入', value: command.params.defaultInput },
+      { label: '自动行为', value: '明确启动后可自动真实交易，不逐单确认' },
     ]
   }
   return [
@@ -177,6 +194,14 @@ function commandDetails(
       data-testid="plugin-workflow-comparison-notice"
     >
       此比较涉及账户工作流和请求权限。导入或启用不会授权；必须在当前会话单独选择授权，真实交易仍需单独确认。
+    </p>
+
+    <p
+      v-if="comparisonHasStrategy"
+      class="plugin-manifest-comparison__warning"
+      data-testid="plugin-strategy-comparison-notice"
+    >
+      此比较涉及自动交易策略和请求权限。比较、导入、启用或打开不会启动；每次启动或恢复必须重新选择权限和原生硬限制，并明确同意不逐单确认的真实自动交易。
     </p>
 
     <p

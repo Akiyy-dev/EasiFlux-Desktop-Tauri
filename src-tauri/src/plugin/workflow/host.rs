@@ -23,6 +23,44 @@ pub(crate) struct AccountAuthority {
 pub(crate) trait WorkflowHost: Send + Sync {
     fn lifecycle(&self) -> &AccountLifecycleCoordinator;
     fn now_ms(&self) -> u64;
+    // Separate unattended-trading durability seams; v5 hosts never acquire this authority.
+    fn strategy_place_locked<'a>(
+        &'a self,
+        _context: SubmissionContext,
+        _request: PlaceOrderRequest,
+        _admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, Order> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
+    fn strategy_cancel_locked<'a>(
+        &'a self,
+        _context: SessionContext,
+        _request: CancelOrderRequest,
+        _admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, Order> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
+    fn strategy_scope_locked(&self) -> HostFuture<'_, String> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
+    fn strategy_acknowledge_locked<'a>(
+        &'a self,
+        _scope: &'a str,
+        _id: &'a str,
+        _expected: &'a Order,
+        _request: &'a PlaceProposal,
+    ) -> HostFuture<'a, ()> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
+    fn strategy_reconcile_locked<'a>(
+        &'a self,
+        _scope: &'a str,
+        _symbol: &'a str,
+        _submission: Option<&'a str>,
+        _exchange: Option<&'a str>,
+    ) -> HostFuture<'a, Option<Order>> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
     // Caller holds the lifecycle read/write guard. Never acquire it recursively.
     fn authority_locked(&self) -> HostFuture<'_, AccountAuthority>;
     fn balances_locked(&self) -> HostFuture<'_, Vec<Balance>>;

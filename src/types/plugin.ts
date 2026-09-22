@@ -4,6 +4,7 @@ export type PluginStatus = 'enabled' | 'disabled' | 'blocked'
 export type PluginAvailability = 'available' | 'unavailable'
 export type PluginAvailabilityReason = 'stateUnavailable' | 'catalogInvalid'
 import type { PluginWorkflowCapability } from './pluginWorkflow'
+import type { PluginStrategyCapability } from './pluginStrategy'
 export type PluginManagement =
   | 'builtIn'
   | 'managed'
@@ -94,15 +95,34 @@ export interface PluginWorkflowCommandContribution {
   }
 }
 
+export interface PluginStrategyCommandContribution {
+  kind: 'command'
+  contributionId: string
+  title: string
+  actionId: 'sandbox.strategy'
+  params: {
+    runtime: 'wasm-v1'
+    abi: 'strategy-json-v1'
+    moduleBase64: string
+    defaultInput: string
+  }
+}
+
 export type PluginCommandContribution =
   | PluginShowInfoCommandContribution
   | PluginOpenPageCommandContribution
   | PluginComputeCommandContribution
   | PluginWorkflowCommandContribution
+  | PluginStrategyCommandContribution
 
 export type PluginV4CommandContribution = Exclude<
   PluginCommandContribution,
-  PluginWorkflowCommandContribution
+  PluginWorkflowCommandContribution | PluginStrategyCommandContribution
+>
+
+export type PluginV5CommandContribution = Exclude<
+  PluginCommandContribution,
+  PluginStrategyCommandContribution
 >
 
 export type PluginV3CommandContribution =
@@ -129,8 +149,17 @@ export interface PluginManifestV5 extends Omit<
   'schemaVersion' | 'contributions' | 'requestedCapabilities'
 > {
   schemaVersion: 5
-  contributions: PluginCommandContribution[]
+  contributions: PluginV5CommandContribution[]
   requestedCapabilities: PluginWorkflowCapability[]
+}
+
+export interface PluginManifestV6 extends Omit<
+  PluginManifestV1,
+  'schemaVersion' | 'contributions' | 'requestedCapabilities'
+> {
+  schemaVersion: 6
+  contributions: Exclude<PluginCommandContribution, PluginWorkflowCommandContribution>[]
+  requestedCapabilities: PluginStrategyCapability[]
 }
 
 export type PluginManifest =
@@ -139,6 +168,7 @@ export type PluginManifest =
   | PluginManifestV3
   | PluginManifestV4
   | PluginManifestV5
+  | PluginManifestV6
 
 export type PluginManifestField =
   | 'schemaVersion'
@@ -188,6 +218,10 @@ export type PluginCommandSummary =
       actionId: 'sandbox.accountWorkflow'
       requestedCapabilities: PluginWorkflowCapability[]
     })
+  | (PluginCommandSummaryBase & {
+      actionId: 'sandbox.strategy'
+      requestedCapabilities: PluginStrategyCapability[]
+    })
 
 export type PluginCommandExecution =
   | { actionId: 'host.showInfo'; info: PluginCommandInfo }
@@ -223,6 +257,19 @@ export type PluginCommandExecution =
       expectedCatalogGeneration: string
       expectedRevision: string
     }
+  | {
+      actionId: 'sandbox.strategy'
+      pluginId: string
+      pluginName: string
+      contributionId: string
+      title: string
+      runtime: 'wasm-v1'
+      abi: 'strategy-json-v1'
+      defaultInput: string
+      requestedCapabilities: PluginStrategyCapability[]
+      expectedCatalogGeneration: string
+      expectedRevision: string
+    }
 
 export type PluginComputeExecutionIntent = Extract<
   PluginCommandExecution,
@@ -232,6 +279,11 @@ export type PluginComputeExecutionIntent = Extract<
 export type PluginWorkflowExecutionIntent = Extract<
   PluginCommandExecution,
   { actionId: 'sandbox.accountWorkflow' }
+>
+
+export type PluginStrategyExecutionIntent = Extract<
+  PluginCommandExecution,
+  { actionId: 'sandbox.strategy' }
 >
 
 export interface PluginComputeRequest {

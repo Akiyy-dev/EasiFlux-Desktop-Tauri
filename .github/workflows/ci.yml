@@ -26,6 +26,8 @@ jobs:
       - run: pnpm test
       - name: Verify packaged account workflow guests with synthetic data
         run: node examples/plugins/account-workflow/verify.mjs
+      - name: Verify automatic strategy guest with synthetic data
+        run: node examples/plugins/threshold-strategy/verify.mjs
       - run: pnpm build
 
   rust:
@@ -49,6 +51,9 @@ jobs:
         working-directory: src-tauri
       - name: Verify account workflow Wasm matches its readable sources
         run: cargo run --locked --example build_account_workflow_manifest -- --check
+        working-directory: src-tauri
+      - name: Verify strategy Wasm matches its readable source
+        run: cargo run --locked --example build_threshold_strategy_manifest -- --check
         working-directory: src-tauri
       - run: cargo clippy --locked --all-targets
         working-directory: src-tauri
@@ -86,7 +91,8 @@ jobs:
             'plugin::compute',
             'plugin::runtime::compute',
             'plugin::workflow',
-            'plugin::runtime::workflow'
+            'plugin::runtime::workflow',
+            'plugin::strategy'
           )
           foreach ($suite in $suites) {
             $listed = @(& cargo test --locked --manifest-path src-tauri/Cargo.toml $suite --lib -- --list --format terse)
