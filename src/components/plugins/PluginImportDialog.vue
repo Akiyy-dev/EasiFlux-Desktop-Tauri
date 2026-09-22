@@ -46,6 +46,12 @@ const hasWorkflowCommand = computed(() => (
     (command) => command.actionId === 'sandbox.accountWorkflow',
   )
 ))
+const hasStrategyCommand = computed(() => (
+  props.preview.manifest.schemaVersion === 6
+  && props.preview.manifest.contributions.some(
+    (command) => command.actionId === 'sandbox.strategy',
+  )
+))
 
 function commandPreviewLabel(command: PluginCommandContribution): string {
   if (command.actionId === 'host.showInfo') return `显示信息：${command.title}`
@@ -53,7 +59,8 @@ function commandPreviewLabel(command: PluginCommandContribution): string {
     return `打开页面：${pluginPageLabel(command.params.destination)}`
   }
   if (command.actionId === 'sandbox.computeSeries') return `运行计算：${command.title}`
-  return `账户工作流：${command.title}`
+  if (command.actionId === 'sandbox.accountWorkflow') return `账户工作流：${command.title}`
+  return `自动交易策略：${command.title}`
 }
 
 function requestCancel(event?: { preventDefault: () => void }): void {
@@ -157,7 +164,10 @@ onUnmounted(() => {
 
       <p v-if="!isComparison" id="plugin-import-warning" class="plugin-import-dialog__warning">
         目录中未发现相同插件 ID；确认后将作为新清单导入。发布者信息由清单作者填写，未经认证。
-        <template v-if="hasWorkflowCommand">
+        <template v-if="hasStrategyCommand">
+          此 v6 清单包含可执行的本地 WebAssembly 自动策略。导入、启用、打开或刷新都不会启动策略；每次启动或恢复都必须选择权限和硬限制，并明确同意在限制内自动真实交易且不再逐单确认。
+        </template>
+        <template v-else-if="hasWorkflowCommand">
           此 v5 清单包含可执行的本地 WebAssembly，并请求账户数据或交易提案能力。导入和启用都不会授权；用户必须在账户工作流中于会话内单独选择每项授权，真实下单仍需单独确认。
         </template>
         <template v-else-if="hasComputeCommand">
@@ -218,6 +228,24 @@ onUnmounted(() => {
                     : '' }}</bdi>
                 </dd>
               </div>
+            </dl>
+            <dl
+              v-else-if="command.actionId === 'sandbox.strategy'"
+              data-testid="plugin-import-strategy-details"
+            >
+              <div><dt>运行时</dt><dd><bdi>{{ command.params.runtime }}</bdi></dd></div>
+              <div><dt>ABI</dt><dd><bdi>{{ command.params.abi }}</bdi></dd></div>
+              <div><dt>代码模块</dt><dd><bdi>{{ pluginComputeModuleByteLength(command) }} 字节</bdi></dd></div>
+              <div><dt>默认输入</dt><dd><bdi>{{ command.params.defaultInput }}</bdi></dd></div>
+              <div>
+                <dt>请求权限</dt>
+                <dd>
+                  <bdi>{{ props.preview.manifest.schemaVersion === 6
+                    ? props.preview.manifest.requestedCapabilities.map((capability) => pluginCapabilityLabels[capability]).join('、')
+                    : '' }}</bdi>
+                </dd>
+              </div>
+              <div><dt>自动行为</dt><dd>明确启动后可在原生限制内自动下单或撤单，不逐单确认。</dd></div>
             </dl>
           </li>
         </ul>

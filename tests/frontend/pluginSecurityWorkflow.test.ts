@@ -23,6 +23,9 @@ it('runs nonzero lifecycle security suites on all three OS runners', () => {
     'plugin::runtime::removal::tests',
     'plugin::compute',
     'plugin::runtime::compute',
+    'plugin::workflow',
+    'plugin::runtime::workflow',
+    'plugin::strategy',
   ]) {
     expect(job).toContain(`'${suite}'`)
   }
@@ -34,6 +37,6 @@ it('runs nonzero lifecycle security suites on all three OS runners', () => {
   expect(job).toContain('if ($listExit -ne 0) { throw')
   expect(job).toContain('if ($runExit -ne 0) { throw')
   expect(job).toContain('& cargo test --locked --manifest-path src-tauri/Cargo.toml $suite --lib')
-  expect(workflow).toMatch(/permissions:\r?\n  contents: read/)
+  expect(workflow).toMatch(/permissions:\r?\n {2}contents: read/)
   expect(workflow).toContain('cargo test --locked --all-targets')
 })

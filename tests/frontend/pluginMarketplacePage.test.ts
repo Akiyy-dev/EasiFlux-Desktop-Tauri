@@ -200,7 +200,12 @@ function mountPage(section: PluginSection = 'installed', attachTo?: Element) {
   return mount(PluginMarketplacePage, {
     props: { section },
     attachTo,
-    global: { plugins: [pinia] },
+    global: {
+      plugins: [pinia],
+      // Strategy monitor behavior has its own real-component suite. These page
+      // tests isolate catalog recovery and should not count the monitor's IPC state.
+      stubs: { PluginStrategyMonitor: true },
+    },
   })
 }
 

@@ -71,12 +71,19 @@ function commandEqual(
       && current.params.moduleBase64 === incoming.params.moduleBase64
       && current.params.defaultInput === incoming.params.defaultInput
   }
+  if (current.actionId === 'sandbox.strategy' && incoming.actionId === 'sandbox.strategy') {
+    return current.params.runtime === incoming.params.runtime
+      && current.params.abi === incoming.params.abi
+      && current.params.moduleBase64 === incoming.params.moduleBase64
+      && current.params.defaultInput === incoming.params.defaultInput
+  }
   return false
 }
 
 export function pluginComputeModuleByteLength(command: PluginCommandContribution): number | null {
   return command.actionId === 'sandbox.computeSeries'
     || command.actionId === 'sandbox.accountWorkflow'
+    || command.actionId === 'sandbox.strategy'
     ? atob(command.params.moduleBase64).length
     : null
 }
@@ -87,8 +94,10 @@ export function pluginComputeCodeChanged(
 ): boolean {
   const beforeExecutable = before.actionId === 'sandbox.computeSeries'
     || before.actionId === 'sandbox.accountWorkflow'
+    || before.actionId === 'sandbox.strategy'
   const afterExecutable = after.actionId === 'sandbox.computeSeries'
     || after.actionId === 'sandbox.accountWorkflow'
+    || after.actionId === 'sandbox.strategy'
   if (!beforeExecutable && !afterExecutable) {
     return false
   }

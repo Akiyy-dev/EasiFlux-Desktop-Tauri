@@ -46,8 +46,14 @@ const hasWorkflowCommand = computed(() => (
     (command) => command.actionId === 'sandbox.accountWorkflow',
   )
 ))
+const hasStrategyCommand = computed(() => (
+  props.plugin.manifest.schemaVersion === 6
+  && props.plugin.manifest.contributions.some(
+    (command) => command.actionId === 'sandbox.strategy',
+  )
+))
 const requestedCapabilityLabel = computed(() => (
-  props.plugin.manifest.schemaVersion === 5
+  props.plugin.manifest.schemaVersion === 5 || props.plugin.manifest.schemaVersion === 6
     ? props.plugin.manifest.requestedCapabilities.map(
       (capability) => pluginCapabilityLabels[capability],
     ).join('、')
@@ -148,15 +154,17 @@ function requestRemoval(event: RemovalClickEvent): void {
     </dl>
 
     <p v-if="plugin.source === 'localDeclarative'" class="plugin-card__local-note">
-      {{ hasWorkflowCommand
-        ? '只有明确打开账户工作流并在会话内选择授权后，插件才能读取对应数据或准备提案；每次真实交易仍需单独确认'
-        : hasComputeCommand
-          ? '只有明确点击运行才会在 WebAssembly 沙箱中执行本地计算；输入和结果仅保存在内存中'
-          : plugin.manifest.schemaVersion !== 1
-            ? plugin.manifest.schemaVersion >= 3
-              ? '启用后可显示信息或请求宿主打开白名单页面，不会运行插件代码'
-              : '启用后提供只读命令，不会运行插件代码'
-            : '启用仅记录宿主偏好，不会运行插件代码' }}
+      {{ hasStrategyCommand
+        ? '启用或打开不会启动策略；只有选择本次权限、硬限制并明确同意后，原生宿主才会自动真实交易且不逐单确认'
+        : hasWorkflowCommand
+          ? '只有明确打开账户工作流并在会话内选择授权后，插件才能读取对应数据或准备提案；每次真实交易仍需单独确认'
+          : hasComputeCommand
+            ? '只有明确点击运行才会在 WebAssembly 沙箱中执行本地计算；输入和结果仅保存在内存中'
+            : plugin.manifest.schemaVersion !== 1
+              ? plugin.manifest.schemaVersion >= 3
+                ? '启用后可显示信息或请求宿主打开白名单页面，不会运行插件代码'
+                : '启用后提供只读命令，不会运行插件代码'
+              : '启用仅记录宿主偏好，不会运行插件代码' }}
     </p>
 
     <slot name="commands" />
@@ -166,9 +174,11 @@ function requestRemoval(event: RemovalClickEvent): void {
         <strong>请求权限：</strong>{{ requestedCapabilityLabel }}
       </p>
       <p data-testid="granted-capabilities">
-        <strong>已授予权限：</strong>{{ hasWorkflowCommand
-          ? '目录不显示会话授权；启用不会授权，请在账户工作流中查看和选择'
-          : '无需额外权限' }}
+        <strong>已授予权限：</strong>{{ hasStrategyCommand
+          ? '目录不恢复运行授权；每次启动或恢复都必须使用新的短期凭据和明确同意'
+          : hasWorkflowCommand
+            ? '目录不显示会话授权；启用不会授权，请在账户工作流中查看和选择'
+            : '无需额外权限' }}
       </p>
     </div>
 

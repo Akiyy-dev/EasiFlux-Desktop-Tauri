@@ -12,6 +12,8 @@ import type {
   PluginCatalogSnapshot,
   PluginLocalDiscoverySummary,
   PluginManifest,
+  PluginManifestV6,
+  PluginV5CommandContribution,
   PluginCommandContribution,
   PluginComputeCancelResult,
   PluginComputeRequest,
@@ -28,6 +30,10 @@ import {
   PLUGIN_WORKFLOW_CAPABILITIES,
   type PluginWorkflowCapability,
 } from '../types/pluginWorkflow'
+import {
+  PLUGIN_STRATEGY_CAPABILITIES,
+  type PluginStrategyCapability,
+} from '../types/pluginStrategy'
 
 const INVALID_RESPONSE_ERROR = '插件服务返回的数据无效，请重试。'
 const GENERIC_ERROR = '插件操作失败，请重试。'
@@ -397,7 +403,7 @@ function requireWasmModuleBase64(value: unknown): string {
   return moduleBase64
 }
 
-function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5): PluginCommandContribution {
+function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5 | 6): PluginCommandContribution {
   const command = requireExactObject(value, ['kind', 'contributionId', 'title', 'actionId', 'params'])
   if (command.kind !== 'command') invalidResponse()
   const contributionId = requireReverseDomainId(command.contributionId)
@@ -448,7 +454,31 @@ function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5): PluginComma
       },
     }
   }
-  if ((schemaVersion !== 4 && schemaVersion !== 5)
+  if (command.actionId === 'sandbox.strategy') {
+    if (schemaVersion !== 6) invalidResponse()
+    const params = requireExactObject(
+      command.params,
+      ['runtime', 'abi', 'moduleBase64', 'defaultInput'],
+    )
+    if (params.runtime !== 'wasm-v1' || params.abi !== 'strategy-json-v1') invalidResponse()
+    const defaultInput = requireString(params.defaultInput)
+    if (textEncoder.encode(defaultInput).byteLength > 4096) invalidResponse()
+    let parsedDefault: unknown
+    try {
+      parsedDefault = JSON.parse(defaultInput)
+    } catch {
+      return invalidResponse()
+    }
+    if (!isObject(parsedDefault)) invalidResponse()
+    return {
+      kind: 'command', contributionId, title, actionId: 'sandbox.strategy',
+      params: {
+        runtime: 'wasm-v1', abi: 'strategy-json-v1',
+        moduleBase64: requireWasmModuleBase64(params.moduleBase64), defaultInput,
+      },
+    }
+  }
+  if ((schemaVersion !== 4 && schemaVersion !== 5 && schemaVersion !== 6)
     || command.actionId !== 'sandbox.computeSeries') invalidResponse()
   const params = requireExactObject(
     command.params,
@@ -476,6 +506,22 @@ function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5): PluginComma
   }
 }
 
+function parseStrategyCapabilities(value: unknown): PluginStrategyCapability[] {
+  if (!Array.isArray(value) || value.length < 2
+    || value.length > PLUGIN_STRATEGY_CAPABILITIES.length) invalidResponse()
+  const capabilities = value.map((candidate) => {
+    if (typeof candidate !== 'string'
+      || !PLUGIN_STRATEGY_CAPABILITIES.includes(candidate as PluginStrategyCapability)) {
+      return invalidResponse()
+    }
+    return candidate as PluginStrategyCapability
+  })
+  if (new Set(capabilities).size !== capabilities.length
+    || !capabilities.includes('account.read')
+    || !capabilities.includes('strategy.run')) invalidResponse()
+  return capabilities
+}
+
 function parseRequestedCapabilities(value: unknown): PluginWorkflowCapability[] {
   if (!Array.isArray(value) || value.length < 1
     || value.length > PLUGIN_WORKFLOW_CAPABILITIES.length) invalidResponse()
@@ -498,7 +544,8 @@ function parseManifest(value: unknown): PluginManifest {
     && manifest.schemaVersion !== 2
     && manifest.schemaVersion !== 3
     && manifest.schemaVersion !== 4
-    && manifest.schemaVersion !== 5) invalidResponse()
+    && manifest.schemaVersion !== 5
+    && manifest.schemaVersion !== 6) invalidResponse()
   const id = requireReverseDomainId(manifest.id)
   const publisherId = requireReverseDomainId(manifest.publisherId)
   const publisher = requireDisplayText(manifest.publisher, 80)
@@ -531,7 +578,23 @@ function parseManifest(value: unknown): PluginManifest {
     if (!contributions.some((command) => command.actionId === 'sandbox.accountWorkflow')) {
       invalidResponse()
     }
-    return { schemaVersion, ...metadata, contributions, requestedCapabilities }
+    return {
+      schemaVersion, ...metadata,
+      contributions: contributions as PluginV5CommandContribution[],
+      requestedCapabilities,
+    }
+  }
+  if (schemaVersion === 6) {
+    const requestedCapabilities = parseStrategyCapabilities(manifest.requestedCapabilities)
+    if (!contributions.some((command) => command.actionId === 'sandbox.strategy')
+      || contributions.some((command) => command.actionId === 'sandbox.accountWorkflow')) {
+      invalidResponse()
+    }
+    return {
+      schemaVersion, ...metadata,
+      contributions: contributions as PluginManifestV6['contributions'],
+      requestedCapabilities,
+    }
   }
   requireEmptyArray(manifest.requestedCapabilities)
   return { schemaVersion, ...metadata, contributions, requestedCapabilities: [] } as PluginManifest

@@ -342,6 +342,41 @@ describe('PluginImportDialog', () => {
     wrapper.unmount()
   })
 
+  it('makes v6 automatic trading and one-time start authority conspicuous', () => {
+    const wrapper = mount(PluginImportDialog, {
+      props: {
+        preview: {
+          ...readyPreview,
+          manifest: {
+            ...readyPreview.manifest,
+            schemaVersion: 6,
+            requestedCapabilities: ['account.read', 'market.read', 'trade.place', 'strategy.run'],
+            contributions: [{
+              kind: 'command', contributionId: 'strategy.threshold', title: 'Threshold once',
+              actionId: 'sandbox.strategy',
+              params: {
+                runtime: 'wasm-v1', abi: 'strategy-json-v1', moduleBase64: 'AGFzbQEAAAA=',
+                defaultInput: '{"threshold":"50000"}',
+              },
+            }],
+          },
+        },
+        committing: false,
+        stale: false,
+      },
+    })
+
+    expect(wrapper.text()).toContain('导入、启用、打开或刷新都不会启动策略')
+    expect(wrapper.text()).toContain('自动真实交易且不再逐单确认')
+    expect(wrapper.get('[data-testid="plugin-import-commands"]').text())
+      .toContain('自动交易策略：Threshold once')
+    const details = wrapper.get('[data-testid="plugin-import-strategy-details"]')
+    expect(details.text()).toContain('strategy-json-v1')
+    expect(details.text()).toContain('自动下单或撤单，不逐单确认')
+    expect(details.text()).not.toContain('AGFzbQEAAAA=')
+    expect(tauriInvoke).not.toHaveBeenCalled()
+  })
+
   it('discloses v5 requested account/trading access and separate session grant and confirmation', () => {
     const wrapper = mount(PluginImportDialog, {
       props: {

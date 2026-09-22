@@ -6,6 +6,7 @@ import { pluginPageLabel } from '../../services/pluginNavigation'
 import type { PluginCommandSummary } from '../../types/plugin'
 import PluginComputeDialog from './PluginComputeDialog.vue'
 import PluginWorkflowDialog from './PluginWorkflowDialog.vue'
+import PluginStrategyDialog from './PluginStrategyDialog.vue'
 import PluginCommandResult from './PluginCommandResult.vue'
 
 const props = withDefaults(defineProps<{ navigationAvailable?: boolean }>(), {
@@ -16,7 +17,7 @@ const emit = defineEmits<{
 }>()
 const store = usePluginStore()
 const query = ref('')
-const { result, computeIntent, workflowIntent, run, clear } = usePluginCommandResult(
+const { result, computeIntent, workflowIntent, strategyIntent, run, clear } = usePluginCommandResult(
   undefined,
   (intent) => emit('open-page', intent),
 )
@@ -37,7 +38,8 @@ function commandActionLabel(command: PluginCommandSummary): string {
     return `打开页面：${pluginPageLabel(command.destination)}`
   }
   if (command.actionId === 'sandbox.computeSeries') return '运行计算'
-  return '打开账户工作流'
+  if (command.actionId === 'sandbox.accountWorkflow') return '打开账户工作流'
+  return '配置自动策略'
 }
 </script>
 
@@ -52,7 +54,7 @@ function commandActionLabel(command: PluginCommandSummary): string {
         <h2 id="plugin-command-workbench-title">
           命令工作台
         </h2>
-        <p>集中查找当前已启用插件提供的信息、导航、本地计算与账户工作流；只有明确点击后才会执行。</p>
+        <p>集中查找当前已启用插件提供的信息、导航、本地计算、账户工作流与自动策略配置；只有明确点击后才会执行或打开配置。</p>
       </div>
       <p
         class="plugin-command-workbench__count"
@@ -133,7 +135,7 @@ function commandActionLabel(command: PluginCommandSummary): string {
       v-if="!props.navigationAvailable && store.availableCommands.some((command) => command.actionId === 'host.openPage')"
       class="plugin-marketplace-page__empty"
     >
-      当前宿主不提供页面导航；信息显示、本地计算与账户工作流命令仍可使用。
+      当前宿主不提供页面导航；信息显示、本地计算、账户工作流与自动策略配置仍可使用。
     </p>
 
     <PluginCommandResult
@@ -151,6 +153,12 @@ function commandActionLabel(command: PluginCommandSummary): string {
       v-if="workflowIntent"
       :key="`${workflowIntent.expectedCatalogGeneration}:${workflowIntent.expectedRevision}:${workflowIntent.pluginId}:${workflowIntent.contributionId}`"
       :intent="workflowIntent"
+      @close="clear"
+    />
+    <PluginStrategyDialog
+      v-if="strategyIntent"
+      :key="`${strategyIntent.expectedCatalogGeneration}:${strategyIntent.expectedRevision}:${strategyIntent.pluginId}:${strategyIntent.contributionId}`"
+      :intent="strategyIntent"
       @close="clear"
     />
   </section>
