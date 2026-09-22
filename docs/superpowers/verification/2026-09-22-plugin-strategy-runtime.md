@@ -34,7 +34,7 @@ Final source parity:
 ```text
 src-tauri\target\debug\examples\build_threshold_strategy_manifest.exe --check
 verified ...\examples\plugins\threshold-strategy\manifest.json
-(module 6105 bytes, manifest 9223 bytes)
+(module 5934 bytes, manifest 8995 bytes)
 exit 0
 ```
 
@@ -48,7 +48,7 @@ Final executable behavior:
 
 ```text
 node examples/plugins/threshold-strategy/verify.mjs
-threshold-strategy fixture: 17 behavior checks passed; module 6105 bytes; manifest 9223 bytes
+threshold-strategy fixture: 17 behavior checks passed; module 5934 bytes; manifest 8995 bytes; data segments 15; bulk memory false
 exit 0
 ```
 
@@ -62,7 +62,7 @@ cancellation, later stop state, malformed input, unrelated action-field
 injection, input over the guest's 4,096-byte bound, and both known persisted
 state key orders across chained callbacks.
 
-The decoded module is 6,105 bytes (limit 8,192) and `manifest.json` is 9,223
+The decoded module is 5,934 bytes (limit 8,192) and `manifest.json` is 8,995
 bytes (limit 16,384). The generator uses the locked `wat` dependency, accepts
 only `--check`/`--write`, and reads the fixed example path.
 
@@ -82,6 +82,20 @@ now accepts both exact known key orders for `awaitingOrder` and
 The 17-case GREEN above covers both orders through
 accepted -> awaiting -> cancel -> cancelRequested -> stop.
 
+## Native sandbox feature-subset integration fix
+
+The next real Wasmi attempt rejected the otherwise Node-valid artifact before
+execution: it had 51 data segments while native preflight permits at most 32,
+and it used `memory.copy` while the native engine explicitly disables bulk
+memory. The host sandbox was not relaxed.
+
+The verifier now parses binary Wasm sections rather than searching WAT text. Its
+RED reported `native sandbox shape: 51 data segments, bulk memory true`. The WAT
+coalesces readable token tables into two documented segments and replaces
+`memory.copy` with a bounded MVP `i32.load8_u`/`i32.store8` loop. Final artifact
+shape is 15 data segments and no bulk-memory opcode, alongside the 17 behavior
+checks above.
+
 JavaScript syntax checks also passed:
 
 ```text
@@ -90,15 +104,24 @@ node --check examples/plugins/threshold-strategy/verify.mjs
 exit 0
 ```
 
-## Native and frontend acceptance status
+## Native packaged-loop acceptance
 
-The checked-in manifest path and sizes were shared with the frontend implementer
-for strict parser acceptance and with the backend implementer for injected-loop
-acceptance. At the time this section was written, no result from either task had
-been incorporated here.
+The backend implementer ran the checked-in packaged guest through the real
+Wasmi sandbox and owned native supervisor loop:
 
-In particular, this document does **not** yet claim that the native supervisor
-has launched the guest, automatically placed and cancelled exactly once, or
-verified journal/ack ordering. Those are backend injected-host acceptance
-requirements. Broad Rust/frontend/CI, CodeQL, native smoke, production app,
+```text
+cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::strategy::tests::supervisor::packaged_threshold_guest --lib --target-dir src-tauri/target
+1 passed; 0 failed; 1237 filtered out
+exit 0 (20.64 s compile, 0.18 s test; 37 baseline warnings)
+```
+
+The native assertions observed zero placements below threshold, one placement
+on the crossing, the receipt-owned-state transition with zero early cancels,
+one cancel only when the owned order became visible, and completed stop state.
+Final totals were one placement, one cancellation, and one acknowledgement.
+This is the decisive compatibility check for the native feature subset; the
+Node engine alone is not used to claim native compatibility.
+
+The stable manifest was also shared with the frontend implementer for strict
+parser acceptance. Broad Rust/frontend/CI, CodeQL, native smoke, production app,
 real-account, installer, and release tests were not run by the example task.

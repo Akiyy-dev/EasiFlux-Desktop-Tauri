@@ -1,48 +1,32 @@
 (module
   (memory (export "memory") 1 16)
 
-  ;; Strict compact-input tokens. The example deliberately rejects alternate
-  ;; layouts instead of attempting to be a general JSON parser in Wasm.
-  (data (i32.const 0) "{\"threshold\":\"")
-  (data (i32.const 128) "\",\"order\":{\"symbol\":\"")
-  (data (i32.const 256) "\",\"side\":\"")
-  (data (i32.const 384) "\",\"orderType\":\"")
-  (data (i32.const 512) "\",\"qty\":\"")
-  (data (i32.const 640) "\",\"price\":\"")
-  (data (i32.const 768) "\",\"timeInForce\":\"")
-  (data (i32.const 896) "\",\"positionIdx\":")
-  (data (i32.const 1024) ",\"reduceOnly\":")
-  (data (i32.const 1152) "}}")
-  (data (i32.const 1280) "Buy")
-  (data (i32.const 1296) "Sell")
-  (data (i32.const 1312) "Limit")
-  (data (i32.const 1328) "GTC")
-  (data (i32.const 1344) "IOC")
-  (data (i32.const 1360) "FOK")
-  (data (i32.const 1376) "true")
-  (data (i32.const 1392) "false")
-  (data (i32.const 1408) "{}")
-  (data (i32.const 1424) "null")
-  (data (i32.const 1536) "{\"orderId\":\"")
-  (data (i32.const 1664) "\",\"phase\":\"awaitingOrder\"},\"lastReceipt\":")
-  (data (i32.const 1792) "\",\"phase\":\"cancelRequested\"},\"lastReceipt\":")
+  ;; Strict compact-input tokens, coalesced into one MVP data segment. Offsets
+  ;; are documented so the parser stays reviewable without exceeding the host's
+  ;; 32-segment preflight limit.
+  (data (i32.const 0)
+    ;; 0, 14, 35, 45, 60, 69, 80, 97, 113, 127
+    "{\"threshold\":\"" "\",\"order\":{\"symbol\":\"" "\",\"side\":\""
+    "\",\"orderType\":\"" "\",\"qty\":\"" "\",\"price\":\""
+    "\",\"timeInForce\":\"" "\",\"positionIdx\":" ",\"reduceOnly\":" "}}"
+    ;; 129, 132, 136, 141, 144, 147, 150, 154, 159, 161
+    "Buy" "Sell" "Limit" "GTC" "IOC" "FOK" "true" "false" "{}" "null"
+    ;; 165, 177, 218
+    "{\"orderId\":\"" "\",\"phase\":\"awaitingOrder\"},\"lastReceipt\":"
+    "\",\"phase\":\"cancelRequested\"},\"lastReceipt\":")
 
-  ;; Host-owned context tokens.
-  (data (i32.const 2048) "\"state\":")
-  (data (i32.const 2176) "{\"phase\":\"waiting\"}")
-  (data (i32.const 2304) "{\"phase\":\"placed\"}")
-  (data (i32.const 2432) "{\"phase\":\"awaitingOrder\",\"orderId\":\"")
-  (data (i32.const 2560) "{\"phase\":\"cancelRequested\",\"orderId\":\"")
-  (data (i32.const 2688) "{\"phase\":\"done\"}")
-  (data (i32.const 2816) ",\"lastReceipt\":")
-  (data (i32.const 2944) "\"},\"lastReceipt\":")
-  (data (i32.const 3072) "\"kind\":\"placeOrder\",\"status\":\"accepted\"")
-  (data (i32.const 3200) "\"orderId\":\"")
-  (data (i32.const 3328) "\"market\":{\"ticker\":{\"symbol\":\"")
-  (data (i32.const 3456) "\",\"lastPrice\":\"")
-  (data (i32.const 3584) "\"orders\":{\"items\":[")
-  (data (i32.const 3712) "\",\"status\":\"New\"")
-  (data (i32.const 3840) "\",\"status\":\"PartiallyFilled\"")
+  ;; Host-owned context tokens in one segment. Offsets begin at 2048:
+  ;; 2048, 2056, 2075, 2093, 2129, 2167, 2183, 2198,
+  ;; 2215, 2254, 2265, 2295, 2310, 2329, 2345.
+  (data (i32.const 2048)
+    "\"state\":" "{\"phase\":\"waiting\"}" "{\"phase\":\"placed\"}"
+    "{\"phase\":\"awaitingOrder\",\"orderId\":\""
+    "{\"phase\":\"cancelRequested\",\"orderId\":\"" "{\"phase\":\"done\"}"
+    ",\"lastReceipt\":" "\"},\"lastReceipt\":"
+    "\"kind\":\"placeOrder\",\"status\":\"accepted\"" "\"orderId\":\""
+    "\"market\":{\"ticker\":{\"symbol\":\"" "\",\"lastPrice\":\""
+    "\"orders\":{\"items\":[" "\",\"status\":\"New\""
+    "\",\"status\":\"PartiallyFilled\"")
 
   ;; Output fragments. Dynamic values are copied only after allowlist checks.
   (data (i32.const 4096) "{\"state\":{\"phase\":\"waiting\"},\"action\":{\"kind\":\"none\"},\"message\":\"Waiting for the configured threshold.\"}")
@@ -274,7 +258,15 @@
     i32.const 1)
 
   (func $append (param $destination i32) (param $source i32) (param $length i32) (result i32)
-    local.get $destination local.get $source local.get $length memory.copy
+    (local $i i32)
+    (block $done
+      (loop $copy
+        local.get $i local.get $length i32.ge_u br_if $done
+        local.get $destination local.get $i i32.add
+        local.get $source local.get $i i32.add i32.load8_u
+        i32.store8
+        local.get $i i32.const 1 i32.add local.set $i
+        br $copy))
     local.get $destination local.get $length i32.add)
 
   (func $packed (param $ptr i32) (param $length i32) (result i64)
@@ -345,7 +337,7 @@
     if unreachable end
     local.get $threshold local.get $threshold_len i32.add local.set $cursor
 
-    local.get $cursor i32.const 128 i32.const 21 call $require
+    local.get $cursor i32.const 14 i32.const 21 call $require
     local.get $cursor i32.const 10 i32.add local.set $order_start
     local.get $cursor i32.const 21 i32.add local.set $cursor
     local.get $cursor local.get $input_end i32.const 32 call $read_string local.set $packed_value
@@ -355,24 +347,24 @@
     if unreachable end
     local.get $symbol local.get $symbol_len i32.add local.set $cursor
 
-    local.get $cursor i32.const 256 i32.const 10 call $require
+    local.get $cursor i32.const 35 i32.const 10 call $require
     local.get $cursor i32.const 10 i32.add local.set $cursor
     local.get $cursor local.get $input_end i32.const 4 call $read_string local.set $packed_value
     local.get $packed_value i32.wrap_i64 local.set $side_len
     local.get $packed_value i64.const 32 i64.shr_u i32.wrap_i64 local.set $side
-    local.get $side local.get $side_len i32.const 1280 i32.const 3 call $same local.tee $side_buy
-    local.get $side local.get $side_len i32.const 1296 i32.const 4 call $same i32.or i32.eqz
+    local.get $side local.get $side_len i32.const 129 i32.const 3 call $same local.tee $side_buy
+    local.get $side local.get $side_len i32.const 132 i32.const 4 call $same i32.or i32.eqz
     if unreachable end
     local.get $side local.get $side_len i32.add local.set $cursor
 
-    local.get $cursor i32.const 384 i32.const 15 call $require
+    local.get $cursor i32.const 45 i32.const 15 call $require
     local.get $cursor i32.const 15 i32.add local.set $cursor
-    local.get $cursor i32.const 1312 i32.const 5 call $require
+    local.get $cursor i32.const 136 i32.const 5 call $require
     local.get $cursor i32.const 5 i32.add i32.load8_u i32.const 34 i32.ne
     if unreachable end
     local.get $cursor i32.const 5 i32.add local.set $cursor
 
-    local.get $cursor i32.const 512 i32.const 9 call $require
+    local.get $cursor i32.const 60 i32.const 9 call $require
     local.get $cursor i32.const 9 i32.add local.set $cursor
     local.get $cursor local.get $input_end i32.const 64 call $read_string local.set $packed_value
     local.get $packed_value i32.wrap_i64 local.set $value_len
@@ -381,7 +373,7 @@
     if unreachable end
     local.get $value local.get $value_len i32.add local.set $cursor
 
-    local.get $cursor i32.const 640 i32.const 11 call $require
+    local.get $cursor i32.const 69 i32.const 11 call $require
     local.get $cursor i32.const 11 i32.add local.set $cursor
     local.get $cursor local.get $input_end i32.const 64 call $read_string local.set $packed_value
     local.get $packed_value i32.wrap_i64 local.set $value_len
@@ -390,18 +382,18 @@
     if unreachable end
     local.get $value local.get $value_len i32.add local.set $cursor
 
-    local.get $cursor i32.const 768 i32.const 17 call $require
+    local.get $cursor i32.const 80 i32.const 17 call $require
     local.get $cursor i32.const 17 i32.add local.set $cursor
     local.get $cursor local.get $input_end i32.const 3 call $read_string local.set $packed_value
     local.get $packed_value i32.wrap_i64 local.set $value_len
     local.get $packed_value i64.const 32 i64.shr_u i32.wrap_i64 local.set $value
-    local.get $value local.get $value_len i32.const 1328 i32.const 3 call $same
-    local.get $value local.get $value_len i32.const 1344 i32.const 3 call $same i32.or
-    local.get $value local.get $value_len i32.const 1360 i32.const 3 call $same i32.or i32.eqz
+    local.get $value local.get $value_len i32.const 141 i32.const 3 call $same
+    local.get $value local.get $value_len i32.const 144 i32.const 3 call $same i32.or
+    local.get $value local.get $value_len i32.const 147 i32.const 3 call $same i32.or i32.eqz
     if unreachable end
     local.get $value local.get $value_len i32.add local.set $cursor
 
-    local.get $cursor i32.const 896 i32.const 16 call $require
+    local.get $cursor i32.const 97 i32.const 16 call $require
     local.get $cursor i32.const 16 i32.add local.set $cursor
     local.get $cursor i32.load8_u local.tee $position i32.const 49 i32.eq
     local.get $position i32.const 50 i32.eq i32.or i32.eqz
@@ -409,19 +401,19 @@
     local.get $position i32.const 48 i32.sub local.set $position
     local.get $cursor i32.const 1 i32.add local.set $cursor
 
-    local.get $cursor i32.const 1024 i32.const 14 call $require
+    local.get $cursor i32.const 113 i32.const 14 call $require
     local.get $cursor i32.const 14 i32.add local.set $cursor
-    local.get $cursor i32.const 1376 i32.const 4 call $matches
+    local.get $cursor i32.const 150 i32.const 4 call $matches
     if
       i32.const 1 local.set $reduce_only
       local.get $cursor i32.const 4 i32.add local.set $cursor
     else
-      local.get $cursor i32.const 1392 i32.const 5 call $require
+      local.get $cursor i32.const 154 i32.const 5 call $require
       i32.const 0 local.set $reduce_only
       local.get $cursor i32.const 5 i32.add local.set $cursor
     end
     local.get $cursor local.set $value
-    local.get $cursor i32.const 1152 i32.const 2 call $require
+    local.get $cursor i32.const 127 i32.const 2 call $require
     local.get $cursor i32.const 2 i32.add local.get $input_end i32.ne
     if unreachable end
     local.get $value i32.const 1 i32.add local.get $order_start i32.sub local.set $order_len
@@ -433,7 +425,7 @@
     if unreachable end
 
     ;; Read the selected market price and prove it belongs to the order symbol.
-    local.get $context_ptr local.get $context_len i32.const 3328 i32.const 30 call $find local.tee $market i32.eqz
+    local.get $context_ptr local.get $context_len i32.const 2265 i32.const 30 call $find local.tee $market i32.eqz
     if unreachable end
     local.get $market i32.const 30 i32.add local.set $cursor
     local.get $cursor local.get $context_end i32.const 32 call $read_string local.set $packed_value
@@ -442,7 +434,7 @@
     local.get $market_symbol local.get $market_symbol_len local.get $symbol local.get $symbol_len call $same i32.eqz
     if unreachable end
     local.get $market_symbol local.get $market_symbol_len i32.add local.set $cursor
-    local.get $cursor i32.const 3456 i32.const 15 call $require
+    local.get $cursor i32.const 2295 i32.const 15 call $require
     local.get $cursor i32.const 15 i32.add local.set $cursor
     local.get $cursor local.get $context_end i32.const 64 call $read_string local.set $packed_value
     local.get $packed_value i32.wrap_i64 local.set $last_price_len
@@ -454,48 +446,48 @@
     local.get $context_ptr local.get $context_len i32.const 2048 i32.const 8 call $find local.tee $state i32.eqz
     if unreachable end
     local.get $state i32.const 8 i32.add local.set $state_value
-    local.get $state_value i32.const 1408 i32.const 2 call $matches
+    local.get $state_value i32.const 159 i32.const 2 call $matches
     if
       i32.const 0 local.set $phase
       local.get $state_value i32.const 2 i32.add local.set $cursor
-      local.get $cursor i32.const 2816 i32.const 15 call $require
+      local.get $cursor i32.const 2183 i32.const 15 call $require
       local.get $cursor i32.const 15 i32.add local.set $receipt
     else
-      local.get $state_value i32.const 2176 i32.const 19 call $matches
+      local.get $state_value i32.const 2056 i32.const 19 call $matches
       if
         i32.const 0 local.set $phase
         local.get $state_value i32.const 19 i32.add local.set $cursor
-        local.get $cursor i32.const 2816 i32.const 15 call $require
+        local.get $cursor i32.const 2183 i32.const 15 call $require
         local.get $cursor i32.const 15 i32.add local.set $receipt
       else
-        local.get $state_value i32.const 2304 i32.const 18 call $matches
+        local.get $state_value i32.const 2075 i32.const 18 call $matches
         if
           i32.const 1 local.set $phase
           local.get $state_value i32.const 18 i32.add local.set $cursor
-          local.get $cursor i32.const 2816 i32.const 15 call $require
+          local.get $cursor i32.const 2183 i32.const 15 call $require
           local.get $cursor i32.const 15 i32.add local.set $receipt
         else
-          local.get $state_value i32.const 2432 i32.const 36 call $matches
+          local.get $state_value i32.const 2093 i32.const 36 call $matches
           if
             i32.const 2 local.set $phase
             local.get $state_value i32.const 36 i32.add local.set $owned_id
           else
-            local.get $state_value i32.const 2560 i32.const 38 call $matches
+            local.get $state_value i32.const 2129 i32.const 38 call $matches
             if
               i32.const 3 local.set $phase
               local.get $state_value i32.const 38 i32.add local.set $owned_id
             else
-              local.get $state_value i32.const 1536 i32.const 12 call $matches
+              local.get $state_value i32.const 165 i32.const 12 call $matches
               if
                 i32.const 1 local.set $sorted_state
                 i32.const 2 local.set $phase
                 local.get $state_value i32.const 12 i32.add local.set $owned_id
               else
-                local.get $state_value i32.const 2688 i32.const 16 call $matches
+                local.get $state_value i32.const 2167 i32.const 16 call $matches
                 if
                   i32.const 4 local.set $phase
                   local.get $state_value i32.const 16 i32.add local.set $cursor
-                  local.get $cursor i32.const 2816 i32.const 15 call $require
+                  local.get $cursor i32.const 2183 i32.const 15 call $require
                   local.get $cursor i32.const 15 i32.add local.set $receipt
                 else
                   unreachable
@@ -512,17 +504,17 @@
             local.get $owned_id local.get $owned_id_len i32.add local.set $cursor
             local.get $sorted_state
             if
-              local.get $cursor i32.const 1664 i32.const 41 call $matches
+              local.get $cursor i32.const 177 i32.const 41 call $matches
               if
                 i32.const 2 local.set $phase
                 local.get $cursor i32.const 41 i32.add local.set $receipt
               else
-                local.get $cursor i32.const 1792 i32.const 43 call $require
+                local.get $cursor i32.const 218 i32.const 43 call $require
                 i32.const 3 local.set $phase
                 local.get $cursor i32.const 43 i32.add local.set $receipt
               end
             else
-              local.get $cursor i32.const 2944 i32.const 17 call $require
+              local.get $cursor i32.const 2198 i32.const 17 call $require
               local.get $cursor i32.const 17 i32.add local.set $receipt
             end
           end
@@ -546,13 +538,13 @@
     ;; Placed: do not place again. Only an accepted native receipt supplies ownership.
     local.get $phase i32.const 1 i32.eq
     if
-      local.get $receipt i32.const 1424 i32.const 4 call $matches
+      local.get $receipt i32.const 161 i32.const 4 call $matches
       if i32.const 4608 i32.const 100 call $packed return end
       local.get $receipt local.get $context_end local.get $receipt i32.sub
-      i32.const 3072 i32.const 39 call $find i32.eqz
+      i32.const 2215 i32.const 39 call $find i32.eqz
       if i32.const 6400 i32.const 113 call $packed return end
       local.get $receipt local.get $context_end local.get $receipt i32.sub
-      i32.const 3200 i32.const 11 call $find local.tee $candidate i32.eqz
+      i32.const 2254 i32.const 11 call $find local.tee $candidate i32.eqz
       if unreachable end
       local.get $candidate i32.const 11 i32.add local.set $owned_id
       local.get $owned_id local.get $context_end i32.const 128 call $read_string local.set $packed_value
@@ -565,7 +557,7 @@
     ;; Awaiting: cancel only the exact receipt-derived ID when it is active in orders.
     local.get $phase i32.const 2 i32.eq
     if
-      local.get $context_ptr local.get $context_len i32.const 3584 i32.const 19 call $find local.tee $orders i32.eqz
+      local.get $context_ptr local.get $context_len i32.const 2310 i32.const 19 call $find local.tee $orders i32.eqz
       if local.get $owned_id local.get $owned_id_len i32.const 0 call $awaiting_output return end
       local.get $market local.set $orders_end
       local.get $orders local.get $orders_end i32.ge_u
@@ -574,7 +566,7 @@
       (block $not_visible
         (loop $next_order
           local.get $scan local.get $orders_end local.get $scan i32.sub
-          i32.const 3200 i32.const 11 call $find local.tee $candidate i32.eqz br_if $not_visible
+          i32.const 2254 i32.const 11 call $find local.tee $candidate i32.eqz br_if $not_visible
           local.get $candidate i32.const 11 i32.add local.set $candidate_id
           local.get $candidate_id local.get $orders_end i32.const 128 call $read_string local.set $packed_value
           local.get $packed_value i32.wrap_i64 local.set $candidate_len
@@ -583,9 +575,9 @@
             local.get $candidate_id local.get $orders_end i32.const 125 call $find_byte local.tee $object_end i32.eqz
             if unreachable end
             local.get $candidate local.get $object_end local.get $candidate i32.sub
-            i32.const 3712 i32.const 16 call $find
+            i32.const 2329 i32.const 16 call $find
             local.get $candidate local.get $object_end local.get $candidate i32.sub
-            i32.const 3840 i32.const 27 call $find i32.or
+            i32.const 2345 i32.const 28 call $find i32.or
             if
               local.get $owned_id local.get $owned_id_len local.get $symbol local.get $symbol_len call $cancel_output return
             end

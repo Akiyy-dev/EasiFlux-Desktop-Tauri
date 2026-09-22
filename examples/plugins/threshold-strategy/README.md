@@ -31,8 +31,14 @@ path and uses the repository's pinned `wat` dependency. `verify.mjs` instantiate
 the packaged bytes with no imports and supplies only synthetic context, state,
 receipts, and snapshots. It performs no account, keychain, network, or trade I/O.
 
-The checked-in module is 6,105 decoded bytes and the manifest is 9,223 bytes,
+The checked-in module is 5,934 decoded bytes and the manifest is 8,995 bytes,
 within the 8,192-byte module and 16 KiB manifest limits.
+
+Node's WebAssembly engine supports features that the native runtime deliberately
+disables. The verifier therefore also parses the packaged binary: this example
+has 15 data segments (native maximum 32) and no bulk-memory instruction. Its
+copy helper is a bounded MVP byte loop, not `memory.copy`. Real native packaged
+execution remains the decisive compatibility test.
 
 ## Configure the compact example input
 

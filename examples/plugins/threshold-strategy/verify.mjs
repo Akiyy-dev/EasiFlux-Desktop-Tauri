@@ -28,6 +28,48 @@ assert.equal(command.params.abi, 'strategy-json-v1')
 const moduleBytes = Buffer.from(command.params.moduleBase64, 'base64')
 assert.ok(moduleBytes.length > 0, 'strategy module is empty')
 assert.ok(moduleBytes.length <= 8192, 'strategy module exceeds 8192 decoded bytes')
+
+function readUnsignedLeb(bytes, start) {
+  let value = 0
+  let shift = 0
+  let offset = start
+  while (offset < bytes.length && shift <= 28) {
+    const byte = bytes[offset++]
+    value |= (byte & 0x7f) << shift
+    if ((byte & 0x80) === 0) return { value: value >>> 0, offset }
+    shift += 7
+  }
+  throw new Error('invalid unsigned LEB128 in packaged module')
+}
+
+function inspectNativeSandboxShape(bytes) {
+  assert.deepEqual([...bytes.subarray(0, 8)], [0, 97, 115, 109, 1, 0, 0, 0])
+  let offset = 8
+  let dataSegmentCount = 0
+  let usesBulkMemory = false
+  while (offset < bytes.length) {
+    const sectionId = bytes[offset++]
+    const sectionSize = readUnsignedLeb(bytes, offset)
+    const payloadStart = sectionSize.offset
+    const payloadEnd = payloadStart + sectionSize.value
+    assert.ok(payloadEnd <= bytes.length, 'packaged module section exceeds byte length')
+    if (sectionId === 11) dataSegmentCount = readUnsignedLeb(bytes, payloadStart).value
+    if (sectionId === 10) {
+      for (let index = payloadStart; index + 1 < payloadEnd; index += 1) {
+        if (bytes[index] === 0xfc && bytes[index + 1] === 0x0a) usesBulkMemory = true
+      }
+    }
+    offset = payloadEnd
+  }
+  return { dataSegmentCount, usesBulkMemory }
+}
+
+const nativeShape = inspectNativeSandboxShape(moduleBytes)
+assert.deepEqual(
+  [nativeShape.dataSegmentCount <= 32, !nativeShape.usesBulkMemory],
+  [true, true],
+  `native sandbox shape: ${nativeShape.dataSegmentCount} data segments, bulk memory ${nativeShape.usesBulkMemory}`,
+)
 const module = new WebAssembly.Module(moduleBytes)
 assert.deepEqual(WebAssembly.Module.imports(module), [], 'strategy module unexpectedly imports host authority')
 
@@ -247,4 +289,4 @@ assert.throws(
   WebAssembly.RuntimeError,
 )
 
-console.log(`threshold-strategy fixture: 17 behavior checks passed; module ${moduleBytes.length} bytes; manifest ${manifestBytes.length} bytes`)
+console.log(`threshold-strategy fixture: 17 behavior checks passed; module ${moduleBytes.length} bytes; manifest ${manifestBytes.length} bytes; data segments ${nativeShape.dataSegmentCount}; bulk memory ${nativeShape.usesBulkMemory}`)

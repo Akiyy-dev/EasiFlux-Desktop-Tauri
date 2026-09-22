@@ -45,6 +45,18 @@ alloc(length: i32) -> i32
 run(context_ptr: i32, context_len: i32, input_ptr: i32, input_len: i32) -> i64
 ```
 
+The native Wasmi preflight is narrower than a browser/Node WebAssembly engine.
+It permits no imports, start function, tables, elements, tags, or unknown
+sections; at most 128 types/functions/code bodies, 64 globals, 32 exports, and
+32 data segments; and exactly one non-shared 32-bit memory with initial and
+declared maximum no greater than 16 pages. Function signatures are capped at 16
+parameters and one result, and each body at 256 local declarations/locals.
+Bulk-memory instructions (including `memory.copy`) and mutable globals,
+multi-memory/value, reference types, tail calls, sign-extension, saturating
+float conversion, extended constants, custom page sizes, and wide arithmetic
+are disabled. Authors must verify with the native sandbox, not infer compatibility
+from Node/browser instantiation alone.
+
 The packed result uses the unsigned high 32 bits for the output pointer and low
 32 bits for its length. Existing sandbox limits remain 1 MiB memory, 2,000,000
 fuel, and a two-second callback deadline. Input JSON is an object up to 4,096
