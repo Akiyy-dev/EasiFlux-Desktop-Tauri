@@ -126,6 +126,9 @@ stop a run: an owned worker accounts for its receipt first. `stopping`/pause-pen
 remains visible until it drains. Stop does not imply that exchange orders were cancelled
 or positions closed. No implicit cancellation, liquidation or restart is authorized.
 Emergency stop applies to every run even if account is disconnected or plugin removed.
+Control intent also invalidates already-issued start/resume tickets and queued starts
+through a native supervisor admission epoch: an earlier queued start must not resurrect
+a run after pause/stop-all returns. Fresh explicit starts require a freshly issued ticket.
 The UI warns that outstanding exchange orders remain and displays the last receipt.
 App exit requests revoke admission before scheduler shutdown. Drain owned workers within
 the existing bounded shutdown path where possible; forceful termination leaves durable
@@ -147,7 +150,8 @@ tests use workspace-owned temporary paths. No arbitrary path comes from IPC or g
 
 The file snapshot is bounded to 16 MiB with monotonic revision. Atomic writes fsync the
 new candidate before publishing. Load examines main/temp/backup, validates every
-present candidate, and chooses the highest revision, never silently downgrading to an
+present candidate (including pending variants when using SafePluginDocument), and
+chooses the highest revision, never silently downgrading to an
 older state. Any malformed candidate, contradictory same revision, symlink/reparse
 target, invalid record, or ambiguous intent makes strategy trading unavailable. Do not
 reuse config_persistence::load's first-valid fallback semantics for trading authority.
@@ -218,6 +222,16 @@ StrategyReceipt exact fields:
 `sequence:string, kind:"placeOrder"|"cancelOrder", status:"accepted"|"rejected"|"unknown",
 submissionId:string|null, orderId:string|null, errorCode:string|null`.
 Only closed sanitized error codes are exposed. Accepted never means filled or profit.
+
+`reason` is null or one of `plugin_strategy_paused`, `plugin_strategy_stopped`,
+`plugin_strategy_restarted`, `plugin_strategy_expired`, `plugin_strategy_limit_reached`,
+`plugin_strategy_stale`, `plugin_strategy_data_unavailable`, `plugin_strategy_compute_failed`,
+`plugin_strategy_invalid_output`, `plugin_strategy_recovery_required`,
+`plugin_strategy_storage_unavailable`, `plugin_strategy_ack_failed`,
+`plugin_strategy_unavailable`. Receipt `errorCode` is null or
+`plugin_strategy_rejected` / `plugin_strategy_unknown`. Do not serialize raw errors
+into either field. IPC rejection codes may separately describe invalid input,
+denied authority, expired tickets, capacity or busy admission.
 
 ## User interface
 

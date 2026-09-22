@@ -125,3 +125,49 @@ Node engine alone is not used to claim native compatibility.
 The stable manifest was also shared with the frontend implementer for strict
 parser acceptance. Broad Rust/frontend/CI, CodeQL, native smoke, production app,
 real-account, installer, and release tests were not run by the example task.
+
+## Integrated native and frontend evidence
+
+The native implementation's final focused runs use injected hosts, temporary
+strategy/submission journals and the real Wasmi engine. All Cargo commands use
+`--locked --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target`:
+
+| Command/filter | Result |
+| --- | --- |
+| `cargo test ... plugin::strategy --lib` | 40 passed, 0 failed |
+| `cargo test ... plugin:: --lib` | 426 passed, 0 failed, 2 ignored subprocess helpers |
+| `cargo test ... capability_tests --lib` | 6 passed |
+| `cargo test ... events::emitter::tests::native_strategy_wake --lib` | 1 passed |
+| `cargo test ... services::order_submission --lib` | 9 passed |
+| `cargo test ... storage::safe_plugin_document --lib` | 21 passed |
+| `cargo check ... --features plugin-smoke --bin plugin-smoke` | Exit 0; compile only |
+
+The production adapter's focused tests also passed (16 tests, including existing
+v5 coverage). The two ignored plugin cases are subprocess entry points exercised
+by their parent crash tests, not skipped strategy behavior. Test builds retain
+37 existing warnings; the smoke feature check reports 62 dead-code warnings.
+
+Fail-first native tests caught and verified fixes for stopping during the final
+authority read, stopping during durable publication, lock-blocked shutdown
+drain, frozen/rolled-back wall clocks renewing expiry, completed runs becoming
+resumable, and malformed or contradictory durable candidates. Pending intent
+and quantity/action debit precede dispatch; receipt and ownership precede
+submission acknowledgement. Unknown actions are never automatically replayed.
+
+Frontend verification used mocked Tauri IPC only:
+
+- Initial focused integration: 11 Vitest files, 625 tests passed.
+- Independent-review fix round: two focused Vitest files, 33 tests passed.
+  Previously failing cases cover emergency stop during access/start/reconcile,
+  stale refresh cleanup, required capabilities, fixed lifetime and monotonic
+  resume counters.
+- `vue-tsc --noEmit` and scoped ESLint exited 0 after those fixes.
+- Final `vite build` exited 0 (4,775 modules). Vite retains its advisory warning
+  about the existing large application chunk; no installer was built.
+- The example verifier now rejects impossible context/receipt chronology; the
+  corrected fixture still passes all 17 actual execution cases and source parity.
+
+Independent native and whole-branch review, broad cross-platform CI and CodeQL
+are separate merge gates; local focused results alone do not claim those gates
+passed. Native-window acceptance, real-account testing and release remain outside
+this verification.
