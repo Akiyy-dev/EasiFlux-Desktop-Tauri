@@ -46,7 +46,15 @@ impl StrategySupervisor {
                 Err(_) => return,
             };
             if let Err(code) = self.clock_check(live, &record) {
-                self.mark(id, StrategyStatus::Completed, code);
+                self.mark(
+                    id,
+                    if code == "plugin_strategy_expired" {
+                        StrategyStatus::Completed
+                    } else {
+                        StrategyStatus::Paused
+                    },
+                    code,
+                );
                 return;
             }
             match self.pass(id, live, event).await {
@@ -186,6 +194,10 @@ impl StrategySupervisor {
             lease.cancel.store(true, Ordering::Release);
             return Err(error("plugin_strategy_stale"));
         }
+        // The oldest input used by this decision must remain fresh all the way
+        // through compute, gate waits, fsync and downstream quote/risk preparation.
+        let observed = Instant::now();
+        let observed_wall = self.host.now_ms();
         let snapshot = self.fresh(live, &record).await?;
         let sequence = workflow::counter(&record.view.sequence)?
             .checked_add(1)
@@ -237,14 +249,14 @@ impl StrategySupervisor {
         let _op = tokio::select! {biased;_=live.signal.notified()=>return Err(error("plugin_strategy_stale")),guard=self.runtime.strategy_gate()=>guard};
         let _account = tokio::select! {biased;_=live.signal.notified()=>return Err(error("plugin_strategy_stale")),guard=self.host.lifecycle().mutation_guard()=>guard};
         self.check_binding(live).await?;
-        self.clock_check(live, &record).map_err(error)?;
+        self.check_dispatch(live, &record, observed, observed_wall)?;
         let fresh = if matches!(output.action, StrategyAction::CancelOrder { .. }) {
             Some(self.fresh(live, &record).await?)
         } else {
             None
         };
         self.check_binding(live).await?;
-        self.clock_check(live, &record).map_err(error)?;
+        self.check_dispatch(live, &record, observed, observed_wall)?;
         let action = validate_action(output.action, &record, fresh.as_ref().unwrap_or(&snapshot))?;
         let pending = {
             let mut inner = self.lock()?;
@@ -323,7 +335,7 @@ impl StrategySupervisor {
         if let Err(failure) = self
             .check_binding(live)
             .await
-            .and_then(|_| self.clock_check(live, &record).map_err(error))
+            .and_then(|_| self.check_dispatch(live, &record, observed, observed_wall))
         {
             self.account_response(
                 id,
@@ -339,6 +351,20 @@ impl StrategySupervisor {
             account_id: live.authority.account.account_id.clone(),
             session_epoch: workflow::counter(&live.authority.account.session_epoch)?,
         };
+        let denied = std::sync::Mutex::new(None);
+        let admission = || match self.check_dispatch(live, &record, observed, observed_wall) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                *denied
+                    .lock()
+                    .map_err(|_| error("plugin_strategy_unavailable"))? = Some(failure);
+                // Definitely no mutation API hand-off: submit_once may close its
+                // own intent as rejected, while the strategy's caps stay spent.
+                Err(AppError::OrderSubmissionRejected(
+                    "strategy admission revoked".into(),
+                ))
+            }
+        };
         let response = match &pending.action {
             StrategyAction::PlaceOrder { order } => {
                 let id = pending
@@ -346,32 +372,64 @@ impl StrategySupervisor {
                     .clone()
                     .ok_or_else(|| error("plugin_strategy_unavailable"))?;
                 self.host
-                    .place_locked(
+                    .strategy_place_locked(
                         SubmissionContext {
                             submission_id: id.clone(),
                             account_id: context.account_id,
                             session_epoch: context.session_epoch,
                         },
                         placement(order, id),
+                        &admission,
                     )
                     .await
             }
             StrategyAction::CancelOrder { order } => {
                 self.host
-                    .cancel_locked(
+                    .strategy_cancel_locked(
                         context,
                         CancelOrderRequest {
                             symbol: order.symbol.clone(),
                             order_id: Some(order.order_id.clone()),
                             order_link_id: None,
                         },
+                        &admission,
                     )
                     .await
             }
             _ => unreachable!(),
         };
         self.account_response(id, &pending, response).await?;
+        if let Some(failure) = denied
+            .into_inner()
+            .map_err(|_| error("plugin_strategy_unavailable"))?
+        {
+            return Err(failure);
+        }
         Ok(live.admitted() && self.state(id)?.pending.is_none())
+    }
+    fn check_dispatch(
+        &self,
+        live: &Live,
+        record: &RunRecord,
+        observed: Instant,
+        observed_wall: u64,
+    ) -> AppResult<()> {
+        self.clock_check(live, record).map_err(error)?;
+        if observed.elapsed() > Duration::from_secs(30)
+            || self
+                .host
+                .now_ms()
+                .checked_sub(observed_wall)
+                .is_none_or(|age| age > 30000)
+        {
+            return Err(error("plugin_strategy_data_unavailable"));
+        }
+        // These are synchronous native checks. The final call occurs directly
+        // before the mutation API hand-off; later stop drains that admitted call.
+        if self.runtime.strategy_epoch()? != live.epoch || !live.admitted() {
+            return Err(error("plugin_strategy_stale"));
+        }
+        Ok(())
     }
     pub(super) async fn account_response(
         &self,

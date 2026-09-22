@@ -226,6 +226,7 @@ impl StrategyRunView {
                     .checked_add(self.policy.max_run_seconds * 1000)
                     .ok_or_else(|| error("plugin_strategy_storage_unavailable"))?
             || self.actions_submitted > self.policy.max_actions
+            || u64::from(self.actions_submitted) > workflow::counter(&self.sequence)?
             || total < rust_decimal::Decimal::ZERO
             || total > quantity(&self.policy.max_total_qty)?
             || self.last_message.len() > 2000

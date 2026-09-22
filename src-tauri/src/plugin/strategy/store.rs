@@ -178,6 +178,9 @@ impl StrategyDocument {
                             .as_ref()
                             .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
                             || quantity(&order.qty)? > quantity(&r.view.policy.max_order_qty)?
+                            || quantity(&order.qty)?
+                                > rust_decimal::Decimal::from_str_exact(&r.view.total_submitted_qty)
+                                    .map_err(|_| error("plugin_strategy_storage_unavailable"))?
                             || (r.view.policy.reduce_only && !order.reduce_only)
                         {
                             return Err(error("plugin_strategy_storage_unavailable"));

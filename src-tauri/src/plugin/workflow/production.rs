@@ -194,6 +194,41 @@ impl WorkflowHost for ProductionWorkflowHost {
             .await
         })
     }
+    fn strategy_place_locked<'a>(
+        &'a self,
+        context: SubmissionContext,
+        mut request: PlaceOrderRequest,
+        admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, Order> {
+        Box::pin(async move {
+            request.time_in_force =
+                Some(exchange_time_in_force(request.time_in_force.as_deref())?.into());
+            let scope = self.api.order_submission_scope(&context.account_id).await?;
+            crate::services::order_submission::submit_once(
+                &self.submissions,
+                &scope,
+                request,
+                self.time.local_now_ms(),
+                |request| {
+                    self.trading
+                        .place_strategy_order(context, request, admission)
+                },
+            )
+            .await
+        })
+    }
+    fn strategy_cancel_locked<'a>(
+        &'a self,
+        context: SessionContext,
+        request: CancelOrderRequest,
+        admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, Order> {
+        Box::pin(async move {
+            self.trading
+                .cancel_strategy_order(context, request, admission)
+                .await
+        })
+    }
     fn cancel_locked(
         &self,
         context: SessionContext,

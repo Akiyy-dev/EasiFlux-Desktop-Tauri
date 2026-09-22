@@ -129,6 +129,9 @@ struct Fake {
     unknown_cancel: AtomicBool,
     terminal_cancel: AtomicBool,
     after_authority: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    hold_preparation: AtomicBool,
+    preparing: tokio::sync::Notify,
+    prepare_release: tokio::sync::Notify,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -186,8 +189,20 @@ impl WorkflowHost for Fake {
             })
         })
     }
-    fn place_locked(&self, c: SubmissionContext, r: PlaceOrderRequest) -> HostFuture<'_, Order> {
+    fn place_locked(&self, _: SubmissionContext, _: PlaceOrderRequest) -> HostFuture<'_, Order> {
+        panic!("strategies must not use the unguarded v5 placement seam")
+    }
+    fn strategy_place_locked<'a>(
+        &'a self,
+        c: SubmissionContext,
+        r: PlaceOrderRequest,
+        admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, Order> {
         Box::pin(async move {
+            if self.hold_preparation.load(Ordering::SeqCst) {
+                self.preparing.notify_one();
+                self.prepare_release.notified().await;
+            }
             let doc = self.store.load()?;
             let run = &doc.runs[0];
             assert!(run.pending.is_some());
@@ -200,6 +215,7 @@ impl WorkflowHost for Fake {
                 r,
                 self.now_ms(),
                 |r| async move {
+                    admission()?;
                     self.placed.fetch_add(1, Ordering::SeqCst);
                     self.entered.notify_one();
                     if self.hold_http.load(Ordering::SeqCst) {
@@ -217,12 +233,25 @@ impl WorkflowHost for Fake {
             .await
         })
     }
-    fn cancel_locked(&self, _: SessionContext, r: CancelOrderRequest) -> HostFuture<'_, Order> {
+    fn cancel_locked(&self, _: SessionContext, _: CancelOrderRequest) -> HostFuture<'_, Order> {
+        panic!("strategies must not use the unguarded v5 cancellation seam")
+    }
+    fn strategy_cancel_locked<'a>(
+        &'a self,
+        _: SessionContext,
+        r: CancelOrderRequest,
+        admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, Order> {
         Box::pin(async move {
+            if self.hold_preparation.load(Ordering::SeqCst) {
+                self.preparing.notify_one();
+                self.prepare_release.notified().await;
+            }
             let doc = self.store.load()?;
             assert_eq!(doc.runs[0].view.actions_submitted, 2);
             assert!(doc.runs[0].pending.is_some());
             assert_eq!(r.order_id.as_deref(), Some("owned-1"));
+            admission()?;
             self.cancelled.fetch_add(1, Ordering::SeqCst);
             if self.unknown_cancel.load(Ordering::SeqCst) {
                 return Err(AppError::Connection(
@@ -370,6 +399,9 @@ async fn fixture_manifest(m: serde_json::Value) -> Fixture {
         unknown_cancel: AtomicBool::new(false),
         terminal_cancel: AtomicBool::new(true),
         after_authority: Mutex::new(None),
+        hold_preparation: AtomicBool::new(false),
+        preparing: tokio::sync::Notify::new(),
+        prepare_release: tokio::sync::Notify::new(),
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
@@ -1189,4 +1221,168 @@ async fn drain_timeout_remains_pollable_while_persistence_mutex_is_held() {
         "drain blocked the executor on persistence"
     );
     assert_eq!(f.host.acked.load(Ordering::SeqCst), 1);
+}
+
+// Review1: preparation is not mutation admission. Stop, expiry and snapshot age
+// must be checked after preparation, with no replay of the definitely-unsent intent.
+#[tokio::test(start_paused = true)]
+async fn blocked_placement_preparation_rechecks_stop_expiry_and_snapshot_age() {
+    let _serial = SERIAL.lock().await;
+    for cause in ["stop", "expiry", "stale"] {
+        let f = fixture(PLACE, CANCEL).await;
+        f.host.hold_preparation.store(true, Ordering::SeqCst);
+        let mut request = request(f.supervisor.access(f.authority.clone()).await.unwrap());
+        request.policy.max_run_seconds = 60;
+        f.supervisor.start(request).await.unwrap();
+        f.host.preparing.notified().await;
+        let expected = match cause {
+            "stop" => {
+                f.supervisor.stop_all().await.unwrap();
+                StrategyStatus::Stopped
+            }
+            "expiry" => {
+                f.host.now.fetch_add(60001, Ordering::SeqCst);
+                tokio::time::advance(std::time::Duration::from_millis(60001)).await;
+                StrategyStatus::Completed
+            }
+            _ => {
+                f.host.now.fetch_add(30001, Ordering::SeqCst);
+                tokio::time::advance(std::time::Duration::from_millis(30001)).await;
+                StrategyStatus::Paused
+            }
+        };
+        f.host.prepare_release.notify_one();
+        // Let any wrongly admitted HTTP finish, so the assertion detects dispatch
+        // rather than merely testing a transient status before the host resumes.
+        for _ in 0..100_000 {
+            if f.store.load().unwrap().runs[0].pending.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            f.host.placed.load(Ordering::SeqCst),
+            0,
+            "{cause} dispatched after preparation"
+        );
+        let view = status(&f, expected).await;
+        assert_eq!(view.actions_submitted, 1);
+        assert_eq!(view.total_submitted_qty, "0.001");
+        assert_eq!(view.last_receipt.unwrap().status, ReceiptStatus::Rejected);
+        f.supervisor.drain().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_cancellation_preparation_rechecks_stop_before_mutation_handoff() {
+    let _serial = SERIAL.lock().await;
+    let f = fixture(PLACE, CANCEL).await;
+    start(&f).await;
+    settled(&f, "1").await;
+    f.host.hold_preparation.store(true, Ordering::SeqCst);
+    tick(&f).await;
+    f.host.preparing.notified().await;
+    f.supervisor.stop_all().await.unwrap();
+    f.host.prepare_release.notify_one();
+    f.supervisor.drain().await;
+    assert_eq!(f.host.cancelled.load(Ordering::SeqCst), 0);
+    let view = f.supervisor.list().unwrap().runs[0].clone();
+    assert_eq!(view.actions_submitted, 2);
+    assert_eq!(view.last_receipt.unwrap().status, ReceiptStatus::Rejected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_guest_waiting_on_account_gate_cannot_dispatch_old_snapshot_decision() {
+    let _serial = SERIAL.lock().await;
+    let f = fixture(PLACE, CANCEL).await;
+    let held = f.host.lifecycle.read_guard().await;
+    let run = start(&f).await;
+    let mut computed = false;
+    for _ in 0..100_000 {
+        computed = f.host.reads.load(Ordering::SeqCst) > 0
+            && f.supervisor.lock().unwrap().live[&run.run_id]
+                .cancel
+                .lock()
+                .unwrap()
+                .is_none();
+        if computed {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(computed, "guest did not finish behind the account gate");
+    f.host.now.fetch_add(30001, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_millis(30001)).await;
+    drop(held);
+    for _ in 0..100_000 {
+        let v = f.supervisor.list().unwrap().runs[0].clone();
+        if v.status != StrategyStatus::Running || v.sequence == "1" {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(f.host.placed.load(Ordering::SeqCst), 0);
+    let view = status(&f, StrategyStatus::Paused).await;
+    assert_eq!(
+        view.reason.as_deref(),
+        Some("plugin_strategy_data_unavailable")
+    );
+    assert_eq!(view.actions_submitted, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn real_pending_document_with_missing_quantity_debit_or_impossible_sequence_disables_authority(
+) {
+    let _serial = SERIAL.lock().await;
+    for corruption in ["quantity", "sequence"] {
+        let f = fixture(PLACE, CANCEL).await;
+        f.host.unknown.store(true, Ordering::SeqCst);
+        start(&f).await;
+        status(&f, StrategyStatus::RecoveryRequired).await;
+        f.supervisor.drain().await;
+        let mut doc = f.store.load().unwrap();
+        assert!(doc.runs[0].pending.is_some());
+        if corruption == "quantity" {
+            doc.runs[0].view.total_submitted_qty = "0".into();
+        } else {
+            doc.runs[0].view.sequence = "0".into();
+            doc.runs[0].view.last_receipt.as_mut().unwrap().sequence = "0".into();
+            doc.runs[0].pending.as_mut().unwrap().sequence = "0".into();
+        }
+        std::fs::write(
+            f._temp.0.join("journal/strategy.json"),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
+        let restarted = StrategySupervisor::new(
+            f.runtime.clone(),
+            f.host.clone(),
+            f.store.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        assert!(
+            restarted.list().is_err(),
+            "{corruption} corruption loaded as authority"
+        );
+        assert!(restarted.access(f.authority.clone()).await.is_err());
+        assert_eq!(f.host.placed.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn rollback_after_start_commit_before_first_pass_pauses_without_completing() {
+    let _serial = SERIAL.lock().await;
+    let f = fixture(PLACE, CANCEL).await;
+    let host = Arc::downgrade(&f.host);
+    *f.store.after_write.lock().unwrap() = Some(Arc::new(move |index| {
+        if index == 0 {
+            host.upgrade().unwrap().now.store(0, Ordering::SeqCst);
+        }
+    }));
+    start(&f).await;
+    f.supervisor.drain().await;
+    let view = f.supervisor.list().unwrap().runs[0].clone();
+    assert_eq!(view.status, StrategyStatus::Paused);
+    assert_eq!(view.reason.as_deref(), Some("plugin_strategy_stale"));
+    assert_eq!(f.host.placed.load(Ordering::SeqCst), 0);
 }

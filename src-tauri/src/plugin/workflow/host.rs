@@ -24,6 +24,22 @@ pub(crate) trait WorkflowHost: Send + Sync {
     fn lifecycle(&self) -> &AccountLifecycleCoordinator;
     fn now_ms(&self) -> u64;
     // Separate unattended-trading durability seams; v5 hosts never acquire this authority.
+    fn strategy_place_locked<'a>(
+        &'a self,
+        _context: SubmissionContext,
+        _request: PlaceOrderRequest,
+        _admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, Order> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
+    fn strategy_cancel_locked<'a>(
+        &'a self,
+        _context: SessionContext,
+        _request: CancelOrderRequest,
+        _admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, Order> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
     fn strategy_scope_locked(&self) -> HostFuture<'_, String> {
         Box::pin(async { Err(error("plugin_strategy_unavailable")) })
     }
