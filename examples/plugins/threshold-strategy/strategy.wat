@@ -23,6 +23,9 @@
   (data (i32.const 1392) "false")
   (data (i32.const 1408) "{}")
   (data (i32.const 1424) "null")
+  (data (i32.const 1536) "{\"orderId\":\"")
+  (data (i32.const 1664) "\",\"phase\":\"awaitingOrder\"},\"lastReceipt\":")
+  (data (i32.const 1792) "\",\"phase\":\"cancelRequested\"},\"lastReceipt\":")
 
   ;; Host-owned context tokens.
   (data (i32.const 2048) "\"state\":")
@@ -317,6 +320,7 @@
     (local $value i32) (local $value_len i32)
     (local $position i32) (local $reduce_only i32)
     (local $state i32) (local $state_value i32) (local $phase i32) (local $receipt i32)
+    (local $sorted_state i32)
     (local $owned_id i32) (local $owned_id_len i32)
     (local $market i32) (local $market_symbol i32) (local $market_symbol_len i32)
     (local $last_price i32) (local $last_price_len i32)
@@ -481,14 +485,21 @@
               i32.const 3 local.set $phase
               local.get $state_value i32.const 38 i32.add local.set $owned_id
             else
-              local.get $state_value i32.const 2688 i32.const 16 call $matches
+              local.get $state_value i32.const 1536 i32.const 12 call $matches
               if
-                i32.const 4 local.set $phase
-                local.get $state_value i32.const 16 i32.add local.set $cursor
-                local.get $cursor i32.const 2816 i32.const 15 call $require
-                local.get $cursor i32.const 15 i32.add local.set $receipt
+                i32.const 1 local.set $sorted_state
+                i32.const 2 local.set $phase
+                local.get $state_value i32.const 12 i32.add local.set $owned_id
               else
-                unreachable
+                local.get $state_value i32.const 2688 i32.const 16 call $matches
+                if
+                  i32.const 4 local.set $phase
+                  local.get $state_value i32.const 16 i32.add local.set $cursor
+                  local.get $cursor i32.const 2816 i32.const 15 call $require
+                  local.get $cursor i32.const 15 i32.add local.set $receipt
+                else
+                  unreachable
+                end
               end
             end
           end
@@ -499,8 +510,21 @@
             local.get $owned_id local.get $owned_id_len call $valid_id i32.eqz
             if unreachable end
             local.get $owned_id local.get $owned_id_len i32.add local.set $cursor
-            local.get $cursor i32.const 2944 i32.const 17 call $require
-            local.get $cursor i32.const 17 i32.add local.set $receipt
+            local.get $sorted_state
+            if
+              local.get $cursor i32.const 1664 i32.const 41 call $matches
+              if
+                i32.const 2 local.set $phase
+                local.get $cursor i32.const 41 i32.add local.set $receipt
+              else
+                local.get $cursor i32.const 1792 i32.const 43 call $require
+                i32.const 3 local.set $phase
+                local.get $cursor i32.const 43 i32.add local.set $receipt
+              end
+            else
+              local.get $cursor i32.const 2944 i32.const 17 call $require
+              local.get $cursor i32.const 17 i32.add local.set $receipt
+            end
           end
         end
       end

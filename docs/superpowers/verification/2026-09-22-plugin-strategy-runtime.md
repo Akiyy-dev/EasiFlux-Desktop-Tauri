@@ -34,7 +34,7 @@ Final source parity:
 ```text
 src-tauri\target\debug\examples\build_threshold_strategy_manifest.exe --check
 verified ...\examples\plugins\threshold-strategy\manifest.json
-(module 5899 bytes, manifest 8951 bytes)
+(module 6105 bytes, manifest 9223 bytes)
 exit 0
 ```
 
@@ -48,7 +48,7 @@ Final executable behavior:
 
 ```text
 node examples/plugins/threshold-strategy/verify.mjs
-threshold-strategy fixture: 14 behavior checks passed; module 5899 bytes; manifest 8951 bytes
+threshold-strategy fixture: 17 behavior checks passed; module 6105 bytes; manifest 9223 bytes
 exit 0
 ```
 
@@ -59,11 +59,28 @@ cases cover below threshold, threshold crossing with the configured order,
 threshold parameter dependence, null/rejected/accepted placement receipts with
 no duplicate placement, invisible/wrong owned order, exact visible owned-order
 cancellation, later stop state, malformed input, unrelated action-field
-injection, and input over the guest's 4,096-byte bound.
+injection, input over the guest's 4,096-byte bound, and both known persisted
+state key orders across chained callbacks.
 
-The decoded module is 5,899 bytes (limit 8,192) and `manifest.json` is 8,951
+The decoded module is 6,105 bytes (limit 8,192) and `manifest.json` is 9,223
 bytes (limit 16,384). The generator uses the locked `wat` dependency, accepts
 only `--check`/`--write`, and reads the fixed example path.
+
+## Persisted state key-order integration fix
+
+Actual injected native-loop execution parsed guest state into
+`serde_json::Value` and reserialized it as `{"orderId":...,"phase":...}`.
+The original WAT accepted only `{"phase":...,"orderId":...}` and trapped after
+the accepted placement callback. JSON object key order is not an authority or ABI
+guarantee.
+
+Before changing the WAT, the Node verifier was extended to recursively normalize
+every persisted object key between real callback outputs. The next callback then
+reproduced `RuntimeError: unreachable` at the normalized awaiting state. The WAT
+now accepts both exact known key orders for `awaitingOrder` and
+`cancelRequested`, while continuing to reject unknown fields and state shapes.
+The 17-case GREEN above covers both orders through
+accepted -> awaiting -> cancel -> cancelRequested -> stop.
 
 JavaScript syntax checks also passed:
 

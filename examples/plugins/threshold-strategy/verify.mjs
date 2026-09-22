@@ -145,6 +145,16 @@ function activeOrder(orderId, status = 'New') {
   }
 }
 
+function normalizePersistedState(value) {
+  if (Array.isArray(value)) return value.map(normalizePersistedState)
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value).sort().map(key => [key, normalizePersistedState(value[key])]),
+    )
+  }
+  return value
+}
+
 assert.deepEqual(execute(contextAt('99'), parameters), {
   state: { phase: 'waiting' },
   action: { kind: 'none' },
@@ -170,7 +180,8 @@ assert.deepEqual(execute(contextAt('102', placed, rejectedPlacement()), paramete
   action: { kind: 'stop' },
   message: 'Placement was not accepted; stopping the example.',
 })
-assert.deepEqual(execute(contextAt('102', placed, acceptedPlacement('owned-123')), parameters), {
+const acceptedResult = execute(contextAt('102', placed, acceptedPlacement('owned-123')), parameters)
+assert.deepEqual(acceptedResult, {
   state: { phase: 'awaitingOrder', orderId: 'owned-123' },
   action: { kind: 'none' },
   message: 'Placement accepted; waiting for the owned active order.',
@@ -200,6 +211,29 @@ assert.deepEqual(
   },
 )
 
+const normalizedAwaiting = normalizePersistedState(acceptedResult.state)
+assert.equal(
+  execute(contextAt('102', normalizedAwaiting, acceptedPlacement('owned-123')), parameters).action.kind,
+  'none',
+)
+const normalizedCancelResult = execute(
+  contextAt('102', normalizedAwaiting, acceptedPlacement('owned-123'), [activeOrder('owned-123')]),
+  parameters,
+)
+assert.deepEqual(normalizedCancelResult, {
+  state: { phase: 'cancelRequested', orderId: 'owned-123' },
+  action: { kind: 'cancelOrder', order: { symbol: 'BTCUSDT', orderId: 'owned-123' } },
+  message: 'Owned active order is visible; requesting one cancellation.',
+})
+assert.deepEqual(
+  execute(contextAt('102', normalizePersistedState(normalizedCancelResult.state)), parameters),
+  {
+    state: { phase: 'done' },
+    action: { kind: 'stop' },
+    message: 'Cancellation was requested; stopping the example.',
+  },
+)
+
 assert.throws(() => execute(contextAt('101'), '{"threshold":"100"}'), WebAssembly.RuntimeError)
 assert.throws(
   () => execute(
@@ -213,4 +247,4 @@ assert.throws(
   WebAssembly.RuntimeError,
 )
 
-console.log(`threshold-strategy fixture: 14 behavior checks passed; module ${moduleBytes.length} bytes; manifest ${manifestBytes.length} bytes`)
+console.log(`threshold-strategy fixture: 17 behavior checks passed; module ${moduleBytes.length} bytes; manifest ${manifestBytes.length} bytes`)

@@ -51,6 +51,10 @@ fuel, and a two-second callback deadline. Input JSON is an object up to 4,096
 UTF-8 bytes; context is at most 65,536 bytes; output is at most 16,384 bytes; the
 serialized guest `state` object is at most 4,096 bytes.
 
+JSON object key order is not part of the state contract. A guest must parse its
+known state fields structurally, or accept all exact known serializations, rather
+than treating insertion order as authority. Unknown state fields still fail closed.
+
 The context is exactly:
 
 ```text

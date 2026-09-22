@@ -31,7 +31,7 @@ path and uses the repository's pinned `wat` dependency. `verify.mjs` instantiate
 the packaged bytes with no imports and supplies only synthetic context, state,
 receipts, and snapshots. It performs no account, keychain, network, or trade I/O.
 
-The checked-in module is 5,899 decoded bytes and the manifest is 8,951 bytes,
+The checked-in module is 6,105 decoded bytes and the manifest is 9,223 bytes,
 within the 8,192-byte module and 16 KiB manifest limits.
 
 ## Configure the compact example input
@@ -50,6 +50,11 @@ The opening/reduce-only pairing must remain valid: Buy/1 or Sell/2 opens;
 Sell/1 or Buy/2 is reduce-only. The host independently parses, normalizes, and
 enforces every action and all run limits. Unsupported formatting or fields trap
 the guest and the host fails the run closed.
+
+The host may reserialize saved `state` objects with their keys in a different
+order. The guest accepts both exact known layouts for its two order-owning states
+(`phase` first or `orderId` first); it does not treat key order as authority and
+still rejects unknown state fields or shapes.
 
 ## Try it deliberately
 
