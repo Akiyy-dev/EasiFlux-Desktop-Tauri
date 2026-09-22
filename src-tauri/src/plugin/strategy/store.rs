@@ -197,6 +197,33 @@ impl StrategyDocument {
                     _ => return Err(error("plugin_strategy_storage_unavailable")),
                 }
             }
+            if let Some(receipt) = r
+                .view
+                .last_receipt
+                .as_ref()
+                .filter(|receipt| receipt.status == ReceiptStatus::Unknown)
+            {
+                // Unknown is authority-bearing: without the exact unresolved
+                // intent a restart could admit trading instead of recovery.
+                let pending = r
+                    .pending
+                    .as_ref()
+                    .ok_or_else(|| error("plugin_strategy_storage_unavailable"))?;
+                let (kind, order_id) = match &pending.action {
+                    StrategyAction::PlaceOrder { .. } => (ReceiptKind::PlaceOrder, None),
+                    StrategyAction::CancelOrder { order } => {
+                        (ReceiptKind::CancelOrder, Some(order.order_id.as_str()))
+                    }
+                    _ => return Err(error("plugin_strategy_storage_unavailable")),
+                };
+                if receipt.sequence != pending.sequence
+                    || receipt.kind != kind
+                    || receipt.submission_id != pending.submission_id
+                    || receipt.order_id.as_deref() != order_id
+                {
+                    return Err(error("plugin_strategy_storage_unavailable"));
+                }
+            }
         }
         Ok(())
     }

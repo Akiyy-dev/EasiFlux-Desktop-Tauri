@@ -37,6 +37,7 @@ impl StrategySupervisor {
     }
     async fn worker_loop(&self, id: &str, live: &Arc<Live>, resume: bool) {
         let mut event = if resume { "update" } else { "start" };
+        let mut initial_callback_pending = true;
         loop {
             if !live.admitted() {
                 return;
@@ -59,7 +60,7 @@ impl StrategySupervisor {
             }
             match self.pass(id, live, event).await {
                 Ok(false) => return,
-                Ok(true) => {}
+                Ok(true) => initial_callback_pending = false,
                 Err(AppError::Plugin {
                     code: "plugin_strategy_busy",
                     ..
@@ -93,7 +94,11 @@ impl StrategySupervisor {
             let wall = self.host.now_ms();
             let interval = Duration::from_millis(record.view.policy.interval_ms);
             let deadline = completed + interval;
-            event = "timer";
+            // Busy gates/compute slots did not invoke the guest. Preserve its
+            // required first event until an actual callback has completed.
+            if !initial_callback_pending {
+                event = "timer";
+            }
             loop {
                 if !live.admitted() {
                     return;
@@ -101,7 +106,7 @@ impl StrategySupervisor {
                 tokio::select! {biased;
                     _=live.signal.notified()=>{if !live.admitted(){return;}}
                     _=tokio::time::sleep_until(deadline)=>break,
-                    _=self.wake.notified()=>{event="update";}
+                    _=self.wake.notified()=>{if !initial_callback_pending {event="update";}}
                 }
             }
             let max_gap = 30000.max(record.view.policy.interval_ms * 3);

@@ -1386,3 +1386,315 @@ async fn rollback_after_start_commit_before_first_pass_pauses_without_completing
     assert_eq!(view.reason.as_deref(), Some("plugin_strategy_stale"));
     assert_eq!(f.host.placed.load(Ordering::SeqCst), 0);
 }
+
+// Break: an unknown receipt loses its blocking pending identity after restart.
+#[tokio::test(start_paused = true)]
+async fn final_review_unknown_receipt_requires_matching_persisted_pending_identity() {
+    let _serial = SERIAL.lock().await;
+    let mut accepted_corruptions = Vec::new();
+    for cancellation in [true, false] {
+        let f = fixture(PLACE, CANCEL).await;
+        f.host.unknown.store(!cancellation, Ordering::SeqCst);
+        start(&f).await;
+        if cancellation {
+            settled(&f, "1").await;
+            f.host.unknown_cancel.store(true, Ordering::SeqCst);
+            tick(&f).await;
+        }
+        status(&f, StrategyStatus::RecoveryRequired).await;
+        f.supervisor.drain().await;
+        let original = f.store.load().unwrap();
+        assert_eq!(
+            original.runs[0].view.last_receipt.as_ref().unwrap().status,
+            ReceiptStatus::Unknown,
+        );
+        assert!(original.runs[0].pending.is_some());
+        let start_request = request(f.supervisor.access(f.authority.clone()).await.unwrap());
+        for corruption in ["missing", "sequence", "kind", "submission", "exchange"] {
+            let root = Temp::new();
+            let mut doc = original.clone();
+            let record = &mut doc.runs[0];
+            let receipt = record.view.last_receipt.as_mut().unwrap();
+            match corruption {
+                "missing" => record.pending = None,
+                "sequence" => receipt.sequence = "0".into(),
+                "kind" => {
+                    receipt.kind = if cancellation {
+                        ReceiptKind::PlaceOrder
+                    } else {
+                        ReceiptKind::CancelOrder
+                    };
+                    receipt.submission_id = cancellation.then(|| uuid::Uuid::new_v4().to_string());
+                }
+                "submission" if cancellation => receipt.order_id = None,
+                "submission" => receipt.submission_id = Some(uuid::Uuid::new_v4().to_string()),
+                "exchange" => receipt.order_id = Some("different-order".into()),
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                root.0.join("strategy.json"),
+                serde_json::to_vec(&doc).unwrap(),
+            )
+            .unwrap();
+            let restarted = StrategySupervisor::new(
+                f.runtime.clone(),
+                f.host.clone(),
+                Arc::new(FileStrategyStore::new(root.0.clone())),
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            let access_denied = matches!(
+                restarted.access(f.authority.clone()).await,
+                Err(AppError::Plugin {
+                    code: "plugin_strategy_storage_unavailable",
+                    ..
+                })
+            );
+            let start_denied = matches!(
+                restarted.start(start_request.clone()).await,
+                Err(AppError::Plugin {
+                    code: "plugin_strategy_storage_unavailable",
+                    ..
+                })
+            );
+            if !access_denied || !start_denied || restarted.list().is_ok() {
+                accepted_corruptions.push(format!("cancel={cancellation}/{corruption}"));
+            }
+        }
+        assert_eq!(f.host.placed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.host.cancelled.load(Ordering::SeqCst),
+            usize::from(cancellation)
+        );
+    }
+    assert!(
+        accepted_corruptions.is_empty(),
+        "accepted: {accepted_corruptions:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_review_preserves_prior_resolved_receipts_and_accepted_unacknowledged_transitions() {
+    let _serial = SERIAL.lock().await;
+    for rejected in [false, true] {
+        let f = fixture(PLACE, PLACE).await;
+        f.host.rejected.store(rejected, Ordering::SeqCst);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let snapshots = captured.clone();
+        let store = Arc::downgrade(&f.store);
+        let supervisor = Arc::downgrade(&f.supervisor);
+        *f.store.after_write.lock().unwrap() = Some(Arc::new(move |_| {
+            let document = store.upgrade().unwrap().file.load().unwrap();
+            let run = &document.runs[0];
+            if run.pending.is_some() && run.view.last_receipt.is_some() {
+                snapshots.lock().unwrap().push(document.clone());
+            }
+            // Preserve the exact next-intent image without dispatching a second
+            // synthetic placement. The first response and acknowledgement are real.
+            if run.pending.is_some() && run.view.actions_submitted == 2 {
+                supervisor.upgrade().unwrap().revoke_for_exit();
+            }
+        }));
+        start(&f).await;
+        settled(&f, "1").await;
+        tick(&f).await;
+        f.supervisor.drain().await;
+        let snapshots = captured.lock().unwrap().clone();
+        assert_eq!(snapshots.len(), if rejected { 1 } else { 2 });
+        for snapshot in snapshots {
+            let run = &snapshot.runs[0];
+            let receipt = run.view.last_receipt.as_ref().unwrap();
+            assert_eq!(receipt.sequence, "1");
+            assert_eq!(
+                receipt.status,
+                if rejected {
+                    ReceiptStatus::Rejected
+                } else {
+                    ReceiptStatus::Accepted
+                }
+            );
+            assert_eq!(
+                run.pending.as_ref().unwrap().sequence,
+                if run.view.actions_submitted == 1 {
+                    "1"
+                } else {
+                    "2"
+                }
+            );
+            let root = Temp::new();
+            std::fs::write(
+                root.0.join("strategy.json"),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+            let restarted = StrategySupervisor::new(
+                f.runtime.clone(),
+                f.host.clone(),
+                Arc::new(FileStrategyStore::new(root.0.clone())),
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            assert_eq!(
+                restarted.list().unwrap().runs[0].status,
+                StrategyStatus::RecoveryRequired
+            );
+            let access = restarted.access(f.authority.clone()).await.unwrap();
+            assert!(matches!(
+                restarted.start(request(access)).await,
+                Err(AppError::Plugin {
+                    code: "plugin_strategy_recovery_required",
+                    ..
+                })
+            ));
+        }
+        assert_eq!(f.host.placed.load(Ordering::SeqCst), 1);
+    }
+}
+
+fn event_guest() -> Vec<u8> {
+    let output =
+        |event: &str| format!(r#"{{"state":{{}},"action":{{"kind":"none"}},"message":"{event}"}}"#);
+    let start = output("start");
+    let update = output("update");
+    let timer = output("timer");
+    let escape = |s: &str| s.bytes().map(|b| format!("\\{b:02x}")).collect::<String>();
+    wat::parse_str(format!(
+        r#"(module (memory (export "memory") 16 16)
+      (data (i32.const 0) "{}{}{}")
+      (func (export "alloc") (param i32) (result i32)
+        local.get 0 i32.const 4096 i32.gt_u if (result i32)
+          i32.const 32768 else local.get 0 i32.const 4096 i32.add end)
+      (func (export "run") (param $c i32) (param $n i32) (param i32 i32) (result i64) (local $i i32)
+        (block $done (loop $scan
+          local.get $i local.get $n i32.const 10 i32.sub i32.ge_u br_if $done
+          local.get $c local.get $i i32.add i64.load align=1 i64.const {} i64.eq
+          if
+            local.get $c local.get $i i32.add i32.const 9 i32.add i32.load8_u i32.const 115 i32.eq
+            if i64.const {} return end
+            local.get $c local.get $i i32.add i32.const 9 i32.add i32.load8_u i32.const 117 i32.eq
+            if i64.const {} return end
+          end
+          local.get $i i32.const 1 i32.add local.set $i br $scan))
+        i64.const {}))"#,
+        escape(&start),
+        escape(&update),
+        escape(&timer),
+        u64::from_le_bytes(*b"\"event\":"),
+        start.len(),
+        ((start.len() as u64) << 32) | update.len() as u64,
+        (((start.len() + update.len()) as u64) << 32) | timer.len() as u64,
+    ))
+    .unwrap()
+}
+
+async fn initial_event_survives_busy(resume: bool) {
+    let mut wrong_events = Vec::new();
+    for operation_gate in [false, true] {
+        for wake in [false, true] {
+            let mut manifest = super::manifest();
+            manifest["requestedCapabilities"] = json!(CAPS);
+            manifest["contributions"][0]["params"]["moduleBase64"] =
+                json!(STANDARD.encode(event_guest()));
+            let f = fixture_manifest(manifest).await;
+            let mut resume_run_id = None;
+            if resume {
+                let run = start(&f).await;
+                assert_eq!(settled(&f, "1").await.last_message, "start");
+                f.supervisor
+                    .control(StrategyControlRequest {
+                        run_id: run.run_id.clone(),
+                        action: ControlAction::Pause,
+                    })
+                    .await
+                    .unwrap();
+                f.supervisor.drain().await;
+                resume_run_id = Some(run.run_id);
+            }
+            let mut request = request(f.supervisor.access(f.authority.clone()).await.unwrap());
+            request.resume_run_id = resume_run_id;
+            let authorities = Arc::new(AtomicUsize::new(0));
+            let count = authorities.clone();
+            *f.host.after_authority.lock().unwrap() = Some(Arc::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            }));
+            let mut lease = Some(f.runtime.strategy_compute("busy-test-owner").unwrap());
+            f.supervisor.start(request).await.unwrap();
+            for _ in 0..100_000 {
+                if authorities.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                authorities.load(Ordering::SeqCst) >= 2,
+                "worker did not reach occupied compute lease"
+            );
+            let gate = if operation_gate {
+                let gate = f.runtime.strategy_gate().await;
+                lease.take();
+                Some(gate)
+            } else {
+                None
+            };
+            tick(&f).await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                f.supervisor.list().unwrap().runs[0].sequence,
+                if resume { "1" } else { "0" }
+            );
+            if wake {
+                f.supervisor.wake.notify_one();
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            drop(gate);
+            drop(lease);
+            tick(&f).await;
+            let view = settled(&f, if resume { "2" } else { "1" }).await;
+            if view.last_message != if resume { "update" } else { "start" } {
+                wrong_events.push(format!(
+                    "gate={operation_gate}/wake={wake}: {}",
+                    view.last_message
+                ));
+            }
+            tick(&f).await;
+            assert_eq!(
+                settled(&f, if resume { "3" } else { "2" })
+                    .await
+                    .last_message,
+                "timer"
+            );
+            f.supervisor.wake.notify_one();
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            tick(&f).await;
+            assert_eq!(
+                settled(&f, if resume { "4" } else { "3" })
+                    .await
+                    .last_message,
+                "update"
+            );
+            f.supervisor.stop_all().await.unwrap();
+            f.supervisor.drain().await;
+            assert_eq!(f.host.placed.load(Ordering::SeqCst), 0);
+            assert_eq!(f.host.cancelled.load(Ordering::SeqCst), 0);
+        }
+    }
+    assert!(
+        wrong_events.is_empty(),
+        "wrong first guest event: {wrong_events:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_review_first_start_callback_survives_busy_gates_and_native_wakes() {
+    let _serial = SERIAL.lock().await;
+    initial_event_survives_busy(false).await;
+}
+#[tokio::test(start_paused = true)]
+async fn final_review_first_resume_callback_survives_busy_gates_and_native_wakes() {
+    let _serial = SERIAL.lock().await;
+    initial_event_survives_busy(true).await;
+}

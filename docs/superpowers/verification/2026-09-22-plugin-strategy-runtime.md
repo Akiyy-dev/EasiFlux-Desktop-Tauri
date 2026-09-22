@@ -210,3 +210,32 @@ and v5 runtime workflow 13: 99 passed, zero failures. The real risk-pipeline tes
 blocks preparation, revokes, and verifies zero mutation calls and zero occupied
 risk slots; the unchanged legacy path still submits and retains its occupied slot.
 These are injected, no-network tests, not real-account validation.
+
+## Whole-branch review fix wave
+
+The independent whole-branch review found two remaining issues: a damaged
+unknown-receipt record could lose its matching pending intent, and busy skips
+could replace the initial start/resume callback event. Three fail-first tests
+reproduced both using real persisted unknown-cancellation/placement records and
+actual Wasm guest-observed events.
+
+Unknown receipts now require a pending action with matching sequence, kind and
+submission/exchange identity. Compatibility tests retain legitimate prior
+accepted/rejected receipts alongside new pending actions and accepted-before-ack
+transitions. The initial callback event remains unchanged through operation-gate
+and compute-slot contention, including native wakes; later timer/update events
+still behave normally.
+
+Final focused command:
+
+```text
+cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::strategy --lib --target-dir src-tauri/target
+49 passed; 0 failed; 1212 filtered out
+exit 0 (5.02 s tests)
+```
+
+Scoped Rust formatting and whitespace checks also exited 0. No production
+application, network, credentials or live account was used. The exact final
+commit's independent scoped re-review and all CI/CodeQL outcomes are recorded
+on [PR #42](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/pull/42); previous
+head results do not substitute for that merge gate.
