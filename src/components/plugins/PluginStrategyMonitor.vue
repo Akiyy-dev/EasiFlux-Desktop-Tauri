@@ -24,10 +24,13 @@ const props = withDefaults(defineProps<{
 
 let disposed = false
 let generation = 0
+let refreshSequence = 0
+let activeRefreshOwner: number | null = null
 let pollTimer: ReturnType<typeof globalThis.setInterval> | null = null
 const runs = ref<StrategyRunView[]>([])
 const loading = ref(false)
 const mutating = ref(new Set<string>())
+const stopAllPending = ref(false)
 const resumeAcknowledgements = ref(new Set<string>())
 const error = ref<string | null>(null)
 
@@ -61,8 +64,11 @@ function replaceRun(run: StrategyRunView): void {
 }
 
 async function refresh(preserveError = false, duringMutation = false): Promise<void> {
-  if (loading.value || disposed || (!duringMutation && mutating.value.size > 0)) return
+  if (disposed || (activeRefreshOwner !== null && !duringMutation)
+    || (!duringMutation && mutating.value.size > 0)) return
   const owner = nextGeneration()
+  const refreshOwner = ++refreshSequence
+  activeRefreshOwner = refreshOwner
   loading.value = true
   if (!preserveError) error.value = null
   try {
@@ -73,7 +79,10 @@ async function refresh(preserveError = false, duringMutation = false): Promise<v
     if (disposed || owner !== generation) return
     error.value = pluginStrategyErrorMessage(caught)
   } finally {
-    if (!disposed && owner === generation) loading.value = false
+    if (activeRefreshOwner === refreshOwner) {
+      activeRefreshOwner = null
+      loading.value = false
+    }
   }
 }
 
@@ -98,19 +107,21 @@ async function control(run: StrategyRunView, action: 'pause' | 'stop'): Promise<
 }
 
 async function stopAll(): Promise<void> {
-  if (mutating.value.size > 0) return
-  const owner = nextGeneration()
+  if (disposed || stopAllPending.value) return
+  nextGeneration()
+  stopAllPending.value = true
   mutating.value = new Set(mutating.value).add('*')
   error.value = null
   try {
     const updated = await stopAllPluginStrategies()
-    if (disposed || owner !== generation) return
+    if (disposed) return
     runs.value = updated.runs
   } catch (caught) {
-    if (disposed || owner !== generation) return
+    if (disposed) return
     error.value = `${pluginStrategyErrorMessage(caught)} 未假定任何运行已经停止，正在重新读取权威列表。`
     await refresh(true, true)
   } finally {
+    stopAllPending.value = false
     const next = new Set(mutating.value)
     next.delete('*')
     mutating.value = next
@@ -187,7 +198,7 @@ async function resume(run: StrategyRunView): Promise<void> {
       capabilities: [...run.capabilities],
       policy: { ...run.policy },
       acknowledgeAutomaticTrading: true,
-    })
+    }, run)
     if (disposed || owner !== generation) return
     replaceRun(resumed)
   } catch (caught) {
@@ -249,7 +260,7 @@ onBeforeUnmount(() => {
           class="ef-btn ef-btn-danger ef-btn-sm"
           data-testid="strategy-stop-all"
           type="button"
-          :disabled="mutating.size > 0"
+          :disabled="stopAllPending"
           @click="stopAll"
         >
           紧急停止全部策略

@@ -314,6 +314,91 @@ describe('plugin strategy strict service boundary', () => {
     await expect(listPluginStrategies()).rejects.toThrow(INVALID_RESPONSE)
   })
 
+  it('rejects run responses that omit mandatory capability relationships', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      schemaVersion: 1,
+      runs: [runFixture({ capabilities: ['market.read', 'strategy.run'] })],
+    })
+    await expect(listPluginStrategies()).rejects.toThrow(INVALID_RESPONSE)
+
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(runFixture({
+      status: 'paused', capabilities: ['account.read', 'market.read'],
+    }))
+    await expect(controlPluginStrategy(RUN_ID, 'pause')).rejects.toThrow(INVALID_RESPONSE)
+
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(runFixture({
+      status: 'paused',
+      capabilities: ['account.read', 'trade.cancel', 'strategy.run'],
+    }))
+    await expect(reconcilePluginStrategy(RUN_ID)).rejects.toThrow(INVALID_RESPONSE)
+  })
+
+  it('rejects a run whose fixed lifetime disagrees with maxRunSeconds', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      schemaVersion: 1,
+      runs: [runFixture({ expiresAtMs: '1789923600124' })],
+    })
+
+    await expect(listPluginStrategies()).rejects.toThrow(INVALID_RESPONSE)
+  })
+
+  it('accepts only fixed-lifetime monotonic resume responses', async () => {
+    const access = parsePluginStrategyAccess(accessFixture(), intent())
+    const previous = runFixture({
+      requestId: '00000000-0000-4000-8000-000000000003',
+      status: 'paused', sequence: '4', actionsSubmitted: 2, totalSubmittedQty: '0.002',
+    })
+    const resumeInput: Parameters<typeof startPluginStrategy>[2] = {
+      requestId: REQUEST_ID, resumeRunId: RUN_ID, symbol: 'BTCUSDT',
+      inputJson: '{"threshold":"50000"}',
+      capabilities: ['account.read', 'market.read', 'trade.place', 'strategy.run'],
+      policy: policy(), acknowledgeAutomaticTrading: true,
+    }
+    const resetResponses = [
+      runFixture({
+        startedAtMs: '1789920001123', expiresAtMs: '1789923601123',
+        sequence: '4', actionsSubmitted: 2, totalSubmittedQty: '0.002',
+      }),
+      runFixture({ sequence: '3', actionsSubmitted: 2, totalSubmittedQty: '0.002' }),
+      runFixture({ sequence: '4', actionsSubmitted: 1, totalSubmittedQty: '0.002' }),
+      runFixture({ sequence: '4', actionsSubmitted: 2, totalSubmittedQty: '0.001' }),
+    ]
+
+    for (const response of resetResponses) {
+      vi.mocked(tauriInvoke).mockResolvedValueOnce(response)
+      await expect(startPluginStrategy(intent(), access, resumeInput, previous))
+        .rejects.toThrow(INVALID_RESPONSE)
+    }
+
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(runFixture({
+      sequence: '5', actionsSubmitted: 3, totalSubmittedQty: '0.003',
+    }))
+    await expect(startPluginStrategy(intent(), access, resumeInput, previous)).resolves.toMatchObject({
+      runId: RUN_ID, startedAtMs: previous.startedAtMs, expiresAtMs: previous.expiresAtMs,
+      sequence: '5', actionsSubmitted: 3, totalSubmittedQty: '0.003',
+    })
+  })
+
+  it('accepts a fresh session epoch when resume keeps the same durable account scope', async () => {
+    const access = parsePluginStrategyAccess({
+      ...accessFixture(),
+      account: { accountId: 'paper-main', sessionEpoch: '22', environment: 'Testnet' },
+    }, intent())
+    const previous = runFixture({ status: 'paused' })
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(runFixture({
+      account: { accountId: 'paper-main', sessionEpoch: '22', environment: 'Testnet' },
+    }))
+
+    await expect(startPluginStrategy(intent(), access, {
+      requestId: REQUEST_ID, resumeRunId: RUN_ID, symbol: 'BTCUSDT',
+      inputJson: '{"threshold":"50000"}',
+      capabilities: ['account.read', 'market.read', 'trade.place', 'strategy.run'],
+      policy: policy(), acknowledgeAutomaticTrading: true,
+    }, previous)).resolves.toMatchObject({
+      account: { accountId: 'paper-main', sessionEpoch: '22', environment: 'Testnet' },
+    })
+  })
+
   it('maps only exact native strategy errors and never exposes raw host text', () => {
     expect(pluginStrategyErrorMessage({
       code: 'plugin_strategy_token_invalid', message: 'D:\\private\\secret',

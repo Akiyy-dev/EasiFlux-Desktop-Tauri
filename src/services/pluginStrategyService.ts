@@ -120,6 +120,10 @@ function sameAccount(left: PluginWorkflowAccount, right: PluginWorkflowAccount):
     && left.environment === right.environment
 }
 
+function sameAccountScope(left: PluginWorkflowAccount, right: PluginWorkflowAccount): boolean {
+  return left.accountId === right.accountId && left.environment === right.environment
+}
+
 function parseCapabilities(value: unknown): PluginStrategyCapability[] {
   if (!Array.isArray(value) || value.length < 1 || value.length > CAPABILITIES.size) {
     invalidResponse()
@@ -131,6 +135,15 @@ function parseCapabilities(value: unknown): PluginStrategyCapability[] {
     return candidate as PluginStrategyCapability
   })
   if (new Set(parsed).size !== parsed.length) invalidResponse()
+  return parsed
+}
+
+function parseRunCapabilities(value: unknown): PluginStrategyCapability[] {
+  const parsed = parseCapabilities(value)
+  if (!parsed.includes('account.read') || !parsed.includes('strategy.run')
+    || (parsed.includes('trade.cancel') && !parsed.includes('orders.read'))) {
+    invalidResponse()
+  }
   return parsed
 }
 
@@ -295,6 +308,7 @@ interface RunExpectation {
   intent?: PluginStrategyExecutionIntent
   access?: StrategyAccess
   start?: PluginStrategyStartInput
+  previousRun?: StrategyRunView
 }
 
 export function parsePluginStrategyRunView(
@@ -306,7 +320,7 @@ export function parsePluginStrategyRunView(
   const requestId = uuid(run.requestId)
   const account = parseAccount(run.account)
   const policy = parsePluginStrategyPolicy(run.policy)
-  const capabilities = parseCapabilities(run.capabilities)
+  const capabilities = parseRunCapabilities(run.capabilities)
   const status = typeof run.status === 'string' && STATUSES.has(run.status as StrategyRunStatus)
     ? run.status as StrategyRunStatus
     : invalidResponse()
@@ -316,7 +330,9 @@ export function parsePluginStrategyRunView(
   if (run.schemaVersion !== 1
     || !Number.isInteger(run.actionsSubmitted) || (run.actionsSubmitted as number) < 0
     || (run.actionsSubmitted as number) > policy.maxActions
-    || BigInt(expiresAtMs) < BigInt(startedAtMs)) invalidResponse()
+    || BigInt(expiresAtMs) - BigInt(startedAtMs) !== BigInt(policy.maxRunSeconds) * 1000n) {
+    invalidResponse()
+  }
   const totalSubmittedQty = decimal(run.totalSubmittedQty, false)
   const maxTotalQty = decimal(policy.maxTotalQty, true)
   if (compareDecimal(totalSubmittedQty.comparable, maxTotalQty.comparable) > 0) invalidResponse()
@@ -362,6 +378,17 @@ export function parsePluginStrategyRunView(
     || JSON.stringify(parsed.policy) !== JSON.stringify(expectation.start.policy)
     || (expectation.start.resumeRunId !== null && parsed.runId !== expectation.start.resumeRunId)
   )) invalidResponse()
+  if (expectation.previousRun && (
+    parsed.runId !== expectation.previousRun.runId
+    || parsed.startedAtMs !== expectation.previousRun.startedAtMs
+    || parsed.expiresAtMs !== expectation.previousRun.expiresAtMs
+    || BigInt(parsed.sequence) < BigInt(expectation.previousRun.sequence)
+    || parsed.actionsSubmitted < expectation.previousRun.actionsSubmitted
+    || compareDecimal(
+      decimal(parsed.totalSubmittedQty, false).comparable,
+      decimal(expectation.previousRun.totalSubmittedQty, false).comparable,
+    ) < 0
+  )) invalidResponse()
   return parsed
 }
 
@@ -379,6 +406,7 @@ function validateStart(
   intent: PluginStrategyExecutionIntent,
   access: StrategyAccess,
   value: PluginStrategyStartInput,
+  previousRun?: StrategyRunView,
 ): PluginStrategyStartInput {
   const requestId = uuid(value.requestId)
   const resumeRunId = value.resumeRunId === null ? null : uuid(value.resumeRunId)
@@ -386,11 +414,23 @@ function validateStart(
   const inputJson = parseInputJson(value.inputJson)
   const capabilities = parseCapabilities(value.capabilities)
   const policy = parsePluginStrategyPolicy(value.policy)
+  const isResume = resumeRunId !== null
   if (value.acknowledgeAutomaticTrading !== true
     || !capabilities.includes('account.read') || !capabilities.includes('strategy.run')
     || (capabilities.includes('trade.cancel') && !capabilities.includes('orders.read'))
     || capabilities.some((capability) => !access.requestedCapabilities.includes(capability))
-    || !sameCapabilities(access.requestedCapabilities, intent.requestedCapabilities)) invalidResponse()
+    || !sameCapabilities(access.requestedCapabilities, intent.requestedCapabilities)
+    || isResume !== (previousRun !== undefined)) invalidResponse()
+  if (previousRun && (
+    previousRun.runId !== resumeRunId
+    || previousRun.pluginId !== intent.pluginId
+    || previousRun.contributionId !== intent.contributionId
+    || !sameAccountScope(previousRun.account, access.account)
+    || previousRun.symbol !== symbol
+    || previousRun.inputJson !== inputJson
+    || !sameCapabilities(previousRun.capabilities, capabilities)
+    || JSON.stringify(previousRun.policy) !== JSON.stringify(policy)
+  )) invalidResponse()
   return {
     requestId, resumeRunId, symbol, inputJson, capabilities, policy,
     acknowledgeAutomaticTrading: true,
@@ -410,8 +450,9 @@ export async function startPluginStrategy(
   intent: PluginStrategyExecutionIntent,
   access: StrategyAccess,
   input: PluginStrategyStartInput,
+  previousRun?: StrategyRunView,
 ): Promise<StrategyRunView> {
-  const start = validateStart(intent, access, input)
+  const start = validateStart(intent, access, input, previousRun)
   const value = await tauriInvoke<unknown>('start_plugin_strategy', {
     request: {
       authorizationToken: access.authorizationToken,
@@ -425,7 +466,7 @@ export async function startPluginStrategy(
     },
   })
   return parsePluginStrategyRunView(value, {
-    requestId: start.requestId, intent, access, start,
+    requestId: start.requestId, intent, access, start, previousRun,
   })
 }
 
