@@ -128,6 +128,7 @@ pub struct EventEmitter {
     #[cfg(test)]
     test_sink: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     websocket_status: WebsocketStatusTracker,
+    strategy_wake: Arc<tokio::sync::Notify>,
 }
 
 impl EventEmitter {
@@ -152,6 +153,7 @@ impl EventEmitter {
         Self {
             app,
             websocket_status: WebsocketStatusTracker::default(),
+            strategy_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -165,6 +167,7 @@ impl EventEmitter {
         Self {
             test_sink: sink,
             websocket_status: WebsocketStatusTracker::default(),
+            strategy_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -186,12 +189,19 @@ impl EventEmitter {
         let _ = self.emit("app:ready", version);
     }
 
+    /// Native-only dirty signal. No frontend event payload is forwarded as authority.
+    pub(crate) fn strategy_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.strategy_wake)
+    }
+
     pub fn emit_connection_for_session(&self, context: &SessionContext, status: &str) {
+        self.strategy_wake.notify_one();
         self.emit_account_session(context, "connection:status", status);
         self.emit_log("info", &format!("API 连接状态: {}", status));
     }
 
     pub fn emit_websocket_for_session(&self, context: &SessionContext, status: &str) {
+        self.strategy_wake.notify_one();
         self.websocket_status.record(status);
         self.emit_account_session(context, "websocket:status", status);
         self.emit_log("info", &format!("WebSocket 状态: {}", status));
@@ -202,6 +212,7 @@ impl EventEmitter {
     }
 
     pub fn emit_ticker(&self, ticker: Ticker) {
+        self.strategy_wake.notify_one();
         let _ = self.emit("market:ticker", &ticker);
     }
 
@@ -214,14 +225,17 @@ impl EventEmitter {
     }
 
     pub fn emit_order(&self, context: &SessionContext, order: Order) {
+        self.strategy_wake.notify_one();
         self.emit_account_session(context, "order:updated", &order);
     }
 
     pub fn emit_position(&self, context: &SessionContext, position: Position) {
+        self.strategy_wake.notify_one();
         self.emit_account_session(context, "position:updated", &position);
     }
 
     pub fn emit_balance(&self, context: &SessionContext, balance: crate::models::account::Balance) {
+        self.strategy_wake.notify_one();
         self.emit_account_session(context, "balance:updated", &balance);
     }
 
@@ -230,6 +244,7 @@ impl EventEmitter {
     }
 
     pub fn emit_account_snapshot(&self, context: &SessionContext, snapshot: AccountSummary) {
+        self.strategy_wake.notify_one();
         self.emit_account_session(context, "account:snapshot", &snapshot);
     }
 
@@ -238,6 +253,7 @@ impl EventEmitter {
         context: &SessionContext,
         snapshot: PrivatePanelsSnapshot,
     ) {
+        self.strategy_wake.notify_one();
         self.emit_account_session(context, "private-panels:snapshot", &snapshot);
     }
 
@@ -314,6 +330,43 @@ mod tests {
         emit_error_with, emit_notification_changed_with, AccountSessionEvent,
         WebsocketStatusTracker,
     };
+
+    #[test]
+    fn native_strategy_wake_coalesces_cloned_host_updates_without_forwarding_payloads() {
+        use futures_util::FutureExt;
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitter = super::EventEmitter::new_test(sink);
+        let observer = emitter.strategy_wake();
+        assert!(observer.notified().now_or_never().is_none());
+
+        for _ in 0..3 {
+            emitter
+                .clone()
+                .emit_ticker(crate::models::market::Ticker::default());
+        }
+        assert!(observer.notified().now_or_never().is_some());
+        assert!(
+            observer.notified().now_or_never().is_none(),
+            "updates must coalesce"
+        );
+
+        // A plain event with the same name does not act as a native domain update.
+        emitter
+            .emit("market:ticker", &json!({"lastPrice":"untrusted"}))
+            .unwrap();
+        emitter.emit_log("info", "unrelated host log");
+        assert!(observer.notified().now_or_never().is_none());
+
+        emitter.emit_connection_for_session(
+            &crate::models::trading::SessionContext {
+                account_id: "fixture-account".into(),
+                session_epoch: 1,
+            },
+            "disconnected",
+        );
+        assert!(observer.notified().now_or_never().is_some());
+        assert!(observer.notified().now_or_never().is_none());
+    }
 
     #[test]
     fn account_session_event_serializes_a_camel_case_epoch_envelope() {

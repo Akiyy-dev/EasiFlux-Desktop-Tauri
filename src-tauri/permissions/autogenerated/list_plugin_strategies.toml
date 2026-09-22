@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-plugin-strategies"
+description = "Enables the list_plugin_strategies command without any pre-configured scope."
+commands.allow = ["list_plugin_strategies"]
+
+[[permission]]
+identifier = "deny-list-plugin-strategies"
+description = "Denies the list_plugin_strategies command without any pre-configured scope."
+commands.deny = ["list_plugin_strategies"]

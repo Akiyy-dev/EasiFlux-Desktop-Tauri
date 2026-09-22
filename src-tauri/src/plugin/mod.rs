@@ -12,6 +12,7 @@ mod runtime;
 #[cfg(any(test, feature = "plugin-smoke"))]
 pub(crate) mod smoke;
 pub(crate) mod workflow;
+pub(crate) mod strategy;
 
 pub use registry::PluginRegistry;
 pub(crate) use runtime::PluginRuntime;

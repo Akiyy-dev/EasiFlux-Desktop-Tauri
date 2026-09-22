@@ -22,6 +22,12 @@ fn main() {
         "set_plugin_workflow_grants",
         "run_plugin_workflow",
         "confirm_plugin_workflow",
+        "get_plugin_strategy_access",
+        "start_plugin_strategy",
+        "list_plugin_strategies",
+        "control_plugin_strategy",
+        "stop_all_plugin_strategies",
+        "reconcile_plugin_strategy",
     ];
     if smoke {
         commands.push("finish_plugin_smoke");

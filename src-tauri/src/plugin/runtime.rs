@@ -300,9 +300,20 @@ fn runtime_error() -> AppError {
 
 mod compute;
 mod import;
+mod strategy;
 mod workflow;
 
 mod removal;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod strategy_test_utils {
+    // Each injected app fixture owns the real coordinator, isolated from other
+    // test runtimes whose catalog reloads invalidate their process-wide slot.
+    pub(crate) fn isolate_compute(runtime: &mut super::PluginRuntime) {
+        runtime.compute_slot =
+            std::sync::Arc::new(crate::plugin::compute::slot::ComputeSlot::default());
+    }
+}

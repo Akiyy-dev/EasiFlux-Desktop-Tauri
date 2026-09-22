@@ -33,6 +33,8 @@ pub enum PluginCommandActionId {
     SandboxComputeSeries,
     #[serde(rename = "sandbox.accountWorkflow")]
     SandboxAccountWorkflow,
+    #[serde(rename = "sandbox.strategy")]
+    SandboxStrategy,
 }
 
 impl<'de> Deserialize<'de> for PluginCommandActionId {
@@ -45,6 +47,7 @@ impl<'de> Deserialize<'de> for PluginCommandActionId {
             "host.openPage" => Ok(Self::HostOpenPage),
             "sandbox.computeSeries" => Ok(Self::SandboxComputeSeries),
             "sandbox.accountWorkflow" => Ok(Self::SandboxAccountWorkflow),
+            "sandbox.strategy" => Ok(Self::SandboxStrategy),
             value => Err(serde::de::Error::unknown_variant(
                 value,
                 &["host.showInfo", "host.openPage", "sandbox.computeSeries"],
@@ -166,6 +169,7 @@ pub enum PluginCommandParams {
     ShowInfo(PluginInfoParams),
     OpenPage(PluginOpenPageParams),
     ComputeSeries(super::compute::PluginComputeParams),
+    Strategy(super::strategy::PluginStrategyParams),
     AccountWorkflow(super::workflow::PluginWorkflowParams),
 }
 
@@ -223,6 +227,9 @@ impl PluginCommandContribution {
                 PluginCommandActionId::SandboxAccountWorkflow,
                 PluginCommandParams::AccountWorkflow(params),
             ) => params.validate(),
+            (PluginCommandActionId::SandboxStrategy, PluginCommandParams::Strategy(params)) => {
+                params.validate()
+            }
             _ => Err("plugin command action does not match params".into()),
         }
     }

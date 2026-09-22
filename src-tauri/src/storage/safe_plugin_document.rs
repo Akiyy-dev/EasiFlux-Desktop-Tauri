@@ -63,6 +63,15 @@ pub(crate) struct SafeDocumentNames {
     bak_pending: &'static str,
 }
 impl SafeDocumentNames {
+    pub(crate) fn strategy() -> Self {
+        Self {
+            main: "strategy.json",
+            tmp: "strategy.json.tmp",
+            bak: "strategy.json.bak",
+            pending: "strategy.json.pending",
+            bak_pending: "strategy.json.bak.pending",
+        }
+    }
     pub(crate) fn plugin_state() -> Self {
         Self {
             main: "state.json",
@@ -146,19 +155,21 @@ impl SafePluginDocument {
         self.hook.as_ref().map_or(Ok(()), |hook| hook(step))
     }
     pub(crate) fn load_candidates(&self) -> io::Result<Vec<CandidateBytes>> {
+        self.load_names(&[self.names.main, self.names.tmp, self.names.bak])
+    }
+    pub(crate) fn load_all_candidates(&self) -> io::Result<Vec<CandidateBytes>> {
+        self.load_names(&self.names.all())
+    }
+    fn load_names(&self, names: &[&str]) -> io::Result<Vec<CandidateBytes>> {
         let parent = match platform::Directory::open(&self.root, false) {
             Ok(parent) => parent,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(vec![
-                    CandidateBytes::Missing,
-                    CandidateBytes::Missing,
-                    CandidateBytes::Missing,
-                ])
+                return Ok(names.iter().map(|_| CandidateBytes::Missing).collect())
             }
             Err(error) => return Err(error),
         };
         let mut candidates = Vec::new();
-        for name in [self.names.main, self.names.tmp, self.names.bak] {
+        for name in names {
             candidates.push(match self.open_existing(&parent, name)? {
                 None => CandidateBytes::Missing,
                 Some(mut file) => {

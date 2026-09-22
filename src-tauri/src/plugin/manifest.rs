@@ -12,6 +12,7 @@ pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V2: u32 = 2;
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V3: u32 = 3;
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V4: u32 = 4;
 pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V5: u32 = 5;
+pub const PLUGIN_MANIFEST_SCHEMA_VERSION_V6: u32 = 6;
 
 const CATALOG_TRANSPORT_SCHEMA_VERSION: u8 = 3;
 
@@ -164,12 +165,23 @@ impl PluginManifest {
             version @ (PLUGIN_MANIFEST_SCHEMA_VERSION_V2
             | PLUGIN_MANIFEST_SCHEMA_VERSION_V3
             | PLUGIN_MANIFEST_SCHEMA_VERSION_V4
-            | PLUGIN_MANIFEST_SCHEMA_VERSION_V5)
+            | PLUGIN_MANIFEST_SCHEMA_VERSION_V5
+            | PLUGIN_MANIFEST_SCHEMA_VERSION_V6)
                 if (1..=16).contains(&self.contributions.len()) =>
             {
                 let mut contribution_ids = std::collections::BTreeSet::new();
                 for contribution in &self.contributions {
                     contribution.validate()?;
+                    if contribution.action_id == PluginCommandActionId::SandboxStrategy
+                        && version != 6
+                    {
+                        return Err("strategy requires manifest v6".into());
+                    }
+                    if version == 6
+                        && contribution.action_id == PluginCommandActionId::SandboxAccountWorkflow
+                    {
+                        return Err("v6 excludes account workflows".into());
+                    }
                     if version < 5
                         && contribution.action_id == PluginCommandActionId::SandboxAccountWorkflow
                     {
@@ -210,6 +222,15 @@ impl PluginManifest {
                     .any(|c| c.action_id == PluginCommandActionId::SandboxAccountWorkflow)
             {
                 return Err("v5 requires account.read and an account workflow".into());
+            }
+        } else if self.schema_version == 6 {
+            super::strategy::validate_capabilities(&self.requested_capabilities)?;
+            if !self
+                .contributions
+                .iter()
+                .any(|c| c.action_id == PluginCommandActionId::SandboxStrategy)
+            {
+                return Err("v6 requires a strategy".into());
             }
         } else if !self.requested_capabilities.is_empty() {
             return Err("plugin requested capabilities are reserved".into());

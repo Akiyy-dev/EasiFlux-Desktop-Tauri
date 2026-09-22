@@ -272,6 +272,14 @@ pub fn run_plugin_smoke() -> Result<(), String> {
             PluginCommandState::new(profile.runtime())
         };
         let workflow_host = profile.workflow_host();
+        let strategies = crate::plugin::strategy::StrategySupervisor::new(
+            Arc::clone(&command_state.runtime),
+            Arc::clone(&workflow_host),
+            Arc::new(crate::plugin::strategy::FileStrategyStore::new(
+                profile.root.join("strategies"),
+            )),
+            Arc::new(tokio::sync::Notify::new()),
+        );
         let webview_data = profile.root.join("webview2");
         std::fs::create_dir(&webview_data)
             .map_err(|e| format!("cannot reserve WebView2 directory: {e}"))?;
@@ -280,6 +288,7 @@ pub fn run_plugin_smoke() -> Result<(), String> {
             .plugin(tauri_plugin_dialog::init())
             .manage(command_state)
             .manage(crate::plugin::workflow::WorkflowHostState(workflow_host))
+            .manage(strategies)
             .manage(HostState {
                 profile: Arc::clone(&profile),
                 gate: Arc::clone(&gate),
@@ -299,6 +308,12 @@ pub fn run_plugin_smoke() -> Result<(), String> {
                 crate::commands::plugin_workflow::set_plugin_workflow_grants,
                 crate::commands::plugin_workflow::run_plugin_workflow,
                 crate::commands::plugin_workflow::confirm_plugin_workflow,
+                crate::commands::plugin_strategy::get_plugin_strategy_access,
+                crate::commands::plugin_strategy::start_plugin_strategy,
+                crate::commands::plugin_strategy::list_plugin_strategies,
+                crate::commands::plugin_strategy::control_plugin_strategy,
+                crate::commands::plugin_strategy::stop_all_plugin_strategies,
+                crate::commands::plugin_strategy::reconcile_plugin_strategy,
                 finish_plugin_smoke,
             ])
             .build(smoke_context())
@@ -562,6 +577,12 @@ mod tests {
             "set_plugin_workflow_grants",
             "run_plugin_workflow",
             "confirm_plugin_workflow",
+            "get_plugin_strategy_access",
+            "start_plugin_strategy",
+            "list_plugin_strategies",
+            "control_plugin_strategy",
+            "stop_all_plugin_strategies",
+            "reconcile_plugin_strategy",
             "finish_plugin_smoke",
         ] {
             assert!(

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-plugin-strategy"
+description = "Enables the start_plugin_strategy command without any pre-configured scope."
+commands.allow = ["start_plugin_strategy"]
+
+[[permission]]
+identifier = "deny-start-plugin-strategy"
+description = "Denies the start_plugin_strategy command without any pre-configured scope."
+commands.deny = ["start_plugin_strategy"]
