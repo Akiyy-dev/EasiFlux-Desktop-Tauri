@@ -171,3 +171,42 @@ Independent native and whole-branch review, broad cross-platform CI and CodeQL
 are separate merge gates; local focused results alone do not claim those gates
 passed. Native-window acceptance, real-account testing and release remain outside
 this verification.
+
+## Initial draft-PR CI (before native review fixes)
+
+Draft PR #42 head `eee968a00becb6141b9d8c17dff0bdad2d72e60e`:
+
+- Frontend job: 91 test files / 1,465 tests passed, lint/typecheck/build passed,
+  both packaged guest verifiers passed.
+- Rust job: 1,223 library tests passed, two subprocess helpers ignored; locked
+  source-parity generators and clippy passed.
+- Plugin-security jobs passed on Ubuntu, Windows and macOS.
+- All nine check-runs, including the three CodeQL analyses and aggregate CodeQL
+  check, subsequently completed successfully on that initial head.
+
+These are first-head results, not evidence for subsequent native review fixes.
+The final merge gate must inspect the exact updated head and completed CodeQL
+analysis as well as the CI jobs.
+
+## Native review fix round
+
+Independent native review found four issues: final admission preceded awaited
+quote/risk preparation, decisions could become stale behind gates, a corrupted
+pending record could omit its quantity debit, and first-pass clock rollback used
+the wrong terminal status. Five new supervisor regressions first failed while
+the existing 40 remained green. Three trading hand-off regressions also failed
+before their implementation.
+
+Strategy-only host methods now carry a synchronous native admission check to the
+final mutation API hand-off. Decision freshness is checked throughout preparation;
+definitely-unsent revocation releases the global risk reservation but retains the
+strategy's conservative debit. Existing manual/v5 entry points retain their path.
+Durable validation rejects inconsistent pending debit and impossible action counts;
+initial stale clocks pause, while expiry completes.
+
+Focused post-fix results: strategy 45, trading hand-off/risk-pipeline 4, existing
+synthetic trading risk/lifecycle 12, submission 9, production adapter/parser 16,
+and v5 runtime workflow 13: 99 passed, zero failures. The real risk-pipeline test
+blocks preparation, revokes, and verifies zero mutation calls and zero occupied
+risk slots; the unchanged legacy path still submits and retains its occupied slot.
+These are injected, no-network tests, not real-account validation.

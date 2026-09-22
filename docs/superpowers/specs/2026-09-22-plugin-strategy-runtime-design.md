@@ -120,6 +120,15 @@ duration (>30 seconds), authority change, invalid guest, or missed scheduling ga
 >max(30 seconds, 3*intervalMs) pauses/faults admission rather than using stale data.
 Reconnect does not restore trading authority automatically.
 
+Snapshot/decision freshness must remain bounded through post-compute gate waits,
+durable publication and quote/risk preparation, not just the initial read. A decision
+older than 30 seconds cannot be submitted. A strategy-only synchronous admission
+check reaches the final mutation API hand-off after preparation; revoke/expiry/stale
+failure releases any unsubmitted global risk reservation while retaining the strategy's
+conservative submission debit. Existing manually confirmed v5 entry points are unchanged.
+The hand-off is the admission boundary; it does not promise atomic physical wire-send
+timing or cancellation of an already admitted request.
+
 Pause/stop intent synchronously revokes run admission and signals guest cancellation
 before waiting for any gate. A dispatched network future is never aborted as a way to
 stop a run: an owned worker accounts for its receipt first. `stopping`/pause-pending

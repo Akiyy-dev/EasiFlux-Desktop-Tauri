@@ -44,7 +44,7 @@
 - Consumes `WorkflowHost`, native AccountAuthority, `snapshot_locked`, `compute::sandbox::execute_json`, PluginRuntime operation/epoch/registry seams, production submit_once and submission recovery.
 - Produces six exact IPCs, DTOs, v6 manifest/action, native wake signal and injectable StrategyStore/host described by spec. Task 2 consumes only those wire contracts; Task 3 consumes guest ABI. Publish any necessary seam adjustment to root before changing contract.
 
-- [ ] Step 1: Read spec and relevant existing interfaces; add failing tests for v6 acceptance, unknown fields, wrong ABI and rejection of strategy.run in v5. For example, independently constructed manifest v6 must round-trip and the same object with schemaVersion=5 must reject.
+- [x] Step 1: Read spec and relevant existing interfaces; add failing tests for v6 acceptance, unknown fields, wrong ABI and rejection of strategy.run in v5. For example, independently constructed manifest v6 must round-trip and the same object with schemaVersion=5 must reject.
 
 ```rust
 #[test]
@@ -55,8 +55,8 @@ fn v5_cannot_acquire_unattended_authority() {
 }
 ```
 
-- [ ] Step 2: Run focused RED, implement closed contract/action dispatch preserving old canonical bytes, then run GREEN. Use `cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::strategy --lib --target-dir src-tauri/target`; retain expected failing output in report.
-- [ ] Step 3: Add fail-first native-loop tests using injected host and explicit temporary store. Specify observable mutation counts and journal state, not mock existence: launch one bounded guest, allow two changing snapshots, assert exactly one placement and cancellation; no confirm_workflow calls occur. Use paused Tokio time or Notify barriers instead of wall-clock sleeps.
+- [x] Step 2: Run focused RED, implement closed contract/action dispatch preserving old canonical bytes, then run GREEN. Use `cargo test --locked --manifest-path src-tauri/Cargo.toml plugin::strategy --lib --target-dir src-tauri/target`; retain expected failing output in report.
+- [x] Step 3: Add fail-first native-loop tests using injected host and explicit temporary store. Specify observable mutation counts and journal state, not mock existence: launch one bounded guest, allow two changing snapshots, assert exactly one placement and cancellation; no confirm_workflow calls occur. Use paused Tokio time or Notify barriers instead of wall-clock sleeps.
 
 ```text
 start(ticket, selected caps, symbol, parameters, mandatory policy, acknowledged=true)
@@ -67,9 +67,9 @@ owned active order snapshot -> cancel once -> persist accepted-request receipt
 pause/stop -> advance -> mutation count unchanged
 ```
 
-- [ ] Step 4: Implement bounded store and supervisor modules to satisfy the exact spec. Use structural typed deserialization, action-specific ABI parsing, checked counters/Decimal, content+private-authority bindings, owned futures, monotonic cancellation admission, and fresh pre-dispatch checks. Build the production acknowledgment/reconciliation seam by reusing existing exact-match query logic; never acknowledge before durable ownership/receipt. Add internal native-only Notify wakeups to emitter, not a Tauri frontend event listener.
-- [ ] Step 5: Add targeted safety tests: empty/partial snapshots cannot establish ownership/terminal state; budget still applies when risk off; forbidden symbol/side/oversize/duplicate output; credential same-epoch reinstall; disable/reload; paused/stop during blocked compute and HTTP; dropped IPC; storage write/read corruption, conflicting generations, symlinks; restart pending not replayed; accepted-unack recovery; failed cancel not retried; resumed limits/state retained and mismatch denied; capacity/expiry/data staleness.
-- [ ] Step 6: Wire six commands to local main ACL and production host, including constructor safety (no automatic worker/start on app startup). Run focused plugin, submission, emitter and capability checks relevant to changed files, then coordinate one Rust plugin regression with root. Keep errors sanitized. Write report with RED/GREEN evidence, exact commands/results, files and limitations; request root-coordinated commit of Rust files only.
+- [x] Step 4: Implement bounded store and supervisor modules to satisfy the exact spec. Use structural typed deserialization, action-specific ABI parsing, checked counters/Decimal, content+private-authority bindings, owned futures, monotonic cancellation admission, and fresh pre-dispatch checks. Build the production acknowledgment/reconciliation seam by reusing existing exact-match query logic; never acknowledge before durable ownership/receipt. Add internal native-only Notify wakeups to emitter, not a Tauri frontend event listener.
+- [x] Step 5: Add targeted safety tests: empty/partial snapshots cannot establish ownership/terminal state; budget still applies when risk off; forbidden symbol/side/oversize/duplicate output; credential same-epoch reinstall; disable/reload; paused/stop during blocked compute and HTTP; dropped IPC; storage write/read corruption, conflicting generations, symlinks; restart pending not replayed; accepted-unack recovery; failed cancel not retried; resumed limits/state retained and mismatch denied; capacity/expiry/data staleness.
+- [x] Step 6: Wire six commands to local main ACL and production host, including constructor safety (no automatic worker/start on app startup). Run focused plugin, submission, emitter and capability checks relevant to changed files, then coordinate one Rust plugin regression with root. Keep errors sanitized. Write report with RED/GREEN evidence, exact commands/results, files and limitations; request root-coordinated commit of Rust files only.
 
 ### Task 2: v6 import, launch authorization and strategy monitor
 
@@ -82,7 +82,7 @@ pause/stop -> advance -> mutation count unchanged
 - Consumes the exact six IPCs, StrategyAccess/StartRequest/RunView/Receipt/Policy shapes from spec; v6 action and strategy.run. Do not change these independently of root.
 - Produces launch intent/display controls compatible with current marketplace/workbench and an always-mounted plugin-page monitor. Existing v5 component remains unchanged in meaning.
 
-- [ ] Step 1: Write failing tests for strict service parsing/correlation and v6 import capabilities. Include copied v5 manifest with strategy.run rejection, unrecognized fields/status/counters, full requested-capability comparison on preview/commit, and ABI discrimination. Preserve old canonical test fixtures.
+- [x] Step 1: Write failing tests for strict service parsing/correlation and v6 import capabilities. Include copied v5 manifest with strategy.run rejection, unrecognized fields/status/counters, full requested-capability comparison on preview/commit, and ABI discrimination. Preserve old canonical test fixtures.
 
 ```ts
 it('does not treat enabling or opening a strategy as permission to trade', async () => {
@@ -93,8 +93,8 @@ it('does not treat enabling or opening a strategy as permission to trade', async
 })
 ```
 
-- [ ] Step 2: Implement strict wire service and domain types with bounded exact shapes, u64 string validation, decimal-string validation without Number conversion, allowed capabilities/policy. Start uses one-shot ticket and user acknowledgment. Correlate account/plugin and requestId; uncertain start outcome must refresh list rather than resubmit automatically.
-- [ ] Step 3: Write RED DOM tests for user-selected capabilities + policy + explicit automatic-trading acknowledgment, one start invocation, no per-order confirm command, modal closing preserving running monitor, pause/stop errors, and emergency stop while disconnected/plugin removed. Implement launch dialog and polling monitor with disposed/generation guards. Monitor handles statuses honestly and supports explicit reconcile and new-ticket resume with unchanged policy/counters.
+- [x] Step 2: Implement strict wire service and domain types with bounded exact shapes, u64 string validation, decimal-string validation without Number conversion, allowed capabilities/policy. Start uses one-shot ticket and user acknowledgment. Correlate account/plugin and requestId; uncertain start outcome must refresh list rather than resubmit automatically.
+- [x] Step 3: Write RED DOM tests for user-selected capabilities + policy + explicit automatic-trading acknowledgment, one start invocation, no per-order confirm command, modal closing preserving running monitor, pause/stop errors, and emergency stop while disconnected/plugin removed. Implement launch dialog and polling monitor with disposed/generation guards. Monitor handles statuses honestly and supports explicit reconcile and new-ticket resume with unchanged policy/counters.
 
 ```text
 access -> all unchecked -> user chooses caps/policy -> explicit automatic-trading consent
@@ -104,8 +104,8 @@ IPC stop failure -> do not show stopped; refresh authoritative list
 recoveryRequired -> reconcile only, never automatic resume
 ```
 
-- [ ] Step 4: Extend import preview and action descriptions to make automatic behavior conspicuous. Add strategy intent/call sites without conflating v5 grants. Show quantity-unit/gross-volume caps, remaining expiry, accepted-vs-filled difference, and no implicit exchange cancellation on stop. Ensure inactive plugin/account UI does not hide emergency controls.
-- [ ] Step 5: Run focused new/touched Vitest files, vue-tsc and scoped ESLint. Root handles full frontend CI. Report exact RED/GREEN evidence and touched files, then request root-coordinated frontend-only commit.
+- [x] Step 4: Extend import preview and action descriptions to make automatic behavior conspicuous. Add strategy intent/call sites without conflating v5 grants. Show quantity-unit/gross-volume caps, remaining expiry, accepted-vs-filled difference, and no implicit exchange cancellation on stop. Ensure inactive plugin/account UI does not hide emergency controls.
+- [x] Step 5: Run focused new/touched Vitest files, vue-tsc and scoped ESLint. Root handles full frontend CI. Report exact RED/GREEN evidence and touched files, then request root-coordinated frontend-only commit.
 
 ### Task 3: Executable strategy example and authoring/acceptance documentation
 
@@ -119,7 +119,7 @@ recoveryRequired -> reconcile only, never automatic resume
 - Consumes exact v6 manifest and strategy guest ABI from spec. Example must remain <=8,192 module bytes and <=16 KiB manifest; use existing pinned wat compiler without new deps.
 - Produces reproducible checked-in manifest, synthetic Node guest verifier and exact user runbook; root uses verifier and source parity in CI.
 
-- [ ] Step 1: Build a synthetic verification harness first with hand-derived expected outcomes. Load packaged Wasm bytes with no imports and send actual encoded context/state/input. Cases: below threshold=>none, crossing threshold=>parameterized place, next native accepted receipt=>no duplicate place, visible owned active order=>cancel that exact orderId once, later state=>stop, malformed/oversized input fails safely.
+- [x] Step 1: Build a synthetic verification harness first with hand-derived expected outcomes. Load packaged Wasm bytes with no imports and send actual encoded context/state/input. Cases: below threshold=>none, crossing threshold=>parameterized place, next native accepted receipt=>no duplicate place, visible owned active order=>cancel that exact orderId once, later state=>stop, malformed/oversized input fails safely.
 
 ```js
 assert.equal(run(contextAt('99'), {threshold:'100', order:limitTemplate}).action.kind, 'none')
@@ -127,9 +127,9 @@ assert.deepEqual(run(contextAt('101'), params).action, {kind:'placeOrder',order:
 assert.equal(run(afterReceipt('owned-123'), params).action.order.orderId, 'owned-123')
 ```
 
-- [ ] Step 2: Implement readable small WAT using bounded parsing (reject unsupported formats rather than guessing), explicit state transitions and context/receipt inspection. Ensure copied input cannot inject unrelated action fields. Create fixed-path generator patterned after account-workflow example, then run source-to-Wasm parity check and synthetic verifier.
-- [ ] Step 3: Document import -> enable -> select current account/caps -> configure symbol, parameters and mandatory limits -> explicit real automatic-trading start -> monitor -> pause/stop -> reconcile -> explicit resume. Describe accepted vs filled, partial snapshots, quantity cap semantics, stop not cancelling orders, app/sleep limitations and no credential access. Clearly label execution demo, not investment advice or a proven profitable strategy.
-- [ ] Step 4: Coordinate with backend implementer for native injected-loop acceptance evidence; do not claim native pass before seeing it and do not launch production app. Keep verification doc honest about tests not run, initial failures and any remaining scope limits. Report generated sizes, commands/results, files, and request root-coordinated commit.
+- [x] Step 2: Implement readable small WAT using bounded parsing (reject unsupported formats rather than guessing), explicit state transitions and context/receipt inspection. Ensure copied input cannot inject unrelated action fields. Create fixed-path generator patterned after account-workflow example, then run source-to-Wasm parity check and synthetic verifier.
+- [x] Step 3: Document import -> enable -> select current account/caps -> configure symbol, parameters and mandatory limits -> explicit real automatic-trading start -> monitor -> pause/stop -> reconcile -> explicit resume. Describe accepted vs filled, partial snapshots, quantity cap semantics, stop not cancelling orders, app/sleep limitations and no credential access. Clearly label execution demo, not investment advice or a proven profitable strategy.
+- [x] Step 4: Coordinate with backend implementer for native injected-loop acceptance evidence; do not claim native pass before seeing it and do not launch production app. Keep verification doc honest about tests not run, initial failures and any remaining scope limits. Report generated sizes, commands/results, files, and request root-coordinated commit.
 
 ## Controller integration and final gate
 
