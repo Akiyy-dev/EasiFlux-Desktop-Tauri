@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.7.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.6.1...easiflux-desktop-tauri-v0.7.0) (2026-09-22)
+
+
+### Features
+
+* add plugin compute frontend ([f5c222b](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/f5c222bfb5f82060224f4cae7da2a06a4a84a8fa))
+* **plugin:** add authorized resource-bounded Wasm computation runtime ([ee3966a](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/ee3966a6c234bc8dbfc96eb7e1f046a896b12d67))
+* **plugin:** add executable SMA example and smoke ([dbb91f0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/dbb91f09917955d2574033c02f14035274e05db1))
+* **plugin:** authorized account workflows and confirmed trading ([#41](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/issues/41)) ([f1c3ec4](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/f1c3ec48a9df88f7f06c9b9630088dc2067acfe5))
+* **plugin:** native supervised automatic trading strategies ([#42](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/issues/42)) ([37bf8b2](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/37bf8b2434ac427b16f893e9fdf8cc135733e915))
+* **plugins:** add advisory same-ID manifest comparison ([3f4169d](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/3f4169d0d32d811d20604f7e37886097eea18177))
+* **plugins:** add advisory update preflight ([13404be](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/13404be979a7cad6b0a5d843796db340bdc7df05))
+* **plugins:** add controlled host navigation commands ([3caae28](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/3caae283312b0beddaaf7079bc259a12647fbd65))
+* **plugins:** Phase 1F 受控页面快捷命令与作者指南 ([b42f45b](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/b42f45b9cc8fc77622cc998662071ab3fb7d1497))
+* **plugins:** run resource-bounded local WebAssembly computations ([000f2c1](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/000f2c1c85399a6a3aac7fde26e9f7b4a4dd083f))
+
+
+### Bug Fixes
+
+* harden plugin compute review flows ([8738bf4](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/8738bf4e892ea23d2da26cb2c80495414e3510b0))
+* **plugin:** avoid focusing hidden smoke webview ([b990dbe](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/b990dbe44cc1bded57489f3c6962dcc3061858b5))
+* **plugin:** reserve lifecycle gate before compute invalidation ([bb8cf88](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/bb8cf889740656c6297fd1fe0acac0de6ec20def))
+* **plugins:** complete reviewed import metadata and deterministic CI regression ([d5f2e53](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/d5f2e53b676a579f4a7e711aa65d1bba48ede773))
+* **plugins:** keep comparison identity visible ([8e93d4f](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/8e93d4faa89f933b2493a97cef933bf220af2d33))
+
 ## [0.6.1](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.6.0...easiflux-desktop-tauri-v0.6.1) (2026-09-18)
 
 
