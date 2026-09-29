@@ -53,3 +53,21 @@ fn public_enum_literals_never_accept_external_enum_objects() {
     assert!(serde_json::from_str::<ReceiptStatus>(r#"{"accepted":null}"#).is_err());
     assert!(serde_json::from_str::<ReceiptKind>(r#"{"placeOrder":null}"#).is_err());
 }
+
+#[test]
+fn management_actions_are_strict_and_preserve_exact_price_strings() {
+    let amend = r#"{"kind":"amendOrder","order":{"symbol":"BTCUSDT","orderId":"owned-1","price":"50010","qty":"0.001"}}"#;
+    let parsed: StrategyAction = serde_json::from_str(amend).unwrap();
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), amend);
+    let protected = r#"{"kind":"placeProtectedOrder","order":{"symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"50000","timeInForce":"GTC","positionIdx":1,"reduceOnly":false},"protection":{"takeProfit":"55000","stopLoss":"45000","triggerBy":"LastPrice"}}"#;
+    let parsed: StrategyAction = serde_json::from_str(protected).unwrap();
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), protected);
+    for invalid in [
+        protected.replace("\"LastPrice\"", "\"IndexPrice\""),
+        protected.replace("\"stopLoss\":\"45000\"", "\"stopLoss\":null,\"takeProfit\":null"),
+        protected.replace("\"triggerBy\":\"LastPrice\"", "\"triggerBy\":\"LastPrice\",\"extra\":true"),
+        amend.replace("\"qty\":\"0.001\"", "\"qty\":\"0.001\",\"qty\":\"1\""),
+    ] {
+        assert!(serde_json::from_str::<StrategyAction>(&invalid).is_err(), "accepted {invalid}");
+    }
+}

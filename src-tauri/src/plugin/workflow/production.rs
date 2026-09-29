@@ -7,7 +7,7 @@ use crate::{
         account::Balance,
         config::{normalize_account_id, AppConfig, ConnectionStatus},
         trading::{
-            CancelOrderRequest, Order, OrderStatus, PlaceOrderRequest, Position, SessionContext,
+            CancelOrderRequest, Order, OrderAcknowledgement, OrderStatus, PlaceOrderRequest, Position, SessionContext,
             SubmissionContext,
         },
     },
@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 mod strategy;
+mod management;
 
 pub(crate) struct ProductionWorkflowHost {
     api: Arc<ApiClient>,
@@ -98,6 +99,16 @@ impl WorkflowHost for ProductionWorkflowHost {
             .await
         })
     }
+    fn strategy_acknowledge_protected_locked<'a>(
+        &'a self, scope: &'a str, id: &'a str, expected: &'a Order,
+        request: &'a PlaceOrderRequest,
+    ) -> HostFuture<'a, ()> {
+        Box::pin(async move {
+            let current = self.strategy_scope_locked().await?;
+            management::acknowledge_protected(&self.submissions, &current, scope, id,
+                expected, request, |endpoint, params| self.api.private_get(endpoint, params)).await
+        })
+    }
     fn strategy_reconcile_locked<'a>(
         &'a self,
         scope: &'a str,
@@ -117,6 +128,26 @@ impl WorkflowHost for ProductionWorkflowHost {
                 |endpoint, params| self.api.private_get(endpoint, params),
             )
             .await
+        })
+    }
+    fn strategy_reconcile_amend_locked<'a>(
+        &'a self, scope: &'a str, request: &'a crate::plugin::strategy::AmendProposal,
+        original: &'a PlaceOrderRequest,
+    ) -> HostFuture<'a, Option<Order>> {
+        Box::pin(async move {
+            let current = self.strategy_scope_locked().await?;
+            if current != scope { return Err(unavailable()); }
+            management::reconcile_amend(request, original,
+                |endpoint, params| self.api.private_get(endpoint, params)).await
+        })
+    }
+    fn strategy_reconcile_protected_locked<'a>(
+        &'a self, scope: &'a str, request: &'a PlaceOrderRequest,
+    ) -> HostFuture<'a, Option<Order>> {
+        Box::pin(async move {
+            let current = self.strategy_scope_locked().await?;
+            management::reconcile_protected(&self.submissions, &current, scope, request,
+                |endpoint, params| self.api.private_get(endpoint, params)).await
         })
     }
     fn authority_locked(&self) -> HostFuture<'_, AccountAuthority> {
@@ -203,7 +234,18 @@ impl WorkflowHost for ProductionWorkflowHost {
         Box::pin(async move {
             request.time_in_force =
                 Some(exchange_time_in_force(request.time_in_force.as_deref())?.into());
-            let scope = self.api.order_submission_scope(&context.account_id).await?;
+            if let Some(protection) = request.protection.as_mut() {
+                let preflight = || crate::error::AppError::OrderSubmissionRejected("protected order preflight failed".into());
+                if request.reduce_only != Some(false) { return Err(preflight()); }
+                let quote = self.market_locked(&request.symbol).await.map_err(|_| preflight())?;
+                let reference = if protection.trigger_by == "LastPrice" { &quote.last_price } else { &quote.mark_price };
+                protection.validate(&request.side, request.price.as_deref(), reference).map_err(|_| preflight())?;
+            }
+            let scope = self.api.order_submission_scope(&context.account_id).await.map_err(|failure| {
+                if request.protection.is_some() {
+                    crate::error::AppError::OrderSubmissionRejected("protected order preflight unavailable".into())
+                } else { failure }
+            })?;
             crate::services::order_submission::submit_once(
                 &self.submissions,
                 &scope,
@@ -215,6 +257,30 @@ impl WorkflowHost for ProductionWorkflowHost {
                 },
             )
             .await
+        })
+    }
+    fn strategy_amend_locked<'a>(
+        &'a self, context: SessionContext,
+        mut request: crate::plugin::strategy::AmendProposal,
+        original: PlaceOrderRequest,
+        admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, OrderAcknowledgement> {
+        Box::pin(async move {
+            let preflight = || crate::error::AppError::OrderSubmissionRejected("amendment preflight failed".into());
+            request.validate(&original.symbol).map_err(|_| preflight())?;
+            let link = original.order_link_id.as_deref().ok_or_else(preflight)?;
+            strategy::validate_request(link, &original).map_err(|_| preflight())?;
+            if original.protection.is_some() || original.order_type != "Limit" { return Err(preflight()); }
+            let target = management::query_amend_target(&request, &original,
+                |endpoint, params| self.api.private_get(endpoint, params)).await.map_err(|_| preflight())?;
+            management::validate_amend_change(&request, &target).map_err(|_| preflight())?;
+            let quote = self.market_locked(&request.symbol).await.map_err(|_| preflight())?;
+            decimal(&quote.last_price, true).map_err(|_| preflight())?;
+            let mut effective = original.clone();
+            effective.qty = request.qty.clone();
+            effective.price = Some(request.price.clone());
+            self.trading.amend_strategy_order(context, &request.order_id,
+                original.order_link_id.as_deref(), effective, &quote.last_price, admission).await
         })
     }
     fn strategy_cancel_locked<'a>(

@@ -407,6 +407,7 @@ async fn successful_switch_does_not_reset_global_risk_quota() {
         time_in_force: None,
         order_link_id: None,
         reduce_only: None,
+        protection: None,
     };
     risk.reserve_order(&order, None, 1_700_000_000_000).unwrap();
     let port = FakeLifecyclePort::new(ConnectionStatus::Disconnected);
@@ -444,6 +445,7 @@ async fn account_switch_waits_for_in_flight_order_lifecycle() {
         time_in_force: None,
         order_link_id: None,
         reduce_only: None,
+        protection: None,
     };
     let (release_submit, wait_for_release) = tokio::sync::oneshot::channel::<()>();
     let order_events = &port.events;

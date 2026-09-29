@@ -70,6 +70,7 @@ fn request() -> PlaceOrderRequest {
         time_in_force: Some("GoodTillCancel".into()),
         position_idx: 1,
         reduce_only: Some(false),
+        protection: None,
         order_link_id: Some(ID.into()),
     }
 }

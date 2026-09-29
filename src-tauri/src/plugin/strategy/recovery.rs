@@ -1,4 +1,5 @@
 use super::*;
+use super::execution::StrategyMutationResponse;
 use crate::{error::AppResult, models::trading::OrderStatus};
 use std::sync::Arc;
 
@@ -47,15 +48,26 @@ impl StrategySupervisor {
             StrategyAction::CancelOrder { order } => Some(order.order_id.as_str()),
             _ => None,
         };
-        let result = self
-            .host
-            .strategy_reconcile_locked(
-                &record.scope,
-                &record.view.symbol,
-                pending.submission_id.as_deref(),
-                exchange,
-            )
-            .await;
+        let result = match &pending.action {
+            StrategyAction::AmendOrder { order } => {
+                let original = record.owned.get(&order.order_id).and_then(|o| o.placement.as_ref())
+                    .ok_or_else(|| error("plugin_strategy_recovery_required"))?;
+                self.host.strategy_reconcile_amend_locked(&record.scope, order, original).await
+            }
+            StrategyAction::PlaceProtectedOrder { order, protection } => {
+                let id = pending.submission_id.as_deref().ok_or_else(|| error("plugin_strategy_recovery_required"))?;
+                let canonical = super::execution::canonical_placement(order, id, Some(protection.clone()));
+                if record.owned.values().any(|owned| owned.submission_id == id
+                    && owned.placement.as_ref() != Some(&canonical)) {
+                    return Err(error("plugin_strategy_recovery_required"));
+                }
+                self.host.strategy_reconcile_protected_locked(&record.scope, &canonical).await
+            }
+            _ => self.host.strategy_reconcile_locked(
+                &record.scope, &record.view.symbol,
+                pending.submission_id.as_deref(), exchange,
+            ).await,
+        };
         let response = match result {
             Ok(Some(order))
                 if super::execution::matches_response(&pending, &order)
@@ -65,9 +77,10 @@ impl StrategySupervisor {
                             OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
                         )) =>
             {
-                Ok(order)
+                Ok(StrategyMutationResponse::Order(order))
             }
-            Err(failure) if exchange.is_none() && super::execution::known_rejection(&failure) => {
+            Err(failure) if matches!(pending.action, StrategyAction::PlaceOrder { .. })
+                && super::execution::known_rejection(&failure) => {
                 Err(failure)
             }
             _ => return Err(error("plugin_strategy_recovery_required")),

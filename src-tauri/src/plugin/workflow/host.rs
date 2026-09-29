@@ -4,11 +4,12 @@ use crate::{
     models::{
         account::Balance,
         trading::{
-            CancelOrderRequest, Order, PlaceOrderRequest, Position, SessionContext,
+            CancelOrderRequest, Order, OrderAcknowledgement, PlaceOrderRequest, Position, SessionContext,
             SubmissionContext,
         },
     },
     services::AccountLifecycleCoordinator,
+    plugin::strategy::AmendProposal,
 };
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -40,6 +41,15 @@ pub(crate) trait WorkflowHost: Send + Sync {
     ) -> HostFuture<'a, Order> {
         Box::pin(async { Err(error("plugin_strategy_unavailable")) })
     }
+    fn strategy_amend_locked<'a>(
+        &'a self,
+        _context: SessionContext,
+        _request: AmendProposal,
+        _original: PlaceOrderRequest,
+        _admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, OrderAcknowledgement> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
     fn strategy_scope_locked(&self) -> HostFuture<'_, String> {
         Box::pin(async { Err(error("plugin_strategy_unavailable")) })
     }
@@ -52,12 +62,32 @@ pub(crate) trait WorkflowHost: Send + Sync {
     ) -> HostFuture<'a, ()> {
         Box::pin(async { Err(error("plugin_strategy_unavailable")) })
     }
+    fn strategy_acknowledge_protected_locked<'a>(
+        &'a self,
+        _scope: &'a str,
+        _id: &'a str,
+        _expected: &'a Order,
+        _request: &'a PlaceOrderRequest,
+    ) -> HostFuture<'a, ()> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
     fn strategy_reconcile_locked<'a>(
         &'a self,
         _scope: &'a str,
         _symbol: &'a str,
         _submission: Option<&'a str>,
         _exchange: Option<&'a str>,
+    ) -> HostFuture<'a, Option<Order>> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
+    fn strategy_reconcile_amend_locked<'a>(
+        &'a self, _scope: &'a str, _request: &'a AmendProposal,
+        _original: &'a PlaceOrderRequest,
+    ) -> HostFuture<'a, Option<Order>> {
+        Box::pin(async { Err(error("plugin_strategy_unavailable")) })
+    }
+    fn strategy_reconcile_protected_locked<'a>(
+        &'a self, _scope: &'a str, _request: &'a PlaceOrderRequest,
     ) -> HostFuture<'a, Option<Order>> {
         Box::pin(async { Err(error("plugin_strategy_unavailable")) })
     }

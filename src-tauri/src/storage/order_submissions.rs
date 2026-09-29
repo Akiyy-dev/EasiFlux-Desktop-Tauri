@@ -294,6 +294,7 @@ mod tests {
             time_in_force: Some("GTC".into()),
             order_link_id: Some(id.into()),
             reduce_only: Some(false),
+            protection: None,
         }
     }
 

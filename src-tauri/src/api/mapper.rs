@@ -610,6 +610,10 @@ pub fn build_place_order_body(req: &crate::models::trading::PlaceOrderRequest) -
         time_in_force: req.time_in_force.clone(),
         order_link_id: req.order_link_id.clone(),
         reduce_only: req.reduce_only,
+        take_profit: req.protection.as_ref().and_then(|p| p.take_profit.clone()),
+        stop_loss: req.protection.as_ref().and_then(|p| p.stop_loss.clone()),
+        tp_trigger_by: req.protection.as_ref().and_then(|p| p.take_profit.as_ref().map(|_| p.trigger_by.clone())),
+        sl_trigger_by: req.protection.as_ref().and_then(|p| p.stop_loss.as_ref().map(|_| p.trigger_by.clone())),
     }
     .to_value()
 }
@@ -982,11 +986,22 @@ mod tests {
             time_in_force: None,
             order_link_id: None,
             reduce_only: None,
+            protection: None,
         };
         let body = build_place_order_body(&req);
         assert_eq!(body["symbol"], "BTCUSDT");
         assert_eq!(body["position_idx"], 1);
         assert_eq!(body["order_type"], "Limit");
         assert!(body.get("orderType").is_none());
+        assert!(body.get("take_profit").is_none());
+        let mut protected = req;
+        protected.protection = Some(crate::models::trading::OrderProtection {
+            take_profit: Some("55000".into()), stop_loss: None, trigger_by: "MarkPrice".into(),
+        });
+        let body = build_place_order_body(&protected);
+        assert_eq!(body["take_profit"], "55000");
+        assert_eq!(body["tp_trigger_by"], "MarkPrice");
+        assert!(body.get("stop_loss").is_none());
+        assert!(body.get("sl_trigger_by").is_none());
     }
 }

@@ -318,6 +318,7 @@ fn market_request(order_link_id: Option<&str>) -> PlaceOrderRequest {
         time_in_force: None,
         order_link_id: order_link_id.map(str::to_owned),
         reduce_only: None,
+        protection: None,
     }
 }
 
@@ -668,6 +669,7 @@ async fn confirmed_rejection_persists_when_release_save_fails_without_leaking_de
         time_in_force: None,
         order_link_id: None,
         reduce_only: None,
+        protection: None,
     };
     let reservation = risk
         .read()
@@ -758,6 +760,7 @@ async fn undocumented_list_rejection_is_ambiguous_without_notification_or_succes
             time_in_force: None,
             order_link_id: None,
             reduce_only: None,
+            protection: None,
         },
         None,
         NOW_MS,
@@ -785,6 +788,7 @@ async fn undocumented_list_rejection_is_ambiguous_without_notification_or_succes
                 time_in_force: None,
                 order_link_id: None,
                 reduce_only: None,
+                protection: None,
             },
             None,
             NOW_MS + 1,

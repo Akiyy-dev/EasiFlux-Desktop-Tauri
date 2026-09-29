@@ -415,6 +415,7 @@ impl PluginRuntime {
                     time_in_force: Some(order.time_in_force.clone()),
                     order_link_id: Some(submission_id.clone()),
                     reduce_only: Some(order.reduce_only),
+                    protection: None,
                 };
                 (
                     "placeOrder",

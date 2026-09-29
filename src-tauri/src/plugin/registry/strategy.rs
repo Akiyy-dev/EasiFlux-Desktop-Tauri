@@ -58,7 +58,7 @@ impl PluginRegistry {
         let PluginCommandParams::Strategy(params) = &contribution.params else {
             return Err(error("plugin_strategy_denied"));
         };
-        if record.manifest().schema_version != 6
+        if ![6, 7].contains(&record.manifest().schema_version)
             || contribution.action_id != PluginCommandActionId::SandboxStrategy
         {
             return Err(error("plugin_strategy_denied"));

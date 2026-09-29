@@ -30,6 +30,8 @@ const SCOPE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const PLACE: &str = r#"{"state":{"phase":1},"action":{"kind":"placeOrder","order":{"symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"50000","timeInForce":"GTC","positionIdx":1,"reduceOnly":false}},"message":"placed"}"#;
 const CANCEL: &str = r#"{"state":{"phase":2},"action":{"kind":"cancelOrder","order":{"symbol":"BTCUSDT","orderId":"owned-1"}},"message":"cancel requested"}"#;
 const STOP: &str = r#"{"state":{"phase":3},"action":{"kind":"stop"},"message":"done"}"#;
+const PROTECTED: &str = r#"{"state":{"phase":1},"action":{"kind":"placeProtectedOrder","order":{"symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"50000","timeInForce":"GTC","positionIdx":1,"reduceOnly":false},"protection":{"takeProfit":"55000","stopLoss":"45000","triggerBy":"LastPrice"}},"message":"protected request"}"#;
+const AMEND: &str = r#"{"state":{"phase":2},"action":{"kind":"amendOrder","order":{"symbol":"BTCUSDT","orderId":"owned-1","price":"50010","qty":"0.0008"}},"message":"amended request"}"#;
 const CAPS: &[&str] = &[
     "account.read",
     "strategy.run",
@@ -119,6 +121,7 @@ struct Fake {
     submissions: OrderSubmissionStore,
     placed: AtomicUsize,
     cancelled: AtomicUsize,
+    amended: AtomicUsize,
     acked: AtomicUsize,
     reads: AtomicUsize,
     visible: AtomicBool,
@@ -127,7 +130,11 @@ struct Fake {
     hold_http: AtomicBool,
     read_delay_ms: AtomicU64,
     unknown_cancel: AtomicBool,
+    unknown_amend: AtomicBool,
+    amend_reconciled: AtomicBool,
     terminal_cancel: AtomicBool,
+    last_submission: Mutex<Option<String>>,
+    visible_filled: Mutex<String>,
     after_authority: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     hold_preparation: AtomicBool,
     preparing: tokio::sync::Notify,
@@ -168,7 +175,9 @@ impl WorkflowHost for Fake {
         Box::pin(async {
             Ok(
                 if self.placed.load(Ordering::SeqCst) > 0 && self.visible.load(Ordering::SeqCst) {
-                    vec![order(None)]
+                    let mut current = order(self.last_submission.lock().unwrap().clone());
+                    current.filled_qty = self.visible_filled.lock().unwrap().clone();
+                    vec![current]
                 } else {
                     vec![]
                 },
@@ -195,7 +204,7 @@ impl WorkflowHost for Fake {
     fn strategy_place_locked<'a>(
         &'a self,
         c: SubmissionContext,
-        r: PlaceOrderRequest,
+        mut r: PlaceOrderRequest,
         admission: &'a crate::services::trading::StrategyAdmission<'a>,
     ) -> HostFuture<'a, Order> {
         Box::pin(async move {
@@ -209,6 +218,7 @@ impl WorkflowHost for Fake {
             assert_eq!(run.view.actions_submitted, 1);
             assert_eq!(run.view.total_submitted_qty, "0.001");
             assert_eq!(c.submission_id, r.order_link_id.clone().unwrap());
+            r.time_in_force = Some("GoodTillCancel".into());
             crate::services::order_submission::submit_once(
                 &self.submissions,
                 SCOPE,
@@ -217,6 +227,7 @@ impl WorkflowHost for Fake {
                 |r| async move {
                     admission()?;
                     self.placed.fetch_add(1, Ordering::SeqCst);
+                    *self.last_submission.lock().unwrap() = r.order_link_id.clone();
                     self.entered.notify_one();
                     if self.hold_http.load(Ordering::SeqCst) {
                         self.release.notified().await;
@@ -261,6 +272,53 @@ impl WorkflowHost for Fake {
             Ok(order(None))
         })
     }
+    fn strategy_amend_locked<'a>(
+        &'a self, _: SessionContext, request: AmendProposal, original: PlaceOrderRequest,
+        admission: &'a crate::services::trading::StrategyAdmission<'a>,
+    ) -> HostFuture<'a, OrderAcknowledgement> {
+        Box::pin(async move {
+            let doc = self.store.load()?;
+            assert_eq!(doc.runs[0].view.actions_submitted, 2);
+            assert_eq!(doc.runs[0].view.total_submitted_qty, "0.0018");
+            assert_eq!(request.order_id, "owned-1");
+            assert_eq!(request.price, "50010");
+            assert_eq!(request.qty, "0.0008");
+            assert_eq!(original.order_link_id, *self.last_submission.lock().unwrap());
+            if self.hold_preparation.load(Ordering::SeqCst) {
+                self.preparing.notify_one();
+                self.prepare_release.notified().await;
+            }
+            admission()?;
+            self.amended.fetch_add(1, Ordering::SeqCst);
+            if self.unknown_amend.load(Ordering::SeqCst) {
+                return Err(AppError::Connection("synthetic unknown amendment".into()));
+            }
+            Ok(OrderAcknowledgement { order_id: "owned-1".into(), order_link_id: original.order_link_id })
+        })
+    }
+    fn strategy_reconcile_amend_locked<'a>(
+        &'a self, _: &'a str, request: &'a AmendProposal,
+        original: &'a PlaceOrderRequest,
+    ) -> HostFuture<'a, Option<Order>> {
+        Box::pin(async move {
+            let mut observed = order(original.order_link_id.clone());
+            if self.amend_reconciled.load(Ordering::SeqCst) {
+                observed.price = request.price.clone();
+                observed.qty = request.qty.clone();
+            }
+            Ok(Some(observed))
+        })
+    }
+    fn strategy_reconcile_protected_locked<'a>(
+        &'a self, scope: &'a str, request: &'a PlaceOrderRequest,
+    ) -> HostFuture<'a, Option<Order>> {
+        Box::pin(async move {
+            assert!(request.protection.is_some());
+            let id = request.order_link_id.as_deref().unwrap();
+            crate::services::order_submission::reconcile(&self.submissions, scope, id,
+                |_| async { Ok(vec![order(Some(id.into()))]) }).await
+        })
+    }
     fn strategy_scope_locked(&self) -> HostFuture<'_, String> {
         Box::pin(async { Ok(SCOPE.into()) })
     }
@@ -281,6 +339,21 @@ impl WorkflowHost for Fake {
             );
             assert!(run.pending.is_some());
             assert_eq!(expected.order_link_id.as_deref(), Some(id));
+            self.submissions.acknowledge(scope, id)?;
+            self.acked.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+    fn strategy_acknowledge_protected_locked<'a>(
+        &'a self, scope: &'a str, id: &'a str, expected: &'a Order,
+        request: &'a PlaceOrderRequest,
+    ) -> HostFuture<'a, ()> {
+        Box::pin(async move {
+            assert_eq!(expected.order_id, "owned-1");
+            assert_eq!(request.order_link_id.as_deref(), Some(id));
+            assert_eq!(request.protection.as_ref().unwrap().take_profit.as_deref(), Some("55000"));
+            let record = self.submissions.get(scope, id)?.unwrap();
+            assert_eq!(record.request, *request);
             self.submissions.acknowledge(scope, id)?;
             self.acked.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -389,6 +462,7 @@ async fn fixture_manifest(m: serde_json::Value) -> Fixture {
         submissions: OrderSubmissionStore::with_dir(temp.0.join("submissions")),
         placed: AtomicUsize::new(0),
         cancelled: AtomicUsize::new(0),
+        amended: AtomicUsize::new(0),
         acked: AtomicUsize::new(0),
         reads: AtomicUsize::new(0),
         visible: AtomicBool::new(true),
@@ -397,7 +471,11 @@ async fn fixture_manifest(m: serde_json::Value) -> Fixture {
         hold_http: AtomicBool::new(false),
         read_delay_ms: AtomicU64::new(0),
         unknown_cancel: AtomicBool::new(false),
+        unknown_amend: AtomicBool::new(false),
+        amend_reconciled: AtomicBool::new(false),
         terminal_cancel: AtomicBool::new(true),
+        last_submission: Mutex::new(None),
+        visible_filled: Mutex::new("0".into()),
         after_authority: Mutex::new(None),
         hold_preparation: AtomicBool::new(false),
         preparing: tokio::sync::Notify::new(),
@@ -487,6 +565,201 @@ async fn native_worker_places_then_cancels_once_with_durable_intent_and_receipt_
     tick(&f).await;
     assert_eq!(f.host.placed.load(Ordering::SeqCst), 1);
     assert_eq!(f.host.cancelled.load(Ordering::SeqCst), 1);
+}
+
+// Break: a v7 protected action reaches the ordinary placement seam without a
+// canonical protection field or a durable owned request.
+#[tokio::test(start_paused = true)]
+async fn protected_action_dispatches_exact_canonical_request_only_with_grant() {
+    let _serial = SERIAL.lock().await;
+    let mut manifest = super::manifest();
+    manifest["schemaVersion"] = json!(7);
+    manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "trade.protect"]);
+    manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PROTECTED, STOP)));
+    let f = fixture_manifest(manifest).await;
+    let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+    let mut requested = request(access);
+    requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "trade.protect"]
+        .into_iter().map(str::to_string).collect();
+    f.supervisor.start(requested).await.unwrap();
+    let view = settled(&f, "1").await;
+    assert_eq!(view.last_receipt.as_ref().unwrap().kind, ReceiptKind::PlaceProtectedOrder);
+    assert_eq!(f.host.placed.load(Ordering::SeqCst), 1);
+    let owned = &f.store.load().unwrap().runs[0].owned["owned-1"];
+    let canonical = owned.placement.as_ref().unwrap();
+    assert_eq!(canonical.protection.as_ref().unwrap().take_profit.as_deref(), Some("55000"));
+    assert_eq!(canonical.protection.as_ref().unwrap().stop_loss.as_deref(), Some("45000"));
+    let mut corrupted = f.store.load().unwrap();
+    corrupted.runs[0].owned.get_mut("owned-1").unwrap().placement.as_mut().unwrap()
+        .protection.as_mut().unwrap().take_profit = Some("40000".into());
+    assert!(corrupted.validate().is_err(), "persisted protection must remain directional to entry");
+    f.supervisor.stop_all().await.unwrap();
+    f.supervisor.drain().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn amend_uses_owned_original_and_conservatively_debits_before_dispatch() {
+    let _serial = SERIAL.lock().await;
+    let mut manifest = super::manifest();
+    manifest["schemaVersion"] = json!(7);
+    manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.amend"]);
+    manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PLACE, AMEND)));
+    let f = fixture_manifest(manifest).await;
+    let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+    let mut requested = request(access);
+    requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.amend"]
+        .into_iter().map(str::to_string).collect();
+    f.supervisor.start(requested).await.unwrap();
+    settled(&f, "1").await;
+    tick(&f).await;
+    let view = settled(&f, "2").await;
+    assert_eq!(view.last_receipt.unwrap().kind, ReceiptKind::AmendOrder);
+    assert_eq!(view.total_submitted_qty, "0.0018");
+    assert_eq!(f.host.amended.load(Ordering::SeqCst), 1);
+    f.supervisor.stop_all().await.unwrap();
+    f.supervisor.drain().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_amend_survives_restart_and_resolves_only_at_desired_state_without_replay() {
+    let _serial = SERIAL.lock().await;
+    let mut manifest = super::manifest();
+    manifest["schemaVersion"] = json!(7);
+    manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.amend"]);
+    manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PLACE, AMEND)));
+    let f = fixture_manifest(manifest).await;
+    f.host.unknown_amend.store(true, Ordering::SeqCst);
+    let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+    let mut requested = request(access);
+    requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.amend"]
+        .into_iter().map(str::to_string).collect();
+    let run = f.supervisor.start(requested).await.unwrap();
+    settled(&f, "1").await;
+    tick(&f).await;
+    let unknown = status(&f, StrategyStatus::RecoveryRequired).await;
+    assert_eq!(unknown.total_submitted_qty, "0.0018");
+    f.supervisor.drain().await;
+    let restarted = StrategySupervisor::new(f.runtime.clone(), f.host.clone(), f.store.clone(),
+        Arc::new(tokio::sync::Notify::new()));
+    assert!(restarted.reconcile(run.run_id.clone()).await.is_err());
+    assert!(f.store.load().unwrap().runs[0].pending.is_some());
+    assert_eq!(f.host.amended.load(Ordering::SeqCst), 1);
+    f.host.amend_reconciled.store(true, Ordering::SeqCst);
+    let resolved = restarted.reconcile(run.run_id).await.unwrap();
+    assert_eq!(resolved.status, StrategyStatus::Paused);
+    assert_eq!(resolved.last_receipt.unwrap().kind, ReceiptKind::AmendOrder);
+    assert_eq!(f.host.amended.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_during_amend_preparation_spends_budget_but_sends_no_mutation() {
+    let _serial = SERIAL.lock().await;
+    let mut manifest = super::manifest();
+    manifest["schemaVersion"] = json!(7);
+    manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.amend"]);
+    manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PLACE, AMEND)));
+    let f = fixture_manifest(manifest).await;
+    let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+    let mut requested = request(access);
+    requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.amend"]
+        .into_iter().map(str::to_string).collect();
+    f.supervisor.start(requested).await.unwrap();
+    settled(&f, "1").await;
+    f.host.hold_preparation.store(true, Ordering::SeqCst);
+    tick(&f).await;
+    f.host.preparing.notified().await;
+    f.supervisor.stop_all().await.unwrap();
+    f.host.prepare_release.notify_one();
+    f.supervisor.drain().await;
+    assert_eq!(f.host.amended.load(Ordering::SeqCst), 0);
+    let view = f.supervisor.list().unwrap().runs[0].clone();
+    assert_eq!(view.total_submitted_qty, "0.0018");
+    assert_eq!(view.last_receipt.unwrap().status, ReceiptStatus::Rejected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn amend_rejects_noop_increase_filled_and_foreign_targets_before_debit() {
+    let _serial = SERIAL.lock().await;
+    for case in ["noop", "increase", "filled", "foreign"] {
+        let action = match case {
+            "noop" => AMEND.replace("50010", "50000").replace("0.0008", "0.001"),
+            "increase" => AMEND.replace("0.0008", "0.0015"),
+            "foreign" => AMEND.replace("owned-1", "foreign-1"),
+            _ => AMEND.to_string(),
+        };
+        let mut manifest = super::manifest();
+        manifest["schemaVersion"] = json!(7);
+        manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.amend"]);
+        manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PLACE, &action)));
+        let f = fixture_manifest(manifest).await;
+        let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+        let mut requested = request(access);
+        requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.amend"]
+            .into_iter().map(str::to_string).collect();
+        requested.policy.max_order_qty = "0.003".into();
+        f.supervisor.start(requested).await.unwrap();
+        settled(&f, "1").await;
+        if case == "filled" { *f.host.visible_filled.lock().unwrap() = "0.0008".into(); }
+        tick(&f).await;
+        status(&f, StrategyStatus::Faulted).await;
+        assert_eq!(f.host.amended.load(Ordering::SeqCst), 0, "{case}");
+        assert_eq!(f.supervisor.list().unwrap().runs[0].actions_submitted, 1, "{case}");
+        f.supervisor.drain().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn protected_direction_or_missing_grant_never_submits() {
+    let _serial = SERIAL.lock().await;
+    for case in ["equal", "wrong_stop", "no_grant"] {
+        let action = match case {
+            "equal" => PROTECTED.replace("55000", "50000"),
+            "wrong_stop" => PROTECTED.replace("45000", "60000"),
+            _ => PROTECTED.into(),
+        };
+        let mut manifest = super::manifest();
+        manifest["schemaVersion"] = json!(7);
+        manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "trade.protect"]);
+        manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(&action, STOP)));
+        let f = fixture_manifest(manifest).await;
+        let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+        let mut requested = request(access);
+        requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read"]
+            .into_iter().map(str::to_string).collect();
+        if case != "no_grant" { requested.capabilities.push("trade.protect".into()); }
+        f.supervisor.start(requested).await.unwrap();
+        status(&f, StrategyStatus::Faulted).await;
+        assert_eq!(f.host.placed.load(Ordering::SeqCst), 0, "{case}");
+        assert_eq!(f.supervisor.list().unwrap().runs[0].actions_submitted, 0, "{case}");
+        f.supervisor.drain().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_protected_submission_restarts_without_replay_and_keeps_canonical_request() {
+    let _serial = SERIAL.lock().await;
+    let mut manifest = super::manifest();
+    manifest["schemaVersion"] = json!(7);
+    manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "trade.protect"]);
+    manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PROTECTED, STOP)));
+    let f = fixture_manifest(manifest).await;
+    f.host.unknown.store(true, Ordering::SeqCst);
+    let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+    let mut requested = request(access);
+    requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "trade.protect"]
+        .into_iter().map(str::to_string).collect();
+    let run = f.supervisor.start(requested).await.unwrap();
+    let unknown = status(&f, StrategyStatus::RecoveryRequired).await;
+    assert_eq!(unknown.last_receipt.unwrap().kind, ReceiptKind::PlaceProtectedOrder);
+    f.supervisor.drain().await;
+    let restarted = StrategySupervisor::new(f.runtime.clone(), f.host.clone(), f.store.clone(),
+        Arc::new(tokio::sync::Notify::new()));
+    let resolved = restarted.reconcile(run.run_id).await.unwrap();
+    assert_eq!(resolved.status, StrategyStatus::Paused);
+    assert_eq!(f.host.placed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.host.acked.load(Ordering::SeqCst), 1);
+    let owned = &f.store.load().unwrap().runs[0].owned["owned-1"];
+    assert_eq!(owned.placement.as_ref().unwrap().protection.as_ref().unwrap().take_profit.as_deref(), Some("55000"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -931,6 +1204,13 @@ async fn malformed_durable_ownership_or_omitted_intent_never_loads_as_safe() {
     f.supervisor.stop_all().await.unwrap();
     f.supervisor.drain().await;
     let doc = f.store.load().unwrap();
+    let mut legacy = doc.clone();
+    legacy.runs[0].owned.get_mut("owned-1").unwrap().placement = None;
+    assert!(legacy.validate().is_ok(), "old ownership without metadata stays readable");
+    let mut bad_placement = doc.clone();
+    bad_placement.runs[0].owned.get_mut("owned-1").unwrap()
+        .placement.as_mut().unwrap().order_link_id = Some("foreign-client".into());
+    assert!(bad_placement.validate().is_err());
     let mut missing = serde_json::to_value(&doc).unwrap();
     missing["runs"][0]
         .as_object_mut()

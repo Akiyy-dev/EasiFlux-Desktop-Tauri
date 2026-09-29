@@ -220,6 +220,7 @@ mod tests {
                     time_in_force: Some("GTC".into()),
                     order_link_id: Some(submission_id),
                     reduce_only: Some(false),
+                    protection: None,
                 },
             )
             .await

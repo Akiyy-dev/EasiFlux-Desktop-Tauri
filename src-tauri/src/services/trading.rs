@@ -9,7 +9,7 @@ use crate::events::EventEmitter;
 use crate::models::config::{normalize_account_id, AppConfig};
 use crate::models::risk::RiskViolation;
 use crate::models::trading::{
-    CancelOrderRequest, Order, OrderStatus, OrderStreamContext, PlaceOrderRequest,
+    CancelOrderRequest, Order, OrderAcknowledgement, OrderStatus, OrderStreamContext, PlaceOrderRequest,
     SubmissionContext,
 };
 use crate::services::account_profiles::{
@@ -397,6 +397,7 @@ impl TradingService {
         request: PlaceOrderRequest,
         admission: &StrategyAdmission<'_>,
     ) -> AppResult<Order> {
+        let protected = request.protection.is_some();
         let session_context = OrderStreamContext::from(&context);
         let requires_reference_price = self.risk.read().await.requires_reference_price(&request);
         let reference_price = if requires_reference_price {
@@ -412,8 +413,15 @@ impl TradingService {
             reference_price.as_deref(),
             self.time.now_ms(),
             Some(admission),
-            |request| async move { PrivateApi::create_order(self.api.as_ref(), &request).await },
+            |request| async move {
+                if protected { PrivateApi::create_protected_order_ack(self.api.as_ref(), &request).await }
+                else { PrivateApi::create_order(self.api.as_ref(), &request).await }
+            },
             |order| async move {
+                if protected {
+                    self.emitter.emit_log("info", &format!("受保护下单请求已受理: {}", order.order_id));
+                    return;
+                }
                 let _ = self.trade_log.append_order(&order);
                 self.emitter.emit_order(&session_context, order.clone());
                 self.emitter
@@ -440,6 +448,36 @@ impl TradingService {
             &format!("撤单请求已受理: {}", acknowledgement.order_id),
         );
         Ok(acknowledgement)
+    }
+
+    pub(crate) async fn amend_strategy_order(
+        &self,
+        _context: OrderStreamContext,
+        order_id: &str,
+        original_link: Option<&str>,
+        effective: PlaceOrderRequest,
+        reference_price: &str,
+        admission: &StrategyAdmission<'_>,
+    ) -> AppResult<OrderAcknowledgement> {
+        let now_ms = self.time.now_ms();
+        // Deliberately conservative: an amendment reserves native risk usage as
+        // an additional requested quantity. Unknown sends retain the reservation.
+        let reservation = self.risk.read().await.reserve_order(&effective, Some(reference_price), now_ms)?;
+        let request = crate::models::api_requests::ApiReplaceOrderRequest {
+            symbol: effective.symbol,
+            order_id: Some(order_id.into()),
+            order_link_id: None,
+            price: effective.price,
+            qty: Some(effective.qty),
+        };
+        let result = strategy::dispatch_reserved(&self.risk, &reservation, now_ms, Some(admission), || async {
+            let payload = PrivateApi::replace_order(self.api.as_ref(), &request).await?;
+            PrivateApi::parse_amend_ack(&payload, order_id, original_link)
+        }).await;
+        if let Ok(ack) = &result {
+            self.emitter.emit_log("info", &format!("改单请求已受理: {}", ack.order_id));
+        }
+        result
     }
 
     pub(crate) async fn cancel_order_acknowledged(
@@ -590,6 +628,7 @@ where
         None => context.submission_id.clone(),
     };
     request.order_link_id = Some(transmitted_order_link_id.clone());
+    let request_protection_absent = request.protection.is_none();
     let reservation_result = {
         let risk = risk.read().await;
         risk.reserve_order(&request, reference_price, now_ms)
@@ -638,20 +677,22 @@ where
         }
     };
 
-    let mut observed_order = order.clone();
-    if observed_order.order_link_id.is_none() {
-        observed_order.order_link_id = Some(transmitted_order_link_id);
+    if request_protection_absent {
+        let mut observed_order = order.clone();
+        if observed_order.order_link_id.is_none() {
+            observed_order.order_link_id = Some(transmitted_order_link_id);
+        }
+        observer
+            .observe(
+                &context.account_id,
+                context.session_epoch,
+                &observed_order,
+                OrderObservationOrigin::Command,
+                Some(&context.submission_id),
+                now_ms,
+            )
+            .await;
     }
-    observer
-        .observe(
-            &context.account_id,
-            context.session_epoch,
-            &observed_order,
-            OrderObservationOrigin::Command,
-            Some(&context.submission_id),
-            now_ms,
-        )
-        .await;
     success_side_effects(order.clone()).await;
     Ok(order)
 }
@@ -873,6 +914,7 @@ mod tests {
             time_in_force: None,
             order_link_id: None,
             reduce_only: None,
+            protection: None,
         }
     }
 
@@ -887,6 +929,7 @@ mod tests {
             time_in_force: Some("GTC".into()),
             order_link_id: None,
             reduce_only: None,
+            protection: None,
         }
     }
 

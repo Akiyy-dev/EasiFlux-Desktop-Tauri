@@ -20,16 +20,16 @@ where
     submit().await
 }
 
-pub(super) async fn dispatch_reserved<F, Fut>(
+pub(super) async fn dispatch_reserved<T, F, Fut>(
     risk: &Arc<tokio::sync::RwLock<RiskService>>,
     reservation: &RiskReservation,
     now_ms: u64,
     admission: Option<&StrategyAdmission<'_>>,
     submit: F,
-) -> AppResult<Order>
+) -> AppResult<T>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = AppResult<Order>>,
+    Fut: Future<Output = AppResult<T>>,
 {
     if let Some(admission) = admission {
         if let Err(rejection) = admission() {
@@ -86,6 +86,7 @@ mod tests {
             time_in_force: Some("ImmediateOrCancel".into()),
             order_link_id: Some(uuid::Uuid::new_v4().to_string()),
             reduce_only: Some(false),
+            protection: None,
         }
     }
     fn order() -> Order {

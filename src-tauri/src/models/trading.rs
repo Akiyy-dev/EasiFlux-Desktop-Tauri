@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionContext {
@@ -109,8 +109,8 @@ pub struct Position {
     pub position_idx: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlaceOrderRequest {
     pub symbol: String,
     pub side: String,
@@ -122,6 +122,70 @@ pub struct PlaceOrderRequest {
     pub time_in_force: Option<String>,
     pub order_link_id: Option<String>,
     pub reduce_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection: Option<OrderProtection>,
+}
+
+/// Exchange receipt identity only; it does not describe current order state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderAcknowledgement {
+    pub order_id: String,
+    pub order_link_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderProtection {
+    pub take_profit: Option<String>,
+    pub stop_loss: Option<String>,
+    pub trigger_by: String,
+}
+impl OrderProtection {
+    pub fn validate_shape(&self) -> Result<(), String> {
+        if !["LastPrice", "MarkPrice"].contains(&self.trigger_by.as_str())
+            || (self.take_profit.is_none() && self.stop_loss.is_none()) {
+            return Err("invalid protection selector or empty legs".into());
+        }
+        for value in self.take_profit.iter().chain(self.stop_loss.iter()) {
+            if value.is_empty() || value.len() > 64
+                || !value.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                || value.starts_with('.') || value.ends_with('.')
+                || !rust_decimal::Decimal::from_str_exact(value).is_ok_and(|n| n > rust_decimal::Decimal::ZERO) {
+                return Err("invalid protection price".into());
+            }
+        }
+        Ok(())
+    }
+}
+impl<'de> Deserialize<'de> for OrderProtection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            #[serde(deserialize_with = "required_nullable_price")]
+            take_profit: Option<String>,
+            #[serde(deserialize_with = "required_nullable_price")]
+            stop_loss: Option<String>,
+            trigger_by: String,
+        }
+        struct ObjectVisitor;
+        impl<'de> serde::de::Visitor<'de> for ObjectVisitor {
+            type Value = OrderProtection;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an exact protection object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                let wire = Wire::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                let value = OrderProtection { take_profit: wire.take_profit, stop_loss: wire.stop_loss, trigger_by: wire.trigger_by };
+                value.validate_shape().map_err(serde::de::Error::custom)?;
+                Ok(value)
+            }
+        }
+        deserializer.deserialize_map(ObjectVisitor)
+    }
+}
+fn required_nullable_price<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Option::deserialize(d)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

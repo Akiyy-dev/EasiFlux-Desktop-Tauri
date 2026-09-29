@@ -186,6 +186,7 @@ async fn place_with_quote_and_notifications(
         time_in_force: None,
         order_link_id: None,
         reduce_only: Some(reduce_only),
+        protection: None,
     };
     let result = service
         .place_order(

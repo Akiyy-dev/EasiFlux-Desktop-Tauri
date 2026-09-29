@@ -209,6 +209,7 @@ mod tests {
             time_in_force: None,
             order_link_id: Some(id.into()),
             reduce_only: Some(reduce_only),
+            protection: None,
         }
     }
     fn accepted(id: &str) -> Order {
