@@ -8,12 +8,29 @@ export const PLUGIN_STRATEGY_CAPABILITIES = [
   'market.read',
   'trade.place',
   'trade.cancel',
+  'trade.amend',
+  'trade.protect',
   'strategy.run',
 ] as const
 
 export type PluginStrategyCapability =
   | PluginWorkflowCapability
   | 'strategy.run'
+  | 'trade.amend'
+  | 'trade.protect'
+
+export type PluginStrategyCapabilityV6 = Exclude<
+  PluginStrategyCapability,
+  'trade.amend' | 'trade.protect'
+>
+
+export function hasStrategyCapabilityDependencies(capabilities: readonly PluginStrategyCapability[]): boolean {
+  const has = (capability: PluginStrategyCapability) => capabilities.includes(capability)
+  return has('account.read') && has('strategy.run')
+    && (!has('trade.cancel') || has('orders.read'))
+    && (!has('trade.amend') || (has('trade.place') && has('orders.read') && has('market.read')))
+    && (!has('trade.protect') || (has('trade.place') && has('market.read')))
+}
 
 export interface StrategyAccess {
   schemaVersion: 1
@@ -73,7 +90,7 @@ export type StrategyRunReason =
 
 export interface StrategyReceipt {
   sequence: string
-  kind: 'placeOrder' | 'cancelOrder'
+  kind: 'placeOrder' | 'cancelOrder' | 'amendOrder' | 'placeProtectedOrder'
   status: 'accepted' | 'rejected' | 'unknown'
   submissionId: string | null
   orderId: string | null

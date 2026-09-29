@@ -4,7 +4,7 @@ export type PluginStatus = 'enabled' | 'disabled' | 'blocked'
 export type PluginAvailability = 'available' | 'unavailable'
 export type PluginAvailabilityReason = 'stateUnavailable' | 'catalogInvalid'
 import type { PluginWorkflowCapability } from './pluginWorkflow'
-import type { PluginStrategyCapability } from './pluginStrategy'
+import type { PluginStrategyCapability, PluginStrategyCapabilityV6 } from './pluginStrategy'
 export type PluginManagement =
   | 'builtIn'
   | 'managed'
@@ -159,6 +159,11 @@ export interface PluginManifestV6 extends Omit<
 > {
   schemaVersion: 6
   contributions: Exclude<PluginCommandContribution, PluginWorkflowCommandContribution>[]
+  requestedCapabilities: PluginStrategyCapabilityV6[]
+}
+
+export interface PluginManifestV7 extends Omit<PluginManifestV6, 'schemaVersion' | 'requestedCapabilities'> {
+  schemaVersion: 7
   requestedCapabilities: PluginStrategyCapability[]
 }
 
@@ -169,6 +174,7 @@ export type PluginManifest =
   | PluginManifestV4
   | PluginManifestV5
   | PluginManifestV6
+  | PluginManifestV7
 
 export type PluginManifestField =
   | 'schemaVersion'

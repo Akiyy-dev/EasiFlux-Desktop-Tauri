@@ -377,6 +377,37 @@ describe('PluginImportDialog', () => {
     expect(tauriInvoke).not.toHaveBeenCalled()
   })
 
+  it('identifies v7 management authority without describing import as a grant', () => {
+    const wrapper = mount(PluginImportDialog, {
+      props: {
+        preview: {
+          ...readyPreview,
+          manifest: {
+            ...readyPreview.manifest,
+            schemaVersion: 7,
+            requestedCapabilities: [
+              'account.read', 'orders.read', 'market.read', 'trade.place',
+              'trade.amend', 'trade.protect', 'strategy.run',
+            ],
+            contributions: [{
+              kind: 'command', contributionId: 'strategy.management', title: 'Manage owned order',
+              actionId: 'sandbox.strategy', params: {
+                runtime: 'wasm-v1', abi: 'strategy-json-v1', moduleBase64: 'AGFzbQEAAAA=',
+                defaultInput: '{}',
+              },
+            }],
+          },
+        },
+        committing: false, stale: false,
+      },
+    })
+    expect(wrapper.text()).toContain('v7 清单')
+    expect(wrapper.get('[data-testid="plugin-import-strategy-details"]').text()).toContain('数量不可增加')
+    expect(wrapper.get('[data-testid="plugin-import-strategy-details"]').text()).toContain('附带止盈止损')
+    expect(wrapper.text()).toContain('导入、启用、打开或刷新都不会启动策略')
+    expect(tauriInvoke).not.toHaveBeenCalled()
+  })
+
   it('discloses v5 requested account/trading access and separate session grant and confirmation', () => {
     const wrapper = mount(PluginImportDialog, {
       props: {

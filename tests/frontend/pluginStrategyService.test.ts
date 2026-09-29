@@ -74,7 +74,7 @@ function runFixture(overrides: Record<string, unknown> = {}): StrategyRunView & 
   } as StrategyRunView & Record<string, unknown>
 }
 
-function catalogFixture(schemaVersion: 5 | 6, capabilities: string[], action = 'sandbox.strategy', abi = 'strategy-json-v1') {
+function catalogFixture(schemaVersion: 5 | 6 | 7, capabilities: string[], action = 'sandbox.strategy', abi = 'strategy-json-v1') {
   return {
     schemaVersion: 3, revision: '13', catalogGeneration: '8', availability: 'available',
     availabilityReasonCode: null,
@@ -192,8 +192,140 @@ describe('v6 strategy manifests', () => {
   })
 })
 
+describe('v7 strategy manifest authority', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  const capabilities = [
+    'account.read', 'orders.read', 'market.read', 'trade.place',
+    'trade.amend', 'trade.protect', 'strategy.run',
+  ]
+
+  it('accepts v7 catalog and import preview with explicit management capabilities', async () => {
+    const wire = catalogFixture(7, capabilities)
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(wire)
+    expect((await getPluginCatalog()).plugins[0].manifest.requestedCapabilities).toEqual(capabilities)
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      schemaVersion: 2, status: 'ready', token: 'a'.repeat(32), expiresInSeconds: 300,
+      catalogGeneration: '8', manifest: wire.plugins[0].manifest,
+      assessment: { kind: 'notInCatalog' },
+    })
+    const preview = await prepareLocalManifestImport()
+    expect(preview.status).toBe('ready')
+    if (preview.status !== 'ready') throw new Error('expected ready preview')
+    expect(preview.manifest.requestedCapabilities).toEqual(capabilities)
+    const imported = catalogFixture(7, capabilities)
+    imported.plugins[0] = {
+      ...imported.plugins[0], management: 'managed', canRemove: true, status: 'disabled',
+    }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      schemaVersion: 2, status: 'imported', pluginId: 'com.example.strategy', snapshot: imported,
+    })
+    await expect(commitLocalManifestImport(preview)).resolves.toMatchObject({ status: 'imported' })
+  })
+
+  it.each([
+    [6, capabilities],
+    [7, capabilities.filter((capability) => capability !== 'orders.read')],
+    [7, capabilities.filter((capability) => capability !== 'market.read')],
+    [7, capabilities.filter((capability) => capability !== 'trade.place')],
+  ])('rejects version %i or missing declared dependencies %#', async (version, requested) => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(catalogFixture(version as 6 | 7, requested))
+    await expect(getPluginCatalog()).rejects.toThrow('插件服务返回的数据无效')
+  })
+})
+
 describe('plugin strategy strict service boundary', () => {
   beforeEach(() => vi.resetAllMocks())
+
+  function managementIntent(): PluginStrategyExecutionIntent {
+    return { ...intent(), requestedCapabilities: [
+      'account.read', 'orders.read', 'market.read', 'trade.place',
+      'trade.amend', 'trade.protect', 'strategy.run',
+    ] }
+  }
+
+  function managementAccess() {
+    return { ...accessFixture(), requestedCapabilities: managementIntent().requestedCapabilities }
+  }
+
+  it('rejects grant dependencies before IPC and mismatched v7 access responses', async () => {
+    const requested = managementIntent()
+    expect(() => parsePluginStrategyAccess({
+      ...managementAccess(), requestedCapabilities: [
+        'account.read', 'orders.read', 'market.read', 'trade.place', 'trade.amend', 'strategy.run',
+      ],
+    }, requested)).toThrow(INVALID_RESPONSE)
+    const access = parsePluginStrategyAccess(managementAccess(), requested)
+    for (const capabilities of [
+      ['account.read', 'market.read', 'trade.place', 'trade.amend', 'strategy.run'],
+      ['account.read', 'orders.read', 'trade.place', 'trade.amend', 'strategy.run'],
+      ['account.read', 'market.read', 'trade.protect', 'strategy.run'],
+    ]) {
+      await expect(startPluginStrategy(requested, access, {
+        requestId: REQUEST_ID, resumeRunId: null, symbol: 'BTCUSDT', inputJson: '{}',
+        capabilities: capabilities as typeof access.requestedCapabilities,
+        policy: policy(), acknowledgeAutomaticTrading: true,
+      })).rejects.toThrow(INVALID_RESPONSE)
+    }
+    expect(tauriInvoke).not.toHaveBeenCalled()
+  })
+
+  it('accepts exact new receipt identities and rejects swapped or missing ones', async () => {
+    const submissionId = '00000000-0000-4000-8000-000000000003'
+    for (const receipt of [
+      { kind: 'placeProtectedOrder', submissionId, orderId: 'owned-1' },
+      { kind: 'amendOrder', submissionId: null, orderId: 'owned-1' },
+    ]) {
+      vi.mocked(tauriInvoke).mockResolvedValueOnce({ schemaVersion: 1, runs: [runFixture({ sequence: '1',
+        capabilities: managementIntent().requestedCapabilities,
+        lastReceipt: { sequence: '1', status: 'accepted', errorCode: null, ...receipt },
+      })] })
+      expect((await listPluginStrategies()).runs[0].lastReceipt).toMatchObject(receipt)
+    }
+    for (const receipt of [
+      { kind: 'placeProtectedOrder', submissionId: null, orderId: 'owned-1' },
+      { kind: 'amendOrder', submissionId, orderId: 'owned-1' },
+      { kind: 'amendOrder', submissionId: null, orderId: null },
+      { kind: 'amendOrder', submissionId: null, orderId: '   ' },
+      { kind: 'placeProtectedOrder', submissionId: 'wrong-id', orderId: 'owned-1' },
+    ]) {
+      vi.mocked(tauriInvoke).mockResolvedValueOnce({ schemaVersion: 1, runs: [runFixture({ sequence: '1',
+        capabilities: managementIntent().requestedCapabilities,
+        lastReceipt: { sequence: '1', status: 'accepted', errorCode: null, ...receipt },
+      })] })
+      await expect(listPluginStrategies()).rejects.toThrow(INVALID_RESPONSE)
+    }
+  })
+
+  it('rejects a management receipt without its matching durable grant', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ schemaVersion: 1, runs: [runFixture({
+      sequence: '1',
+      lastReceipt: {
+        sequence: '1', kind: 'amendOrder', status: 'accepted',
+        submissionId: null, orderId: 'owned-1', errorCode: null,
+      },
+    })] })
+    await expect(listPluginStrategies()).rejects.toThrow(INVALID_RESPONSE)
+  })
+
+  it('resumes v7 only with the identical durable grant and policy', async () => {
+    const requested = managementIntent()
+    const access = parsePluginStrategyAccess(managementAccess(), requested)
+    const previous = runFixture({ status: 'paused', capabilities: requested.requestedCapabilities })
+    const resume = {
+      requestId: REQUEST_ID, resumeRunId: RUN_ID, symbol: 'BTCUSDT',
+      inputJson: '{"threshold":"50000"}', capabilities: [...requested.requestedCapabilities],
+      policy: policy(), acknowledgeAutomaticTrading: true as const,
+    }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(runFixture({
+      capabilities: requested.requestedCapabilities,
+    }))
+    await expect(startPluginStrategy(requested, access, resume, previous)).resolves.toMatchObject({ runId: RUN_ID })
+    await expect(startPluginStrategy(requested, access, {
+      ...resume, capabilities: resume.capabilities.filter((capability) => capability !== 'trade.protect'),
+    }, previous)).rejects.toThrow(INVALID_RESPONSE)
+    expect(tauriInvoke).toHaveBeenCalledTimes(1)
+  })
 
   it('parses an exact correlated access ticket and rejects drift or unknown fields', () => {
     expect(parsePluginStrategyAccess(accessFixture(), intent()).authorizationToken)

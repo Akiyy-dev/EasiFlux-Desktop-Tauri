@@ -50,6 +50,13 @@ const reasonCopy: Record<StrategyRunReason, string> = {
   plugin_strategy_unavailable: '策略运行服务不可用',
 }
 
+const receiptKindCopy = {
+  placeOrder: '下单请求',
+  cancelOrder: '撤单请求',
+  amendOrder: '自有活动限价单修改请求',
+  placeProtectedOrder: '附带止盈止损的开仓请求',
+} as const
+
 const hasRuns = computed(() => runs.value.length > 0)
 
 function nextGeneration(): number {
@@ -312,9 +319,9 @@ onBeforeUnmount(() => {
       <section v-if="run.lastReceipt">
         <h4>最后回执</h4>
         <p>
-          {{ run.lastReceipt.kind }} / {{ run.lastReceipt.status }}；提交标识
+          {{ receiptKindCopy[run.lastReceipt.kind] }} / {{ run.lastReceipt.status }}；提交标识
           {{ run.lastReceipt.submissionId ?? '无' }}；订单 ID {{ run.lastReceipt.orderId ?? '无' }}。
-          accepted 不代表成交、盈利或撤单终态，filled 必须从权威订单状态另行确认。
+          accepted 不代表成交、盈利或撤单终态，也不代表保护已生效或修改最终生效；它仅表示请求已获确认，filled 必须从权威订单状态另行确认。
         </p>
         <p v-if="run.lastReceipt.errorCode">
           {{ run.lastReceipt.errorCode === 'plugin_strategy_rejected'

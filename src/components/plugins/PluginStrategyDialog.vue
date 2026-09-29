@@ -7,6 +7,7 @@ import type {
   StrategyPolicy,
   StrategyRunView,
 } from '../../types/pluginStrategy'
+import { hasStrategyCapabilityDependencies } from '../../types/pluginStrategy'
 import {
   getPluginStrategyAccess,
   listPluginStrategies,
@@ -72,8 +73,7 @@ const symbolValid = computed(() => {
 const canStart = computed(() => (
   status.value === 'ready'
   && access.value !== null
-  && selectedCapabilities.value.includes('account.read')
-  && selectedCapabilities.value.includes('strategy.run')
+  && hasStrategyCapabilityDependencies(selectedCapabilities.value)
   && acknowledged.value
   && policyValid.value
   && inputValid.value
@@ -173,7 +173,7 @@ onBeforeUnmount(() => {
     </header>
 
     <p class="plugin-strategy-dialog__warning">
-      导入、启用、打开或刷新页面都不会启动策略。启动后，原生宿主可在下列硬限制内自动下单或撤单，不再逐单确认。
+      导入、启用、打开或刷新页面都不会启动策略。启动后，原生宿主可在下列硬限制和显式授权内自动提交下单、撤单、自有限价单数量不增加的修改或附带止盈止损的开仓请求，不再逐单确认。
     </p>
     <p v-if="status === 'loading'" role="status">
       正在获取 60 秒内有效的一次性启动凭据…

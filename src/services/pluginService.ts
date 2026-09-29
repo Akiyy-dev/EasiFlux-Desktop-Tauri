@@ -32,6 +32,7 @@ import {
 } from '../types/pluginWorkflow'
 import {
   PLUGIN_STRATEGY_CAPABILITIES,
+  hasStrategyCapabilityDependencies,
   type PluginStrategyCapability,
 } from '../types/pluginStrategy'
 
@@ -403,7 +404,7 @@ function requireWasmModuleBase64(value: unknown): string {
   return moduleBase64
 }
 
-function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5 | 6): PluginCommandContribution {
+function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5 | 6 | 7): PluginCommandContribution {
   const command = requireExactObject(value, ['kind', 'contributionId', 'title', 'actionId', 'params'])
   if (command.kind !== 'command') invalidResponse()
   const contributionId = requireReverseDomainId(command.contributionId)
@@ -455,7 +456,7 @@ function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5 | 6): PluginC
     }
   }
   if (command.actionId === 'sandbox.strategy') {
-    if (schemaVersion !== 6) invalidResponse()
+    if (schemaVersion !== 6 && schemaVersion !== 7) invalidResponse()
     const params = requireExactObject(
       command.params,
       ['runtime', 'abi', 'moduleBase64', 'defaultInput'],
@@ -478,7 +479,7 @@ function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5 | 6): PluginC
       },
     }
   }
-  if ((schemaVersion !== 4 && schemaVersion !== 5 && schemaVersion !== 6)
+  if ((schemaVersion !== 4 && schemaVersion !== 5 && schemaVersion !== 6 && schemaVersion !== 7)
     || command.actionId !== 'sandbox.computeSeries') invalidResponse()
   const params = requireExactObject(
     command.params,
@@ -506,7 +507,7 @@ function parseCommand(value: unknown, schemaVersion: 2 | 3 | 4 | 5 | 6): PluginC
   }
 }
 
-function parseStrategyCapabilities(value: unknown): PluginStrategyCapability[] {
+function parseStrategyCapabilities(value: unknown, schemaVersion: 6 | 7): PluginStrategyCapability[] {
   if (!Array.isArray(value) || value.length < 2
     || value.length > PLUGIN_STRATEGY_CAPABILITIES.length) invalidResponse()
   const capabilities = value.map((candidate) => {
@@ -517,8 +518,10 @@ function parseStrategyCapabilities(value: unknown): PluginStrategyCapability[] {
     return candidate as PluginStrategyCapability
   })
   if (new Set(capabilities).size !== capabilities.length
-    || !capabilities.includes('account.read')
-    || !capabilities.includes('strategy.run')) invalidResponse()
+    || (schemaVersion === 6 && capabilities.some((capability) => (
+      capability === 'trade.amend' || capability === 'trade.protect'
+    )))
+    || !hasStrategyCapabilityDependencies(capabilities)) invalidResponse()
   return capabilities
 }
 
@@ -545,7 +548,8 @@ function parseManifest(value: unknown): PluginManifest {
     && manifest.schemaVersion !== 3
     && manifest.schemaVersion !== 4
     && manifest.schemaVersion !== 5
-    && manifest.schemaVersion !== 6) invalidResponse()
+    && manifest.schemaVersion !== 6
+    && manifest.schemaVersion !== 7) invalidResponse()
   const id = requireReverseDomainId(manifest.id)
   const publisherId = requireReverseDomainId(manifest.publisherId)
   const publisher = requireDisplayText(manifest.publisher, 80)
@@ -584,17 +588,20 @@ function parseManifest(value: unknown): PluginManifest {
       requestedCapabilities,
     }
   }
-  if (schemaVersion === 6) {
-    const requestedCapabilities = parseStrategyCapabilities(manifest.requestedCapabilities)
+  if (schemaVersion === 6 || schemaVersion === 7) {
+    const requestedCapabilities = parseStrategyCapabilities(manifest.requestedCapabilities, schemaVersion)
     if (!contributions.some((command) => command.actionId === 'sandbox.strategy')
       || contributions.some((command) => command.actionId === 'sandbox.accountWorkflow')) {
       invalidResponse()
     }
-    return {
-      schemaVersion, ...metadata,
-      contributions: contributions as PluginManifestV6['contributions'],
-      requestedCapabilities,
-    }
+    const strategyContributions = contributions as PluginManifestV6['contributions']
+    return schemaVersion === 6
+      ? {
+          schemaVersion, ...metadata,
+          contributions: strategyContributions,
+          requestedCapabilities: requestedCapabilities as PluginManifestV6['requestedCapabilities'],
+        }
+      : { schemaVersion, ...metadata, contributions: strategyContributions, requestedCapabilities }
   }
   requireEmptyArray(manifest.requestedCapabilities)
   return { schemaVersion, ...metadata, contributions, requestedCapabilities: [] } as PluginManifest

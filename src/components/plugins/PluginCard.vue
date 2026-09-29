@@ -47,13 +47,14 @@ const hasWorkflowCommand = computed(() => (
   )
 ))
 const hasStrategyCommand = computed(() => (
-  props.plugin.manifest.schemaVersion === 6
+  (props.plugin.manifest.schemaVersion === 6 || props.plugin.manifest.schemaVersion === 7)
   && props.plugin.manifest.contributions.some(
     (command) => command.actionId === 'sandbox.strategy',
   )
 ))
 const requestedCapabilityLabel = computed(() => (
   props.plugin.manifest.schemaVersion === 5 || props.plugin.manifest.schemaVersion === 6
+    || props.plugin.manifest.schemaVersion === 7
     ? props.plugin.manifest.requestedCapabilities.map(
       (capability) => pluginCapabilityLabels[capability],
     ).join('、')

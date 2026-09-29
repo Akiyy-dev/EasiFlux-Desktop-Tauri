@@ -35,7 +35,7 @@ const importDialogOpener = ref<FocusControl | null>(null)
 const removalDialogOpener = ref<FocusControl | null>(null)
 const installedView = ref<'plugins' | 'commands'>('plugins')
 const strategyIntents = computed<PluginStrategyExecutionIntent[]>(() => store.catalog.flatMap((plugin) => {
-  if (plugin.manifest.schemaVersion !== 6) return []
+  if (plugin.manifest.schemaVersion !== 6 && plugin.manifest.schemaVersion !== 7) return []
   return plugin.manifest.contributions.flatMap((command) => command.actionId === 'sandbox.strategy'
     ? [{
         actionId: 'sandbox.strategy' as const,

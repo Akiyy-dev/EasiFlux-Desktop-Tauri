@@ -13,6 +13,7 @@ import type {
   PluginManifestField,
 } from '../../types/plugin'
 import {
+  pluginCapabilityLabels,
   pluginManagementLabel,
   pluginSourceLabel,
   pluginStatusLabel,
@@ -39,7 +40,7 @@ const comparisonHasWorkflow = computed(() => (
 ))
 const comparisonHasStrategy = computed(() => (
   [props.current.manifest, props.incoming].some((manifest) => (
-    manifest.schemaVersion === 6
+    (manifest.schemaVersion === 6 || manifest.schemaVersion === 7)
     && manifest.contributions.some((command) => command.actionId === 'sandbox.strategy')
   ))
 ))
@@ -63,7 +64,9 @@ const versionRelationCopy = {
 function fieldValue(manifest: PluginManifest, field: PluginManifestField): string {
   if (field === 'requestedCapabilities') {
     return manifest.requestedCapabilities.length > 0
-      ? manifest.requestedCapabilities.join('、')
+      ? manifest.requestedCapabilities.map((capability) => (
+        `${pluginCapabilityLabels[capability] ?? capability}（${capability}）`
+      )).join('、')
       : '无'
   }
   return String(manifest[field])

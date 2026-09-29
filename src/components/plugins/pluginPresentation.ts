@@ -41,5 +41,7 @@ export const pluginCapabilityLabels: Record<PluginStrategyCapability, string> = 
   'market.read': '市场报价',
   'trade.place': '真实下单提案',
   'trade.cancel': '真实撤单提案',
+  'trade.amend': '仅修改本策略所有的普通活动限价单，数量不可增加，且按新总数量计入累计预算',
+  'trade.protect': '新开仓订单附带止盈止损请求；接受回执不保证保护已生效',
   'strategy.run': '自动策略运行',
 }

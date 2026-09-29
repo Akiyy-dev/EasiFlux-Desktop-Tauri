@@ -27,6 +27,7 @@ import type {
   PluginV4CommandContribution,
   PluginV5CommandContribution,
   PluginManifestV6,
+  PluginManifestV7,
   ReadyLocalManifestImport,
   RemoveManagedLocalPluginResult,
 } from '../types/plugin'
@@ -134,10 +135,18 @@ function cloneCatalogItem(plugin: PluginCatalogItem): PluginCatalogItem {
               ),
               requestedCapabilities: [...plugin.manifest.requestedCapabilities],
             }
-            : {
+            : plugin.manifest.schemaVersion === 6
+              ? {
                 ...plugin.manifest,
                 contributions: plugin.manifest.contributions.map(
                   (command) => cloneCommand(command) as PluginManifestV6['contributions'][number],
+                ),
+                requestedCapabilities: [...plugin.manifest.requestedCapabilities],
+              }
+              : {
+                ...plugin.manifest,
+                contributions: plugin.manifest.contributions.map(
+                  (command) => cloneCommand(command) as PluginManifestV7['contributions'][number],
                 ),
                 requestedCapabilities: [...plugin.manifest.requestedCapabilities],
               }
@@ -261,6 +270,7 @@ export const usePluginStore = defineStore('plugin', () => {
             ...base,
             actionId: 'sandbox.strategy',
             requestedCapabilities: selected.plugin.manifest.schemaVersion === 6
+              || selected.plugin.manifest.schemaVersion === 7
               ? [...selected.plugin.manifest.requestedCapabilities]
               : [],
           })
@@ -322,7 +332,8 @@ export const usePluginStore = defineStore('plugin', () => {
         expectedRevision: revision.value,
       }
     }
-    if (command.actionId !== 'sandbox.strategy' || plugin.manifest.schemaVersion !== 6) return null
+    if (command.actionId !== 'sandbox.strategy'
+      || (plugin.manifest.schemaVersion !== 6 && plugin.manifest.schemaVersion !== 7)) return null
     return {
       actionId: 'sandbox.strategy', pluginId, pluginName: plugin.manifest.name,
       contributionId, title: command.title, runtime: command.params.runtime,

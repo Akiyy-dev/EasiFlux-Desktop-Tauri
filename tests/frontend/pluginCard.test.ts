@@ -193,6 +193,31 @@ describe('PluginCard', () => {
     expect(wrapper.text()).not.toContain('每次真实交易仍需单独确认')
   })
 
+  it('discloses v7 management permissions without implying enablement grants them', () => {
+    const wrapper = mountCard(pluginFixture('enabled', {
+      source: 'localDeclarative', management: 'external',
+      manifest: {
+        ...pluginFixture().manifest,
+        schemaVersion: 7,
+        requestedCapabilities: [
+          'account.read', 'orders.read', 'market.read', 'trade.place',
+          'trade.amend', 'trade.protect', 'strategy.run',
+        ],
+        contributions: [{
+          kind: 'command', contributionId: 'strategy.management', title: 'Manage owned order',
+          actionId: 'sandbox.strategy', params: {
+            runtime: 'wasm-v1', abi: 'strategy-json-v1', moduleBase64: 'AGFzbQEAAAA=',
+            defaultInput: '{}',
+          },
+        }],
+      },
+    }))
+    expect(wrapper.get('[data-testid="requested-capabilities"]').text()).toContain('数量不可增加')
+    expect(wrapper.get('[data-testid="requested-capabilities"]').text()).toContain('附带止盈止损')
+    expect(wrapper.get('[data-testid="granted-capabilities"]').text()).toContain('每次启动或恢复')
+    expect(wrapper.text()).toContain('启用或打开不会启动策略')
+  })
+
   it.each([
     ['enabled', '已启用', true],
     ['disabled', '已停用', false],
