@@ -61,10 +61,8 @@ where
                 != original.time_in_force.as_deref().ok_or_else(unavailable)?
             || strict_position_idx(raw)? != original.position_idx
             || strict_reduce_only(raw)? != original.reduce_only.ok_or_else(unavailable)?
-            || raw
-                .get("stop_order_type")
-                .or_else(|| raw.get("stopOrderType"))
-                .is_some_and(|v| v.as_str().is_none_or(|s| !s.is_empty()))
+            || optional_raw_text(raw, "stop_order_type", "stopOrderType")?
+                .is_some_and(|value| !value.is_empty() && value != "UNKNOWN")
         {
             return Err(unavailable());
         }
@@ -177,10 +175,15 @@ pub(super) fn strict_protection_raw(raw: &Value, request: &PlaceOrderRequest) ->
             {
                 return Err(unavailable());
             }
-        } else if raw_price.is_some_and(|v| !v.is_empty() && v != "0")
-            || raw_trigger.is_some_and(|v| !v.is_empty())
-        {
-            return Err(unavailable());
+        } else {
+            // Official ordinary/unused-leg rows use 0.0 and UNKNOWN sentinels.
+            // Only the absent state gets this tolerance; requested legs remain exact.
+            if raw_price.is_some_and(|v| {
+                !v.is_empty() && Decimal::from_str_exact(v).ok() != Some(Decimal::ZERO)
+            }) || raw_trigger.is_some_and(|v| !v.is_empty() && v != "UNKNOWN")
+            {
+                return Err(unavailable());
+            }
         }
     }
     Ok(())
@@ -331,6 +334,12 @@ pub(super) fn validate_amend_change(request: &AmendProposal, target: &Order) -> 
 mod tests {
     use super::*;
     use serde_json::json;
+    struct TestDir(std::path::PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     fn original() -> PlaceOrderRequest {
         PlaceOrderRequest {
             symbol: "BTCUSDT".into(),
@@ -350,6 +359,107 @@ mod tests {
             "side":"Buy","order_type":"Limit","qty":"0.001","price":"50000",
             "order_status":"New","cum_exec_qty":"0","avg_price":"0",
             "time_in_force":"GoodTillCancel","position_idx":1,"reduce_only":false}]})
+    }
+    fn documented_no_protection_raw() -> Value {
+        let mut payload = raw();
+        payload["data"][0]["stop_order_type"] = json!("UNKNOWN");
+        payload["data"][0]["take_profit"] = json!("0.0");
+        payload["data"][0]["stop_loss"] = json!("0.0");
+        payload["data"][0]["tp_trigger_by"] = json!("UNKNOWN");
+        payload["data"][0]["sl_trigger_by"] = json!("UNKNOWN");
+        payload
+    }
+    #[tokio::test]
+    async fn documented_raw_no_condition_sentinels_allow_ordinary_amend_but_not_conflicts() {
+        let amend = AmendProposal {
+            symbol: "BTCUSDT".into(),
+            order_id: "exchange-1".into(),
+            price: "50010".into(),
+            qty: "0.0008".into(),
+        };
+        let documented = documented_no_protection_raw();
+        assert!(query_amend_target(&amend, &original(), |_, _| {
+            std::future::ready(Ok(documented.clone()))
+        })
+        .await
+        .is_ok());
+        let mut conflicting = documented.clone();
+        conflicting["data"][0]["stopOrderType"] = json!("Stop");
+        assert!(query_amend_target(&amend, &original(), |_, _| {
+            std::future::ready(Ok(conflicting.clone()))
+        })
+        .await
+        .is_err());
+        let mut active = documented;
+        active["data"][0]["stop_loss"] = json!("45000");
+        assert!(query_amend_target(&amend, &original(), |_, _| {
+            std::future::ready(Ok(active.clone()))
+        })
+        .await
+        .is_err());
+    }
+    #[test]
+    fn documented_unused_leg_sentinels_allow_one_leg_protected_identity() {
+        let mut request = original();
+        request.protection = Some(crate::models::trading::OrderProtection {
+            take_profit: Some("55000".into()),
+            stop_loss: None,
+            trigger_by: "LastPrice".into(),
+        });
+        let mut documented = documented_no_protection_raw();
+        documented["data"][0]["take_profit"] = json!("55000");
+        documented["data"][0]["tp_trigger_by"] = json!("LastPrice");
+        assert!(strict_protection_raw(&documented["data"][0], &request).is_ok());
+        documented["data"][0]["sl_trigger_by"] = json!("LastPrice");
+        assert!(strict_protection_raw(&documented["data"][0], &request).is_err());
+    }
+    #[tokio::test]
+    async fn protected_market_id_only_acknowledges_production_journal_without_observed_price() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/strategy-production-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let temp = TestDir(root);
+        let store = OrderSubmissionStore::with_dir(temp.0.clone());
+        let mut request = original();
+        request.order_link_id = Some(id.clone());
+        request.order_type = "Market".into();
+        request.price = None;
+        request.time_in_force = Some("ImmediateOrCancel".into());
+        request.protection = Some(crate::models::trading::OrderProtection {
+            take_profit: Some("55000".into()),
+            stop_loss: Some("45000".into()),
+            trigger_by: "LastPrice".into(),
+        });
+        let accepted = crate::services::order_submission::submit_once(
+            &store,
+            "scope",
+            request.clone(),
+            1,
+            |actual| async move {
+                crate::api::PrivateApi::parse_protected_create_ack(
+                    &json!({"code":0,"data":{"order_id":"exchange-market","order_link_id":""}}),
+                    &actual,
+                )
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.price, "");
+        assert_eq!(accepted.status, OrderStatus::Unknown);
+        acknowledge_protected(
+            &store,
+            "scope",
+            "scope",
+            &id,
+            &accepted,
+            &request,
+            |_, _| -> std::future::Ready<AppResult<Value>> { panic!("known ack must not query") },
+        )
+        .await
+        .unwrap();
+        assert!(store.get("scope", &id).unwrap().unwrap().acknowledged);
     }
     #[tokio::test]
     async fn amend_target_requires_exact_raw_immutable_identity() {

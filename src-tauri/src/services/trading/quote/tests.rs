@@ -101,6 +101,41 @@ impl Drop for QuoteServer {
     }
 }
 
+#[tokio::test]
+async fn fresh_protection_reference_uses_selected_trigger_without_last_price_fallback() {
+    let server = QuoteServer::new(
+        200,
+        json!({"code":0,"data":[{
+            "symbol":"BTCUSDT","last_price":"50000","mark_price":"56000"
+        }]}),
+    );
+    let api = ApiClient::new();
+    api.set_credential(ApiCredential {
+        api_key: "test-key".into(),
+        api_secret: "test-secret".into(),
+        base_url: server.base_url.clone(),
+        label: "quote-test".into(),
+    })
+    .await;
+    assert_eq!(
+        super::fresh_protection_reference(&api, "BTCUSDT", "LastPrice")
+            .await
+            .as_deref(),
+        Some("50000")
+    );
+    assert_eq!(
+        super::fresh_protection_reference(&api, "BTCUSDT", "MarkPrice")
+            .await
+            .as_deref(),
+        Some("56000")
+    );
+    assert!(
+        super::fresh_protection_reference(&api, "BTCUSDT", "UNKNOWN")
+            .await
+            .is_none()
+    );
+}
+
 async fn place_with_quote(
     server: &QuoteServer,
     risk_enabled: bool,

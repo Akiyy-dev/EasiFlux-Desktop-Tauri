@@ -31,6 +31,7 @@ const PLACE: &str = r#"{"state":{"phase":1},"action":{"kind":"placeOrder","order
 const CANCEL: &str = r#"{"state":{"phase":2},"action":{"kind":"cancelOrder","order":{"symbol":"BTCUSDT","orderId":"owned-1"}},"message":"cancel requested"}"#;
 const STOP: &str = r#"{"state":{"phase":3},"action":{"kind":"stop"},"message":"done"}"#;
 const PROTECTED: &str = r#"{"state":{"phase":1},"action":{"kind":"placeProtectedOrder","order":{"symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"50000","timeInForce":"GTC","positionIdx":1,"reduceOnly":false},"protection":{"takeProfit":"55000","stopLoss":"45000","triggerBy":"LastPrice"}},"message":"protected request"}"#;
+const PROTECTED_MARKET: &str = r#"{"state":{"phase":1},"action":{"kind":"placeProtectedOrder","order":{"symbol":"BTCUSDT","side":"Buy","orderType":"Market","qty":"0.001","price":null,"timeInForce":"IOC","positionIdx":1,"reduceOnly":false},"protection":{"takeProfit":"55000","stopLoss":"45000","triggerBy":"LastPrice"}},"message":"protected market request"}"#;
 const AMEND: &str = r#"{"state":{"phase":2},"action":{"kind":"amendOrder","order":{"symbol":"BTCUSDT","orderId":"owned-1","price":"50010","qty":"0.0008"}},"message":"amended request"}"#;
 const CAPS: &[&str] = &[
     "account.read",
@@ -126,6 +127,7 @@ struct Fake {
     reads: AtomicUsize,
     visible: AtomicBool,
     unknown: AtomicBool,
+    market_id_only_ack: AtomicBool,
     rejected: AtomicBool,
     hold_http: AtomicBool,
     read_delay_ms: AtomicU64,
@@ -218,7 +220,7 @@ impl WorkflowHost for Fake {
             assert_eq!(run.view.actions_submitted, 1);
             assert_eq!(run.view.total_submitted_qty, "0.001");
             assert_eq!(c.submission_id, r.order_link_id.clone().unwrap());
-            r.time_in_force = Some("GoodTillCancel".into());
+            r.time_in_force = Some(if r.order_type == "Market" { "ImmediateOrCancel" } else { "GoodTillCancel" }.into());
             crate::services::order_submission::submit_once(
                 &self.submissions,
                 SCOPE,
@@ -237,6 +239,10 @@ impl WorkflowHost for Fake {
                     }
                     if self.rejected.load(Ordering::SeqCst) {
                         return Err(AppError::Risk("private-raw-reason".into()));
+                    }
+                    if self.market_id_only_ack.load(Ordering::SeqCst) {
+                        return crate::api::PrivateApi::parse_protected_create_ack(
+                            &json!({"code":0,"data":{"order_id":"owned-1","order_link_id":""}}), &r);
                     }
                     Ok(order(r.order_link_id))
                 },
@@ -466,6 +472,7 @@ async fn fixture_manifest(m: serde_json::Value) -> Fixture {
         reads: AtomicUsize::new(0),
         visible: AtomicBool::new(true),
         unknown: AtomicBool::new(false),
+        market_id_only_ack: AtomicBool::new(false),
         rejected: AtomicBool::new(false),
         hold_http: AtomicBool::new(false),
         read_delay_ms: AtomicU64::new(0),
@@ -592,6 +599,40 @@ async fn protected_action_dispatches_exact_canonical_request_only_with_grant() {
     corrupted.runs[0].owned.get_mut("owned-1").unwrap().placement.as_mut().unwrap()
         .protection.as_mut().unwrap().take_profit = Some("40000".into());
     assert!(corrupted.validate().is_err(), "persisted protection must remain directional to entry");
+    f.supervisor.stop_all().await.unwrap();
+    f.supervisor.drain().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn protected_market_id_only_ack_journals_and_receipts_without_observed_price() {
+    let _serial = SERIAL.lock().await;
+    let mut manifest = super::manifest();
+    manifest["schemaVersion"] = json!(7);
+    manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "trade.protect"]);
+    manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PROTECTED_MARKET, STOP)));
+    let f = fixture_manifest(manifest).await;
+    f.host.market_id_only_ack.store(true, Ordering::SeqCst);
+    let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+    let mut requested = request(access);
+    requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "trade.protect"]
+        .into_iter().map(str::to_string).collect();
+    f.supervisor.start(requested).await.unwrap();
+    let view = settled(&f, "1").await;
+    let receipt = view.last_receipt.unwrap();
+    assert_eq!(receipt.kind, ReceiptKind::PlaceProtectedOrder);
+    assert_eq!(receipt.status, ReceiptStatus::Accepted);
+    assert_eq!(receipt.order_id.as_deref(), Some("owned-1"));
+    assert_eq!(f.host.placed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.host.acked.load(Ordering::SeqCst), 1);
+    let id = f.host.last_submission.lock().unwrap().clone().unwrap();
+    let durable = f.host.submissions.get(SCOPE, &id).unwrap().unwrap();
+    assert!(durable.acknowledged);
+    assert_eq!(durable.request.order_type, "Market");
+    assert!(durable.request.price.is_none());
+    assert!(durable.request.protection.is_some());
+    let crate::models::order_submission::SubmissionOutcome::Accepted(accepted) = durable.outcome else { panic!("expected accepted journal outcome") };
+    assert_eq!(accepted.price, "");
+    assert_eq!(accepted.status, OrderStatus::Unknown);
     f.supervisor.stop_all().await.unwrap();
     f.supervisor.drain().await;
 }

@@ -93,6 +93,60 @@ fn payload() -> Value {
         "side":"Buy","order_type":"Limit","qty":"0.010","price":"50000.0","order_status":"New",
         "cum_exec_qty":"0","avg_price":"0","time_in_force":"GoodTillCancel","position_idx":1,"reduce_only":false}]})
 }
+#[tokio::test]
+async fn protected_market_history_accepts_documented_empty_price_without_inventing_one() {
+    let mut original = request();
+    original.order_type = "Market".into();
+    original.price = None;
+    original.time_in_force = Some("ImmediateOrCancel".into());
+    original.protection = Some(crate::models::trading::OrderProtection {
+        take_profit: Some("55000".into()),
+        stop_loss: None,
+        trigger_by: "LastPrice".into(),
+    });
+    let mut observed = payload();
+    observed["data"][0]["order_type"] = json!("Market");
+    observed["data"][0]["price"] = json!("");
+    observed["data"][0]["time_in_force"] = json!("ImmediateOrCancel");
+    observed["data"][0]["order_status"] = json!("Filled");
+    observed["data"][0]["cum_exec_qty"] = json!("0.01");
+    observed["data"][0]["stop_order_type"] = json!("UNKNOWN");
+    observed["data"][0]["take_profit"] = json!("55000");
+    observed["data"][0]["tp_trigger_by"] = json!("LastPrice");
+    observed["data"][0]["stop_loss"] = json!("0.0");
+    observed["data"][0]["sl_trigger_by"] = json!("UNKNOWN");
+    let parsed = parse_orders(&observed).unwrap();
+    assert_eq!(parsed[0].price, "");
+    assert!(validate_order(&parsed[0], "BTCUSDT").is_ok());
+    assert!(matches_request(&parsed[0], &original).is_ok());
+    assert!(
+        super::super::management::strict_protection_raw(&observed["data"][0], &original).is_ok()
+    );
+    let found = query_exact("BTCUSDT", Some(ID), None, Some(&original), &mut |_, _| {
+        std::future::ready(Ok(observed.clone()))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.price, "");
+    assert_eq!(found.status, OrderStatus::Filled);
+    assert_eq!(found.order_link_id.as_deref(), Some(ID));
+    let mut empty_limit = observed.clone();
+    empty_limit["data"][0]["order_type"] = json!("Limit");
+    assert!(
+        parse_orders(&empty_limit).is_err(),
+        "empty price is only a Market response shape"
+    );
+    observed["data"][0].as_object_mut().unwrap().remove("price");
+    assert!(
+        query_exact("BTCUSDT", Some(ID), None, Some(&original), &mut |_, _| {
+            std::future::ready(Ok(observed.clone()))
+        })
+        .await
+        .is_err(),
+        "a missing raw price must not be fabricated by parse_order"
+    );
+}
 fn no_query(_: &'static str, _: Vec<(String, String)>) -> std::future::Ready<AppResult<Value>> {
     panic!("persisted acceptance must not contact exchange")
 }

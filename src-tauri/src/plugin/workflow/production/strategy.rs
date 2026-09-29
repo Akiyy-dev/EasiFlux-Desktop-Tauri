@@ -254,8 +254,13 @@ where
         {
             return Err(unavailable());
         }
+        // A protected Market recovery may have an empty documented price, but
+        // the raw field must exist; parse_orders must not fabricate a value.
+        if request.is_some_and(|request| request.protection.is_some() && request.order_type == "Market")
+            && raw.get("price").and_then(Value::as_str).is_none() {
+            return Err(unavailable());
+        }
         for value in [
-            &order.price,
             &order.qty,
             &order.filled_qty,
             &order.avg_price,
@@ -263,6 +268,10 @@ where
             if Decimal::from_str_exact(value).map_err(|_| unavailable())? < Decimal::ZERO {
                 return Err(unavailable());
             }
+        }
+        if !(order.order_type == "Market" && order.price.is_empty())
+            && Decimal::from_str_exact(&order.price).map_err(|_| unavailable())? < Decimal::ZERO {
+            return Err(unavailable());
         }
         if Decimal::from_str_exact(&order.qty).map_err(|_| unavailable())? <= Decimal::ZERO
             || Decimal::from_str_exact(&order.filled_qty).map_err(|_| unavailable())?

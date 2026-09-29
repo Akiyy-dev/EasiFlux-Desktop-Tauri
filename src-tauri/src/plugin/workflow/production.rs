@@ -520,12 +520,21 @@ fn parse_orders(payload: &Value) -> AppResult<Vec<Order>> {
                 Some(Value::String(s)) if bounded_id(s) => Some(s.clone()),
                 _ => return Err(unavailable()),
             };
+            let order_type = text(v, &["orderType", "order_type", "type"])?;
+            // The documented Market history row has `price: ""`. Preserve it;
+            // no observed execution price can be inferred from order identity.
+            let price = if order_type == "Market"
+                && matches!(v.get("price"), Some(Value::String(value)) if value.is_empty()) {
+                String::new()
+            } else {
+                number(v, &["price"])?
+            };
             Ok(Order {
                 order_id: text(v, &["orderId", "order_id", "id"])?,
                 symbol: text(v, &["symbol", "s"])?,
                 side: text(v, &["side"])?,
-                order_type: text(v, &["orderType", "order_type", "type"])?,
-                price: number(v, &["price"])?,
+                order_type,
+                price,
                 qty: number(v, &["qty", "quantity", "size"])?,
                 status,
                 order_link_id,

@@ -214,7 +214,12 @@ pub(crate) fn validate_order(o: &Order, expected_symbol: &str) -> AppResult<()> 
     {
         return Err(error("plugin_workflow_data_unavailable"));
     }
-    for v in [&o.price, &o.qty, &o.filled_qty, &o.avg_price] {
+    // Market orders can have an empty `price` in the exchange response. Do not
+    // invent an execution price for an ID-only acknowledgement or history row.
+    if !(o.order_type == "Market" && o.price.is_empty()) {
+        decimal(&o.price, false)?;
+    }
+    for v in [&o.qty, &o.filled_qty, &o.avg_price] {
         decimal(v, false)?;
     }
     Ok(())

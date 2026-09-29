@@ -405,6 +405,7 @@ impl TradingService {
         } else {
             None
         };
+        let protected_request = request.clone();
         let result = execute_place_order_with_submit(
             &self.risk,
             &self.notification_observer,
@@ -413,9 +414,27 @@ impl TradingService {
             reference_price.as_deref(),
             self.time.now_ms(),
             Some(admission),
+            || async move {
+                let Some(protection) = protected_request.protection.as_ref() else {
+                    return Ok(());
+                };
+                let selected = quote::fresh_protection_reference(
+                    self.api.as_ref(),
+                    &protected_request.symbol,
+                    &protection.trigger_by,
+                )
+                .await
+                .ok_or_else(|| {
+                    AppError::OrderSubmissionRejected("protected order fresh quote unavailable".into())
+                })?;
+                validate_protected_reference(&protected_request, &selected)
+            },
             |request| async move {
-                if protected { PrivateApi::create_protected_order_ack(self.api.as_ref(), &request).await }
-                else { PrivateApi::create_order(self.api.as_ref(), &request).await }
+                if protected {
+                    PrivateApi::create_protected_order_ack(self.api.as_ref(), &request).await
+                } else {
+                    PrivateApi::create_order(self.api.as_ref(), &request).await
+                }
             },
             |order| async move {
                 if protected {
@@ -595,13 +614,23 @@ where
         reference_price,
         now_ms,
         None,
+        || async { Ok(()) },
         |request| async move { PrivateApi::create_order(api, &request).await },
         success_side_effects,
     )
     .await
 }
 
-async fn execute_place_order_with_submit<F, Fut, S, SFut>(
+fn validate_protected_reference(request: &PlaceOrderRequest, reference: &str) -> AppResult<()> {
+    if let Some(protection) = &request.protection {
+        let mut protection = protection.clone();
+        protection.validate(&request.side, request.price.as_deref(), reference)
+            .map_err(|_| AppError::OrderSubmissionRejected("protected order fresh quote crossed".into()))?;
+    }
+    Ok(())
+}
+
+async fn execute_place_order_with_submit<P, PFut, F, Fut, S, SFut>(
     risk: &Arc<tokio::sync::RwLock<RiskService>>,
     observer: &OrderNotificationObserver,
     context: &SubmissionContext,
@@ -609,10 +638,13 @@ async fn execute_place_order_with_submit<F, Fut, S, SFut>(
     reference_price: Option<&str>,
     now_ms: u64,
     admission: Option<&StrategyAdmission<'_>>,
+    prepare: P,
     submit: F,
     success_side_effects: S,
 ) -> AppResult<Order>
 where
+    P: FnOnce() -> PFut,
+    PFut: std::future::Future<Output = AppResult<()>>,
     F: FnOnce(PlaceOrderRequest) -> Fut,
     Fut: std::future::Future<Output = AppResult<Order>>,
     S: FnOnce(Order) -> SFut,
@@ -656,6 +688,18 @@ where
             });
         }
     };
+
+    if let Err(preflight_error) = prepare().await {
+        if risk.read().await.release_reservation(&reservation, now_ms).is_err() {
+            tracing::warn!(
+                code = "STRATEGY_UNSENT_RISK_RELEASE_FAILED",
+                "unsubmitted protected order risk reservation could not be released"
+            );
+        }
+        // The mutation API has not been handed off. Even if local quota repair
+        // fails, the response is definitely unsent and the journal may reject.
+        return Err(AppError::OrderSubmissionRejected(preflight_error.user_message()));
+    }
 
     let order = match strategy::dispatch_reserved(risk, &reservation, now_ms, admission, || {
         submit(request)
