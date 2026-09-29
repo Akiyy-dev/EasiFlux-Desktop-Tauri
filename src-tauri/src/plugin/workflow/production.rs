@@ -270,7 +270,7 @@ impl WorkflowHost for ProductionWorkflowHost {
             request.validate(&original.symbol).map_err(|_| preflight())?;
             let link = original.order_link_id.as_deref().ok_or_else(preflight)?;
             strategy::validate_request(link, &original).map_err(|_| preflight())?;
-            if original.protection.is_some() || original.order_type != "Limit" { return Err(preflight()); }
+            if original.order_type != "Limit" { return Err(preflight()); }
             let target = management::query_amend_target(&request, &original,
                 |endpoint, params| self.api.private_get(endpoint, params)).await.map_err(|_| preflight())?;
             management::validate_amend_change(&request, &target).map_err(|_| preflight())?;

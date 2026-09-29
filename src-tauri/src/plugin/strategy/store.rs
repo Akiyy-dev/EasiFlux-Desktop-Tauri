@@ -211,7 +211,8 @@ impl StrategyDocument {
                             .and_then(|o| (!o.cancel_requested).then_some(o))
                             .and_then(|o| o.placement.as_ref());
                         if p.submission_id.is_some() || !r.view.capabilities.iter().any(|c| c == "trade.amend")
-                            || original.is_none_or(|v| v.symbol != order.symbol || v.protection.is_some() || v.order_type != "Limit")
+                            || original.is_none_or(|v| v.symbol != order.symbol || v.order_type != "Limit"
+                                || super::management::validate_amend_entry(v, &order.price).is_err())
                             || order.symbol != r.view.symbol || quantity(&order.qty)? > quantity(&r.view.policy.max_order_qty)?
                             || quantity(&order.qty)? > rust_decimal::Decimal::from_str_exact(&r.view.total_submitted_qty)
                                 .map_err(|_| error("plugin_strategy_storage_unavailable"))?

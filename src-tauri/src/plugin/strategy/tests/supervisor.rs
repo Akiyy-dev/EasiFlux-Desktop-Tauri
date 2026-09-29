@@ -281,7 +281,6 @@ impl WorkflowHost for Fake {
             assert_eq!(doc.runs[0].view.actions_submitted, 2);
             assert_eq!(doc.runs[0].view.total_submitted_qty, "0.0018");
             assert_eq!(request.order_id, "owned-1");
-            assert_eq!(request.price, "50010");
             assert_eq!(request.qty, "0.0008");
             assert_eq!(original.order_link_id, *self.last_submission.lock().unwrap());
             if self.hold_preparation.load(Ordering::SeqCst) {
@@ -621,6 +620,53 @@ async fn amend_uses_owned_original_and_conservatively_debits_before_dispatch() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn protected_owned_limit_can_amend_without_editing_original_protection() {
+    let _serial = SERIAL.lock().await;
+    let mut manifest = super::manifest();
+    manifest["schemaVersion"] = json!(7);
+    manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.protect", "trade.amend"]);
+    manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PROTECTED, AMEND)));
+    let f = fixture_manifest(manifest).await;
+    let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+    let mut requested = request(access);
+    requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.protect", "trade.amend"]
+        .into_iter().map(str::to_string).collect();
+    f.supervisor.start(requested).await.unwrap();
+    settled(&f, "1").await;
+    tick(&f).await;
+    let view = settled(&f, "2").await;
+    assert_eq!(view.last_receipt.unwrap().kind, ReceiptKind::AmendOrder);
+    assert_eq!(f.host.amended.load(Ordering::SeqCst), 1);
+    assert_eq!(f.store.load().unwrap().runs[0].owned["owned-1"].placement.as_ref().unwrap()
+        .protection.as_ref().unwrap().take_profit.as_deref(), Some("55000"));
+    f.supervisor.stop_all().await.unwrap();
+    f.supervisor.drain().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn protected_owned_amend_cannot_move_entry_past_original_legs() {
+    let _serial = SERIAL.lock().await;
+    for crossed_price in ["56000", "44000"] {
+        let mut manifest = super::manifest();
+        manifest["schemaVersion"] = json!(7);
+        manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.protect", "trade.amend"]);
+        manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PROTECTED, &AMEND.replace("50010", crossed_price))));
+        let f = fixture_manifest(manifest).await;
+        let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+        let mut requested = request(access);
+        requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.protect", "trade.amend"]
+            .into_iter().map(str::to_string).collect();
+        f.supervisor.start(requested).await.unwrap();
+        settled(&f, "1").await;
+        tick(&f).await;
+        status(&f, StrategyStatus::Faulted).await;
+        assert_eq!(f.host.amended.load(Ordering::SeqCst), 0, "crossed price {crossed_price}");
+        assert_eq!(f.store.load().unwrap().runs[0].view.actions_submitted, 1);
+        f.supervisor.drain().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn unknown_amend_survives_restart_and_resolves_only_at_desired_state_without_replay() {
     let _serial = SERIAL.lock().await;
     let mut manifest = super::manifest();
@@ -649,6 +695,37 @@ async fn unknown_amend_survives_restart_and_resolves_only_at_desired_state_witho
     assert_eq!(resolved.status, StrategyStatus::Paused);
     assert_eq!(resolved.last_receipt.unwrap().kind, ReceiptKind::AmendOrder);
     assert_eq!(f.host.amended.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_protected_owned_amend_survives_restart_without_replay() {
+    let _serial = SERIAL.lock().await;
+    let mut manifest = super::manifest();
+    manifest["schemaVersion"] = json!(7);
+    manifest["requestedCapabilities"] = json!(["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.protect", "trade.amend"]);
+    manifest["contributions"][0]["params"]["moduleBase64"] = json!(STANDARD.encode(guest(PROTECTED, AMEND)));
+    let f = fixture_manifest(manifest).await;
+    f.host.unknown_amend.store(true, Ordering::SeqCst);
+    let access = f.supervisor.access(f.authority.clone()).await.unwrap();
+    let mut requested = request(access);
+    requested.capabilities = ["account.read", "strategy.run", "trade.place", "market.read", "orders.read", "trade.protect", "trade.amend"]
+        .into_iter().map(str::to_string).collect();
+    let run = f.supervisor.start(requested).await.unwrap();
+    settled(&f, "1").await;
+    tick(&f).await;
+    status(&f, StrategyStatus::RecoveryRequired).await;
+    f.supervisor.drain().await;
+    let restarted = StrategySupervisor::new(f.runtime.clone(), f.host.clone(), f.store.clone(),
+        Arc::new(tokio::sync::Notify::new()));
+    assert!(restarted.reconcile(run.run_id.clone()).await.is_err());
+    assert_eq!(f.host.amended.load(Ordering::SeqCst), 1);
+    assert!(f.store.load().unwrap().runs[0].pending.is_some());
+    f.host.amend_reconciled.store(true, Ordering::SeqCst);
+    let resolved = restarted.reconcile(run.run_id).await.unwrap();
+    assert_eq!(resolved.status, StrategyStatus::Paused);
+    assert_eq!(resolved.last_receipt.unwrap().kind, ReceiptKind::AmendOrder);
+    assert_eq!(f.host.amended.load(Ordering::SeqCst), 1);
+    assert!(f.store.load().unwrap().runs[0].owned["owned-1"].placement.as_ref().unwrap().protection.is_some());
 }
 
 #[tokio::test(start_paused = true)]

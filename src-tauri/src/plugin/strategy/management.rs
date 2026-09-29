@@ -82,6 +82,33 @@ impl OrderProtection {
     }
 }
 
+/// An amendment changes only price/total quantity; original attached exits
+/// remain the immutable bounds for the new limit entry.
+pub(crate) fn validate_amend_entry(original: &PlaceOrderRequest, price: &str) -> AppResult<()> {
+    let Some(protection) = &original.protection else {
+        return Ok(());
+    };
+    protection
+        .validate_shape()
+        .map_err(|_| super::error("plugin_strategy_invalid_output"))?;
+    let entry = rust_decimal::Decimal::from_str_exact(price)
+        .map_err(|_| super::error("plugin_strategy_invalid_output"))?;
+    for (leg, take) in [
+        (&protection.take_profit, true),
+        (&protection.stop_loss, false),
+    ] {
+        if let Some(leg) = leg {
+            let bound = rust_decimal::Decimal::from_str_exact(leg)
+                .map_err(|_| super::error("plugin_strategy_invalid_output"))?;
+            let above = (original.side == "Buy") == take;
+            if !(if above { bound > entry } else { bound < entry }) {
+                return Err(super::error("plugin_strategy_invalid_output"));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_canonical_placement(id: &str, request: &PlaceOrderRequest) -> AppResult<()> {
     if uuid::Uuid::parse_str(id).is_err() || request.order_link_id.as_deref() != Some(id) {
         return Err(super::error("plugin_strategy_storage_unavailable"));

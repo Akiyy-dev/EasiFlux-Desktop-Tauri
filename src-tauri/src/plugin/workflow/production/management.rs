@@ -14,8 +14,8 @@ where
 {
     if request.symbol != original.symbol
         || original.order_type != "Limit"
-        || original.protection.is_some()
         || original.order_link_id.is_none()
+        || crate::plugin::strategy::validate_amend_entry(original, &request.price).is_err()
     {
         return Err(unavailable());
     }
@@ -68,6 +68,7 @@ where
         {
             return Err(unavailable());
         }
+        strict_protection_raw(raw, original)?;
         let qty = Decimal::from_str_exact(&order.qty).map_err(|_| unavailable())?;
         let filled = Decimal::from_str_exact(&order.filled_qty).map_err(|_| unavailable())?;
         let price = Decimal::from_str_exact(&order.price).map_err(|_| unavailable())?;
@@ -151,16 +152,18 @@ fn optional_raw_text<'a>(raw: &'a Value, snake: &str, camel: &str) -> AppResult<
         .transpose()
 }
 pub(super) fn strict_protection_raw(raw: &Value, request: &PlaceOrderRequest) -> AppResult<()> {
-    let protection = request.protection.as_ref().ok_or_else(unavailable)?;
-    protection.validate_shape().map_err(|_| unavailable())?;
+    let protection = request.protection.as_ref();
+    if let Some(protection) = protection {
+        protection.validate_shape().map_err(|_| unavailable())?;
+    }
     for (expected, price_keys, trigger_keys) in [
         (
-            &protection.take_profit,
+            protection.and_then(|p| p.take_profit.as_ref()),
             ("take_profit", "takeProfit"),
             ("tp_trigger_by", "tpTriggerBy"),
         ),
         (
-            &protection.stop_loss,
+            protection.and_then(|p| p.stop_loss.as_ref()),
             ("stop_loss", "stopLoss"),
             ("sl_trigger_by", "slTriggerBy"),
         ),
@@ -170,7 +173,7 @@ pub(super) fn strict_protection_raw(raw: &Value, request: &PlaceOrderRequest) ->
         if let Some(expected) = expected {
             let observed = raw_price.ok_or_else(unavailable)?;
             if Decimal::from_str_exact(observed).ok() != Decimal::from_str_exact(expected).ok()
-                || raw_trigger != Some(protection.trigger_by.as_str())
+                || raw_trigger != protection.map(|p| p.trigger_by.as_str())
             {
                 return Err(unavailable());
             }
@@ -376,6 +379,89 @@ mod tests {
                 .await
                 .is_err(),
                 "missing {key}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn protected_owned_amend_requires_unchanged_raw_protection() {
+        let amend = AmendProposal {
+            symbol: "BTCUSDT".into(),
+            order_id: "exchange-1".into(),
+            price: "50010".into(),
+            qty: "0.0008".into(),
+        };
+        let mut protected = original();
+        protected.protection = Some(crate::models::trading::OrderProtection {
+            take_profit: Some("55000".into()),
+            stop_loss: Some("45000".into()),
+            trigger_by: "LastPrice".into(),
+        });
+        let mut observed = raw();
+        observed["data"][0]["take_profit"] = json!("55000");
+        observed["data"][0]["stop_loss"] = json!("45000");
+        observed["data"][0]["tp_trigger_by"] = json!("LastPrice");
+        observed["data"][0]["sl_trigger_by"] = json!("LastPrice");
+        let target = query_amend_target(&amend, &protected, |_, _| {
+            std::future::ready(Ok(observed.clone()))
+        })
+        .await
+        .unwrap();
+        assert!(validate_amend_change(&amend, &target).is_ok());
+        for key in ["take_profit", "stop_loss", "tp_trigger_by", "sl_trigger_by"] {
+            let mut missing = observed.clone();
+            missing["data"][0].as_object_mut().unwrap().remove(key);
+            assert!(
+                query_amend_target(&amend, &protected, |_, _| {
+                    std::future::ready(Ok(missing.clone()))
+                })
+                .await
+                .is_err(),
+                "missing {key}"
+            );
+        }
+        let mut changed = observed.clone();
+        changed["data"][0]["take_profit"] = json!("56000");
+        assert!(query_amend_target(&amend, &protected, |_, _| {
+            std::future::ready(Ok(changed.clone()))
+        })
+        .await
+        .is_err());
+        assert!(
+            query_amend_target(&amend, &original(), |_, _| {
+                std::future::ready(Ok(observed.clone()))
+            })
+            .await
+            .is_err(),
+            "unprotected ownership cannot inherit raw exchange protection"
+        );
+    }
+    #[tokio::test]
+    async fn protected_owned_amend_preflight_rejects_entry_beyond_immutable_legs() {
+        let mut protected = original();
+        protected.protection = Some(crate::models::trading::OrderProtection {
+            take_profit: Some("55000".into()),
+            stop_loss: Some("45000".into()),
+            trigger_by: "LastPrice".into(),
+        });
+        let mut observed = raw();
+        observed["data"][0]["take_profit"] = json!("55000");
+        observed["data"][0]["stop_loss"] = json!("45000");
+        observed["data"][0]["tp_trigger_by"] = json!("LastPrice");
+        observed["data"][0]["sl_trigger_by"] = json!("LastPrice");
+        for crossed_price in ["55000", "56000", "45000", "44000"] {
+            let amend = AmendProposal {
+                symbol: "BTCUSDT".into(),
+                order_id: "exchange-1".into(),
+                price: crossed_price.into(),
+                qty: "0.0008".into(),
+            };
+            assert!(
+                query_amend_target(&amend, &protected, |_, _| {
+                    std::future::ready(Ok(observed.clone()))
+                })
+                .await
+                .is_err(),
+                "crossed price {crossed_price}"
             );
         }
     }

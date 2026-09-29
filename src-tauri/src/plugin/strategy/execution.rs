@@ -710,9 +710,10 @@ fn validate_action(
             let original = r.owned.get(&order.order_id)
                 .filter(|o| !o.cancel_requested).and_then(|o| o.placement.as_ref())
                 .ok_or_else(|| error("plugin_strategy_invalid_output"))?;
-            if original.protection.is_some() || original.order_type != "Limit" {
+            if original.order_type != "Limit" {
                 return Err(error("plugin_strategy_invalid_output"));
             }
+            super::management::validate_amend_entry(original, &order.price)?;
             let visible = snapshot.orders.as_ref().ok_or_else(|| error("plugin_strategy_invalid_output"))?
                 .items.iter().filter(|o| o.order_id == order.order_id).collect::<Vec<_>>();
             let [target] = visible.as_slice() else { return Err(error("plugin_strategy_invalid_output")); };
