@@ -157,6 +157,52 @@ separate account-workflow generator or add dependencies. Tests used injected
 hosts and temp storage only. Grants remain explicit/unchecked; acknowledgement
 does not prove active protection, and stop does not cancel orders/close positions.
 
-Task review, consolidated broad frontend/Rust/example checks, whole-branch review,
-exact-head CI and integration remain controller-owned and pending. No real account,
-installed profile, desktop launch or exchange acceptance is claimed.
+Independent Task 3 review returned spec compliant / quality approved with no
+blocking defects. It noted an older authoring checklist that omitted v7, and the
+already-disclosed warning debt; both are carried to whole-branch review.
+
+## Controller integration — 2026-09-30
+
+Initial integration snapshot: `00f0c9320dd87ee85fdf537666023c163231fe43`.
+
+| Command | Observed result |
+| --- | --- |
+| `node_modules/.bin/vitest.cmd run --reporter=dot` | Initial run: 90 files passed / 1 failed; 1481 tests passed / 1 failed. Older v5 comparison assertion still expected a plain permission-ID string after shared UI gained Chinese labels; repair pending below. |
+| `cargo test --locked --manifest-path src-tauri/Cargo.toml --all-targets --target-dir src-tauri/target -q` | Exit 0; 1287 passed, 0 failed, 2 ignored; other binary/example test targets have 0 tests. |
+| `node_modules/.bin/eslint.cmd src` | Exit 0; 0 errors, 78 existing Vue formatting warnings in unchanged component files. |
+| `node_modules/.bin/vue-tsc.cmd --noEmit` | Exit 0, no output. |
+| `node_modules/.bin/vite.cmd build` | Exit 0; 4775 modules; main JS 1347.01 kB / gzip 394.02 kB. Existing large-chunk advisory remains. |
+| `cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --target-dir src-tauri/target` | Exit 0; lib 96 warnings, lib-test 116 warnings including 64 duplicates; not warning-free. |
+| `node examples/plugins/account-workflow/verify.mjs` | 5 checks passed. |
+| `node examples/plugins/threshold-strategy/verify.mjs` | 17 behavior checks passed; module 5934 / manifest 8995 bytes. |
+| `node examples/plugins/managed-entry/verify.mjs` | 13 behavior groups passed; module 4740 / manifest 7342 bytes. |
+| All three corresponding `build.mjs --check` wrappers | Exit 0; generated-source parity without rewriting artifacts. |
+| `git diff --check 8f81ed3832415269b879ff411eaa979e1254e832 HEAD` | Exit 0. |
+
+The two ignored native cases are child-process crash helpers, deliberately launched
+by their parent lifecycle tests (import/tests.rs:1526 and removal/tests.rs:233),
+not silently skipped feature tests. Native output includes expected Windows
+filesystem fault-injection diagnostics, unused-code warnings and linker notices.
+Frontend trading-switch tests emit existing missing `n-config-provider` warnings.
+Clippy also flags two needless borrows in the touched strategy acknowledgement
+path and receipt variant naming; these are explicitly carried to final review,
+not mislabeled as entirely inherited noise. No blanket lint suppression or
+unrelated formatting cleanup was applied.
+
+Scoped packaging preflight found no `.env*` files in the isolated source checkout
+(excluding dependency/build/Git directories), no VITE_/EASIFLUX_/TAURI_ variable
+names in the build environment, and no Tauri-bundled account/profile resources.
+Only filenames/config/source were checked; installed data and credential values
+were not read. This is not a historical secret audit.
+
+The stale assertion was reproduced separately (1 failed / 3 passed) and repaired
+in test-only commit `7ba1fe3`: the metadata section must contain the exact three
+Chinese labels plus capability IDs in order; all existing confirmation/input/
+hidden-module assertions remain. Covering comparison tests passed 13/13, scoped
+ESLint and typecheck exited 0. The controller then reran the full frontend suite
+at `7ba1fe3331d0b1625fe4feaaa1c48cfcf645f90f`: **91 files / 1482 tests passed,
+zero failures, exit 0**. This rerun was necessary because the initial full run
+failed; unchanged native code was not needlessly retested.
+
+Whole-branch review, exact-head CI and integration remain pending. No real
+account, installed profile, desktop launch or exchange acceptance is claimed.
