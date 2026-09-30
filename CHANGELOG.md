@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.7.0...easiflux-desktop-tauri-v0.8.0) (2026-09-30)
+
+
+### Features
+
+* **plugin:** support protected entries and owned-order amendments ([#43](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/issues/43)) ([f12feae](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/commit/f12feae30e9ee2478ca86fde6e050b83bc66e6f2))
+
 ## [0.7.0](https://github.com/Akiyy-dev/EasiFlux-Desktop-Tauri/compare/easiflux-desktop-tauri-v0.6.1...easiflux-desktop-tauri-v0.7.0) (2026-09-22)
 
 
