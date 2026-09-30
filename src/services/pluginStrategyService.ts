@@ -3,6 +3,7 @@ import type { PluginStrategyExecutionIntent } from '../types/plugin'
 import {
   PLUGIN_STRATEGY_CAPABILITIES,
   hasStrategyCapabilityDependencies,
+  hasStrategyDeclarationDependencies,
   type PluginStrategyCapability,
   type PluginStrategyStartInput,
   type StrategyAccess,
@@ -238,7 +239,7 @@ export function parsePluginStrategyAccess(
     || canonicalU64(access.catalogGeneration) !== intent.expectedCatalogGeneration
     || canonicalU64(access.revision) !== intent.expectedRevision
     || !sameCapabilities(requestedCapabilities, intent.requestedCapabilities)
-    || !hasStrategyCapabilityDependencies(requestedCapabilities)) invalidResponse()
+    || !hasStrategyDeclarationDependencies(requestedCapabilities)) invalidResponse()
   return {
     schemaVersion: 1,
     pluginId: intent.pluginId,

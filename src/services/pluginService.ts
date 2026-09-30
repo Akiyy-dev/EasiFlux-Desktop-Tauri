@@ -32,7 +32,7 @@ import {
 } from '../types/pluginWorkflow'
 import {
   PLUGIN_STRATEGY_CAPABILITIES,
-  hasStrategyCapabilityDependencies,
+  hasStrategyDeclarationDependencies,
   type PluginStrategyCapability,
 } from '../types/pluginStrategy'
 
@@ -521,7 +521,7 @@ function parseStrategyCapabilities(value: unknown, schemaVersion: 6 | 7): Plugin
     || (schemaVersion === 6 && capabilities.some((capability) => (
       capability === 'trade.amend' || capability === 'trade.protect'
     )))
-    || !hasStrategyCapabilityDependencies(capabilities)) invalidResponse()
+    || !hasStrategyDeclarationDependencies(capabilities)) invalidResponse()
   return capabilities
 }
 

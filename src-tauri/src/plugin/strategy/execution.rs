@@ -566,7 +566,7 @@ impl StrategySupervisor {
             let record = self.state(id)?;
             if self
                 .host
-                .strategy_acknowledge_locked(&record.scope, submission, &order, request)
+                .strategy_acknowledge_locked(&record.scope, submission, order, request)
                 .await
                 .is_err()
             {
@@ -595,7 +595,7 @@ impl StrategySupervisor {
         {
             let record = self.state(id)?;
             let canonical = canonical_placement(request, submission, Some(protection.clone()));
-            if self.host.strategy_acknowledge_protected_locked(&record.scope, submission, &order, &canonical).await.is_err() {
+            if self.host.strategy_acknowledge_protected_locked(&record.scope, submission, order, &canonical).await.is_err() {
                 self.mark(id, StrategyStatus::RecoveryRequired, "plugin_strategy_ack_failed");
                 return Ok(());
             }

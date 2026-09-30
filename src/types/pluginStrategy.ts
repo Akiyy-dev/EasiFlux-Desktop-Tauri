@@ -24,12 +24,16 @@ export type PluginStrategyCapabilityV6 = Exclude<
   'trade.amend' | 'trade.protect'
 >
 
-export function hasStrategyCapabilityDependencies(capabilities: readonly PluginStrategyCapability[]): boolean {
+export function hasStrategyDeclarationDependencies(capabilities: readonly PluginStrategyCapability[]): boolean {
   const has = (capability: PluginStrategyCapability) => capabilities.includes(capability)
   return has('account.read') && has('strategy.run')
-    && (!has('trade.cancel') || has('orders.read'))
     && (!has('trade.amend') || (has('trade.place') && has('orders.read') && has('market.read')))
     && (!has('trade.protect') || (has('trade.place') && has('market.read')))
+}
+
+export function hasStrategyCapabilityDependencies(capabilities: readonly PluginStrategyCapability[]): boolean {
+  return hasStrategyDeclarationDependencies(capabilities)
+    && (!capabilities.includes('trade.cancel') || capabilities.includes('orders.read'))
 }
 
 export interface StrategyAccess {

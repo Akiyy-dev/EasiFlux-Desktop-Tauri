@@ -145,6 +145,33 @@ describe('v6 strategy manifests', () => {
     })
   })
 
+  it('keeps a legacy cancellation declaration loadable through catalog and import', async () => {
+    const requestedCapabilities = ['account.read', 'strategy.run', 'trade.cancel']
+    const wire = catalogFixture(6, requestedCapabilities)
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(wire)
+    expect((await getPluginCatalog()).plugins[0].manifest.requestedCapabilities)
+      .toEqual(requestedCapabilities)
+
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      schemaVersion: 2, status: 'ready', token: 'a'.repeat(32), expiresInSeconds: 300,
+      catalogGeneration: '8', manifest: wire.plugins[0].manifest,
+      assessment: { kind: 'notInCatalog' },
+    })
+    const preview = await prepareLocalManifestImport()
+    expect(preview.status).toBe('ready')
+    if (preview.status !== 'ready') throw new Error('expected ready preview')
+    expect(preview.manifest.requestedCapabilities).toEqual(requestedCapabilities)
+
+    const imported = catalogFixture(6, requestedCapabilities)
+    imported.plugins[0] = {
+      ...imported.plugins[0], management: 'managed', canRemove: true, status: 'disabled',
+    }
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      schemaVersion: 2, status: 'imported', pluginId: 'com.example.strategy', snapshot: imported,
+    })
+    await expect(commitLocalManifestImport(preview)).resolves.toMatchObject({ status: 'imported' })
+  })
+
   it('binds import commit to the complete previewed v6 capability list', async () => {
     const manifest = JSON.parse(readFileSync(resolve(
       process.cwd(), 'examples/plugins/threshold-strategy/manifest.json',
@@ -236,6 +263,32 @@ describe('v7 strategy manifest authority', () => {
 
 describe('plugin strategy strict service boundary', () => {
   beforeEach(() => vi.resetAllMocks())
+
+  it('accepts correlated legacy cancellation requests and starts a safe grant subset', async () => {
+    const requestedCapabilities = ['account.read', 'strategy.run', 'trade.cancel'] as const
+    const legacyIntent = { ...intent(), requestedCapabilities: [...requestedCapabilities] }
+    const legacyAccess = parsePluginStrategyAccess({
+      ...accessFixture(), requestedCapabilities: [...requestedCapabilities],
+    }, legacyIntent)
+    expect(legacyAccess.requestedCapabilities).toEqual(requestedCapabilities)
+
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(runFixture({
+      capabilities: ['account.read', 'strategy.run'],
+    }))
+    await expect(startPluginStrategy(legacyIntent, legacyAccess, {
+      requestId: REQUEST_ID, resumeRunId: null, symbol: 'BTCUSDT', inputJson: legacyIntent.defaultInput,
+      capabilities: ['account.read', 'strategy.run'], policy: policy(),
+      acknowledgeAutomaticTrading: true,
+    })).resolves.toMatchObject({ capabilities: ['account.read', 'strategy.run'] })
+    expect(tauriInvoke).toHaveBeenCalledTimes(1)
+
+    await expect(startPluginStrategy(legacyIntent, legacyAccess, {
+      requestId: REQUEST_ID, resumeRunId: null, symbol: 'BTCUSDT', inputJson: legacyIntent.defaultInput,
+      capabilities: [...requestedCapabilities], policy: policy(),
+      acknowledgeAutomaticTrading: true,
+    })).rejects.toThrow(INVALID_RESPONSE)
+    expect(tauriInvoke).toHaveBeenCalledTimes(1)
+  })
 
   function managementIntent(): PluginStrategyExecutionIntent {
     return { ...intent(), requestedCapabilities: [
