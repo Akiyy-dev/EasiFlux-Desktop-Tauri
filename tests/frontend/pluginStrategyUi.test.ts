@@ -60,7 +60,7 @@ function runFixture(status = 'running', overrides: Record<string, unknown> = {})
     totalSubmittedQty: '0.001', lastMessage: 'Order accepted, not necessarily filled',
     lastReceipt: {
       sequence: '4', kind: 'placeOrder', status: 'accepted',
-      submissionId: 'submission-1', orderId: 'exchange-order-1', errorCode: null,
+      submissionId: '00000000-0000-4000-8000-000000000003', orderId: 'exchange-order-1', errorCode: null,
     },
     ...overrides,
   }
@@ -73,10 +73,39 @@ async function mountDialog() {
   return wrapper
 }
 
+function managementIntent(): PluginStrategyExecutionIntent {
+  return { ...intent(), requestedCapabilities: [
+    'account.read', 'orders.read', 'market.read', 'trade.place',
+    'trade.amend', 'trade.protect', 'strategy.run',
+  ] }
+}
+
+function managementAccess() {
+  return { ...accessFixture(), requestedCapabilities: managementIntent().requestedCapabilities }
+}
+
 describe('strategy launch dialog', () => {
   beforeEach(() => {
     vi.resetAllMocks()
     vi.stubGlobal('crypto', { randomUUID: () => REQUEST_ID })
+  })
+
+  it('shows v7 management grants unchecked and blocks a grant missing dependencies', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce(managementAccess())
+    const wrapper = mount(PluginStrategyDialog, { props: { intent: managementIntent() } })
+    await flushPromises()
+    const boxes = wrapper.findAll<HTMLInputElement>('[data-testid="strategy-capability"]')
+    expect(boxes).toHaveLength(7)
+    expect(boxes.every((box) => !box.element.checked)).toBe(true)
+    expect(wrapper.text()).toContain('trade.amend')
+    expect(wrapper.text()).toContain('trade.protect')
+    for (const box of boxes.filter((box) => box.element.value !== 'orders.read')) {
+      await box.setValue(true)
+    }
+    await wrapper.get('[data-testid="strategy-acknowledgement"]').setValue(true)
+    expect(wrapper.get<HTMLButtonElement>('[data-start-strategy]').element.disabled).toBe(true)
+    expect(vi.mocked(tauriInvoke).mock.calls.some(([command]) => command === 'start_plugin_strategy'))
+      .toBe(false)
   })
 
   it('does not treat enabling or opening a strategy as permission to trade', async () => {
@@ -142,6 +171,21 @@ describe('persistent strategy monitor', () => {
   beforeEach(() => {
     vi.resetAllMocks()
     vi.stubGlobal('crypto', { randomUUID: () => REQUEST_ID })
+  })
+
+  it('names management receipts as acknowledged requests, not finished amendments or active protection', async () => {
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({ schemaVersion: 1, runs: [runFixture('running', {
+      capabilities: managementIntent().requestedCapabilities,
+      lastReceipt: {
+        sequence: '4', kind: 'placeProtectedOrder', status: 'accepted',
+        submissionId: '00000000-0000-4000-8000-000000000003',
+        orderId: 'exchange-order-1', errorCode: null,
+      },
+    })] })
+    const wrapper = mount(PluginStrategyMonitor, { props: { strategyIntents: [] } })
+    await flushPromises()
+    expect(wrapper.get(`[data-run-id="${RUN_ID}"]`).text()).toContain('附带止盈止损')
+    expect(wrapper.text()).toContain('不代表保护已生效')
   })
 
   it('keeps the native run visible without a dialog and explains budgets and accepted versus filled', async () => {

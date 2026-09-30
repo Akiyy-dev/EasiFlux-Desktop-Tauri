@@ -2,6 +2,8 @@ import { tauriInvoke } from '../composables/useTauriCommand'
 import type { PluginStrategyExecutionIntent } from '../types/plugin'
 import {
   PLUGIN_STRATEGY_CAPABILITIES,
+  hasStrategyCapabilityDependencies,
+  hasStrategyDeclarationDependencies,
   type PluginStrategyCapability,
   type PluginStrategyStartInput,
   type StrategyAccess,
@@ -140,10 +142,7 @@ function parseCapabilities(value: unknown): PluginStrategyCapability[] {
 
 function parseRunCapabilities(value: unknown): PluginStrategyCapability[] {
   const parsed = parseCapabilities(value)
-  if (!parsed.includes('account.read') || !parsed.includes('strategy.run')
-    || (parsed.includes('trade.cancel') && !parsed.includes('orders.read'))) {
-    invalidResponse()
-  }
+  if (!hasStrategyCapabilityDependencies(parsed)) invalidResponse()
   return parsed
 }
 
@@ -239,7 +238,8 @@ export function parsePluginStrategyAccess(
     || pluginId(access.contributionId) !== intent.contributionId
     || canonicalU64(access.catalogGeneration) !== intent.expectedCatalogGeneration
     || canonicalU64(access.revision) !== intent.expectedRevision
-    || !sameCapabilities(requestedCapabilities, intent.requestedCapabilities)) invalidResponse()
+    || !sameCapabilities(requestedCapabilities, intent.requestedCapabilities)
+    || !hasStrategyDeclarationDependencies(requestedCapabilities)) invalidResponse()
   return {
     schemaVersion: 1,
     pluginId: intent.pluginId,
@@ -279,7 +279,8 @@ function parseOptionalString(value: unknown, maxBytes: number): string | null {
 function parseReceipt(value: unknown): StrategyReceipt | null {
   if (value === null) return null
   const receipt = exactObject(value, RECEIPT_KEYS)
-  if ((receipt.kind !== 'placeOrder' && receipt.kind !== 'cancelOrder')
+  if ((receipt.kind !== 'placeOrder' && receipt.kind !== 'cancelOrder'
+    && receipt.kind !== 'amendOrder' && receipt.kind !== 'placeProtectedOrder')
     || (receipt.status !== 'accepted' && receipt.status !== 'rejected' && receipt.status !== 'unknown')) {
     invalidResponse()
   }
@@ -292,12 +293,20 @@ function parseReceipt(value: unknown): StrategyReceipt | null {
   if ((receipt.status === 'accepted' && errorCode !== null)
     || (receipt.status === 'rejected' && errorCode !== 'plugin_strategy_rejected')
     || (receipt.status === 'unknown' && errorCode !== 'plugin_strategy_unknown')) invalidResponse()
+  const submissionId = parseOptionalString(receipt.submissionId, 128)
+  const orderId = parseOptionalString(receipt.orderId, 128)
+  const isPlacement = receipt.kind === 'placeOrder' || receipt.kind === 'placeProtectedOrder'
+  if (isPlacement !== (submissionId !== null)
+    || (submissionId !== null && !UUID_PATTERN.test(submissionId))
+    || (orderId !== null && (orderId.trim().length === 0 || /\p{Cc}/u.test(orderId)))
+    || (receipt.kind === 'amendOrder' && !orderId)
+    || (receipt.status === 'accepted' && !orderId)) invalidResponse()
   return {
     sequence: canonicalU64(receipt.sequence),
     kind: receipt.kind,
     status: receipt.status,
-    submissionId: parseOptionalString(receipt.submissionId, 128),
-    orderId: parseOptionalString(receipt.orderId, 128),
+    submissionId,
+    orderId,
     errorCode,
   }
 }
@@ -337,7 +346,11 @@ export function parsePluginStrategyRunView(
   const maxTotalQty = decimal(policy.maxTotalQty, true)
   if (compareDecimal(totalSubmittedQty.comparable, maxTotalQty.comparable) > 0) invalidResponse()
   const receipt = parseReceipt(run.lastReceipt)
-  if (receipt !== null && BigInt(receipt.sequence) > BigInt(sequence)) invalidResponse()
+  if (receipt !== null && (
+    BigInt(receipt.sequence) > BigInt(sequence)
+    || (receipt.kind === 'amendOrder' && !capabilities.includes('trade.amend'))
+    || (receipt.kind === 'placeProtectedOrder' && !capabilities.includes('trade.protect'))
+  )) invalidResponse()
   const parsedReason = parseOptionalString(run.reason, 2000)
   if (parsedReason !== null && !RUN_REASONS.has(parsedReason as StrategyRunReason)) invalidResponse()
   const reason = parsedReason as StrategyRunReason | null
@@ -416,8 +429,7 @@ function validateStart(
   const policy = parsePluginStrategyPolicy(value.policy)
   const isResume = resumeRunId !== null
   if (value.acknowledgeAutomaticTrading !== true
-    || !capabilities.includes('account.read') || !capabilities.includes('strategy.run')
-    || (capabilities.includes('trade.cancel') && !capabilities.includes('orders.read'))
+    || !hasStrategyCapabilityDependencies(capabilities)
     || capabilities.some((capability) => !access.requestedCapabilities.includes(capability))
     || !sameCapabilities(access.requestedCapabilities, intent.requestedCapabilities)
     || isResume !== (previousRun !== undefined)) invalidResponse()

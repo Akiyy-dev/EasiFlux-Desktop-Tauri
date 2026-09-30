@@ -47,7 +47,7 @@ const hasWorkflowCommand = computed(() => (
   )
 ))
 const hasStrategyCommand = computed(() => (
-  props.preview.manifest.schemaVersion === 6
+  (props.preview.manifest.schemaVersion === 6 || props.preview.manifest.schemaVersion === 7)
   && props.preview.manifest.contributions.some(
     (command) => command.actionId === 'sandbox.strategy',
   )
@@ -165,7 +165,7 @@ onUnmounted(() => {
       <p v-if="!isComparison" id="plugin-import-warning" class="plugin-import-dialog__warning">
         目录中未发现相同插件 ID；确认后将作为新清单导入。发布者信息由清单作者填写，未经认证。
         <template v-if="hasStrategyCommand">
-          此 v6 清单包含可执行的本地 WebAssembly 自动策略。导入、启用、打开或刷新都不会启动策略；每次启动或恢复都必须选择权限和硬限制，并明确同意在限制内自动真实交易且不再逐单确认。
+          此 v{{ props.preview.manifest.schemaVersion }} 清单包含可执行的本地 WebAssembly 自动策略。导入、启用、打开或刷新都不会启动策略；每次启动或恢复都必须选择权限和硬限制，并明确同意在限制内自动真实交易且不再逐单确认。
         </template>
         <template v-else-if="hasWorkflowCommand">
           此 v5 清单包含可执行的本地 WebAssembly，并请求账户数据或交易提案能力。导入和启用都不会授权；用户必须在账户工作流中于会话内单独选择每项授权，真实下单仍需单独确认。
@@ -240,12 +240,20 @@ onUnmounted(() => {
               <div>
                 <dt>请求权限</dt>
                 <dd>
-                  <bdi>{{ props.preview.manifest.schemaVersion === 6
+                  <bdi>{{ props.preview.manifest.schemaVersion === 6 || props.preview.manifest.schemaVersion === 7
                     ? props.preview.manifest.requestedCapabilities.map((capability) => pluginCapabilityLabels[capability]).join('、')
                     : '' }}</bdi>
                 </dd>
               </div>
-              <div><dt>自动行为</dt><dd>明确启动后可在原生限制内自动下单或撤单，不逐单确认。</dd></div>
+              <div>
+                <dt>自动行为</dt>
+                <dd>
+                  明确启动后可在原生限制内自动下单或撤单，不逐单确认。
+                  <template v-if="props.preview.manifest.schemaVersion === 7">
+                    显式授权后还可提交自有活动限价单数量不增加的修改或附带止盈止损的开仓请求；接受回执不代表修改最终生效或保护已生效。
+                  </template>
+                </dd>
+              </div>
             </dl>
           </li>
         </ul>

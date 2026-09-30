@@ -83,13 +83,15 @@ function legacyPlugin(): PluginCatalogItem {
   }
 }
 
-function strategyPlugin(): PluginCatalogItem {
+function strategyPlugin(schemaVersion: 6 | 7 = 6): PluginCatalogItem {
   return {
     manifest: {
-      schemaVersion: 6,
+      schemaVersion,
       id: 'com.example.strategy', publisherId: 'com.example', publisher: 'Example publisher',
       name: 'Strategy tools', description: 'Native supervised strategy', version: '1.0.0',
-      requestedCapabilities: ['account.read', 'market.read', 'trade.place', 'strategy.run'],
+      requestedCapabilities: schemaVersion === 7
+        ? ['account.read', 'orders.read', 'market.read', 'trade.place', 'trade.amend', 'trade.protect', 'strategy.run']
+        : ['account.read', 'market.read', 'trade.place', 'strategy.run'],
       contributions: [{
         kind: 'command', contributionId: 'strategy.threshold', title: 'Threshold once',
         actionId: 'sandbox.strategy',
@@ -207,6 +209,28 @@ describe('installed plugin command workbench', () => {
     await action.trigger('click')
     await flushPromises()
     expect(wrapper.get('[data-testid="strategy-dialog"]').exists()).toBe(true)
+    expect(vi.mocked(tauriInvoke).mock.calls.some(([command]) => command === 'start_plugin_strategy'))
+      .toBe(false)
+  })
+
+  it('launches a v7 management strategy from the installed command workbench without granting or starting it', async () => {
+    const plugin = strategyPlugin(7)
+    const wrapper = await mountLoaded(snapshot([plugin], '13', '8'))
+    await wrapper.get('[data-testid="plugin-command-view"]').trigger('click')
+    vi.mocked(tauriInvoke).mockResolvedValueOnce({
+      schemaVersion: 1, pluginId: 'com.example.strategy', contributionId: 'strategy.threshold',
+      catalogGeneration: '8', revision: '13',
+      account: { accountId: 'paper-main', sessionEpoch: '21', environment: 'Testnet' },
+      requestedCapabilities: plugin.manifest.requestedCapabilities,
+      authorizationToken: 'strategy-ticket-1', expiresAtMs: '1789920060123',
+    })
+    await wrapper.get('[data-testid="plugin-workbench-command"]').trigger('click')
+    await flushPromises()
+    const dialog = wrapper.get('[data-testid="strategy-dialog"]')
+    expect(dialog.findAll<HTMLInputElement>('[data-testid="strategy-capability"]')).toHaveLength(7)
+    expect(dialog.findAll<HTMLInputElement>('[data-testid="strategy-capability"]')
+      .every((box) => !box.element.checked)).toBe(true)
+    expect(dialog.get<HTMLButtonElement>('[data-start-strategy]').element.disabled).toBe(true)
     expect(vi.mocked(tauriInvoke).mock.calls.some(([command]) => command === 'start_plugin_strategy'))
       .toBe(false)
   })

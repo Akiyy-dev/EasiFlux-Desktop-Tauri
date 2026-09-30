@@ -1,5 +1,8 @@
 mod contract;
 pub(crate) use contract::*;
+mod management;
+pub(crate) use management::*;
+pub(crate) use crate::models::trading::OrderProtection;
 mod types;
 pub(crate) use types::*;
 mod execution;

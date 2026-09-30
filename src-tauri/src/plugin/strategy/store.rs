@@ -16,6 +16,8 @@ pub(crate) const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) struct OwnedOrder {
     pub(crate) submission_id: String,
     pub(crate) cancel_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) placement: Option<crate::models::trading::PlaceOrderRequest>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -55,7 +57,8 @@ macro_rules! object {
 }
 object!(OwnedOrder {
     submission_id: String,
-    cancel_requested: bool
+    cancel_requested: bool,
+    #[serde(default)] placement: Option<crate::models::trading::PlaceOrderRequest>
 });
 object!(PendingAction{sequence:String,action:StrategyAction,#[serde(deserialize_with="nullable")] submission_id:Option<String>,state:serde_json::Value,message:String});
 object!(RunRecord{view:StrategyRunView,fingerprint:String,scope:String,state:serde_json::Value,#[serde(deserialize_with="owned_orders")] owned:BTreeMap<String,OwnedOrder>,#[serde(deserialize_with="nullable")] pending:Option<PendingAction>,last_observed_at_ms:String});
@@ -151,6 +154,14 @@ impl StrategyDocument {
                 if !workflow::bounded_id(id)
                     || uuid::Uuid::parse_str(&o.submission_id).is_err()
                     || !submissions.insert(&o.submission_id)
+                    || o.placement.as_ref().is_some_and(|p| {
+                        p.order_link_id.as_deref() != Some(o.submission_id.as_str())
+                            || p.symbol != r.view.symbol
+                            || !r.view.capabilities.iter().any(|c| c == "trade.place")
+                            || (p.protection.is_some() && !r.view.capabilities.iter().any(|c| c == "trade.protect"))
+                            || (r.view.policy.reduce_only && p.reduce_only != Some(true))
+                            || super::management::validate_canonical_placement(&o.submission_id, p).is_err()
+                    })
                 {
                     return Err(error("plugin_strategy_storage_unavailable"));
                 }
@@ -164,7 +175,7 @@ impl StrategyDocument {
                     return Err(error("plugin_strategy_storage_unavailable"));
                 }
                 match &p.action {
-                    StrategyAction::PlaceOrder { order } => {
+                    StrategyAction::PlaceOrder { order } | StrategyAction::PlaceProtectedOrder { order, .. } => {
                         workflow::WorkflowOutput::PlaceOrder {
                             order: order.clone(),
                         }
@@ -182,6 +193,7 @@ impl StrategyDocument {
                                 > rust_decimal::Decimal::from_str_exact(&r.view.total_submitted_qty)
                                     .map_err(|_| error("plugin_strategy_storage_unavailable"))?
                             || (r.view.policy.reduce_only && !order.reduce_only)
+                            || matches!(&p.action, StrategyAction::PlaceProtectedOrder { protection, .. } if !r.view.capabilities.iter().any(|c| c == "trade.protect") || order.reduce_only || protection.validate_structure().is_err())
                         {
                             return Err(error("plugin_strategy_storage_unavailable"));
                         }
@@ -191,6 +203,20 @@ impl StrategyDocument {
                             || p.submission_id.is_some()
                             || !r.owned.contains_key(&order.order_id)
                         {
+                            return Err(error("plugin_strategy_storage_unavailable"));
+                        }
+                    }
+                    StrategyAction::AmendOrder { order } => {
+                        let original = r.owned.get(&order.order_id)
+                            .and_then(|o| (!o.cancel_requested).then_some(o))
+                            .and_then(|o| o.placement.as_ref());
+                        if p.submission_id.is_some() || !r.view.capabilities.iter().any(|c| c == "trade.amend")
+                            || original.is_none_or(|v| v.symbol != order.symbol || v.order_type != "Limit"
+                                || super::management::validate_amend_entry(v, &order.price).is_err())
+                            || order.symbol != r.view.symbol || quantity(&order.qty)? > quantity(&r.view.policy.max_order_qty)?
+                            || quantity(&order.qty)? > rust_decimal::Decimal::from_str_exact(&r.view.total_submitted_qty)
+                                .map_err(|_| error("plugin_strategy_storage_unavailable"))?
+                            || order.clone().validate(&r.view.symbol).is_err() {
                             return Err(error("plugin_strategy_storage_unavailable"));
                         }
                     }
@@ -211,9 +237,11 @@ impl StrategyDocument {
                     .ok_or_else(|| error("plugin_strategy_storage_unavailable"))?;
                 let (kind, order_id) = match &pending.action {
                     StrategyAction::PlaceOrder { .. } => (ReceiptKind::PlaceOrder, None),
+                    StrategyAction::PlaceProtectedOrder { .. } => (ReceiptKind::PlaceProtectedOrder, None),
                     StrategyAction::CancelOrder { order } => {
                         (ReceiptKind::CancelOrder, Some(order.order_id.as_str()))
                     }
+                    StrategyAction::AmendOrder { order } => (ReceiptKind::AmendOrder, Some(order.order_id.as_str())),
                     _ => return Err(error("plugin_strategy_storage_unavailable")),
                 };
                 if receipt.sequence != pending.sequence

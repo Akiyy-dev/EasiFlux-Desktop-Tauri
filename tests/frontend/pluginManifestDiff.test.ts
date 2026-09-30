@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
+import { mount } from '@vue/test-utils'
 import { comparePluginManifests } from '../../src/services/pluginManifestDiff'
-import type { PluginCommandContribution, PluginManifest } from '../../src/types/plugin'
+import PluginManifestComparison from '../../src/components/plugins/PluginManifestComparison.vue'
+import type { PluginCatalogItem, PluginCommandContribution, PluginManifest } from '../../src/types/plugin'
 
 function info(
   contributionId: string,
@@ -58,6 +60,62 @@ function manifest(
 }
 
 describe('comparePluginManifests', () => {
+  it('explains new v7 permissions in Chinese in an upgrade comparison', () => {
+    const strategy: PluginCommandContribution = {
+      kind: 'command', contributionId: 'strategy.management', title: 'Manage owned order',
+      actionId: 'sandbox.strategy', params: {
+        runtime: 'wasm-v1', abi: 'strategy-json-v1', moduleBase64: 'AGFzbQEAAAA=', defaultInput: '{}',
+      },
+    }
+    const currentManifest = manifest(4, [strategy], {
+      schemaVersion: 6, requestedCapabilities: [
+        'account.read', 'orders.read', 'market.read', 'trade.place', 'strategy.run',
+      ],
+    } as Partial<PluginManifest>)
+    const incoming = {
+      ...currentManifest, schemaVersion: 7 as const,
+      requestedCapabilities: [
+        'account.read', 'orders.read', 'market.read', 'trade.place',
+        'trade.amend', 'trade.protect', 'strategy.run',
+      ],
+    } as PluginManifest
+    const current: PluginCatalogItem = {
+      manifest: currentManifest, source: 'localDeclarative', management: 'external',
+      canRemove: false, toggleBlockReasonCode: null, status: 'enabled',
+      statusReasonCode: null, canToggle: true, grantedCapabilities: [],
+    }
+    const wrapper = mount(PluginManifestComparison, {
+      props: { current, incoming, versionRelation: 'incomingHigher' },
+    })
+    expect(wrapper.get('[data-testid="plugin-strategy-comparison-notice"]').text())
+      .toContain('每次启动或恢复')
+    expect(wrapper.get('.plugin-manifest-comparison__fields').text()).toContain('数量不可增加')
+    expect(wrapper.get('.plugin-manifest-comparison__fields').text()).toContain('附带止盈止损')
+  })
+  it('discloses a v6 to v7 strategy upgrade and newly requested management authority', () => {
+    const contribution: PluginCommandContribution = {
+      kind: 'command', contributionId: 'strategy.management', title: 'Manage owned order',
+      actionId: 'sandbox.strategy', params: {
+        runtime: 'wasm-v1', abi: 'strategy-json-v1',
+        moduleBase64: 'AGFzbQEAAAA=', defaultInput: '{}',
+      },
+    }
+    const current = manifest(4, [contribution], {
+      schemaVersion: 6,
+      requestedCapabilities: ['account.read', 'orders.read', 'market.read', 'trade.place', 'strategy.run'],
+    } as Partial<PluginManifest>)
+    const incoming = {
+      ...current, schemaVersion: 7 as const,
+      requestedCapabilities: [
+        'account.read', 'orders.read', 'market.read', 'trade.place',
+        'trade.amend', 'trade.protect', 'strategy.run',
+      ],
+    } as PluginManifest
+    expect(comparePluginManifests(current, incoming)).toMatchObject({
+      changedFields: ['schemaVersion', 'requestedCapabilities'],
+      added: [], removed: [], changed: [], sameContent: false,
+    })
+  })
   it('reports every metadata field independently and keeps publisher identity distinct', () => {
     const current = manifest(1)
     const incoming = manifest(3, [page('workspace.home', 'home')], {

@@ -20,16 +20,16 @@ where
     submit().await
 }
 
-pub(super) async fn dispatch_reserved<F, Fut>(
+pub(super) async fn dispatch_reserved<T, F, Fut>(
     risk: &Arc<tokio::sync::RwLock<RiskService>>,
     reservation: &RiskReservation,
     now_ms: u64,
     admission: Option<&StrategyAdmission<'_>>,
     submit: F,
-) -> AppResult<Order>
+) -> AppResult<T>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = AppResult<Order>>,
+    Fut: Future<Output = AppResult<T>>,
 {
     if let Some(admission) = admission {
         if let Err(rejection) = admission() {
@@ -86,6 +86,7 @@ mod tests {
             time_in_force: Some("ImmediateOrCancel".into()),
             order_link_id: Some(uuid::Uuid::new_v4().to_string()),
             reduce_only: Some(false),
+            protection: None,
         }
     }
     fn order() -> Order {
@@ -145,6 +146,7 @@ mod tests {
                 None,
                 1000,
                 guarded.then_some(&admission as &StrategyAdmission<'_>),
+                || async { Ok(()) },
                 |_| async {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(order())
@@ -222,6 +224,107 @@ mod tests {
             .await
             .reserve_order(&request, None, 1000)
             .is_ok());
+    }
+    #[tokio::test]
+    async fn crossed_protection_quote_after_preparation_is_certain_and_releases_risk_without_mutation(
+    ) {
+        let temp = Temp::new();
+        let risk_path = temp.0.join("crossed-risk.toml");
+        let risk = Arc::new(tokio::sync::RwLock::new(RiskService::with_store(
+            RiskConfig {
+                max_daily_orders: 1,
+                ..Default::default()
+            },
+            RiskUsageStore::with_path(risk_path.clone()),
+        )));
+        let submissions =
+            crate::storage::OrderSubmissionStore::with_dir(temp.0.join("submissions"));
+        let observer = OrderNotificationObserver::new(Arc::new(NotificationRuntime::Unavailable(
+            crate::services::notification::NotificationAvailability::new(
+                "TEST_ONLY",
+                "synthetic observer disabled",
+            ),
+        )));
+        let mut protected = request();
+        protected.protection = Some(crate::models::trading::OrderProtection {
+            take_profit: Some("55000".into()),
+            stop_loss: Some("45000".into()),
+            trigger_by: "LastPrice".into(),
+        });
+        let mut initial = protected.protection.clone().unwrap();
+        initial.validate("Buy", None, "50000").unwrap();
+        let id = protected.order_link_id.clone().unwrap();
+        let context = SubmissionContext {
+            submission_id: id.clone(),
+            account_id: "synthetic-account".into(),
+            session_epoch: 1,
+        };
+        let admission_hits = AtomicUsize::new(0);
+        let mutation_hits = AtomicUsize::new(0);
+        let admission = || {
+            admission_hits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let risk_ref = &risk;
+        let observer_ref = &observer;
+        let context_ref = &context;
+        let admission_ref = &admission;
+        let mutation_hits_ref = &mutation_hits;
+        let crossed_request = protected.clone();
+        let prepared_risk_path = risk_path.clone();
+        let result = crate::services::order_submission::submit_once(
+            &submissions,
+            "synthetic-scope",
+            protected,
+            1000,
+            |request| async move {
+                execute_place_order_with_submit(
+                    risk_ref,
+                    observer_ref,
+                    context_ref,
+                    request,
+                    None,
+                    1000,
+                    Some(admission_ref),
+                    || async move {
+                        tokio::task::yield_now().await;
+                        assert_eq!(
+                            RiskUsageStore::with_path(prepared_risk_path)
+                                .load()
+                                .unwrap()
+                                .unwrap()
+                                .occupied_orders,
+                            1
+                        );
+                        validate_protected_reference(&crossed_request, "56000")?;
+                        Ok(())
+                    },
+                    |_request| async move {
+                        mutation_hits_ref.fetch_add(1, Ordering::SeqCst);
+                        Ok(order())
+                    },
+                    |_| async {},
+                )
+                .await
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::OrderSubmissionRejected(_))));
+        assert_eq!(mutation_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(admission_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            RiskUsageStore::with_path(risk_path)
+                .load()
+                .unwrap()
+                .unwrap()
+                .occupied_orders,
+            0
+        );
+        let journal = submissions.get("synthetic-scope", &id).unwrap().unwrap();
+        assert!(matches!(
+            journal.outcome,
+            crate::models::order_submission::SubmissionOutcome::Rejected
+        ));
     }
     #[tokio::test]
     async fn cancellation_handoff_checks_revocation_after_preparation() {

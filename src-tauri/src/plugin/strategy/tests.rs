@@ -21,6 +21,28 @@ fn v6_roundtrips_closed_strategy_contract() {
     assert_eq!(serde_json::to_value(parsed).unwrap(), value);
 }
 
+#[test]
+fn v7_requires_explicit_management_dependencies_without_extending_v6() {
+    for (capability, dependencies) in [
+        ("trade.amend", &["trade.place", "orders.read", "market.read"][..]),
+        ("trade.protect", &["trade.place", "market.read"][..]),
+    ] {
+        let mut valid = manifest();
+        valid["schemaVersion"] = json!(7);
+        let mut caps = vec!["account.read", "strategy.run", capability];
+        caps.extend_from_slice(dependencies);
+        valid["requestedCapabilities"] = json!(caps);
+        assert!(serde_json::from_value::<PluginManifest>(valid.clone()).is_ok());
+        for missing in dependencies {
+            let mut invalid = valid.clone();
+            invalid["requestedCapabilities"] = json!(caps.iter().filter(|c| *c != missing).collect::<Vec<_>>());
+            assert!(serde_json::from_value::<PluginManifest>(invalid).is_err(), "missing {missing}");
+        }
+        valid["schemaVersion"] = json!(6);
+        assert!(serde_json::from_value::<PluginManifest>(valid).is_err());
+    }
+}
+
 // Catches granting unattended authority to any legacy manifest.
 #[test]
 fn v5_cannot_acquire_unattended_authority() {

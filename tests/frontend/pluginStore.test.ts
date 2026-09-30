@@ -142,6 +142,47 @@ const preview = {
   assessment: { kind: 'notInCatalog' },
 } satisfies ReadyLocalManifestImport
 
+describe('v7 strategy launcher', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    serviceMocks.getCatalog.mockReset()
+  })
+
+  it('exposes the v7 command through the catalog and preserves its grant list', async () => {
+    const plugin: PluginCatalogItem = {
+      ...item('com.example.strategy', 'enabled'),
+      source: 'localDeclarative', management: 'external',
+      manifest: {
+        schemaVersion: 7, id: 'com.example.strategy', publisherId: 'com.example',
+        publisher: 'Example', name: 'Management strategy', description: 'Synthetic strategy',
+        version: '1.0.0', requestedCapabilities: [
+          'account.read', 'orders.read', 'market.read', 'trade.place',
+          'trade.amend', 'trade.protect', 'strategy.run',
+        ],
+        contributions: [{
+          kind: 'command', contributionId: 'strategy.management', title: 'Manage owned order',
+          actionId: 'sandbox.strategy', params: {
+            runtime: 'wasm-v1', abi: 'strategy-json-v1',
+            moduleBase64: 'AGFzbQEAAAA=', defaultInput: '{}',
+          },
+        }],
+      },
+    }
+    serviceMocks.getCatalog.mockResolvedValueOnce(snapshot('13', [plugin], '8'))
+    const store = usePluginStore()
+    await store.load()
+    expect(store.availableCommands).toContainEqual(expect.objectContaining({
+      actionId: 'sandbox.strategy', contributionId: 'strategy.management',
+      requestedCapabilities: plugin.manifest.requestedCapabilities,
+    }))
+    expect(store.runCommand('com.example.strategy', 'strategy.management')).toMatchObject({
+      actionId: 'sandbox.strategy',
+      requestedCapabilities: plugin.manifest.requestedCapabilities,
+      expectedCatalogGeneration: '8', expectedRevision: '13',
+    })
+  })
+})
+
 function importedItem(
   sourcePreview: ReadyLocalManifestImport = preview,
 ): PluginCatalogItem {

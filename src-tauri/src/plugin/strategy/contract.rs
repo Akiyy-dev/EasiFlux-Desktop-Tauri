@@ -51,13 +51,21 @@ impl PluginStrategyParams {
 pub(crate) fn validate_capabilities(values: &[String]) -> Result<(), String> {
     let mut seen = std::collections::BTreeSet::new();
     for c in values {
-        if !(workflow::CAPABILITIES.contains(&c.as_str()) || c == "strategy.run") || !seen.insert(c)
+        if !(workflow::CAPABILITIES.contains(&c.as_str()) || ["strategy.run", "trade.amend", "trade.protect"].contains(&c.as_str())) || !seen.insert(c)
         {
             return Err("invalid strategy capability".into());
         }
     }
     if !values.iter().any(|c| c == "account.read") || !values.iter().any(|c| c == "strategy.run") {
         return Err("mandatory strategy capability missing".into());
+    }
+    Ok(())
+}
+pub(crate) fn validate_management_dependencies(values: &[String]) -> Result<(), String> {
+    let has = |c: &str| values.iter().any(|v| v == c);
+    if (has("trade.amend") && !(has("trade.place") && has("orders.read") && has("market.read")))
+        || (has("trade.protect") && !(has("trade.place") && has("market.read"))) {
+        return Err("management capability dependency missing".into());
     }
     Ok(())
 }

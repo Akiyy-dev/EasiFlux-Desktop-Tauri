@@ -2,7 +2,7 @@ use super::{store::*, supervisor::Live, *};
 use crate::{
     error::{AppError, AppResult},
     models::trading::{
-        CancelOrderRequest, Order, PlaceOrderRequest, SessionContext, SubmissionContext,
+        CancelOrderRequest, Order, OrderAcknowledgement, PlaceOrderRequest, SessionContext, SubmissionContext,
     },
     plugin::workflow::{self, snapshot_locked, Snapshot, WorkflowOutput},
 };
@@ -23,6 +23,11 @@ struct Context<'a> {
     snapshot: &'a Snapshot,
     state: &'a serde_json::Value,
     last_receipt: &'a Option<StrategyReceipt>,
+}
+
+pub(super) enum StrategyMutationResponse {
+    Order(Order),
+    Acknowledgement(OrderAcknowledgement),
 }
 
 impl StrategySupervisor {
@@ -255,7 +260,7 @@ impl StrategySupervisor {
         let _account = tokio::select! {biased;_=live.signal.notified()=>return Err(error("plugin_strategy_stale")),guard=self.host.lifecycle().mutation_guard()=>guard};
         self.check_binding(live).await?;
         self.check_dispatch(live, &record, observed, observed_wall)?;
-        let fresh = if matches!(output.action, StrategyAction::CancelOrder { .. }) {
+        let fresh = if matches!(output.action, StrategyAction::CancelOrder { .. } | StrategyAction::AmendOrder { .. } | StrategyAction::PlaceProtectedOrder { .. }) {
             Some(self.fresh(live, &record).await?)
         } else {
             None
@@ -302,7 +307,7 @@ impl StrategySupervisor {
                         .checked_add(1)
                         .ok_or_else(|| error("plugin_strategy_limit_reached"))?;
                     let submission_id = match &action {
-                        StrategyAction::PlaceOrder { order } => {
+                        StrategyAction::PlaceOrder { order } | StrategyAction::PlaceProtectedOrder { order, .. } => {
                             let total =
                                 rust_decimal::Decimal::from_str_exact(&r.view.total_submitted_qty)
                                     .map_err(|_| error("plugin_strategy_limit_reached"))?
@@ -316,6 +321,14 @@ impl StrategySupervisor {
                                 .get_mut(&order.order_id)
                                 .ok_or_else(|| error("plugin_strategy_invalid_output"))?
                                 .cancel_requested = true;
+                            None
+                        }
+                        StrategyAction::AmendOrder { order } => {
+                            let total = rust_decimal::Decimal::from_str_exact(&r.view.total_submitted_qty)
+                                .map_err(|_| error("plugin_strategy_limit_reached"))?
+                                .checked_add(quantity(&order.qty)?)
+                                .ok_or_else(|| error("plugin_strategy_limit_reached"))?;
+                            r.view.total_submitted_qty = total.normalize().to_string();
                             None
                         }
                         _ => unreachable!(),
@@ -386,7 +399,23 @@ impl StrategySupervisor {
                         placement(order, id),
                         &admission,
                     )
-                    .await
+                    .await.map(StrategyMutationResponse::Order)
+            }
+            StrategyAction::PlaceProtectedOrder { order, protection } => {
+                let id = pending.submission_id.clone().ok_or_else(|| error("plugin_strategy_unavailable"))?;
+                let mut request = placement(order, id.clone());
+                request.protection = Some(protection.clone());
+                self.host.strategy_place_locked(
+                    SubmissionContext { submission_id: id, account_id: context.account_id,
+                        session_epoch: context.session_epoch }, request, &admission,
+                ).await.map(StrategyMutationResponse::Order)
+            }
+            StrategyAction::AmendOrder { order } => {
+                let original = record.owned.get(&order.order_id)
+                    .and_then(|o| o.placement.clone())
+                    .ok_or_else(|| error("plugin_strategy_invalid_output"))?;
+                self.host.strategy_amend_locked(context, order.clone(), original, &admission).await
+                    .map(StrategyMutationResponse::Acknowledgement)
             }
             StrategyAction::CancelOrder { order } => {
                 self.host
@@ -399,7 +428,7 @@ impl StrategySupervisor {
                         },
                         &admission,
                     )
-                    .await
+                    .await.map(StrategyMutationResponse::Order)
             }
             _ => unreachable!(),
         };
@@ -440,19 +469,34 @@ impl StrategySupervisor {
         &self,
         id: &str,
         pending: &PendingAction,
-        response: AppResult<Order>,
+        response: AppResult<StrategyMutationResponse>,
     ) -> AppResult<()> {
-        let (status, accepted) = match response {
-            Ok(order) if matches_response(pending, &order) => {
-                (ReceiptStatus::Accepted, Some(order))
-            }
-            Err(ref failure) if known_rejection(failure) => (ReceiptStatus::Rejected, None),
-            _ => (ReceiptStatus::Unknown, None),
+        let original_link = match &pending.action {
+            StrategyAction::AmendOrder { order } => self.state(id)?.owned.get(&order.order_id)
+                .and_then(|o| o.placement.as_ref())
+                .and_then(|p| p.order_link_id.clone()),
+            _ => None,
         };
-        let kind = if matches!(pending.action, StrategyAction::PlaceOrder { .. }) {
-            ReceiptKind::PlaceOrder
-        } else {
-            ReceiptKind::CancelOrder
+        let (status, accepted, accepted_id) = match response {
+            Ok(StrategyMutationResponse::Order(order)) if matches_response(pending, &order) => {
+                let id = order.order_id.clone();
+                (ReceiptStatus::Accepted, Some(order), Some(id))
+            }
+            Ok(StrategyMutationResponse::Acknowledgement(ack))
+                if matches!(&pending.action, StrategyAction::AmendOrder { order }
+                    if ack.order_id == order.order_id
+                    && ack.order_link_id.as_ref().is_none_or(|link| Some(link) == original_link.as_ref())) => {
+                (ReceiptStatus::Accepted, None, Some(ack.order_id))
+            }
+            Err(ref failure) if known_rejection(failure) => (ReceiptStatus::Rejected, None, None),
+            _ => (ReceiptStatus::Unknown, None, None),
+        };
+        let kind = match pending.action {
+            StrategyAction::PlaceOrder { .. } => ReceiptKind::PlaceOrder,
+            StrategyAction::PlaceProtectedOrder { .. } => ReceiptKind::PlaceProtectedOrder,
+            StrategyAction::CancelOrder { .. } => ReceiptKind::CancelOrder,
+            StrategyAction::AmendOrder { .. } => ReceiptKind::AmendOrder,
+            _ => unreachable!(),
         };
         {
             let mut inner = self.lock()?;
@@ -465,11 +509,10 @@ impl StrategySupervisor {
             if r.pending.as_ref() != Some(pending) {
                 return Err(error("plugin_strategy_stale"));
             }
-            let order_id = accepted
-                .as_ref()
-                .map(|o| o.order_id.clone())
+            let order_id = accepted_id
                 .or_else(|| match &pending.action {
                     StrategyAction::CancelOrder { order } => Some(order.order_id.clone()),
+                    StrategyAction::AmendOrder { order } => Some(order.order_id.clone()),
                     _ => None,
                 });
             r.view.last_receipt = Some(StrategyReceipt {
@@ -498,13 +541,18 @@ impl StrategySupervisor {
                     OwnedOrder {
                         submission_id: submission_id.clone(),
                         cancel_requested: false,
+                        placement: match &pending.action {
+                            StrategyAction::PlaceOrder { order } => Some(canonical_placement(order, submission_id, None)),
+                            StrategyAction::PlaceProtectedOrder { order, protection } => Some(canonical_placement(order, submission_id, Some(protection.clone()))),
+                            _ => None,
+                        },
                     },
                 );
             }
             if status == ReceiptStatus::Unknown {
                 r.view.status = StrategyStatus::RecoveryRequired;
                 r.view.reason = Some("plugin_strategy_recovery_required".into());
-            } else if status == ReceiptStatus::Rejected || kind == ReceiptKind::CancelOrder {
+            } else if status == ReceiptStatus::Rejected || matches!(kind, ReceiptKind::CancelOrder | ReceiptKind::AmendOrder) {
                 r.pending = None;
             }
             self.save(&mut inner, next)?;
@@ -513,12 +561,12 @@ impl StrategySupervisor {
             return Ok(());
         }
         if let (StrategyAction::PlaceOrder { order: request }, Some(order), Some(submission)) =
-            (&pending.action, accepted, pending.submission_id.as_ref())
+            (&pending.action, accepted.as_ref(), pending.submission_id.as_ref())
         {
             let record = self.state(id)?;
             if self
                 .host
-                .strategy_acknowledge_locked(&record.scope, submission, &order, request)
+                .strategy_acknowledge_locked(&record.scope, submission, order, request)
                 .await
                 .is_err()
             {
@@ -542,6 +590,22 @@ impl StrategySupervisor {
             r.pending = None;
             self.save(&mut inner, next)?;
         }
+        if let (StrategyAction::PlaceProtectedOrder { order: request, protection }, Some(order), Some(submission)) =
+            (&pending.action, accepted.as_ref(), pending.submission_id.as_ref())
+        {
+            let record = self.state(id)?;
+            let canonical = canonical_placement(request, submission, Some(protection.clone()));
+            if self.host.strategy_acknowledge_protected_locked(&record.scope, submission, order, &canonical).await.is_err() {
+                self.mark(id, StrategyStatus::RecoveryRequired, "plugin_strategy_ack_failed");
+                return Ok(());
+            }
+            let mut inner = self.lock()?;
+            let mut next = inner.document.clone();
+            let r = next.runs.iter_mut().find(|r| r.view.run_id == id).ok_or_else(|| error("plugin_strategy_stale"))?;
+            if r.pending.as_ref() != Some(pending) { return Err(error("plugin_strategy_stale")); }
+            r.pending = None;
+            self.save(&mut inner, next)?;
+        }
         Ok(())
     }
 }
@@ -556,7 +620,16 @@ pub(super) fn placement(order: &workflow::PlaceProposal, id: String) -> PlaceOrd
         time_in_force: Some(order.time_in_force.clone()),
         order_link_id: Some(id),
         reduce_only: Some(order.reduce_only),
+        protection: None,
     }
+}
+pub(super) fn canonical_placement(order: &workflow::PlaceProposal, id: &str, protection: Option<OrderProtection>) -> PlaceOrderRequest {
+    let mut request = placement(order, id.into());
+    request.time_in_force = Some(match order.time_in_force.as_str() {
+        "GTC" => "GoodTillCancel", "IOC" => "ImmediateOrCancel", "FOK" => "FillOrKill", _ => unreachable!(),
+    }.into());
+    request.protection = protection;
+    request
 }
 fn validate_action(
     action: StrategyAction,
@@ -610,12 +683,66 @@ fn validate_action(
             };
             Ok(StrategyAction::CancelOrder { order })
         }
+        StrategyAction::PlaceProtectedOrder { order, mut protection } => {
+            if !r.view.capabilities.iter().any(|c| c == "trade.protect") || r.view.policy.reduce_only || order.reduce_only {
+                return Err(error("plugin_strategy_invalid_output"));
+            }
+            let WorkflowOutput::PlaceOrder { order } = (WorkflowOutput::PlaceOrder { order })
+                .validate(&r.view.symbol, &r.view.capabilities, None)
+                .map_err(|_| error("plugin_strategy_invalid_output"))? else { unreachable!() };
+            let market = snapshot.market.as_ref().ok_or_else(|| error("plugin_strategy_invalid_output"))?;
+            let reference = if protection.trigger_by == "LastPrice" { &market.ticker.last_price } else { &market.ticker.mark_price };
+            protection.validate(&order.side, order.price.as_deref(), reference)?;
+            let qty = quantity(&order.qty)?;
+            let total = rust_decimal::Decimal::from_str_exact(&r.view.total_submitted_qty)
+                .map_err(|_| error("plugin_strategy_limit_reached"))?
+                .checked_add(qty).ok_or_else(|| error("plugin_strategy_limit_reached"))?;
+            if qty > quantity(&r.view.policy.max_order_qty)? || total > quantity(&r.view.policy.max_total_qty)? {
+                return Err(error("plugin_strategy_limit_reached"));
+            }
+            Ok(StrategyAction::PlaceProtectedOrder { order, protection })
+        }
+        StrategyAction::AmendOrder { mut order } => {
+            if !r.view.capabilities.iter().any(|c| c == "trade.amend") {
+                return Err(error("plugin_strategy_invalid_output"));
+            }
+            order.validate(&r.view.symbol)?;
+            let original = r.owned.get(&order.order_id)
+                .filter(|o| !o.cancel_requested).and_then(|o| o.placement.as_ref())
+                .ok_or_else(|| error("plugin_strategy_invalid_output"))?;
+            if original.order_type != "Limit" {
+                return Err(error("plugin_strategy_invalid_output"));
+            }
+            super::management::validate_amend_entry(original, &order.price)?;
+            let visible = snapshot.orders.as_ref().ok_or_else(|| error("plugin_strategy_invalid_output"))?
+                .items.iter().filter(|o| o.order_id == order.order_id).collect::<Vec<_>>();
+            let [target] = visible.as_slice() else { return Err(error("plugin_strategy_invalid_output")); };
+            if target.order_link_id.as_deref() != original.order_link_id.as_deref()
+                || target.side != original.side || target.order_type != "Limit"
+                || !matches!(target.status, crate::models::trading::OrderStatus::New | crate::models::trading::OrderStatus::PartiallyFilled) {
+                return Err(error("plugin_strategy_invalid_output"));
+            }
+            let new_qty = quantity(&order.qty)?;
+            let current_qty = quantity(&target.qty)?;
+            let filled = rust_decimal::Decimal::from_str_exact(&target.filled_qty)
+                .map_err(|_| error("plugin_strategy_invalid_output"))?;
+            let new_price = quantity(&order.price)?;
+            let current_price = quantity(&target.price)?;
+            let total = rust_decimal::Decimal::from_str_exact(&r.view.total_submitted_qty)
+                .map_err(|_| error("plugin_strategy_limit_reached"))?
+                .checked_add(new_qty).ok_or_else(|| error("plugin_strategy_limit_reached"))?;
+            if new_qty > current_qty || new_qty <= filled || (new_qty == current_qty && new_price == current_price)
+                || new_qty > quantity(&r.view.policy.max_order_qty)? || total > quantity(&r.view.policy.max_total_qty)? {
+                return Err(error("plugin_strategy_invalid_output"));
+            }
+            Ok(StrategyAction::AmendOrder { order })
+        }
         _ => unreachable!(),
     }
 }
 pub(super) fn matches_response(p: &PendingAction, o: &Order) -> bool {
     match &p.action {
-        StrategyAction::PlaceOrder { order } => {
+        StrategyAction::PlaceOrder { order } | StrategyAction::PlaceProtectedOrder { order, .. } => {
             workflow::validate_order(o, &order.symbol).is_ok()
                 && o.order_link_id == p.submission_id
                 && o.side == order.side
@@ -629,6 +756,12 @@ pub(super) fn matches_response(p: &PendingAction, o: &Order) -> bool {
             o.symbol == order.symbol
                 && o.order_id == order.order_id
                 && workflow::bounded_id(&o.order_id)
+        }
+        StrategyAction::AmendOrder { order } => {
+            o.symbol == order.symbol && o.order_id == order.order_id
+                && p.submission_id.is_none() && workflow::bounded_id(&o.order_id)
+                && quantity(&o.price).ok() == quantity(&order.price).ok()
+                && quantity(&o.qty).ok() == quantity(&order.qty).ok()
         }
         _ => false,
     }

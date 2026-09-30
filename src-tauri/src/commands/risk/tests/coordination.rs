@@ -20,6 +20,7 @@ fn market_order() -> PlaceOrderRequest {
         time_in_force: None,
         order_link_id: None,
         reduce_only: None,
+        protection: None,
     }
 }
 

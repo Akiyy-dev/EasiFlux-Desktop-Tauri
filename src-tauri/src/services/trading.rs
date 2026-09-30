@@ -9,7 +9,7 @@ use crate::events::EventEmitter;
 use crate::models::config::{normalize_account_id, AppConfig};
 use crate::models::risk::RiskViolation;
 use crate::models::trading::{
-    CancelOrderRequest, Order, OrderStatus, OrderStreamContext, PlaceOrderRequest,
+    CancelOrderRequest, Order, OrderAcknowledgement, OrderStatus, OrderStreamContext, PlaceOrderRequest,
     SubmissionContext,
 };
 use crate::services::account_profiles::{
@@ -397,6 +397,7 @@ impl TradingService {
         request: PlaceOrderRequest,
         admission: &StrategyAdmission<'_>,
     ) -> AppResult<Order> {
+        let protected = request.protection.is_some();
         let session_context = OrderStreamContext::from(&context);
         let requires_reference_price = self.risk.read().await.requires_reference_price(&request);
         let reference_price = if requires_reference_price {
@@ -404,6 +405,7 @@ impl TradingService {
         } else {
             None
         };
+        let protected_request = request.clone();
         let result = execute_place_order_with_submit(
             &self.risk,
             &self.notification_observer,
@@ -412,8 +414,33 @@ impl TradingService {
             reference_price.as_deref(),
             self.time.now_ms(),
             Some(admission),
-            |request| async move { PrivateApi::create_order(self.api.as_ref(), &request).await },
+            || async move {
+                let Some(protection) = protected_request.protection.as_ref() else {
+                    return Ok(());
+                };
+                let selected = quote::fresh_protection_reference(
+                    self.api.as_ref(),
+                    &protected_request.symbol,
+                    &protection.trigger_by,
+                )
+                .await
+                .ok_or_else(|| {
+                    AppError::OrderSubmissionRejected("protected order fresh quote unavailable".into())
+                })?;
+                validate_protected_reference(&protected_request, &selected)
+            },
+            |request| async move {
+                if protected {
+                    PrivateApi::create_protected_order_ack(self.api.as_ref(), &request).await
+                } else {
+                    PrivateApi::create_order(self.api.as_ref(), &request).await
+                }
+            },
             |order| async move {
+                if protected {
+                    self.emitter.emit_log("info", &format!("受保护下单请求已受理: {}", order.order_id));
+                    return;
+                }
                 let _ = self.trade_log.append_order(&order);
                 self.emitter.emit_order(&session_context, order.clone());
                 self.emitter
@@ -440,6 +467,36 @@ impl TradingService {
             &format!("撤单请求已受理: {}", acknowledgement.order_id),
         );
         Ok(acknowledgement)
+    }
+
+    pub(crate) async fn amend_strategy_order(
+        &self,
+        _context: OrderStreamContext,
+        order_id: &str,
+        original_link: Option<&str>,
+        effective: PlaceOrderRequest,
+        reference_price: &str,
+        admission: &StrategyAdmission<'_>,
+    ) -> AppResult<OrderAcknowledgement> {
+        let now_ms = self.time.now_ms();
+        // Deliberately conservative: an amendment reserves native risk usage as
+        // an additional requested quantity. Unknown sends retain the reservation.
+        let reservation = self.risk.read().await.reserve_order(&effective, Some(reference_price), now_ms)?;
+        let request = crate::models::api_requests::ApiReplaceOrderRequest {
+            symbol: effective.symbol,
+            order_id: Some(order_id.into()),
+            order_link_id: None,
+            price: effective.price,
+            qty: Some(effective.qty),
+        };
+        let result = strategy::dispatch_reserved(&self.risk, &reservation, now_ms, Some(admission), || async {
+            let payload = PrivateApi::replace_order(self.api.as_ref(), &request).await?;
+            PrivateApi::parse_amend_ack(&payload, order_id, original_link)
+        }).await;
+        if let Ok(ack) = &result {
+            self.emitter.emit_log("info", &format!("改单请求已受理: {}", ack.order_id));
+        }
+        result
     }
 
     pub(crate) async fn cancel_order_acknowledged(
@@ -557,13 +614,23 @@ where
         reference_price,
         now_ms,
         None,
+        || async { Ok(()) },
         |request| async move { PrivateApi::create_order(api, &request).await },
         success_side_effects,
     )
     .await
 }
 
-async fn execute_place_order_with_submit<F, Fut, S, SFut>(
+fn validate_protected_reference(request: &PlaceOrderRequest, reference: &str) -> AppResult<()> {
+    if let Some(protection) = &request.protection {
+        let mut protection = protection.clone();
+        protection.validate(&request.side, request.price.as_deref(), reference)
+            .map_err(|_| AppError::OrderSubmissionRejected("protected order fresh quote crossed".into()))?;
+    }
+    Ok(())
+}
+
+async fn execute_place_order_with_submit<P, PFut, F, Fut, S, SFut>(
     risk: &Arc<tokio::sync::RwLock<RiskService>>,
     observer: &OrderNotificationObserver,
     context: &SubmissionContext,
@@ -571,10 +638,13 @@ async fn execute_place_order_with_submit<F, Fut, S, SFut>(
     reference_price: Option<&str>,
     now_ms: u64,
     admission: Option<&StrategyAdmission<'_>>,
+    prepare: P,
     submit: F,
     success_side_effects: S,
 ) -> AppResult<Order>
 where
+    P: FnOnce() -> PFut,
+    PFut: std::future::Future<Output = AppResult<()>>,
     F: FnOnce(PlaceOrderRequest) -> Fut,
     Fut: std::future::Future<Output = AppResult<Order>>,
     S: FnOnce(Order) -> SFut,
@@ -590,6 +660,7 @@ where
         None => context.submission_id.clone(),
     };
     request.order_link_id = Some(transmitted_order_link_id.clone());
+    let request_protection_absent = request.protection.is_none();
     let reservation_result = {
         let risk = risk.read().await;
         risk.reserve_order(&request, reference_price, now_ms)
@@ -618,6 +689,18 @@ where
         }
     };
 
+    if let Err(preflight_error) = prepare().await {
+        if risk.read().await.release_reservation(&reservation, now_ms).is_err() {
+            tracing::warn!(
+                code = "STRATEGY_UNSENT_RISK_RELEASE_FAILED",
+                "unsubmitted protected order risk reservation could not be released"
+            );
+        }
+        // The mutation API has not been handed off. Even if local quota repair
+        // fails, the response is definitely unsent and the journal may reject.
+        return Err(AppError::OrderSubmissionRejected(preflight_error.user_message()));
+    }
+
     let order = match strategy::dispatch_reserved(risk, &reservation, now_ms, admission, || {
         submit(request)
     })
@@ -638,20 +721,22 @@ where
         }
     };
 
-    let mut observed_order = order.clone();
-    if observed_order.order_link_id.is_none() {
-        observed_order.order_link_id = Some(transmitted_order_link_id);
+    if request_protection_absent {
+        let mut observed_order = order.clone();
+        if observed_order.order_link_id.is_none() {
+            observed_order.order_link_id = Some(transmitted_order_link_id);
+        }
+        observer
+            .observe(
+                &context.account_id,
+                context.session_epoch,
+                &observed_order,
+                OrderObservationOrigin::Command,
+                Some(&context.submission_id),
+                now_ms,
+            )
+            .await;
     }
-    observer
-        .observe(
-            &context.account_id,
-            context.session_epoch,
-            &observed_order,
-            OrderObservationOrigin::Command,
-            Some(&context.submission_id),
-            now_ms,
-        )
-        .await;
     success_side_effects(order.clone()).await;
     Ok(order)
 }
@@ -873,6 +958,7 @@ mod tests {
             time_in_force: None,
             order_link_id: None,
             reduce_only: None,
+            protection: None,
         }
     }
 
@@ -887,6 +973,7 @@ mod tests {
             time_in_force: Some("GTC".into()),
             order_link_id: None,
             reduce_only: None,
+            protection: None,
         }
     }
 

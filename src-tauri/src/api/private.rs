@@ -7,7 +7,7 @@ use crate::models::api_requests::{
     ApiCreateTpslRequest, ApiReplaceOrderRequest, ApiReplaceTpslRequest, ApiSetLeverageRequest,
     ApiSwitchMarginModeRequest, ApiSwitchSeparatePositionModeRequest, ApiTransferRequest,
 };
-use crate::models::trading::{CancelOrderRequest, Order, PlaceOrderRequest, Position};
+use crate::models::trading::{CancelOrderRequest, Order, OrderAcknowledgement, PlaceOrderRequest, Position};
 
 use super::client::ApiClient;
 use super::endpoints;
@@ -113,6 +113,74 @@ impl PrivateApi {
         let body = build_place_order_body(request);
         let payload = client.private_post(endpoints::CREATE_ORDER, body).await?;
         Self::parse_create_order_payload(&payload)
+    }
+
+    pub(crate) async fn create_protected_order_ack(client: &ApiClient, request: &PlaceOrderRequest) -> AppResult<Order> {
+        let payload = client.private_post(endpoints::CREATE_ORDER, build_place_order_body(request)).await?;
+        Self::parse_protected_create_ack(&payload, request)
+    }
+
+    pub(crate) fn parse_protected_create_ack(payload: &Value, request: &PlaceOrderRequest) -> AppResult<Order> {
+        let unknown = || AppError::Internal("受保护订单提交结果不明确".into());
+        if payload.get("code").and_then(Value::as_i64) != Some(0) || request.protection.is_none() {
+            return Err(unknown());
+        }
+        let data = payload.get("data").and_then(Value::as_object).ok_or_else(unknown)?;
+        let mut status: Option<&str> = None;
+        for key in ["status", "orderStatus", "order_status"] {
+            if let Some(value) = data.get(key) {
+                let value = value.as_str().ok_or_else(unknown)?;
+                if status.is_some_and(|old| old != value) { return Err(unknown()); }
+                status = Some(value);
+            }
+        }
+        if status.is_some_and(|value| crate::models::trading::OrderStatus::from_raw(value)
+            == crate::models::trading::OrderStatus::Rejected) {
+            return Err(AppError::TradingFailure(crate::models::trading::TradingFailure::rejected()));
+        }
+        let exact = |snake: &str, camel: &str| -> AppResult<&str> {
+            let value = data.get(snake).and_then(Value::as_str).ok_or_else(unknown)?;
+            if data.get(camel).is_some_and(|other| other.as_str() != Some(value)) {
+                return Err(unknown());
+            }
+            Ok(value)
+        };
+        let id = exact("order_id", "orderId")?;
+        let link = data.get("order_link_id").or_else(|| data.get("orderLinkId"))
+            .map(|v| v.as_str().ok_or_else(unknown)).transpose()?;
+        if !valid_ack_id(id)
+            || data.get("order_link_id").zip(data.get("orderLinkId"))
+                .is_some_and(|(a, b)| a != b)
+            || link.is_some_and(|v| !v.is_empty() && Some(v) != request.order_link_id.as_deref()) {
+            return Err(unknown());
+        }
+        Ok(Order {
+            order_id: id.into(), symbol: String::new(), side: String::new(),
+            order_type: String::new(), price: String::new(), qty: String::new(),
+            status: crate::models::trading::OrderStatus::Unknown,
+            order_link_id: link.filter(|v| !v.is_empty()).map(str::to_owned), filled_qty: "0".into(), avg_price: "0".into(),
+        })
+    }
+
+    pub(crate) fn parse_amend_ack(payload: &Value, expected_id: &str, client_id: Option<&str>) -> AppResult<OrderAcknowledgement> {
+        let unknown = || AppError::Internal("改单受理结果不明确".into());
+        if payload.get("code").and_then(Value::as_i64) != Some(0) { return Err(unknown()); }
+        let data = payload.get("data").and_then(Value::as_object).ok_or_else(unknown)?;
+        let id = data.get("order_id").and_then(Value::as_str).ok_or_else(unknown)?;
+        if !valid_ack_id(id) || id != expected_id
+            || data.get("orderId").is_some_and(|other| other.as_str() != Some(id)) {
+            return Err(unknown());
+        }
+        let link = data.get("order_link_id").or_else(|| data.get("orderLinkId"))
+            .map(|v| v.as_str().ok_or_else(unknown)).transpose()?;
+        if data.get("order_link_id").zip(data.get("orderLinkId"))
+                .is_some_and(|(a,b)| a != b)
+            || link.is_some_and(|v| !v.is_empty() && Some(v) != client_id) {
+            return Err(unknown());
+        }
+        Ok(OrderAcknowledgement {
+            order_id: id.into(), order_link_id: link.filter(|v| !v.is_empty()).map(str::to_owned),
+        })
     }
 
     fn parse_create_order_payload(payload: &Value) -> AppResult<Order> {
@@ -324,6 +392,10 @@ impl PrivateApi {
     }
 }
 
+fn valid_ack_id(id: &str) -> bool {
+    !id.trim().is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -374,6 +446,7 @@ mod tests {
             time_in_force: None,
             order_link_id: order_link_id.map(str::to_owned),
             reduce_only: None,
+            protection: None,
         }
     }
 
@@ -419,6 +492,56 @@ mod tests {
 
         assert!(matches!(error, AppError::Internal(_)));
         assert!(!matches!(error, AppError::TradingFailure(_)));
+    }
+
+    #[test]
+    fn protected_create_requires_exact_direct_ack_identity_without_claiming_observed_state() {
+        let mut request = place_order_request(Some("client-1"));
+        request.protection = Some(crate::models::trading::OrderProtection {
+            take_profit: Some("55000".into()), stop_loss: Some("45000".into()), trigger_by: "LastPrice".into(),
+        });
+        let accepted = PrivateApi::parse_protected_create_ack(
+            &serde_json::json!({"code":0,"data":{"order_id":"exchange-1","order_link_id":"client-1"}}), &request,
+        ).unwrap();
+        assert_eq!(accepted.order_id, "exchange-1");
+        assert_eq!(accepted.status, crate::models::trading::OrderStatus::Unknown);
+        assert!(PrivateApi::parse_protected_create_ack(
+            &serde_json::json!({"code":0,"data":{"order_id":"exchange-1","order_link_id":""}}), &request,
+        ).is_ok());
+        assert!(PrivateApi::parse_protected_create_ack(
+            &serde_json::json!({"code":0,"data":{"order_id":"exchange-1"}}), &request,
+        ).is_ok());
+        for payload in [
+            serde_json::json!({"code":0,"data":{}}),
+            serde_json::json!({"code":0,"data":{"order_id":"exchange-1","order_link_id":"wrong"}}),
+            serde_json::json!({"code":0,"data":{"order_id":"exchange-1","orderId":"conflict"}}),
+            serde_json::json!({"code":0,"data":{"order_id":"exchange-1","order_link_id":"client-1","orderLinkId":"wrong"}}),
+            serde_json::json!({"code":0,"data":{"order_id":"exchange-1","order_link_id":"client-1","status":"Rejected"}}),
+        ] {
+            assert!(PrivateApi::parse_protected_create_ack(&payload, &request).is_err(), "accepted {payload}");
+        }
+    }
+
+    #[test]
+    fn amend_ack_requires_owned_exchange_id_and_rejects_conflicting_client_link() {
+        assert!(PrivateApi::parse_amend_ack(
+            &serde_json::json!({"code":0,"data":{"order_id":"owned-1"}}), "owned-1", Some("client-1"),
+        ).is_ok());
+        for link in ["", "client-1"] {
+            let payload = serde_json::json!({"code":0,"data":{"order_id":"owned-1","order_link_id":link}});
+            let result = PrivateApi::parse_amend_ack(&payload, "owned-1", Some("client-1"));
+            assert!(result.is_ok(), "{payload}");
+            assert_eq!(result.unwrap().order_id, "owned-1");
+        }
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({"order_id":"other"}),
+            serde_json::json!({"order_id":"owned-1","orderId":"other"}),
+            serde_json::json!({"order_id":"owned-1","order_link_id":"foreign"}),
+            serde_json::json!({"order_id":"owned-1","order_link_id":null}),
+        ] {
+            assert!(PrivateApi::parse_amend_ack(&serde_json::json!({"code":0,"data":data}), "owned-1", Some("client-1")).is_err());
+        }
     }
 
     #[tokio::test]

@@ -70,6 +70,8 @@ pub(crate) enum StrategyStatus {
 pub(crate) enum ReceiptKind {
     PlaceOrder,
     CancelOrder,
+    AmendOrder,
+    PlaceProtectedOrder,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,7 +87,7 @@ macro_rules! literal {
 }
 literal!(ControlAction,"pause"=>Pause,"stop"=>Stop);
 literal!(StrategyStatus,"running"=>Running,"paused"=>Paused,"stopping"=>Stopping,"stopped"=>Stopped,"recoveryRequired"=>RecoveryRequired,"faulted"=>Faulted,"completed"=>Completed);
-literal!(ReceiptKind,"placeOrder"=>PlaceOrder,"cancelOrder"=>CancelOrder);
+literal!(ReceiptKind,"placeOrder"=>PlaceOrder,"cancelOrder"=>CancelOrder,"amendOrder"=>AmendOrder,"placeProtectedOrder"=>PlaceProtectedOrder);
 literal!(ReceiptStatus,"accepted"=>Accepted,"rejected"=>Rejected,"unknown"=>Unknown);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -94,6 +96,8 @@ pub(crate) enum StrategyAction {
     Stop,
     PlaceOrder { order: PlaceProposal },
     CancelOrder { order: CancelProposal },
+    AmendOrder { order: AmendProposal },
+    PlaceProtectedOrder { order: PlaceProposal, protection: OrderProtection },
 }
 impl<'de> Deserialize<'de> for StrategyAction {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -104,12 +108,16 @@ impl<'de> Deserialize<'de> for StrategyAction {
             Stop {},
             PlaceOrder { order: PlaceProposal },
             CancelOrder { order: CancelProposal },
+            AmendOrder { order: AmendProposal },
+            PlaceProtectedOrder { order: PlaceProposal, protection: OrderProtection },
         }
         Ok(match deserialize_object::<D, Wire>(d)? {
             Wire::None {} => Self::None,
             Wire::Stop {} => Self::Stop,
             Wire::PlaceOrder { order } => Self::PlaceOrder { order },
             Wire::CancelOrder { order } => Self::CancelOrder { order },
+            Wire::AmendOrder { order } => Self::AmendOrder { order },
+            Wire::PlaceProtectedOrder { order, protection } => Self::PlaceProtectedOrder { order, protection },
         })
     }
 }
@@ -187,6 +195,8 @@ impl StrategyStartRequest {
         {
             return Err(error("plugin_strategy_denied"));
         }
+        validate_management_dependencies(&self.capabilities)
+            .map_err(|_| error("plugin_strategy_denied"))?;
         self.policy.validate()
     }
 }
@@ -194,6 +204,8 @@ impl StrategyRunView {
     pub(crate) fn validate(&self) -> AppResult<()> {
         self.policy.validate()?;
         validate_capabilities(&self.capabilities)
+            .map_err(|_| error("plugin_strategy_storage_unavailable"))?;
+        validate_management_dependencies(&self.capabilities)
             .map_err(|_| error("plugin_strategy_storage_unavailable"))?;
         workflow::symbol(&self.symbol)?;
         workflow::validate_input(&self.input_json)
@@ -253,7 +265,8 @@ impl StrategyRunView {
                     .submission_id
                     .as_ref()
                     .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
-                || (receipt.kind == ReceiptKind::PlaceOrder) != receipt.submission_id.is_some()
+                || matches!(receipt.kind, ReceiptKind::PlaceOrder | ReceiptKind::PlaceProtectedOrder) != receipt.submission_id.is_some()
+                || (receipt.kind == ReceiptKind::AmendOrder && receipt.order_id.is_none())
                 || (receipt.status == ReceiptStatus::Accepted && receipt.order_id.is_none())
             {
                 return Err(error("plugin_strategy_storage_unavailable"));

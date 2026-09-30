@@ -158,17 +158,18 @@ fn canonical_request(id: &str, proposal: &PlaceProposal) -> AppResult<PlaceOrder
         time_in_force: Some(exchange_time_in_force(Some(&order.time_in_force))?.into()),
         position_idx: order.position_idx,
         reduce_only: Some(order.reduce_only),
+        protection: None,
         order_link_id: Some(id.into()),
     })
 }
-fn validate_request(id: &str, request: &PlaceOrderRequest) -> AppResult<()> {
+pub(super) fn validate_request(id: &str, request: &PlaceOrderRequest) -> AppResult<()> {
     let tif = match request.time_in_force.as_deref() {
         Some("GoodTillCancel") => "GTC",
         Some("ImmediateOrCancel") => "IOC",
         Some("FillOrKill") => "FOK",
         _ => return Err(unavailable()),
     };
-    let canonical = canonical_request(
+    let mut canonical = canonical_request(
         id,
         &PlaceProposal {
             symbol: request.symbol.clone(),
@@ -181,6 +182,11 @@ fn validate_request(id: &str, request: &PlaceOrderRequest) -> AppResult<()> {
             reduce_only: request.reduce_only.ok_or_else(unavailable)?,
         },
     )?;
+    if let Some(protection) = &request.protection {
+        if request.reduce_only != Some(false) { return Err(unavailable()); }
+        protection.validate_shape().map_err(|_| unavailable())?;
+        canonical.protection = Some(protection.clone());
+    }
     if serde_json::to_value(canonical).map_err(|_| unavailable())?
         != serde_json::to_value(request).map_err(|_| unavailable())?
     {
@@ -188,7 +194,7 @@ fn validate_request(id: &str, request: &PlaceOrderRequest) -> AppResult<()> {
     }
     Ok(())
 }
-fn matches_request(order: &Order, request: &PlaceOrderRequest) -> AppResult<()> {
+pub(super) fn matches_request(order: &Order, request: &PlaceOrderRequest) -> AppResult<()> {
     validate_order(order, &request.symbol).map_err(|_| unavailable())?;
     if order.order_link_id != request.order_link_id
         || order.side != request.side
@@ -205,7 +211,7 @@ fn matches_request(order: &Order, request: &PlaceOrderRequest) -> AppResult<()> 
     Ok(())
 }
 
-async fn query_exact<F, Fut>(
+pub(super) async fn query_exact<F, Fut>(
     symbol: &str,
     submission: Option<&str>,
     exchange: Option<&str>,
@@ -248,8 +254,13 @@ where
         {
             return Err(unavailable());
         }
+        // A protected Market recovery may have an empty documented price, but
+        // the raw field must exist; parse_orders must not fabricate a value.
+        if request.is_some_and(|request| request.protection.is_some() && request.order_type == "Market")
+            && raw.get("price").and_then(Value::as_str).is_none() {
+            return Err(unavailable());
+        }
         for value in [
-            &order.price,
             &order.qty,
             &order.filled_qty,
             &order.avg_price,
@@ -257,6 +268,10 @@ where
             if Decimal::from_str_exact(value).map_err(|_| unavailable())? < Decimal::ZERO {
                 return Err(unavailable());
             }
+        }
+        if !(order.order_type == "Market" && order.price.is_empty())
+            && Decimal::from_str_exact(&order.price).map_err(|_| unavailable())? < Decimal::ZERO {
+            return Err(unavailable());
         }
         if Decimal::from_str_exact(&order.qty).map_err(|_| unavailable())? <= Decimal::ZERO
             || Decimal::from_str_exact(&order.filled_qty).map_err(|_| unavailable())?
@@ -266,6 +281,9 @@ where
         }
         if let Some(request) = request {
             matches_request(&order, request)?;
+            if request.protection.is_some() {
+                super::management::strict_protection_raw(raw, request)?;
+            }
             let tif = text(raw, &["timeInForce", "time_in_force"])?;
             let tif = match tif.as_str() {
                 "GTC" => "GoodTillCancel",
@@ -301,7 +319,7 @@ where
     Ok(None)
 }
 
-fn reject_conflicting_aliases(raw: &Value) -> AppResult<()> {
+pub(super) fn reject_conflicting_aliases(raw: &Value) -> AppResult<()> {
     // The snapshot parser supports several documented spelling variants. Recovery
     // cannot use first-alias-wins semantics when a payload supplies contradictions.
     for aliases in [
