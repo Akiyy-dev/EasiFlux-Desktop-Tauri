@@ -204,5 +204,56 @@ at `7ba1fe3331d0b1625fe4feaaa1c48cfcf645f90f`: **91 files / 1482 tests passed,
 zero failures, exit 0**. This rerun was necessary because the initial full run
 failed; unchanged native code was not needlessly retested.
 
-Whole-branch review, exact-head CI and integration remain pending. No real
-account, installed profile, desktop launch or exchange acceptance is claimed.
+## Final whole-branch review and fix verification
+
+Independent whole-branch review at `116a609` found one Important legacy v6
+compatibility regression: actual-grant dependency checks were incorrectly applied
+to requested declarations. A valid legacy cancellation declaration without
+orders.read could invalidate the catalog before users selected a safe subset.
+The reviewer reproduced this in memory without IPC. Two Minor findings were the
+v7 authoring-checklist omission and redundant borrows in acknowledgement paths.
+
+One consolidated fix wave, `49bade79b8deb813a9930b25afc866c48d3a7c7e`, separates
+declaration checks from actual grants. Both keep new amendment/protection
+dependencies; actual cancellation grants still require orders.read. Regressions
+cover catalog/import, correlated access, safe-subset launch and invalid grants
+rejected before IPC. Focused RED showed both declaration failures; GREEN passed
+637 affected frontend tests and two native acknowledgement filters. The checklist
+and both borrows were corrected without new authority or unrelated cleanup.
+
+Controller fresh verification at `49bade7`, using the exact full commands above:
+
+| Gate | Final result |
+| --- | --- |
+| Complete Vitest suite | 91 files / 1484 tests passed, 0 failures, exit 0 |
+| Locked Rust all-targets suite | 1287 passed, 0 failed, 2 deliberate subprocess helpers ignored, exit 0 |
+| Full frontend ESLint | Exit 0; 0 errors / same 78 existing formatting warnings |
+| Typecheck | Exit 0 |
+| Production frontend build | Exit 0; 4775 modules; main JS 1347.05 kB / gzip 394.03 kB; large-chunk advisory remains |
+| Locked all-targets Clippy | Exit 0; lib 94 warnings, lib-test 114 including 62 duplicates; both touched needless-borrow warnings removed |
+| Whole-branch whitespace check | Exit 0 |
+
+The three guest packages/generators/CI wiring did not change in this fix wave;
+their earlier complete execution and parity results remain applicable. The two
+additional frontend tests explain the increase from 1482 to 1484. No new blanket
+warning suppression was added; ReceiptKind naming remains consistent with the
+existing action/wire vocabulary, as accepted by the final reviewer.
+
+### Decisions and remaining acceptance boundary
+
+- Accept documented direct ID-only/empty-client-ID acknowledgements by binding
+  missing client identity to the durable submitted request. Nonempty mismatches,
+  malformed/conflicting identities and inexact amendment IDs remain unknown.
+  If a provider misattributes a direct response, this binding can still be wrong;
+  exact IDs, durable canonical requests and stricter independent recovery limit
+  the risk. Acknowledgement never proves protection activation.
+- Retain the agreed boundaries: no live exchange acceptance, no unsupported
+  position/account operations, no unrelated warning cleanup, and no merge before
+  exact-head CI. Synthetic checks do not prove live operational readiness or full
+  trading takeover; inherited warnings remain and CI can delay integration.
+
+Scoped final re-review of `116a609..49bade7` confirmed all three findings addressed
+and no new Critical/Important breakage. No out-of-scope observation was raised.
+Local implementation, review and synthetic validation gates are complete;
+exact-head CI and integration remain pending publication. No real account,
+installed profile, desktop launch or exchange acceptance is claimed.
