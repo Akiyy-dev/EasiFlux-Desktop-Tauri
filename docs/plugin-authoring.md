@@ -12,6 +12,7 @@
 | v4 | v2/v3 动作，以及 `sandbox.computeSeries`：用户明确运行无导入的数值 Wasm | 需要包含本地计算运行时的构建，v0.6.1 不支持 |
 | v5 | v2/v3/v4 动作，以及 `sandbox.accountWorkflow`：读取逐项授权的当前账户快照并准备需另行确认的交易提案 | 需要包含账户工作流代理的构建，v0.6.1 不支持 |
 | v6 | v2/v3/v4 动作，以及 `sandbox.strategy`：原生监督、可恢复且受强制限制的自动策略回调；不能混用 v5 账户工作流 | 需要包含策略运行时的构建，v0.6.1 不支持 |
+| v7 | v6 能力，以及本运行普通活动限价单改单、开仓请求附带 TP/SL；不开放仓位管理或任意 API | 需要包含 v7 交易管理的构建，旧宿主应拒绝 |
 
 不要把旧版清单改成可以导航、计算、访问账户或自动交易的清单：导航必须显式使用 v3 以上，数值计算必须显式使用 v4 以上，账户工作流必须显式使用 v5，原生监督策略必须显式使用 v6。旧版本宿主拒绝未知版本是兼容性保护，不应通过修改宿主校验绕过。
 
@@ -22,6 +23,7 @@
 - [Series SMA v4](../examples/plugins/series-sma/README.md)：作者可读 WAT、可复现 Base64 和一个数值计算命令。
 - [账户工作流 v5](../examples/plugins/account-workflow/README.md)：三个作者可读 WAT，演示授权余额显示、用户参数化下单提案和从快照选取订单的撤单提案。
 - [阈值单次策略 v6](../examples/plugins/threshold-strategy/README.md)：一个可复现的无导入 WAT，实际检查价格、状态、原生 receipt 与本运行拥有的活动订单，再各请求一次下单和撤单。
+- [受管开仓策略 v7](../examples/plugins/managed-entry/README.md)：一次附带保护的 Buy Limit 开仓，等待匹配回执与可见自有订单后仅改单一次，再等待改单回执停止；不是收益或保护生效承诺。
 
 复制示例到自己选择的普通本地 JSON 文件，修改 `id`、`publisherId`、名称、描述和版本。不要在清单中放 API Key、Secret、账户记录或任何私人数据；清单会以普通文件保存，也会在界面展示。
 
@@ -29,7 +31,7 @@
 
 ## 动作格式
 
-### 显示信息（v2 / v3 / v4 / v5 / v6）
+### 显示信息（v2 / v3 / v4 / v5 / v6 / v7）
 
 ```json
 {
@@ -43,7 +45,7 @@
 
 HTML、Markdown、URL 不会被解释或激活；命令名称和信息标题各最多 80 个 UTF-8 字节，正文最多 2000 个 UTF-8 字节，均不能是空白。
 
-### 打开宿主页面（v3 / v4 / v5 / v6）
+### 打开宿主页面（v3 / v4 / v5 / v6 / v7）
 
 ```json
 {
@@ -68,7 +70,7 @@ HTML、Markdown、URL 不会被解释或激活；命令名称和信息标题各�
 
 正常宿主页面可能自行加载数据或保存已有图表状态；导航命令既不接收这些数据，也不替用户修改账户、设置或提交交易。没有返回值、插件回调或后台任务。
 
-### 本地数值计算（v4 / v5 / v6）
+### 本地数值计算（v4 / v5 / v6 / v7）
 
 `sandbox.computeSeries` 固定使用 `wasm-v1` / `series-f64-v1`，接收用户明确粘贴的有限数字序列和一个数值参数，只返回有限标量。不要自定义导出名、增加 import 或把模块当作通用 Wasm/WASI 应用。完整清单形状、ABI、内存/fuel/期限、取消语义和固定失败代码见[本地数值计算运行时](plugin-compute-runtime.md)。
 
@@ -84,11 +86,17 @@ HTML、Markdown、URL 不会被解释或激活；命令名称和信息标题各�
 
 具体导出、JSON 联合类型、大小限制、确认/恢复语义、上游来源与派生字段规则见[账户工作流契约](plugin-account-workflow.md)。下单的 `positionIdx` 只能是 1/2：开仓 Buy/1、Sell/2，只减仓 Sell/1、Buy/2；不要独立修改方向、只减仓和仓位索引。订单快照只包含 `order_filter=Normal` 的普通活动订单，不包含条件单或 TP/SL。结果为 `unknown` 时不要重试提交，应在交易与恢复界面核对；v5 不提供定时器、自动确认或无人值守策略。
 
-### 原生监督自动策略（仅 v6）
+### 原生监督自动策略（v6 / v7）
 
 `sandbox.strategy` 固定使用 `wasm-v1` / `strategy-json-v1`。导入、启用、查看权限、打开页面、重连或重启都不会启动；用户必须选择当前账户、能力、交易对、参数及所有强制限制，勾选真实自动交易确认，再明确启动一次。启动后没有逐单确认，原生宿主会在每次变更前重新检查内容、账户、权限、期限和预算。V6 不能包含 `sandbox.accountWorkflow`，v5 也不能申请 `strategy.run`，不要用自动确认 v5 token 模拟策略。
 
 策略至少申请 `account.read` 与 `strategy.run`；撤单还必须申请 `orders.read`。强制策略包含 `intervalMs` 5,000–60,000、`maxRunSeconds` 60–86,400、`maxActions` 1–1,000、正数 Decimal 字符串 `maxOrderQty <= maxTotalQty` 以及 `reduceOnly`。数量是交易所订单数量单位，不是美元；累计提交量包括 rejected/unknown，撤单不返还。accepted 只表示请求被接受，不表示成交、利润或撤单终态；partial 快照缺项不能证明订单消失。
+
+仅 v7 可申请 `trade.protect`（依赖 `trade.place` + `market.read`）与 `trade.amend`（再依赖 `orders.read`）。启动/恢复时仍须显式勾选授权，默认均未勾选；导入、更新、启用不授予权限。v1–v6 不会自动获得新能力，目录传输版本 3 与策略 IPC schema 1 不变。
+
+`placeProtectedOrder` 是单次开仓请求附带保护，不能先无保护下单再补保护。两个可空价格字段都必须出现且至少一个非空，触发源仅 LastPrice/MarkPrice，原生端校验新鲜参考价及限价入场价的方向关系。`amendOrder` 必须使用该运行回执里的精确原生 `orderId`，同时提供新价格及新总数量；仅支持可见普通活动 Limit 自有订单，总量不得增加且必须大于已成交量。方向、仓位索引、reduceOnly、有效期与原保护不可改，旧记录无原始下单元数据不能改单。每次改单按完整新总量扣累计预算，因此 0.001 开仓再 0.001 改单共扣 0.002。
+
+保护开仓 accepted 仅为请求确认，不代表 TP/SL 已生效；改单 accepted 不代表最终改单状态。unknown 不重试，须按精确身份只读核对；旧价格、缺失或冲突信息仍未解决。仓位级 TP/SL、杠杆、保证金/模式变更均未开放。示例的 Node 与真实 Wasmi/监督循环检查使用合成数据和临时存储，未做真实账户、应用启动或交易所验收；完整请求形状与[已核对的公开 API 来源](superpowers/specs/2026-09-29-plugin-trading-management-design.md#primary-api-references-checked-2026-09-29)见运行时契约与设计。
 
 停止只阻止新的准入，不会自动撤销挂单、平仓或清算。进程关闭、电脑睡眠、数据过期、权限变化会暂停或故障；重启不会自动恢复权限。每账户最多一个活动 run，最多保留 32 条 run 记录；不会自动清理所有权/恢复历史，容量满时新启动会明确失败，不能通过删除状态文件绕过。完整 ABI、状态、receipt、恢复、恢复授权和限制见[策略运行时契约](plugin-strategy-runtime.md)。
 

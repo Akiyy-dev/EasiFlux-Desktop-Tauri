@@ -3,7 +3,8 @@
 Manifest v6 adds `sandbox.strategy`: an import-free WebAssembly guest makes one
 bounded decision per callback while a native supervisor owns scheduling, fresh
 data, authorization, policy enforcement, durable intent/receipt state, order
-ownership, and recovery. A strategy can place or cancel ordinary orders without
+ownership, and recovery. A strategy can place or cancel ordinary orders, and v7
+can amend owned normal Limit orders or attach TP/SL to new opening orders, without
 a per-order prompt **only after one explicit real automatic-trading start**.
 
 Import, preview, enable, access inspection, page rendering, reconnect, and app
@@ -29,6 +30,13 @@ use the seven v5 names: `balances.read`, `positions.read`, `orders.read`,
 `market.read`, `trade.place`, and `trade.cancel`. Cancellation additionally needs
 `orders.read`. V6 can mix show-info, fixed-page, and numeric-compute commands, but
 cannot contain a v5 `sandbox.accountWorkflow`. V1–v5 cannot request `strategy.run`.
+
+Manifest v7 retains that ABI and adds only `trade.amend` and `trade.protect`.
+V1–v6 cannot declare these capabilities. Amendment requires `trade.place`,
+`orders.read` and `market.read`; protection requires `trade.place` and
+`market.read`. Both declaration and explicit start/resume grants enforce these
+dependencies. Import/update/enable do not grant them. Catalog transport remains
+version 3 and strategy IPC remains schema 1.
 
 The decoded module limit is 8,192 bytes and the whole manifest limit is 16 KiB.
 Import/enable grants nothing, and changing plugin content invalidates captured
@@ -79,7 +87,7 @@ including capture timestamps and partial flags. Each callback gets a new
 authoritative read. `lastReceipt` is null or the latest sanitized native receipt:
 
 ```text
-{sequence, kind:"placeOrder"|"cancelOrder",
+{sequence, kind:"placeOrder"|"cancelOrder"|"placeProtectedOrder"|"amendOrder",
  status:"accepted"|"rejected"|"unknown",
  submissionId:string|null, orderId:string|null, errorCode:string|null}
 ```
@@ -87,6 +95,10 @@ authoritative read. `lastReceipt` is null or the latest sanitized native receipt
 Accepted means the request was accepted; it does not mean filled, cancelled,
 profitable, or terminal. Missing data in a partial snapshot never proves an order
 or position disappeared.
+For protected entry it does not establish active TP/SL. For amendment it does not
+establish final amended state. Protected placement receipts carry a submissionId;
+amendment receipts carry the exact native exchange orderId and no submissionId.
+Guests must correlate action kind, sequence and identity, not HTTP success alone.
 
 Output is exactly `{state:object, action:Action, message:string}`. Message is
 plain text up to 2,000 UTF-8 bytes. A callback requests at most one action:
@@ -110,6 +122,38 @@ plain text up to 2,000 UTF-8 bytes. A callback requests at most one action:
 The host validates the strict union and all trading invariants independently.
 Only the selected symbol can be traded. Cancellation is allowed only for an order
 this run demonstrably placed and that is currently visible as cancellable.
+
+### v7 management actions
+
+```json
+{"kind":"placeProtectedOrder","order":{"symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"50000","timeInForce":"GTC","positionIdx":1,"reduceOnly":false},"protection":{"takeProfit":"55000","stopLoss":"45000","triggerBy":"LastPrice"}}
+```
+
+Both nullable protection legs are required; at least one must be non-null. Every
+specified value is a positive bounded decimal string, and triggerBy is exactly
+LastPrice or MarkPrice. Opening orders only (reduceOnly false and no reduce-only
+run). Long TP > fresh selected quote > SL; short TP < quote < SL. Limit entries
+also require that relation against entry price. Native code rechecks after awaited
+preparation and before final admission. This is one create-order request, never
+an unprotected placement followed by a separate protection request.
+
+```json
+{"kind":"amendOrder","order":{"symbol":"BTCUSDT","orderId":"owned-exchange-id","price":"50010","qty":"0.001"}}
+```
+
+Use the exact native exchange orderId from the owned receipt, never a guessed
+client ID. New price and new **total** quantity are both required positive bounded
+decimal strings. Only this run's currently visible ordinary active Limit order
+may be amended: New/PartiallyFilled, no prior cancellation request, exact owned
+client identity, new qty <= current qty and > filled qty. Duplicate/conflicting
+rows, no-op amendments and quantity increases reject. Native admission requires
+stored original placement metadata; legacy ownership without it cannot amend.
+Direction, positionIdx, reduceOnly, timeInForce, conditional type and protection
+are immutable. A normal owned protected Limit order may amend while preserving
+its original protection identity and TP/SL relation against the new entry price.
+The host uses authoritative fresh raw order metadata and risk quotes; normalized
+snapshot fields alone do not prove attached protection. Concurrent fills/cancels
+can still race the request. Amendment is never emulated with cancel/place.
 
 ## Explicit start and immutable limits
 
@@ -141,6 +185,9 @@ Quantity is the exchange order quantity unit, not a dollar/notional amount.
 `maxTotalQty` is conservative cumulative submitted quantity: rejected and unknown
 submissions count, and cancellation does not refund it. These caps are not maximum
 position, notional, loss, or profit guarantees; global trading risk also applies.
+Each amendment consumes one action and its full requested new total quantity,
+even when dispatched and rejected/unknown. Thus 0.001 placed plus 0.001 amended
+debits 0.002 cumulatively. Protected placement has the ordinary placement debit.
 
 There is one active run per account, one callback/action in flight per run, at
 most four workers globally, and at most 32 retained run records. Records are not
@@ -183,6 +230,15 @@ the same plugin content, account/environment, symbol, input, capabilities, and
 unchanged policy. It retains counters, submitted quantity, state, ownership, and
 expiry; renewal is not a budget reset.
 
+Protected recovery requires exact submitted identity and raw requested TP/SL and
+trigger selectors; the normalized Order DTO cannot prove protection. Amendment
+recovery requires exact exchange/client IDs, unchanged immutable original identity,
+and a fresh observed requested price/total quantity. Missing/conflicting/old data
+remains unresolved; cancellation's terminal-state rule is not amendment recovery.
+A live matching acknowledgement may omit or empty the echoed client ID, bound
+natively to the durable submitted request; nonempty conflicts stay unknown.
+This does not relax read-only lost-response reconciliation or prove activation.
+
 ## Authoring and example
 
 [Threshold-once strategy example](../examples/plugins/threshold-strategy/README.md)
@@ -191,7 +247,25 @@ verifier that instantiates the packaged bytes with synthetic inputs. The example
 inspects price, guest state, native receipt, and visible owned orders; it does not
 return one canned action.
 
+[Managed-entry v7 example](../examples/plugins/managed-entry/README.md) requests
+one protected entry, waits for its matching receipt and exact visible owned order,
+amends once without increasing qty, and stops after the matching acknowledgement.
+Its packaged Node verifier and actual Wasmi/supervisor test use synthetic fixtures
+and temporary storage only. See [scoped evidence and pending integration gates](superpowers/verification/2026-09-29-plugin-trading-management.md).
+
+Public API references checked for this design:
+[create order](https://www.easicoin.io/api-doc/contract/orderHttp/order-create),
+[replace order](https://www.easicoin.io/api-doc/contract/orderHttp/order-replace),
+[open orders](https://www.easicoin.io/api-doc/contract/orderHttp/open-order-list),
+[order history](https://www.easicoin.io/api-doc/contract/orderHttp/order-list).
+Position-level [TP/SL](https://www.easicoin.io/api-doc/contract/positionHttp/set-tpsl)
+and [position operations](https://www.easicoin.io/api-doc/contract/positionHttp/list)
+are not exposed by these guest actions.
+
 Out of scope for v6 are guest-origin arbitrary networking/filesystem access,
 credentials, withdrawals, transfers, conditional orders, TP/SL, multi-account
 strategy concurrency, automatic restart authorization, historical indicator SDKs,
 hosted marketplace delivery, and installer/release publication.
+V7 adds only the owned amendment and attached opening protection described above;
+position-level TP/SL, leverage, margin/mode changes and full account takeover remain
+unsupported. These offline checks are not live/test-environment exchange acceptance.

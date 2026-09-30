@@ -105,6 +105,13 @@ state), not filled, final amendment, active TP/SL, or guaranteed protection.
 UI/docs must state this clearly. A matching acknowledgement must be structurally
 valid and identify the exact order; HTTP success, empty data and wrong/conflicting
 IDs are unknown, never fabricated acceptance.
+The documented live create/replace acknowledgement can omit the client order ID
+or return an empty string. Accept that shape when the exchange order ID is valid
+(and exactly the owned target for amendment), binding absent/empty client identity
+to the durable submitted request as native metadata only. A nonempty echoed client
+ID must match; non-string/null or conflicting identity aliases stay unknown. This
+does not relax lost-response reconciliation, which still requires exact identity
+from an authoritative read, nor establish active protection.
 
 Pending intent and conservative debit precede mutation dispatch. Persist receipts
 and ownership before acknowledging a placement's submission journal. Preserve the
@@ -164,7 +171,19 @@ do not call this full trading takeover or production acceptance.
 
 - [Create order](https://www.easicoin.io/api-doc/contract/orderHttp/order-create)
 - [Replace order](https://www.easicoin.io/api-doc/contract/orderHttp/order-replace)
+- [Open order list](https://www.easicoin.io/api-doc/contract/orderHttp/open-order-list)
+- [Order history](https://www.easicoin.io/api-doc/contract/orderHttp/order-list)
 - [Create position TP/SL](https://www.easicoin.io/api-doc/contract/positionHttp/set-tpsl)
 - [Position list](https://www.easicoin.io/api-doc/contract/positionHttp/list)
 
 Only public documentation was read; no authenticated API request was made.
+
+## Task 3 authoring handoff
+
+The [managed-entry fixture](../../../examples/plugins/managed-entry/README.md)
+implements the scoped lifecycle with explicit start/grants, sequence-correlated
+native receipts and exact visible owned order identity. Its final packaged module
+is 4740 bytes and manifest 7342 bytes; scoped actual Wasmi/supervisor and Node
+evidence is in the [verification record](../verification/2026-09-29-plugin-trading-management.md).
+This is not live acceptance or completion of the controller integration gate.
+Stopping leaves exchange orders/positions untouched.

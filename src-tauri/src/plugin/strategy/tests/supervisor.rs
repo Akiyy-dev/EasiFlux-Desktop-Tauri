@@ -123,6 +123,7 @@ struct Fake {
     placed: AtomicUsize,
     cancelled: AtomicUsize,
     amended: AtomicUsize,
+    expected_amend: Mutex<(String, String)>,
     acked: AtomicUsize,
     reads: AtomicUsize,
     visible: AtomicBool,
@@ -285,9 +286,12 @@ impl WorkflowHost for Fake {
         Box::pin(async move {
             let doc = self.store.load()?;
             assert_eq!(doc.runs[0].view.actions_submitted, 2);
-            assert_eq!(doc.runs[0].view.total_submitted_qty, "0.0018");
+            let expected = self.expected_amend.lock().unwrap().clone();
+            assert_eq!(doc.runs[0].view.total_submitted_qty, expected.1);
             assert_eq!(request.order_id, "owned-1");
-            assert_eq!(request.qty, "0.0008");
+            assert_eq!(request.qty, expected.0);
+            assert_eq!(request.price, "50010");
+            assert_eq!(request.symbol, "BTCUSDT");
             assert_eq!(original.order_link_id, *self.last_submission.lock().unwrap());
             if self.hold_preparation.load(Ordering::SeqCst) {
                 self.preparing.notify_one();
@@ -468,6 +472,7 @@ async fn fixture_manifest(m: serde_json::Value) -> Fixture {
         placed: AtomicUsize::new(0),
         cancelled: AtomicUsize::new(0),
         amended: AtomicUsize::new(0),
+        expected_amend: Mutex::new(("0.0008".into(), "0.0018".into())),
         acked: AtomicUsize::new(0),
         reads: AtomicUsize::new(0),
         visible: AtomicBool::new(true),
@@ -1129,6 +1134,64 @@ async fn packaged_threshold_guest_trades_only_after_price_crossing_then_cancels_
     assert_eq!(f.host.cancelled.load(Ordering::SeqCst), 1);
     assert_eq!(f.host.acked.load(Ordering::SeqCst), 1);
 }
+// Break: packaged bytes fail native preflight/fuel, replay placement/amendment,
+// ignore visibility or fail receipt correlation after persisted key normalization.
+#[tokio::test(start_paused = true)]
+async fn packaged_managed_entry_protects_then_amends_exact_owned_order_once() {
+    let _serial = SERIAL.lock().await;
+    let manifest = serde_json::from_str(include_str!(
+        "../../../../../examples/plugins/managed-entry/manifest.json"
+    )).unwrap();
+    let f = fixture_manifest(manifest).await;
+    *f.host.expected_amend.lock().unwrap() = ("0.001".into(), "0.002".into());
+    let mut r = request(f.supervisor.access(f.authority.clone()).await.unwrap());
+    r.capabilities = ["account.read", "orders.read", "market.read", "trade.place",
+        "trade.protect", "trade.amend", "strategy.run"].into_iter().map(str::to_string).collect();
+    r.input_json = r#"{"symbol":"BTCUSDT","qty":"0.001","entryPrice":"50000","amendPrice":"50010","takeProfit":"55000","stopLoss":"45000"}"#.into();
+    f.supervisor.start(r).await.unwrap();
+    let placed = settled(&f, "1").await;
+    assert_eq!(placed.last_receipt.as_ref().unwrap().kind, ReceiptKind::PlaceProtectedOrder);
+    assert_eq!(placed.last_receipt.unwrap().status, ReceiptStatus::Accepted);
+    assert_eq!(f.host.placed.load(Ordering::SeqCst), 1);
+    let document = f.store.load().unwrap();
+    let original = document.runs[0].owned["owned-1"].placement.as_ref().unwrap();
+    assert_eq!(original.symbol, "BTCUSDT");
+    assert_eq!(original.side, "Buy");
+    assert_eq!(original.order_type, "Limit");
+    assert_eq!(original.price.as_deref(), Some("50000"));
+    assert_eq!(original.qty, "0.001");
+    assert_eq!(original.time_in_force.as_deref(), Some("GoodTillCancel"));
+    assert_eq!(original.position_idx, 1);
+    assert_eq!(original.reduce_only, Some(false));
+    assert_eq!(original.protection.as_ref().unwrap().take_profit.as_deref(), Some("55000"));
+    assert_eq!(original.protection.as_ref().unwrap().stop_loss.as_deref(), Some("45000"));
+    assert_eq!(original.protection.as_ref().unwrap().trigger_by, "LastPrice");
+    f.host.visible.store(false, Ordering::SeqCst);
+    tick(&f).await;
+    settled(&f, "2").await;
+    tick(&f).await;
+    settled(&f, "3").await;
+    assert_eq!(f.host.amended.load(Ordering::SeqCst), 0);
+    f.host.visible.store(true, Ordering::SeqCst);
+    tick(&f).await;
+    let amended = settled(&f, "4").await;
+    assert_eq!(amended.actions_submitted, 2);
+    assert_eq!(amended.total_submitted_qty, "0.002");
+    let receipt = amended.last_receipt.unwrap();
+    assert_eq!(receipt.kind, ReceiptKind::AmendOrder);
+    assert_eq!(receipt.status, ReceiptStatus::Accepted);
+    assert_eq!(receipt.order_id.as_deref(), Some("owned-1"));
+    tick(&f).await;
+    status(&f, StrategyStatus::Completed).await;
+    f.supervisor.drain().await;
+    tick(&f).await;
+    assert_eq!(f.host.placed.load(Ordering::SeqCst), 1);
+    assert_eq!(f.host.amended.load(Ordering::SeqCst), 1);
+    assert_eq!(f.host.cancelled.load(Ordering::SeqCst), 0);
+    assert_eq!(f.host.acked.load(Ordering::SeqCst), 1);
+    assert_eq!(f.store.load().unwrap().runs[0].owned["owned-1"].placement.as_ref(), Some(original));
+}
+
 #[tokio::test(start_paused = true)]
 async fn storage_corruption_revokes_admission_and_cannot_be_bypassed_by_a_new_start() {
     let _serial = SERIAL.lock().await;

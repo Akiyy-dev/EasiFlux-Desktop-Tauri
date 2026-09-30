@@ -28,6 +28,8 @@ jobs:
         run: node examples/plugins/account-workflow/verify.mjs
       - name: Verify automatic strategy guest with synthetic data
         run: node examples/plugins/threshold-strategy/verify.mjs
+      - name: Verify managed-entry strategy guest with synthetic data
+        run: node examples/plugins/managed-entry/verify.mjs
       - run: pnpm build
 
   rust:
@@ -54,6 +56,9 @@ jobs:
         working-directory: src-tauri
       - name: Verify strategy Wasm matches its readable source
         run: cargo run --locked --example build_threshold_strategy_manifest -- --check
+        working-directory: src-tauri
+      - name: Verify managed-entry Wasm matches its readable source
+        run: cargo run --locked --example build_managed_entry_manifest -- --check
         working-directory: src-tauri
       - run: cargo clippy --locked --all-targets
         working-directory: src-tauri
